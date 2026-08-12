@@ -130,10 +130,16 @@ impl Resolver {
             };
         }
 
-        Project {
-            key: self.repo_or_itself(&normalized),
-            pre_worktree: None,
-        }
+        // The git fold keeps its pre-image for the same reason the worktree
+        // fold above does. `<repo>/.claude` folds up to `<repo>`, and dropping
+        // the pre-fold path left the read-side exclusion test with no key equal
+        // to the path the user actually excluded: the only spelling that names
+        // that project directory is the unfolded one, so excluding it hid
+        // nothing and `status` went on listing its sessions. Every subdirectory
+        // of a repository is this case, not just worktrees.
+        let key = self.repo_or_itself(&normalized);
+        let pre_worktree = (key != normalized).then_some(normalized);
+        Project { key, pre_worktree }
     }
 
     /// The git toplevel for a directory that still exists, or the path itself.
