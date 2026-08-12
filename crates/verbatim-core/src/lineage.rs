@@ -68,3 +68,53 @@ pub fn foreign_predecessor(scan: &Scan) -> Option<String> {
         Some(candidate.to_owned())
     })
 }
+
+/// The directory name that marks everything below it as a sidecar (D-03).
+pub const SIDECAR_DIR: &str = "subagents";
+
+/// The transcript a sidecar ran under, derived from the sidecar's **path**
+/// (D-03).
+///
+/// A sidecar sits at `<project>/<sessionId>/subagents/agent-*.jsonl`, and 41
+/// real ones sit two levels deeper still under
+/// `subagents/workflows/wf_*/`. Either way the directory above the nearest
+/// `subagents` ancestor is named for a top-level transcript's session id, and
+/// the parent is that transcript inside the project directory:
+/// `<project>/<sessionId>.jsonl`.
+///
+/// Records cannot answer this. All 822 real sidecar files sit under a directory
+/// named for an existing top-level transcript's session id, and 818 of 818
+/// `agent-*.jsonl` files report that same id as their own `sessionId` - so the
+/// record-level id distinguishes nothing, and keying on it links a sidecar to
+/// itself or to whichever session happens to share the id.
+///
+/// The returned value is a **session key** (a transcript path), not a session
+/// id, and it is returned whether or not that transcript has been ingested -
+/// for the same reason `continues_from` carries no foreign key (D-19). A
+/// top-level transcript has no `subagents` ancestor and gets `None`.
+pub fn sidecar_parent(transcript: &std::path::Path) -> Option<std::path::PathBuf> {
+    let parts: Vec<std::ffi::OsString> = transcript
+        .components()
+        .map(|c| c.as_os_str().to_os_string())
+        .collect();
+
+    // The nearest `subagents` ancestor, which is the deepest one: a sidecar
+    // spawned from a sidecar belongs to the session directory nearest it.
+    let at = (0..parts.len().saturating_sub(1))
+        .rev()
+        .find(|i| parts[*i] == *SIDECAR_DIR)?;
+    // `<project>/<sessionId>/subagents/...` needs a session directory above the
+    // marker and a project directory above that.
+    if at < 2 {
+        return None;
+    }
+
+    let mut parent = std::path::PathBuf::new();
+    for part in &parts[..at - 1] {
+        parent.push(part);
+    }
+    let mut name = parts[at - 1].clone();
+    name.push(".jsonl");
+    parent.push(name);
+    Some(parent)
+}

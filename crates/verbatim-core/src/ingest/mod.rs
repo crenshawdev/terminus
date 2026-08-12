@@ -164,6 +164,14 @@ pub(crate) fn ingest_locked(
     // write transaction held across a subprocess would stop MCP readers.
     let project = first_cwd(&scan).map(|cwd| projects.resolve(&cwd));
 
+    // D-03: a sidecar's parent comes from its path and never from its records,
+    // which all report the parent's `sessionId` and so distinguish nothing. The
+    // path is already the canonical one the walk built, so the derived value is
+    // exactly the key the parent's own ingest wrote - whether or not the parent
+    // has been ingested yet.
+    let parent_session_key =
+        lineage::sidecar_parent(path).map(|p| p.to_string_lossy().into_owned());
+
     let pass = Pass {
         session_key: session_key.clone(),
         bytes_read: consumed as u64,
@@ -201,6 +209,7 @@ pub(crate) fn ingest_locked(
             uncompressed_len,
             continues_from: continues_from.as_deref(),
             project: project.as_ref(),
+            parent_session_key: parent_session_key.as_deref(),
             scan: &scan,
         },
     )?;
@@ -553,6 +562,10 @@ struct MetaRow<'a> {
     /// Resolved from the first `cwd` in this scan (D-20), or `None` for a
     /// transcript that carries no `cwd` at all. One real transcript does.
     project: Option<&'a Project>,
+    /// The `session_key` of the transcript this sidecar ran under (D-03), or
+    /// `None` for a top-level transcript. In the session-KEY namespace, unlike
+    /// [`MetaRow::continues_from`].
+    parent_session_key: Option<&'a str>,
     scan: &'a Scan,
 }
 
@@ -565,8 +578,9 @@ fn first_cwd(scan: &Scan) -> Option<String> {
 ///
 /// Every column that describes the session as a whole is `coalesce`d onto what
 /// is already there: a tail pass sees only the tail, and `session_id`, `cwd`,
-/// `gitBranch`, the project and the first turn's timestamp were established by
-/// the first pass. `is_final` and `is_evicted` stay null - retention is phase 8.
+/// `gitBranch`, the project, the sidecar's parent and the first turn's
+/// timestamp were established by the first pass. `is_final` and `is_evicted`
+/// stay null - retention is phase 8.
 fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
     let scan = row.scan;
     let session_id = scan.records.iter().find_map(|r| r.session_id.clone());
@@ -585,8 +599,8 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
         "INSERT INTO session_meta (
             session_key, session_id, transcript_path, checksum, uncompressed_len,
             continues_from, first_turn_at, last_turn_at, cwd, branch,
-            project, project_pre_worktree
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            project, project_pre_worktree, parent_session_key
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(session_key) DO UPDATE SET
             session_id = coalesce(session_meta.session_id, excluded.session_id),
             transcript_path = excluded.transcript_path,
@@ -599,7 +613,9 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
             branch = coalesce(session_meta.branch, excluded.branch),
             project = coalesce(session_meta.project, excluded.project),
             project_pre_worktree = coalesce(
-                session_meta.project_pre_worktree, excluded.project_pre_worktree)",
+                session_meta.project_pre_worktree, excluded.project_pre_worktree),
+            parent_session_key = coalesce(
+                session_meta.parent_session_key, excluded.parent_session_key)",
         rusqlite::params![
             row.session_key,
             session_id,
@@ -613,6 +629,7 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
             branch,
             project,
             pre_worktree,
+            row.parent_session_key,
         ],
     )?;
     Ok(())

@@ -248,3 +248,109 @@ fn the_parent_uuid_fallback_still_links_a_fork() {
         "the fallback must name a session, not a message uuid"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A sidecar's parent (D-03), which comes from the path and never the records.
+// ---------------------------------------------------------------------------
+
+impl Tree {
+    /// A sidecar reporting `own` - its PARENT's session id, which is what all
+    /// 818 real `agent-*.jsonl` files do.
+    fn sidecar(&self, name: &str, n: u8, own: &str) -> PathBuf {
+        self.write(
+            name,
+            &record(n, own, None).replace(
+                "\"type\":\"user\"",
+                "\"type\":\"user\",\"isSidechain\":true",
+            ),
+        )
+    }
+
+    fn parent_of(&self, path: &Path) -> Option<String> {
+        self.conn()
+            .query_row(
+                "SELECT parent_session_key FROM session_meta WHERE session_key = ?1",
+                [path.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    fn session_id_of(&self, path: &Path) -> Option<String> {
+        self.conn()
+            .query_row(
+                "SELECT session_id FROM session_meta WHERE session_key = ?1",
+                [path.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+}
+
+/// Both sidecar depths link to the top-level transcript whose directory they
+/// sit under, and the top-level transcript's own parent stays null.
+///
+/// 781 real sidecars sit at `<project>/<sessionId>/subagents/` and 41 two
+/// levels deeper under `subagents/workflows/wf_*/`.
+#[test]
+fn both_sidecar_depths_carry_their_parents_session_key() {
+    let tree = tree();
+    let own = session(1);
+    let parent = tree.transcript(1, &own, None);
+    let shallow = tree.sidecar(&format!("{}/subagents/agent-a.jsonl", uuid(1)), 2, &own);
+    let deep = tree.sidecar(
+        &format!("{}/subagents/workflows/wf_x/agent-deep.jsonl", uuid(1)),
+        3,
+        &own,
+    );
+
+    assert_eq!(tree.pass().files_committed, 3);
+
+    let expected = parent.to_str().unwrap().to_owned();
+    assert_eq!(tree.parent_of(&shallow).as_deref(), Some(&*expected));
+    assert_eq!(tree.parent_of(&deep).as_deref(), Some(&*expected));
+    assert_eq!(
+        tree.parent_of(&parent),
+        None,
+        "a top-level transcript has no parent session"
+    );
+
+    // The link cannot have come from the records: the sidecar reports exactly
+    // the same session id as its parent, which is D-01's collision case.
+    assert_eq!(tree.session_id_of(&shallow), tree.session_id_of(&parent));
+    assert_eq!(tree.session_id_of(&deep), tree.session_id_of(&parent));
+}
+
+/// Ingest order does not matter (D-19): the key is stored whether or not the
+/// parent transcript has been ingested, or exists at all.
+#[test]
+fn a_sidecar_ingested_before_its_parent_records_the_same_key() {
+    let tree = tree();
+    let own = session(1);
+    let orphan = tree.sidecar(&format!("{}/subagents/agent-a.jsonl", uuid(1)), 2, &own);
+
+    // Pass one: only the sidecar exists.
+    assert_eq!(tree.pass().files_committed, 1);
+    let expected = tree
+        .projects()
+        .join(PROJECT)
+        .canonicalize()
+        .unwrap()
+        .join(format!("{}.jsonl", uuid(1)))
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(tree.parent_of(&orphan).as_deref(), Some(&*expected));
+
+    let sessions: i64 = tree
+        .conn()
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sessions, 1, "the parent is named, not required");
+
+    // Pass two: the parent appears, and it is the key that was already stored.
+    let parent = tree.transcript(1, &own, None);
+    assert_eq!(tree.pass().files_committed, 1);
+    assert_eq!(parent.to_str(), Some(&*expected));
+    assert_eq!(tree.parent_of(&orphan).as_deref(), Some(&*expected));
+}
