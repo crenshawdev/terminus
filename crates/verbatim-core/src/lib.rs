@@ -13,6 +13,7 @@ pub mod discover;
 pub mod error;
 pub mod ingest;
 pub mod parse;
+pub mod project;
 pub mod recover;
 pub mod reindex;
 pub mod store;
