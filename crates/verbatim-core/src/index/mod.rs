@@ -15,7 +15,7 @@ pub mod entity;
 pub mod expand;
 pub mod text;
 
-pub use entity::{Entity, KINDS};
+pub use entity::{Entity, KINDS, MAX_ENTITIES_PER_TURN};
 pub use expand::MAX_EXPANSION_BYTES;
 pub use text::{MAX_BODY_BYTES, MAX_DEPTH};
 
@@ -34,7 +34,8 @@ pub fn project(record: &Value) -> String {
     body
 }
 
-/// Every entity one turn record leaves behind (RCL-02, RCL-03), capped.
+/// Every entity one turn record leaves behind (RCL-02, RCL-03), deduplicated
+/// and capped at [`MAX_ENTITIES_PER_TURN`].
 ///
 /// The same parsed record the body came from, so a turn is read once and every
 /// derived row for it comes out of that one read.

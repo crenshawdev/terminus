@@ -47,12 +47,30 @@ pub struct Entity {
 /// The `tool_use` input keys that name a file outright.
 const PATH_INPUTS: [&str; 3] = ["file_path", "path", "notebook_path"];
 
-/// Every entity one turn record carries, deduplicated on `(kind, value)` and in
-/// the order the record walk produces.
+/// How many entities one turn may emit, across every kind (RCL-04, D-15).
+///
+/// Measured over a 300-file sample of the real corpus: of the turns emitting any
+/// entity at all, p50 emits 3, p90 emits 10, p99 emits 38 and the largest emits
+/// 146. A cap of 48 therefore binds the tail and leaves the common turn
+/// untouched - which is the point of capping at all, since the alternative is
+/// one `git status --porcelain` result writing a row per changed file.
+///
+/// This is a bound on rows and **not** a stop-list. RCL-04 forbids rejecting an
+/// entity at index time for being common - "too common" changes as the corpus
+/// grows and the rejection is irreversible - and a value dropped by position
+/// because its turn carried 150 of them is not a value rejected for what it is.
+pub const MAX_ENTITIES_PER_TURN: usize = 48;
+
+/// Every entity one turn record carries, deduplicated on `(kind, value)`, in the
+/// order the record walk produces, and no more than
+/// [`MAX_ENTITIES_PER_TURN`] of them.
 ///
 /// The order is the whole reason a rebuild reproduces the same rows: it depends
 /// on the record's bytes and on nothing about the store, so re-deriving the same
-/// record twice writes the same list twice.
+/// record twice writes the same list twice. The cap is applied in that same
+/// order and never by frequency, recency or anything else the store knows -
+/// a data-dependent cut would make the rebuild AC3 asserts depend on what else
+/// was in the store at the time.
 pub fn extract(record: &Value) -> Vec<Entity> {
     let mut out = Collector::default();
 
@@ -84,6 +102,12 @@ struct Collector {
 
 impl Collector {
     fn push(&mut self, kind: &'static str, value: impl Into<String>) {
+        // The cap counts what was KEPT, so a repeated value never consumes a
+        // slot and a turn naming one file forty times still has room for the
+        // tool that touched it.
+        if self.entities.len() >= MAX_ENTITIES_PER_TURN {
+            return;
+        }
         let value = value.into();
         if value.is_empty() {
             return;

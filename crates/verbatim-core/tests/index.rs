@@ -627,3 +627,89 @@ fn the_error_normalization_is_a_function_with_answers() {
     let wide = "é".repeat(MAX_ERROR_BYTES);
     assert!(norm(&wide).len() <= MAX_ERROR_BYTES);
 }
+
+// --- RCL-04: the per-turn cap ------------------------------------------------
+
+/// A turn cannot write more entity rows than the cap, and the cut is positional
+/// so a re-derive reproduces it exactly.
+///
+/// The reproducibility half is what makes the cap safe: AC3 asserts that
+/// dropping the derived tables and rebuilding from the blobs alone reproduces
+/// the same rows, which holds only because the cut depends on the record's own
+/// bytes and on nothing the store knows. A cap applied by frequency or recency
+/// would pass this test on a fresh store and fail it on a full one.
+#[test]
+fn a_turn_writes_no_more_entities_than_the_cap_and_the_same_ones_twice() {
+    use verbatim_core::derive::{self, TurnRow};
+    use verbatim_core::index::MAX_ENTITIES_PER_TURN;
+    use verbatim_core::parse;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = verbatim_core::Store::open(dir.path()).unwrap();
+    let conn = store.conn();
+    conn.execute(
+        "INSERT INTO sessions (session_key, session_no, blob) VALUES ('k', 0, x'00')",
+        [],
+    )
+    .unwrap();
+
+    // One `Bash` call naming three times the cap in files. The real corpus's
+    // heaviest measured turn emits 146 entities against a p99 of 38, so this is
+    // the shape of turn the cap exists for and not an invented one.
+    let files: Vec<String> = (0..MAX_ENTITIES_PER_TURN * 3)
+        .map(|n| format!("crates/x/src/f{n}.rs"))
+        .collect();
+    let line = serde_json::json!({
+        "type": "assistant",
+        "uuid": "u1",
+        "timestamp": "2026-08-12T09:14:21.000Z",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "Bash",
+                "input": { "command": format!("wc -l {}", files.join(" ")) }
+            }]
+        }
+    })
+    .to_string();
+    let bytes = [line.as_bytes(), b"\n"].concat();
+    let scan = parse::scan(&bytes);
+    let (_, turn) = scan.turns().next().unwrap();
+
+    let row = TurnRow {
+        session_key: "k",
+        session_no: 0,
+        turn,
+        stream_offset: 0,
+        byte_len: line.len() as u64,
+        record: line.as_bytes(),
+        subtype: None,
+        compact_metadata: None,
+    };
+    let id = derive::derive_turn(conn, row).unwrap();
+    let first = entities_of(conn, id);
+
+    assert_eq!(first.len(), MAX_ENTITIES_PER_TURN, "{first:?}");
+    // In record-walk order, and the cut is simply where the walk ran out of
+    // room: the tool, the program, then paths until the cap.
+    assert_eq!(first[0], ("tool".into(), "Bash".into()));
+    assert_eq!(first[1], ("command".into(), "wc".into()));
+    assert_eq!(first[2], ("path".into(), "crates/x/src/f0.rs".into()));
+    assert_eq!(
+        first.last().unwrap().1,
+        format!("crates/x/src/f{}.rs", MAX_ENTITIES_PER_TURN - 3)
+    );
+    // Every path entity still writes its `paths` row, so that table is capped
+    // by the same cut rather than by one of its own.
+    assert_eq!(paths_of(conn, id).len(), MAX_ENTITIES_PER_TURN - 2);
+
+    derive::derive_turn(conn, row).unwrap();
+    assert_eq!(
+        entities_of(conn, id),
+        first,
+        "a re-derive of the same record wrote different rows"
+    );
+    assert_eq!(paths_of(conn, id).len(), MAX_ENTITIES_PER_TURN - 2);
+}
