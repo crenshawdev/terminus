@@ -9,7 +9,9 @@ files:
   - crates/verbatim-core/src/parse/record.rs
   - crates/verbatim-core/src/parse/mod.rs
   - crates/verbatim-core/src/derive.rs
+  - crates/verbatim-core/src/reindex.rs
   - crates/verbatim-core/src/verify.rs
+  - crates/verbatim-core/src/error.rs
   - crates/verbatim-core/src/ingest/mod.rs
   - crates/verbatim-core/src/ingest/pass.rs
   - crates/verbatim-core/src/testkit.rs
@@ -140,8 +142,18 @@ every Verify below uses `cargo test --workspace`.
 
 ### Task 2: A compaction boundary becomes a row, through the derive seam
 
-- **Files:** crates/verbatim-core/src/derive.rs, crates/verbatim-core/tests/derive.rs, crates/verbatim-core/tests/compaction.rs
-- **Action:** Write the boundary row inside `derive::derive_turn`, the one seam
+- **Files:** crates/verbatim-core/src/derive.rs, crates/verbatim-core/src/reindex.rs, crates/verbatim-core/tests/derive.rs, crates/verbatim-core/tests/compaction.rs
+- **Action:** First carry the two fields task 1 parsed as far as the seam. The
+  seam's input is `TurnRow { session_key, session_no, turn, stream_offset,
+  byte_len, record }` (`derive.rs:29-41`) and task 1 put `subtype` and the
+  `compactMetadata` bytes on `Record::parse`'s output, which `derive_turn` never
+  receives - so add them as `TurnRow` fields rather than re-parsing `row.record`
+  inside the seam, since task 1 makes the parser the owner of those fields and a
+  second parse site is a second place to get them wrong. `TurnRow` has two
+  construction sites: the ingest path and the literal at `reindex.rs:90-98`.
+  Update BOTH - `reindex.rs` is in this task's lease for exactly that reason,
+  and skipping it makes the rebuild path drop every boundary row, which fails
+  this task's own Verify. Then write the boundary row inside `derive::derive_turn`, the one seam
   ingest and `reindex` share, and nowhere else - a second write site is exactly
   what STOR-04 forbids, and the module's own contract is that the seam owns
   every derived row for a turn. When the turn's record carries
@@ -167,17 +179,25 @@ every Verify below uses `cargo test --workspace`.
 
 ### Task 3: A transcript shorter than its watermark is skipped and flagged
 
-- **Files:** crates/verbatim-core/src/ingest/mod.rs, crates/verbatim-core/src/ingest/pass.rs, crates/verbatim-core/src/verify.rs, crates/verbatim-core/tests/verify.rs, crates/verbatim-core/tests/compaction.rs
+- **Files:** crates/verbatim-core/src/ingest/mod.rs, crates/verbatim-core/src/ingest/pass.rs, crates/verbatim-core/src/error.rs, crates/verbatim-core/src/verify.rs, crates/verbatim-core/tests/verify.rs, crates/verbatim-core/tests/compaction.rs
 - **Action:** Complete D-13. `read_tail` in
   `crates/verbatim-core/src/ingest/mod.rs` already refuses a file shorter than
   its stored watermark rather than guessing which bytes are still ours; keep
   that refusal and never fall back to re-ingesting from offset 0, because the
   append-only property is an observation over one 25-day corpus
   (`DESIGN-BRIEF.md:139`) and not a documented guarantee, and re-ingesting would
-  destroy archived bytes. What this task adds is the signal: the pass records
-  the skip against that file (PLAN-1 task 4 already isolates it) and sets the
-  divergence column PLAN-1 added on that session's `session_meta` row, in a
-  transaction of its own since the file's own pass rolled back. Then make
+  destroy archived bytes. Change how it reports, though: `read_tail` today
+  returns `Error::io(path, io::Error::new(InvalidData, "is N bytes but its
+  watermark is at M"))` (`ingest/mod.rs:391`), which the pass cannot tell apart
+  from any other failure it must NOT flag - `path_key` (`ingest/mod.rs:373`)
+  returns `InvalidData` too, for a non-UTF-8 transcript path, and matching on
+  the message text breaks the first time the wording changes. Add a dedicated
+  variant in `crates/verbatim-core/src/error.rs` carrying the path, the file
+  length and the watermark offset, and have `read_tail` return it; that variant
+  is the only thing the pass matches on. What this task adds is the signal: the
+  pass records the skip against that file (PLAN-1 task 4 already isolates it)
+  and sets the divergence column PLAN-1 added on that session's `session_meta`
+  row, in a transaction of its own since the file's own pass rolled back. Then make
   `verify` report it: `verify::walk` today reads `session_key`, `blob` and
   `checksum` and `verify::check` fails only on a missing metadata row, a blob
   that will not decompress, or a checksum mismatch. Add the divergence as a
@@ -196,7 +216,10 @@ every Verify below uses `cargo test --workspace`.
   pass's `runs` error naming that path, and `verbatim verify` exiting non-zero
   naming that session and no other; then restore the file to its full length,
   re-run the pass, and find the flag cleared and `verbatim verify` exiting 0
-  with an empty stdout.
+  with an empty stdout. Plus the discrimination test the new error variant
+  exists for: a transcript at a non-UTF-8 path fails its file with an error that
+  is NOT the divergence variant, is recorded in the `runs` error like any other
+  per-file failure, and sets the divergence flag on no session.
 
 ### Task 4: Killing a pass mid-tree converges, on a first pass and on an append
 
@@ -242,10 +265,27 @@ every Verify below uses `cargo test --workspace`.
   Claude config directory whose `projects` subdirectory is the tree, and skip
   with a printed reason when it is unset so CI stays green without it. The test
   writes its store into a temporary data directory and never into the user's,
-  and it only reads the corpus. Assert AC1: the archived session count equals
-  the number of `<uuid>.jsonl` files at project depth plus the number of
-  `agent-*.jsonl` files at any depth, counted independently by the test walking
-  the tree itself rather than by asking the code under test; no session exists
+  and it only reads the corpus. It must also point the config-directory override
+  from PLAN-1 task 2 at a temporary directory holding no `verbatim.toml`: that
+  override replaces only the DEFAULT root, so an explicit `roots` list in the
+  developer's real config would win over the corpus variable, and once John
+  configures exclusions - the feature this phase ships - the run would silently
+  walk his configured roots and skip his excluded projects while the test's own
+  walk counted the corpus tree. The corpus variable must be the only thing that
+  decides what is walked.
+
+  Assert AC1 as a set relation over a stable file set, not a bare equality
+  against one walk. Walk the tree and record the transcript path set BEFORE the
+  pass, walk it again AFTER, and assert against the intersection of the two -
+  the corpus is live (the Claude Code session running the test appends to its
+  own transcript and spawns new `agent-*.jsonl` sidecars mid-run), so a
+  before-only count races the pass and fails on correct behaviour. Every path in
+  the intersection has an archived session, EXCEPT a transcript whose bytes hold
+  no complete line: `ingest_locked` returns `Outcome::UpToDate` and writes no
+  `sessions` row when `scan.consumed() == 0` (`ingest/mod.rs:92-95`), which a
+  file created moments before the pass legitimately is. Assert those separately
+  and by name - each unarchived path in the intersection must contain no
+  newline - rather than letting them fail the count. No session exists
   for any `journal.jsonl`, any `.meta.json`, any `workflows/wf_*.json` or
   anything under a `tool-results/` directory; and zero unparseable lines - the
   test decompresses each archived blob and parses every line with `serde_json`,
@@ -264,7 +304,8 @@ every Verify below uses `cargo test --workspace`.
   begins. Assert no panic by the test completing, and assert the pass exits 0.
 - **Verify:** With the corpus env var set to the real Claude config directory,
   `cargo test --workspace --test corpus -- --nocapture` passes and prints the
-  session count, the independently counted file totals it matched, the
+  session count, the size of the before/after path-set intersection it matched,
+  any path it excused as holding no complete line, the
   per-record-type histogram, the `continues_from` counts, and the pass and
   rebuild wall times. With the variable unset, the same command passes and
   prints the skip reason. (human-verify: the corpus run is the one check that
@@ -279,9 +320,15 @@ every Verify below uses `cargo test --workspace`.
   edit still owed.
 - Task 5's counts will not match CONTEXT's exactly and should not be pinned to
   literals: CONTEXT measured 2,075 `.jsonl` files, 1,253 at project depth and
-  818 sidecars, and the live tree has grown since. The assertion is that the
-  store's session count equals what the test itself counted on the same tree in
-  the same run, which is the only form that stays true as the corpus grows.
+  818 sidecars, and the live tree has grown since. The assertion is over the
+  intersection of a walk taken before the pass and one taken after, which is the
+  only form that stays true both as the corpus grows between runs and as it
+  grows *during* one - the developer's own session is writing into the tree the
+  test is measuring.
+- Task 5 isolates the config directory as well as the data directory. Isolating
+  only the data directory leaves the developer's real `roots` and `exclusions`
+  deciding what the corpus run walks, which would make the run pass against a
+  tree nobody asked it to measure.
 - Task 3 changes what `verbatim verify` can report. AC3 from phase 1 stays
   satisfiable because the new failure is attributed by `session_key` like every
   other, but the phase 1 test

@@ -17,6 +17,7 @@ files:
   - crates/verbatim-core/src/recover.rs
   - crates/verbatim-core/src/store/schema.rs
   - crates/verbatim-core/src/store/open.rs
+  - crates/verbatim-core/src/reindex.rs
   - crates/verbatim-core/src/ingest/mod.rs
   - crates/verbatim-core/src/ingest/pass.rs
   - crates/verbatim-core/src/testkit.rs
@@ -32,6 +33,7 @@ files:
   - crates/verbatim/src/cmd/ingest.rs
   - crates/verbatim/src/cmd/status.rs
   - crates/verbatim/tests/status.rs
+  - crates/verbatim/tests/cli.rs
   - tests/fixtures/README.md
   - tests/fixtures/subagents/workflows/wf_demo/agent-deep.jsonl
 ---
@@ -111,7 +113,7 @@ exits 0. Every Verify below uses `cargo test --workspace` for that reason.
 
 ### Task 1: Give the store the shape the rest of the phase writes into
 
-- **Files:** crates/verbatim-core/src/store/schema.rs, crates/verbatim-core/src/store/open.rs, crates/verbatim-core/tests/schema.rs
+- **Files:** crates/verbatim-core/src/store/schema.rs, crates/verbatim-core/src/store/open.rs, crates/verbatim-core/src/reindex.rs, crates/verbatim-core/tests/schema.rs
 - **Action:** Extend `schema::CREATE_SQL` with everything phase 2 fills, so the
   store shape moves once rather than three times. On `session_meta`: a column
   holding the bytes of a sidecar's `agent-*.meta.json` opaquely and unparsed
@@ -133,21 +135,41 @@ exits 0. Every Verify below uses `cargo test --workspace` for that reason.
   `IF NOT EXISTS`, so on an existing store it creates the new table and adds no
   column to `session_meta` or `runs` - add an additive bring-forward that reads
   each table's current column list and issues `ALTER TABLE ... ADD COLUMN` only
-  for the ones missing, run where `reindex::open_up_to_date` already acts on
-  `Store::rebuild_required` and inside the same transaction as the rebuild, so a
-  store stamped up to date whose bring-forward rolled back cannot exist. Never
+  for the ones missing. Run it in `Store::open`, in its own transaction, on
+  every open of an existing store - NOT gated on `Store::rebuild_required` and
+  NOT inside `reindex`. That gating is the obvious placement and it is wrong:
+  `Store::open` executes `CREATE_SQL` only when the store is `StoreState::Fresh`
+  (`crates/verbatim-core/src/store/open.rs:99`), and `reindex::open_up_to_date`
+  is the only caller that acts on `rebuild_required`, while `verbatim status`,
+  `verbatim verify` and every phase 3 reader open through `Store::open` alone.
+  A user who upgrades the binary and runs `status` before any ingest would hit
+  `no such column` on a healthy store, and `status` cannot fix that by calling
+  `open_up_to_date` instead - that runs a destructive derived-table rebuild
+  outside the ingest lock, the exact defect gate fix `3e5d9ff` closed. Adding a
+  column is safe where rebuilding derived tables is not, which is why the two
+  split here: `ALTER TABLE ADD COLUMN` on every open, the derived rebuild left
+  exactly where it is. The bring-forward is idempotent by construction (it adds
+  only missing columns), reads the column list from `PRAGMA table_info`, and
+  must run before `Store` is handed to any caller. Never
   drop, recreate or rewrite `sessions` or `session_meta`; adding a column is the
-  only change either is allowed. Update
+  only change either is allowed. `crates/verbatim-core/src/reindex.rs` is in
+  this task's lease because `DERIVED_TABLES` gains the boundary table and
+  `reindex`'s drop order (reverse of that list, `reindex.rs:50-118`) must stay
+  correct; the bring-forward itself does not live there. Update
   `a_fresh_store_carries_exactly_the_phase_one_tables` in
   `crates/verbatim-core/tests/schema.rs` to the phase 2 table set and rename it
   to match.
 - **Verify:** `cargo test --workspace --test schema --test reindex --test
-  store_open --test ingest` passes, and a new test in
-  `crates/verbatim-core/tests/schema.rs` that opens a store, ingests a fixture,
-  drops each phase 2 column back off `session_meta` and `runs`, sets
+  store_open --test ingest` passes, and two new tests in
+  `crates/verbatim-core/tests/schema.rs`: one that opens a store, ingests a
+  fixture, drops each phase 2 column back off `session_meta` and `runs`, sets
   `meta.derived_schema` back to 1, reopens through `reindex::open_up_to_date`
   and finds every phase 2 column present again with `sessions.session_key`,
-  `sessions.blob` and `session_meta.checksum` byte-identical to before the drop.
+  `sessions.blob` and `session_meta.checksum` byte-identical to before the drop;
+  and one that does the same drop and then reopens through plain `Store::open`
+  WITHOUT going near `reindex`, finds every phase 2 column present again, and
+  finds `meta.derived_schema` still at 1 - the columns come back, the derived
+  rebuild does not fire, and a `SELECT` naming every phase 2 column succeeds.
 
 ### Task 2: Verbatim's own config: transcript roots and project exclusions
 
@@ -179,11 +201,22 @@ exits 0. Every Verify below uses `cargo test --workspace` for that reason.
   name and answers before anything is opened, and one takes a real filesystem
   path and answers on the read side. The encoded test applies the
   `[^A-Za-z0-9] -> '-'` rule to the configured path and requires the encoded
-  directory name to equal it - not to start with it. D-09 requires
+  directory name either to equal it, or to equal it followed by the fixed
+  literal `--claude-worktrees-` and any further text. D-09 requires
   `-data-projects-cadence` not to match `-data-projects-cadence-research`, and
   D-07 proved the encoding is lossy in exactly that spot, so any
   extension-tolerant rule cannot tell a child directory from a hyphenated
-  sibling and would silently exclude a project the user never named. The path
+  sibling and would silently exclude a project the user never named. The
+  worktree clause is the one exception that is safe, and it is not optional:
+  D-06 folds a `cwd` of the form `<repo>/.claude/worktrees/<name>` into
+  `<repo>`, and that path shape encodes literally, so `/data/code/cadence`'s
+  worktrees sit in directories named `-data-code-cadence--claude-worktrees-*`.
+  Without the clause, excluding `/data/code/cadence` walks and archives every
+  one of its worktree sessions - 15 of 69 real project directories have this
+  shape - and PLAN-2 task 6 then hides them at read time, which is read-then-
+  filter and is exactly the ING-08 failure PROJECT.md cites claude-mem for. The
+  clause reintroduces no ambiguity: `--claude-worktrees-` is a fixed literal
+  segment, not an open-ended prefix extension. The path
   test is an ordinary prefix match on `/` segment boundaries against a
   canonicalized path, which is unambiguous and is where subtree exclusion
   actually works. Case-fold the comparison on Windows and macOS. Add an error
@@ -193,8 +226,9 @@ exits 0. Every Verify below uses `cargo test --workspace` for that reason.
   config file yields the default single root; `CLAUDE_CONFIG_DIR` set to a
   temporary directory replaces that default and an empty value does not; a
   config file naming two roots yields both in order; the encoded test says yes
-  to `-data-projects-cadence` for an exclusion of `/data/projects/cadence` and
-  no to `-data-projects-cadence-research`; the path test says yes to
+  to `-data-projects-cadence` for an exclusion of `/data/projects/cadence`, yes
+  to `-data-projects-cadence--claude-worktrees-agent-a33a`, and no to
+  `-data-projects-cadence-research`; the path test says yes to
   `/data/projects/cadence/sub` for the same exclusion and no to
   `/data/projects/cadence-research`; and a loader pointed at a directory
   containing only a `config.toml` with `base_dir = "/data/verbatim"` returns the
@@ -227,10 +261,14 @@ exits 0. Every Verify below uses `cargo test --workspace` for that reason.
   them too. Yield results in a deterministic order - sort each directory's
   entries - so two passes over one tree walk it identically. An unreadable
   directory is reported and skipped, never fatal. Also add to this module the
-  one counted way to open a transcript file for reading, incrementing a
-  testkit-gated counter that tests can read and reset; it exists so AC5's "no
-  read of that file" is a number rather than an argument, and the shipped binary
-  takes no branch for it. Add a fixture at
+  one counted way to open a transcript file for reading, recording each opened
+  path into a testkit-gated log that tests can read and reset; the shipped
+  binary takes no branch for it. It records PATHS and not a bare count, because
+  a scalar cannot answer the question AC5 asks: "zero opens of any file under
+  that directory" is satisfied by a total that a pass could reach by opening the
+  excluded files and skipping an equal number elsewhere. Tests query the log by
+  path prefix, so AC5's assertion is attributable rather than aggregate; a count
+  is derivable from the log where one is wanted. Add a fixture at
   `tests/fixtures/subagents/workflows/wf_demo/agent-deep.jsonl` for the depth-6
   sidecar case, register it in `testkit::TRANSCRIPT_FIXTURES`, document it in
   `tests/fixtures/README.md`, and keep `testkit::UNIQUE_TOKEN` out of its bytes -
@@ -254,7 +292,7 @@ exits 0. Every Verify below uses `cargo test --workspace` for that reason.
 
 ### Task 4: One run walks the tree, and one bad file does not stop it
 
-- **Files:** crates/verbatim-core/src/ingest/pass.rs, crates/verbatim-core/src/ingest/mod.rs, crates/verbatim-core/src/lib.rs, crates/verbatim/src/cmd/ingest.rs, crates/verbatim/src/main.rs, crates/verbatim-core/tests/pass.rs, crates/verbatim-core/tests/ingest.rs
+- **Files:** crates/verbatim-core/src/ingest/pass.rs, crates/verbatim-core/src/ingest/mod.rs, crates/verbatim-core/src/lib.rs, crates/verbatim/src/cmd/ingest.rs, crates/verbatim/src/main.rs, crates/verbatim-core/tests/pass.rs, crates/verbatim-core/tests/ingest.rs, crates/verbatim/tests/cli.rs
 - **Action:** Add a pass module under `ingest` that loads the config, takes the
   ingest lock through the existing `ingest::lock::try_acquire` exactly once for
   the whole pass, opens the store once, walks the discovered transcripts and
@@ -282,6 +320,26 @@ exits 0. Every Verify below uses `cargo test --workspace` for that reason.
   `USAGE` describes both. A pass that skipped a file still exits 0 with the
   skipped files named on stderr - the tree was ingested - while a pass that could
   not run at all keeps `Failure::Operational`.
+
+  Two things in `crates/verbatim/tests/cli.rs` must change with it, and neither
+  is optional. First, `misuse_exits_two_with_an_empty_stdout` (cli.rs:282)
+  asserts that bare `ingest` exits 2 - `cmd::ingest::parse` returns
+  `Failure::Misuse` today. That is the behaviour this task deliberately
+  replaces, so drop `vec!["ingest"]` from that test's misuse list (leaving
+  `verify --json` and `no-such-command`, which stay misuse) and add a positive
+  assertion that bare `ingest` against an isolated config exits 0. Do not leave
+  it: the test is in this task's own Verify and would fail. Second, and more
+  serious, the spawn helper `verbatim()` at cli.rs:58 sets only
+  `VERBATIM_DATA_DIR`. Once bare `ingest` walks configured roots, that helper
+  makes every CLI test spawn resolve roots from the developer's real config and
+  walk the live `~/.claude` tree - 2,000+ private transcripts and ~988 MB
+  ingested into a temp dir on every `cargo test` run. Extend the helper (and
+  `bench()`, and the equivalent spawn helpers in
+  `crates/verbatim/tests/status.rs`) to also set the config-directory override
+  task 2 defines, pointing at a temporary directory that holds no
+  `verbatim.toml`, and to set the transcript root to a temporary tree. No test
+  process may resolve a real transcript root except PLAN-3 task 5's explicitly
+  env-gated corpus test.
 - **Verify:** `cargo test --workspace --test pass --test ingest --test cli
   --test lock_race` passes, including a test that builds a temporary tree of
   five transcripts, corrupts one into each of the two damaged states (its
@@ -289,14 +347,20 @@ exits 0. Every Verify below uses `cargo test --workspace` for that reason.
   its stored watermark), runs one pass, and finds the other four sessions
   archived with their turns while the summary names exactly the two damaged
   paths and their reasons; and a test that runs the pass over a tree with one
-  project excluded and finds the counted-open total for files beneath that
-  directory is zero and no `sessions`, `session_meta`, `turns`, `turns_fts` or
-  `watermarks` row exists for any of them, while the sibling project's rows are
-  present.
+  project excluded and finds the counted-open log holds no path beneath that
+  directory and no path beneath its `--claude-worktrees-` sibling directory, and
+  that no `sessions`, `session_meta`, `turns`, `turns_fts` or `watermarks` row
+  exists for any of them, while the sibling project whose encoded name merely
+  extends the excluded one has its rows present. Plus, in
+  `crates/verbatim/tests/cli.rs`: bare `verbatim ingest` against an isolated
+  config directory and a temporary transcript root exits 0, and the misuse test
+  still exits 2 for `verify --json` and `no-such-command`. Confirm the
+  isolation holds by asserting that a CLI test run leaves the process's resolved
+  root inside the temporary tree - no test spawn may reach a real root.
 
 ### Task 5: Recovery at the top of every run
 
-- **Files:** crates/verbatim-core/src/recover.rs, crates/verbatim-core/src/lib.rs, crates/verbatim-core/src/ingest/pass.rs, crates/verbatim-core/tests/recover.rs
+- **Files:** crates/verbatim-core/src/recover.rs, crates/verbatim-core/src/lib.rs, crates/verbatim-core/src/ingest/pass.rs, crates/verbatim-core/src/ingest/mod.rs, crates/verbatim-core/tests/recover.rs
 - **Action:** Expose recovery as one callable function that every ingest run
   invokes before it walks anything, with no repair command and no external
   supervisor (ING-03, D-24). It is two things and only two. First,
@@ -313,15 +377,26 @@ exits 0. Every Verify below uses `cargo test --workspace` for that reason.
   the return value so the pass can put them in its `runs` row. There is no
   stale-lock handling here and there must not be: the lock is an OS lock that
   dies with the process (`ingest::lock`), so there is no stale lock to recover
-  from. Call it from the pass module, under the lock, before discovery.
-- **Verify:** `cargo test --workspace --test recover --test pass` passes,
-  including a test that ingests a fixture, then writes the watermark for that
-  session to a byte offset past its `session_meta.uncompressed_len` and inserts
-  a watermark row for a path with no `sessions` row, then runs a pass and finds
-  the first watermark equal to the committed length, the second row gone, both
-  repairs named in the returned report, and the session's blob and checksum
-  unchanged; plus a test that the same pass over a store needing no repair
-  changes no `watermarks` row.
+  from. Call it from BOTH ingest entry points, under the lock, before any
+  transcript is read: from the pass module before discovery, and from
+  `ingest::run` (`crates/verbatim-core/src/ingest/mod.rs:76`) before it reaches
+  `ingest_locked`. ING-03 says every run, and `ingest::run` is a run - it calls
+  `reindex::open_up_to_date` today and so gets the rebuild half but no watermark
+  sweep. Wiring only the pass leaves `verbatim ingest <path.jsonl>` proceeding
+  against a watermark ahead of what that file's committed blob holds, so
+  `read_tail` reads from an offset the archive never reached and the gap is
+  silently lost from the blob. One callable, two callers, and the sweep is
+  cheap enough to run twice (one indexed pass over ~2,000 rows, no
+  decompression).
+- **Verify:** `cargo test --workspace --test recover --test pass --test ingest`
+  passes, including a test that ingests a fixture, then writes the watermark for
+  that session to a byte offset past its `session_meta.uncompressed_len` and
+  inserts a watermark row for a path with no `sessions` row, then runs a pass and
+  finds the first watermark equal to the committed length, the second row gone,
+  both repairs named in the returned report, and the session's blob and checksum
+  unchanged; the same test repeated against single-file `verbatim ingest
+  <path.jsonl>` rather than a pass, with the same outcome; plus a test that
+  either entry point over a store needing no repair changes no `watermarks` row.
 
 ### Task 6: One runs row per pass, including the pass that died
 
@@ -388,14 +463,25 @@ exits 0. Every Verify below uses `cargo test --workspace` for that reason.
   under phase 2 and needs a `/cad-phase` edit this workflow does not perform.
 - Task 2 narrows `DESIGN-BRIEF.md:392`'s "prefix match on canonicalized paths"
   on the pre-open side only. The encoded directory name is provably lossy
-  (D-07), so the zero-open test can only be exact equality; a user excluding
-  `/data/clients` therefore excludes the project directory for `/data/clients`
-  itself and not, before any open, the separate project directory for
-  `/data/clients/acme`. The path-side test keeps full subtree semantics
-  everywhere a real path is available. If the human wants subtree exclusion
-  enforced pre-open too, the config needs one entry per project directory, or
-  the ambiguity has to be accepted and `-data-projects-cadence-research`
-  swept up with `-data-projects-cadence`. Flagged rather than chosen silently.
+  (D-07), so the zero-open test is exact equality plus the one fixed-literal
+  `--claude-worktrees-` clause; a user excluding `/data/clients` therefore
+  excludes the project directory for `/data/clients` and its worktrees, and not,
+  before any open, the separate project directory for `/data/clients/acme`. The
+  path-side test keeps full subtree semantics everywhere a real path is
+  available. If the human wants subtree exclusion enforced pre-open too, the
+  config needs one entry per project directory, or the ambiguity has to be
+  accepted and `-data-projects-cadence-research` swept up with
+  `-data-projects-cadence`. Flagged rather than chosen silently.
+- Task 1's bring-forward runs in `Store::open`, not in `reindex`. The split is
+  deliberate and is the one place this plan lets a read path write: adding a
+  missing column is safe on any opener, rebuilding derived tables is not, and
+  gating both on `rebuild_required` would leave `status` and `verify` selecting
+  columns that do not exist on an upgraded store.
+- Task 4 changes a shipped CLI contract: bare `verbatim ingest` stops being
+  misuse (exit 2) and becomes the tree pass (exit 0). That is an intended
+  behaviour change, and it obliges the test-isolation work in the same task -
+  once bare `ingest` resolves configured roots, any test spawn without a config
+  override walks the developer's real `~/.claude`.
 - Task 1 bumps `DERIVED_SCHEMA`. D-24's scale consequence follows directly: the
   next ingest against John's existing store rebuilds every archived session from
   its blob inside the ingest lock before the walk begins. PLAN-3 measures that

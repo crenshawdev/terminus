@@ -277,7 +277,11 @@ every Verify below uses `cargo test --workspace`.
   retroactively hide a session archived before its project was excluded, which
   is precisely the case that matters. Instead expose one session-listing read
   entry point that applies the configured exclusions against
-  `session_meta.project` using the path-side predicate task 2 of PLAN-1 built,
+  `session_meta.project` AND against the pre-mapping key task 2 stored beside
+  it, using the path-side predicate task 2 of PLAN-1 built. Both columns,
+  because either one alone leaks: a worktree session archived before its parent
+  repo was excluded carries the folded parent in `project` and the worktree path
+  in the pre-mapping column, and a user may reasonably exclude either path,
   and make `verbatim status` count sessions, turns and watermarks through it, so
   the phase's only read command already goes through the boundary phase 3's
   search will reuse. A session whose `project` is null - one real transcript
@@ -290,8 +294,10 @@ every Verify below uses `cargo test --workspace`.
   re-ingesting - the session and turn counts drop by exactly that project's
   share and its sessions are absent from the listing entry point, while the rows
   are still present in `session_meta` when queried directly; a project whose
-  path merely shares leading segments with the excluded one stays visible; and a
-  session with a null `project` stays visible under any exclusion list.
+  path merely shares leading segments with the excluded one stays visible; a
+  session whose `project` folded to a repo but whose pre-mapping key is a
+  worktree beneath it is hidden when either of those two paths is excluded; and
+  a session with a null `project` stays visible under any exclusion list.
 
 ## Notes
 
