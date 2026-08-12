@@ -27,7 +27,7 @@ fn names(conn: &Connection, kind: &str) -> BTreeSet<String> {
 }
 
 #[test]
-fn a_fresh_store_carries_exactly_the_phase_one_tables() {
+fn a_fresh_store_carries_exactly_the_phase_two_tables() {
     let (_dir, store) = fresh();
     let tables = names(store.conn(), "table");
 
@@ -172,6 +172,167 @@ fn derived_tables_start_empty() {
             .unwrap();
         assert_eq!(count, 0, "{table} should start empty");
     }
+}
+
+/// A store carrying phase 1's shape: one fixture archived, then every column
+/// phase 2 added dropped back off and `derived_schema` put back where a phase 1
+/// binary left it. What a user's store looks like the moment they upgrade.
+#[cfg(feature = "testkit")]
+struct Aged {
+    _dir: tempfile::TempDir,
+    data_dir: std::path::PathBuf,
+    session_key: String,
+    blob: Vec<u8>,
+    checksum: Vec<u8>,
+}
+
+#[cfg(feature = "testkit")]
+fn aged_store() -> Aged {
+    use verbatim_core::store::{DB_FILE_NAME, META_DERIVED_SCHEMA};
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let path = verbatim_core::testkit::copy_fixture_into("session-basic.jsonl", &work);
+    match verbatim_core::ingest::run(&data_dir, &path).unwrap() {
+        verbatim_core::ingest::Outcome::Committed(_) => {}
+        other => panic!("the fixture must archive: {other:?}"),
+    }
+
+    let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+    let (session_key, blob): (String, Vec<u8>) = conn
+        .query_row("SELECT session_key, blob FROM sessions", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    let checksum: Vec<u8> = conn
+        .query_row("SELECT checksum FROM session_meta", [], |r| r.get(0))
+        .unwrap();
+
+    for (table, added) in schema::BRING_FORWARD_COLUMNS {
+        for (name, _) in *added {
+            conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {name}"))
+                .unwrap_or_else(|e| panic!("drop {table}.{name}: {e}"));
+        }
+    }
+    conn.execute(
+        "UPDATE meta SET value = '1' WHERE key = ?1",
+        [META_DERIVED_SCHEMA],
+    )
+    .unwrap();
+
+    // The premise. Without this the two tests below pass on a store that was
+    // never aged at all.
+    for (table, added) in schema::BRING_FORWARD_COLUMNS {
+        let present = columns(&conn, table);
+        for (name, _) in *added {
+            assert!(!present.contains(*name), "{table}.{name} survived the drop");
+        }
+    }
+    drop(conn);
+
+    Aged {
+        _dir: dir,
+        data_dir,
+        session_key,
+        blob,
+        checksum,
+    }
+}
+
+#[cfg(feature = "testkit")]
+impl Aged {
+    /// Every column phase 2 added is back, and the archive is byte-identical to
+    /// what it held before the columns were dropped.
+    fn assert_brought_forward(&self, conn: &Connection) {
+        for (table, added) in schema::BRING_FORWARD_COLUMNS {
+            let present = columns(conn, table);
+            for (name, _) in *added {
+                assert!(present.contains(*name), "{table}.{name} did not come back");
+            }
+        }
+
+        let (key, blob): (String, Vec<u8>) = conn
+            .query_row("SELECT session_key, blob FROM sessions", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let checksum: Vec<u8> = conn
+            .query_row("SELECT checksum FROM session_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(key, self.session_key, "the archive lost its session key");
+        assert!(blob == self.blob, "the bring-forward rewrote the blob");
+        assert_eq!(
+            checksum, self.checksum,
+            "the bring-forward moved the checksum"
+        );
+    }
+}
+
+/// The ingest path's opener brings the columns back and rebuilds the derived
+/// tables, and the archive comes through untouched.
+#[cfg(feature = "testkit")]
+#[test]
+fn a_reindex_open_brings_every_phase_two_column_back() {
+    use verbatim_core::store::{DERIVED_SCHEMA, META_DERIVED_SCHEMA};
+
+    let aged = aged_store();
+    let store = verbatim_core::reindex::open_up_to_date(&aged.data_dir)
+        .expect("an aged store still opens for work");
+
+    aged.assert_brought_forward(store.conn());
+    assert_eq!(
+        store.meta_int(META_DERIVED_SCHEMA).unwrap(),
+        Some(DERIVED_SCHEMA),
+        "the rebuild did not stamp the store forward"
+    );
+}
+
+/// The one that matters for `status` and `verify`: a plain `Store::open` - no
+/// `reindex`, no ingest lock - still finds every phase 2 column, and fires no
+/// derived rebuild while doing it. Gating the bring-forward on
+/// `rebuild_required` would make a user who upgraded the binary and ran
+/// `status` before any ingest hit `no such column` on a healthy store.
+#[cfg(feature = "testkit")]
+#[test]
+fn a_plain_open_brings_the_columns_back_and_fires_no_rebuild() {
+    use verbatim_core::store::META_DERIVED_SCHEMA;
+
+    let aged = aged_store();
+    let store = Store::open(&aged.data_dir).expect("an aged store opens read-side too");
+
+    aged.assert_brought_forward(store.conn());
+    assert_eq!(
+        store.meta_int(META_DERIVED_SCHEMA).unwrap(),
+        Some(1),
+        "a plain open performed the derived rebuild"
+    );
+    assert!(
+        store.rebuild_required().is_some(),
+        "the aged store must still be reported as needing a rebuild"
+    );
+
+    // The failure this exists to catch, in the shape it actually takes: a
+    // SELECT naming every phase 2 column.
+    store
+        .conn()
+        .query_row(
+            "SELECT agent_meta, transcript_diverged, project_pre_worktree
+             FROM session_meta LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .expect("session_meta is missing a phase 2 column");
+    store
+        .conn()
+        .query_row(
+            "SELECT files_committed, files_failed FROM runs LIMIT 1",
+            [],
+            |_| Ok(()),
+        )
+        .expect("runs is missing a phase 2 column");
 }
 
 fn columns(conn: &Connection, table: &str) -> BTreeSet<String> {

@@ -1,9 +1,11 @@
 //! Rebuilding every derived table from the blobs alone (STOR-04).
 //!
-//! The input is the blobs and nothing else. `turns`, `turns_fts`, `entities`
-//! and `paths` are dropped before a single row is read, so a rebuild cannot
-//! quietly carry forward a value only the old rows knew - which is the property
-//! "everything else is derived" has to mean if it is to mean anything.
+//! The input is the blobs and nothing else. Every table in
+//! `schema::DERIVED_TABLES` - `turns`, `compaction_boundaries`, `turns_fts`,
+//! `entities` and `paths` - is dropped before a single row is read, so a
+//! rebuild cannot quietly carry forward a value only the old rows knew, which
+//! is the property "everything else is derived" has to mean if it is to mean
+//! anything.
 //!
 //! `sessions` and `session_meta` are never touched. The archive table never
 //! migrates (`DESIGN-BRIEF.md:94`), and STOR-05's older-format path rebuilds
@@ -54,14 +56,14 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
     // with `-DSQLITE_DEFAULT_FOREIGN_KEYS=1` (libsqlite3-sys-0.38.1/build.rs:126),
     // so foreign keys are enforced on every connection whatever
     // `crates/verbatim-core/src/store/schema.rs` says about the pragma, and
-    // dropping `turns` while `entities` or `paths` still hold rows fails with a
-    // constraint violation. `DERIVED_TABLES` is in creation order, so a rebuild
-    // drops in reverse.
+    // dropping `turns` while `entities`, `paths` or `compaction_boundaries`
+    // still hold rows fails with a constraint violation. `DERIVED_TABLES` is in
+    // creation order, so a rebuild drops in reverse.
     for table in schema::DERIVED_TABLES.iter().rev() {
         tx.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
     }
     // Every statement in the schema is `IF NOT EXISTS`, so this recreates
-    // exactly the four that were dropped and leaves the archive alone. One
+    // exactly the tables that were dropped and leaves the archive alone. One
     // definition of the schema, rather than a second copy that can drift.
     tx.execute_batch(schema::CREATE_SQL)?;
 

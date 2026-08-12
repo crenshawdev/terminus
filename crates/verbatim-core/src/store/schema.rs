@@ -78,7 +78,24 @@ CREATE TABLE IF NOT EXISTS session_meta (
     branch            TEXT,
     is_final          INTEGER,
     is_evicted        INTEGER,
-    parent_session_key TEXT
+    parent_session_key TEXT,
+    -- The bytes of a sidecar's `agent-*.meta.json`, stored opaquely and never
+    -- parsed into typed columns (D-04). The format is undocumented and may
+    -- drift, and 816 real meta files carry `agentType`, `description`,
+    -- `toolUseId`, `spawnDepth` and `model`; keeping the bytes lets phase 3
+    -- extract `description` without a reingest and bets no column on the shape.
+    agent_meta        BLOB,
+    -- Set when the transcript on disk is shorter than this session's stored
+    -- watermark (D-13). The pass skips such a file rather than re-ingesting it
+    -- from offset 0 - the append-only property is an observation over one
+    -- 25-day corpus, not a guarantee - and `verbatim verify` reports the
+    -- divergence off this column.
+    transcript_diverged INTEGER,
+    -- The project key this session had BEFORE worktree mapping folded it into
+    -- its parent repo (D-06, ING-05). Both keys are stored so a later deletion
+    -- of the worktree directory cannot un-key an already-archived session, and
+    -- so the read-side exclusion test can match either path.
+    project_pre_worktree TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_meta_session_id
@@ -110,6 +127,19 @@ CREATE TABLE IF NOT EXISTS turns (
 
 CREATE INDEX IF NOT EXISTS idx_turns_uuid ON turns(uuid);
 CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns(ts);
+
+-- One row per compaction boundary, keyed on the turn that IS the boundary
+-- (D-21: a `type: system` record with `subtype: compact_boundary` already
+-- classifies as a turn, so this is a derived row and not a new record class).
+-- `metadata` holds that record's `compactMetadata` object bytes verbatim
+-- (D-08). No dropped-turn set is computed: exactly one real boundary exists in
+-- 300,556 measured records and its own token counts contradict the design
+-- brief's reading of `preservedMessages.uuids`, so the complement is derived at
+-- query time in phase 5 (INJ-05) where a wrong reading costs no reingest.
+CREATE TABLE IF NOT EXISTS compaction_boundaries (
+    turn_id  INTEGER PRIMARY KEY REFERENCES turns(id),
+    metadata BLOB
+);
 
 -- content='' because the text lives in the blob and storing it twice would
 -- double the store; contentless_delete=1 because re-deriving a turn deletes
@@ -145,7 +175,13 @@ CREATE TABLE IF NOT EXISTS watermarks (
     updated_at      TEXT
 );
 
--- One committed ingest pass. There is no log file; `status` surfaces this.
+-- One ingest pass, whatever the file count (D-10). There is no log file;
+-- `status` surfaces this table.
+--
+-- `files_seen` is what the pass WALKED. A pass over a tree walks thousands of
+-- files, commits most of them and skips the damaged ones (D-12), and one
+-- integer cannot carry those three numbers - so the other two get columns of
+-- their own rather than being inferred from `error` being non-null.
 CREATE TABLE IF NOT EXISTS runs (
     id           INTEGER PRIMARY KEY,
     started_at   TEXT    NOT NULL,
@@ -154,7 +190,9 @@ CREATE TABLE IF NOT EXISTS runs (
     files_seen   INTEGER NOT NULL DEFAULT 0,
     bytes_read   INTEGER NOT NULL DEFAULT 0,
     turns_added  INTEGER NOT NULL DEFAULT 0,
-    error        TEXT
+    error        TEXT,
+    files_committed INTEGER NOT NULL DEFAULT 0,
+    files_failed    INTEGER NOT NULL DEFAULT 0
 );
 
 -- The two version integers the gate reads before any write (D-09).
@@ -169,6 +207,7 @@ pub const TABLES: &[&str] = &[
     "sessions",
     "session_meta",
     "turns",
+    "compaction_boundaries",
     "turns_fts",
     "entities",
     "paths",
@@ -179,4 +218,53 @@ pub const TABLES: &[&str] = &[
 
 /// The derived tables `reindex` drops and rebuilds from the blobs (STOR-04).
 /// `sessions` and `session_meta` are absent by design.
-pub const DERIVED_TABLES: &[&str] = &["turns", "turns_fts", "entities", "paths"];
+///
+/// In creation order, because `reindex` drops in reverse: a boundary row
+/// references `turns(id)`, so `compaction_boundaries` sits **after** `turns`
+/// here and is therefore dropped **before** it.
+pub const DERIVED_TABLES: &[&str] = &[
+    "turns",
+    "compaction_boundaries",
+    "turns_fts",
+    "entities",
+    "paths",
+];
+
+/// Columns added to an existing table after that table first shipped, with the
+/// type clause that adds each one back.
+///
+/// Every statement in [`CREATE_SQL`] is `IF NOT EXISTS`, so re-running it over
+/// a store that already has `session_meta` and `runs` creates a new *table* and
+/// adds no *column* to either. This list is the other half: `Store::open`
+/// compares it against `PRAGMA table_info` and issues
+/// `ALTER TABLE ... ADD COLUMN` for whatever is missing, which is why a binary
+/// carrying a newer schema can run `status` against a store written by an older
+/// one without hitting `no such column`.
+///
+/// Order matters: `ALTER TABLE ADD COLUMN` appends, so these must be listed in
+/// the same order [`CREATE_SQL`] declares them and must be declared at the END
+/// of their table there. A fresh store and an upgraded store then carry
+/// identical column order. Adding a column in a later phase means appending it
+/// in both places, never inserting it.
+///
+/// Only additive changes belong here. Adding a column is safe on any opener;
+/// dropping, renaming or rewriting one is not, and the archive tables
+/// (`sessions`, `session_meta`) never migrate beyond an added column
+/// (`DESIGN-BRIEF.md:94`).
+pub const BRING_FORWARD_COLUMNS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "session_meta",
+        &[
+            ("agent_meta", "BLOB"),
+            ("transcript_diverged", "INTEGER"),
+            ("project_pre_worktree", "TEXT"),
+        ],
+    ),
+    (
+        "runs",
+        &[
+            ("files_committed", "INTEGER NOT NULL DEFAULT 0"),
+            ("files_failed", "INTEGER NOT NULL DEFAULT 0"),
+        ],
+    ),
+];

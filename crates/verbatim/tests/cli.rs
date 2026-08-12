@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 
 use rusqlite::Connection;
 use verbatim_core::store::{
-    Store, ARCHIVE_FORMAT, DB_FILE_NAME, META_ARCHIVE_FORMAT, META_DERIVED_SCHEMA,
+    Store, ARCHIVE_FORMAT, DB_FILE_NAME, DERIVED_SCHEMA, META_ARCHIVE_FORMAT, META_DERIVED_SCHEMA,
 };
 use verbatim_core::testkit;
 
@@ -239,7 +239,11 @@ fn a_store_one_archive_format_ahead_is_refused_with_both_versions_named() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(derived, "1", "the refused open rewrote meta");
+    assert_eq!(
+        derived,
+        DERIVED_SCHEMA.to_string(),
+        "the refused open rewrote meta"
+    );
 }
 
 /// AC4, end to end through the command. Drop `turns`, `turns_fts`, `entities`

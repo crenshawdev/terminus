@@ -16,10 +16,15 @@ pub const ARCHIVE_FORMAT: i64 = 1;
 /// The derived-table schema this build writes.
 ///
 /// Bumped whenever anything rebuildable from the blobs changes shape: `turns`,
-/// `turns_fts`, `entities`, `paths`. Two integers rather than one, because one
-/// cannot tell "derived tables need a rebuild" from "the archive itself
-/// changed" (D-09).
-pub const DERIVED_SCHEMA: i64 = 1;
+/// `compaction_boundaries`, `turns_fts`, `entities`, `paths`. Two integers
+/// rather than one, because one cannot tell "derived tables need a rebuild"
+/// from "the archive itself changed" (D-09).
+///
+/// 2 as of phase 2: `compaction_boundaries` joined the derived set (D-21), so
+/// the first ingest run against a store written by a phase 1 binary rebuilds
+/// every archived session from its blob, inside the ingest lock, before it
+/// walks anything.
+pub const DERIVED_SCHEMA: i64 = 2;
 
 /// The store file inside the data directory.
 pub const DB_FILE_NAME: &str = "verbatim.db";
@@ -98,6 +103,17 @@ impl Store {
         };
         if state == StoreState::Fresh {
             store.initialize()?;
+        } else {
+            // Every open of an existing store, and deliberately NOT gated on
+            // `rebuild_required`. `reindex::open_up_to_date` is the only caller
+            // that acts on that outcome, while `status`, `verify` and every
+            // phase 3 reader open through here alone - so gating the column
+            // bring-forward on it would leave a user who upgraded the binary
+            // and ran `status` before any ingest hitting `no such column` on a
+            // perfectly healthy store. Adding a missing column is safe on any
+            // opener; the destructive derived-table rebuild stays exactly where
+            // it is, outside this function and inside the ingest lock.
+            bring_forward(&store.conn)?;
         }
         Ok(store)
     }
@@ -169,6 +185,80 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Add whatever this build's schema has and the open store does not.
+///
+/// Additive only, and idempotent by construction: it creates a table this build
+/// declares and the store lacks, and adds a column this build declares and the
+/// table lacks. It drops nothing, renames nothing and rewrites nothing, which
+/// is what makes it safe to run on a read command's open. `sessions` and
+/// `session_meta` are archive tables and an added column is the only change
+/// either is ever allowed (`DESIGN-BRIEF.md:94`).
+///
+/// Nothing is written when nothing is missing - the common case is three read
+/// queries and no transaction at all - so a plain reopen of an up-to-date store
+/// still touches no byte of it.
+fn bring_forward(conn: &Connection) -> Result<()> {
+    let present_tables = table_names(conn)?;
+    let missing_tables: Vec<&&str> = crate::store::schema::TABLES
+        .iter()
+        .filter(|t| !present_tables.iter().any(|p| p == *t))
+        .collect();
+
+    let mut missing_columns: Vec<(&str, &str, &str)> = Vec::new();
+    for (table, columns) in crate::store::schema::BRING_FORWARD_COLUMNS {
+        // A table this build is about to create arrives with every column
+        // already on it, so asking `PRAGMA table_info` about it would only
+        // schedule columns that are not missing.
+        if missing_tables.iter().any(|t| **t == *table) {
+            continue;
+        }
+        let present = column_names(conn, table)?;
+        for (name, declaration) in *columns {
+            if !present.iter().any(|c| c == name) {
+                missing_columns.push((table, name, declaration));
+            }
+        }
+    }
+
+    if missing_tables.is_empty() && missing_columns.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    if !missing_tables.is_empty() {
+        // Every statement in it is `IF NOT EXISTS`, so this creates exactly the
+        // tables and indexes that are absent and leaves the rest alone. One
+        // definition of the schema rather than a second copy that can drift.
+        tx.execute_batch(crate::store::schema::CREATE_SQL)?;
+    }
+    for (table, name, declaration) in missing_columns {
+        // Identifiers come from a `const` in this crate, never from a caller.
+        tx.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+        ))?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Every table in the open database, virtual tables included.
+fn table_names(conn: &Connection) -> Result<Vec<String>> {
+    let mut statement = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+    let names = statement
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(names)
+}
+
+/// The columns of one table, in declaration order.
+fn column_names(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = statement
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(names)
 }
 
 /// What sits at the store path, as far as deciding whether to initialize goes.
