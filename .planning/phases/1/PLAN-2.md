@@ -34,6 +34,13 @@ files:
   - crates/verbatim/src/cmd/reindex.rs
   - crates/verbatim/tests/lock_race.rs
   - crates/verbatim/tests/crash.rs
+  # Added during execution. Tasks 5 and 6 put process-level assertions (exit
+  # codes, stdout, the binary invoked as a command) in `verbatim-core`'s tests,
+  # where `CARGO_BIN_EXE_verbatim` does not exist: that variable is defined only
+  # for integration tests of the package declaring the bin, and `verbatim-core`
+  # does not depend on `verbatim`. Those assertions live here instead, together
+  # with AC5's CLI half, which no task asserted anywhere.
+  - crates/verbatim/tests/cli.rs
 ---
 
 # Phase 1: Archive Core - Plan 2 of 2 (ingest, integrity, rebuild)
