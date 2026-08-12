@@ -27,6 +27,7 @@ use crate::blob;
 use crate::derive;
 use crate::error::{Error, Result};
 use crate::parse::{self, Scan};
+use crate::project::{Project, Resolver};
 use crate::store::Store;
 
 /// What one invocation of [`run`] did.
@@ -79,7 +80,17 @@ pub fn run(data_dir: &Path, transcript: &Path) -> Result<Outcome> {
     // (STOR-05), so a pass never appends turn rows in one shape beside rows
     // written in another.
     let (mut store, _recovered) = crate::recover::recover(data_dir)?;
-    ingest_locked(&mut store, &canonical, started, RunRow::PerFile)
+    // One resolver for one invocation: a single file has one `cwd`, so the memo
+    // buys nothing here and costs nothing either, and `ingest_locked` takes the
+    // same shape whether its caller named one file or walked two thousand.
+    let mut projects = Resolver::new();
+    ingest_locked(
+        &mut store,
+        &canonical,
+        started,
+        RunRow::PerFile,
+        &mut projects,
+    )
 }
 
 /// Who owns the `runs` row for this file's transaction.
@@ -104,6 +115,7 @@ pub(crate) fn ingest_locked(
     path: &Path,
     started: Instant,
     run_row: RunRow,
+    projects: &mut Resolver,
 ) -> Result<Outcome> {
     // The session is keyed on the transcript FILE identity, never on the
     // record's session id (D-01): 812 real sidecar files report their parent's
@@ -143,6 +155,14 @@ pub(crate) fn ingest_locked(
     };
     let continues_from = continues_from(store.conn(), &session_key, &scan)?;
 
+    // D-20: the project comes from the session's FIRST `cwd` record, and the
+    // upsert below coalesces it, so a tail pass never revises what the first
+    // pass established - 19 of 1,253 real transcripts carry more than one
+    // distinct `cwd` and belong to the directory the session started in.
+    // Resolution happens here, outside the transaction: it may spawn git, and a
+    // write transaction held across a subprocess would stop MCP readers.
+    let project = first_cwd(&scan).map(|cwd| projects.resolve(&cwd));
+
     let pass = Pass {
         session_key: session_key.clone(),
         bytes_read: consumed as u64,
@@ -173,12 +193,15 @@ pub(crate) fn ingest_locked(
     )?;
     write_session_meta(
         &tx,
-        &session_key,
-        path,
-        &checksum,
-        uncompressed_len,
-        continues_from.as_deref(),
-        &scan,
+        MetaRow {
+            session_key: &session_key,
+            path,
+            checksum: &checksum,
+            uncompressed_len,
+            continues_from: continues_from.as_deref(),
+            project: project.as_ref(),
+            scan: &scan,
+        },
     )?;
     fault::stall(fault::IN_TX_AFTER_SESSION);
     for (record, turn) in scan.turns() {
@@ -510,36 +533,56 @@ fn continues_from(conn: &Connection, session_key: &str, scan: &Scan) -> Result<O
         .flatten())
 }
 
+/// Everything one `session_meta` upsert writes.
+///
+/// A struct rather than ten positional arguments: every phase adds a column to
+/// this table, and a caller that passes `checksum` where `path` belongs still
+/// compiles when both are borrowed strings.
+struct MetaRow<'a> {
+    session_key: &'a str,
+    path: &'a Path,
+    checksum: &'a [u8; 32],
+    uncompressed_len: u64,
+    /// In the session-id namespace, never the session-key one - see
+    /// [`continues_from`].
+    continues_from: Option<&'a str>,
+    /// Resolved from the first `cwd` in this scan (D-20), or `None` for a
+    /// transcript that carries no `cwd` at all. One real transcript does.
+    project: Option<&'a Project>,
+    scan: &'a Scan,
+}
+
+/// The session's first `cwd`, in byte order.
+fn first_cwd(scan: &Scan) -> Option<String> {
+    scan.records.iter().find_map(|r| r.cwd.clone())
+}
+
 /// Upsert the archive's metadata row.
 ///
 /// Every column that describes the session as a whole is `coalesce`d onto what
 /// is already there: a tail pass sees only the tail, and `session_id`, `cwd`,
-/// `gitBranch` and the first turn's timestamp were established by the first
-/// pass. `project`, `is_final`, `is_evicted` and `parent_session_key` stay null
-/// - project identity from `cwd` and session linking are phase 2.
-#[allow(clippy::too_many_arguments)]
-fn write_session_meta(
-    tx: &Connection,
-    session_key: &str,
-    path: &Path,
-    checksum: &[u8; 32],
-    uncompressed_len: u64,
-    continues_from: Option<&str>,
-    scan: &Scan,
-) -> Result<()> {
+/// `gitBranch`, the project and the first turn's timestamp were established by
+/// the first pass. `is_final` and `is_evicted` stay null - retention is phase 8.
+fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
+    let scan = row.scan;
     let session_id = scan.records.iter().find_map(|r| r.session_id.clone());
-    let cwd = scan.records.iter().find_map(|r| r.cwd.clone());
+    let cwd = first_cwd(scan);
     let branch = scan.records.iter().find_map(|r| r.git_branch.clone());
     // Byte order, not clock order (D-02): the "first" turn is the first in the
     // file even when its timestamp is later than its neighbour's.
     let first_turn_at = scan.turns().next().map(|(_, t)| t.timestamp.clone());
     let last_turn_at = scan.turns().last().map(|(_, t)| t.timestamp.clone());
+    let project = row.project.map(|p| p.key.as_str());
+    // Only when folding actually happened, so the column answers "was this a
+    // worktree" as well as "which one" (D-06, ING-05).
+    let pre_worktree = row.project.and_then(|p| p.pre_worktree.as_deref());
 
     tx.execute(
         "INSERT INTO session_meta (
             session_key, session_id, transcript_path, checksum, uncompressed_len,
-            continues_from, first_turn_at, last_turn_at, cwd, branch
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            continues_from, first_turn_at, last_turn_at, cwd, branch,
+            project, project_pre_worktree
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(session_key) DO UPDATE SET
             session_id = coalesce(session_meta.session_id, excluded.session_id),
             transcript_path = excluded.transcript_path,
@@ -549,18 +592,23 @@ fn write_session_meta(
             first_turn_at = coalesce(session_meta.first_turn_at, excluded.first_turn_at),
             last_turn_at = coalesce(excluded.last_turn_at, session_meta.last_turn_at),
             cwd = coalesce(session_meta.cwd, excluded.cwd),
-            branch = coalesce(session_meta.branch, excluded.branch)",
+            branch = coalesce(session_meta.branch, excluded.branch),
+            project = coalesce(session_meta.project, excluded.project),
+            project_pre_worktree = coalesce(
+                session_meta.project_pre_worktree, excluded.project_pre_worktree)",
         rusqlite::params![
-            session_key,
+            row.session_key,
             session_id,
-            path.to_string_lossy(),
-            checksum.as_slice(),
-            uncompressed_len as i64,
-            continues_from,
+            row.path.to_string_lossy(),
+            row.checksum.as_slice(),
+            row.uncompressed_len as i64,
+            row.continues_from,
             first_turn_at,
             last_turn_at,
             cwd,
             branch,
+            project,
+            pre_worktree,
         ],
     )?;
     Ok(())

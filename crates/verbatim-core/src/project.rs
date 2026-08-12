@@ -19,6 +19,10 @@
 //! other 46 would drop half the archive out of every project-scoped search and
 //! every resume brief.
 //!
+//! **Worktrees fold into their parent repo (D-06).** See [`worktree_parent`].
+//! Both keys are kept, because a worktree directory that is later deleted must
+//! not un-key a session that is already archived.
+//!
 //! **The encoded project directory name is never decoded (D-07).** Applying
 //! `[^A-Za-z0-9] -> '-'` to a `cwd` reproduces its containing directory name
 //! for 1,252 of 1,252 real files, so the encoding is exact and provably lossy:
@@ -46,11 +50,32 @@ use std::time::{Duration, Instant};
 /// so a slow answer is simply not waited for.
 pub const GIT_BUDGET: Duration = Duration::from_secs(2);
 
+/// The path segments a worktree `cwd` carries between the repository and the
+/// worktree's own name (D-06).
+const WORKTREE_SEGMENTS: [&str; 2] = [".claude", "worktrees"];
+
 /// One `cwd`, resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     /// The project key: what `session_meta.project` holds.
     pub key: String,
+    /// The key this `cwd` had **before** worktree folding, when folding
+    /// happened at all (D-06, ING-05). Stored beside the folded key so a later
+    /// deletion of the worktree directory cannot un-key an already-archived
+    /// session, and so the read-side exclusion test can match either path.
+    pub pre_worktree: Option<String>,
+}
+
+impl Project {
+    /// Every path this session is keyed under: the resolved key, then the
+    /// pre-mapping one when the two differ.
+    ///
+    /// The read-side exclusion test needs both, because either one alone leaks
+    /// (D-23): a user may reasonably exclude the worktree path or the repository
+    /// it folded into.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.key.as_str()).chain(self.pre_worktree.as_deref())
+    }
 }
 
 /// Resolves `cwd` values to project keys, remembering what it has answered.
@@ -92,8 +117,22 @@ impl Resolver {
 
     fn resolve_uncached(&mut self, cwd: &str) -> Project {
         let normalized = normalize(cwd);
+
+        // The worktree rule runs BEFORE the on-disk git branch (D-06): the
+        // worktree directory may still exist while the parent repository is
+        // what the session belongs to. The repository then goes through the
+        // same rule as any other `cwd`, so a repo `cwd` and a worktree `cwd`
+        // beneath it land on one key rather than on two spellings of it.
+        if let Some(repo) = worktree_parent(&normalized) {
+            return Project {
+                key: self.repo_or_itself(&repo),
+                pre_worktree: Some(normalized),
+            };
+        }
+
         Project {
             key: self.repo_or_itself(&normalized),
+            pre_worktree: None,
         }
     }
 
@@ -189,6 +228,40 @@ fn git_toplevel_in(program: &Path, dir: &Path) -> Option<String> {
     child.stdout.take()?.read_to_string(&mut out).ok()?;
     let line = out.lines().next()?.trim();
     (!line.is_empty()).then(|| line.to_owned())
+}
+
+/// The repository a worktree `cwd` belongs to (D-06).
+///
+/// A path of the form `<repo>/.claude/worktrees/<name>`, with or without
+/// further path below it, maps to `<repo>`. This is a path-shaped rule and not
+/// `git rev-parse --git-common-dir`, and that is measured rather than
+/// preferred: every worktree `cwd` in the real corpus has exactly that nested
+/// form and all 13 of them are deleted, so git returns nothing for any of them.
+///
+/// Getting it wrong splits six `cadence`, six `hindsight` and six `assistant`
+/// worktrees into seven project keys each - the identity fragmentation
+/// `.planning/PROJECT.md` cites the incumbent for.
+///
+/// The **last** occurrence of the pair wins, so a worktree checked out inside
+/// another worktree keys to the nearer repository rather than the outermost.
+pub fn worktree_parent(cwd: &str) -> Option<String> {
+    let parts: Vec<String> = Path::new(cwd)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+
+    // `<repo>/.claude/worktrees/<name>` needs at least one component before the
+    // pair and one after it, so the pair starts no earlier than index 1 and no
+    // later than three from the end.
+    let at = (1..parts.len().saturating_sub(2))
+        .rev()
+        .find(|i| parts[*i] == WORKTREE_SEGMENTS[0] && parts[i + 1] == WORKTREE_SEGMENTS[1])?;
+
+    let mut repo = PathBuf::new();
+    for part in &parts[..at] {
+        repo.push(part);
+    }
+    Some(repo.to_string_lossy().into_owned())
 }
 
 /// A `cwd` canonicalized **by string**: no filesystem access, no symlink

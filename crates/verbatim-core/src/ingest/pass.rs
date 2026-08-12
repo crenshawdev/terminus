@@ -29,6 +29,7 @@ use crate::discover;
 use crate::error::Result;
 use crate::ingest::lock::{self, Attempt};
 use crate::ingest::{Outcome, RunRow};
+use crate::project::Resolver;
 
 /// What one pass over the tree did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -103,7 +104,17 @@ pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
         ..Summary::default()
     };
 
-    let walked = walk(&mut store, data_dir, &found.transcripts, &mut summary);
+    // One resolver for the whole walk (D-05, ING-05). 1,253 real transcripts
+    // carry 63 distinct `cwd` values, so the memo is what keeps the git spawns
+    // proportional to the projects rather than to the files.
+    let mut projects = Resolver::new();
+    let walked = walk(
+        &mut store,
+        data_dir,
+        &found.transcripts,
+        &mut summary,
+        &mut projects,
+    );
     summary.duration = started.elapsed();
 
     // One row, whatever happened (D-10, D-14). A pass that died writes it in a
@@ -132,6 +143,7 @@ fn walk(
     data_dir: &Path,
     transcripts: &[PathBuf],
     summary: &mut Summary,
+    projects: &mut Resolver,
 ) -> Result<()> {
     for path in transcripts {
         if let Some(after) = crate::ingest::fault::pass_fails_after(data_dir) {
@@ -146,7 +158,8 @@ fn walk(
         summary.files_walked += 1;
         // A fresh `Instant` per file: the elapsed time the pass reports is the
         // walk's, measured by the caller, not this file's.
-        match crate::ingest::ingest_locked(store, path, Instant::now(), RunRow::PassOwns) {
+        match crate::ingest::ingest_locked(store, path, Instant::now(), RunRow::PassOwns, projects)
+        {
             Ok(Outcome::Committed(pass)) => {
                 summary.files_committed += 1;
                 summary.bytes_read += pass.bytes_read;
