@@ -37,11 +37,8 @@ fn tree(data_dir: &std::path::Path) -> Result<(), Failure> {
     // for as long as the damaged file sits there (D-12). A pass that could not
     // run at all is a different thing and reaches `Failure::Operational`
     // through the `?` above.
-    for (path, reason) in &summary.failures {
-        eprintln!("{}: {reason}", path.display());
-    }
-    for (path, reason) in &summary.unreadable {
-        eprintln!("{}: {reason}", path.display());
+    for (path, reason) in summary.failures.iter().chain(&summary.unreadable) {
+        eprintln!("{}", pass::note(path, reason));
     }
     if !summary.failures.is_empty() {
         eprintln!("{} file(s) skipped", summary.failures.len());

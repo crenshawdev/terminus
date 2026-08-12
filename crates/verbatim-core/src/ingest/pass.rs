@@ -165,6 +165,20 @@ fn walk(
     Ok(())
 }
 
+/// One reported line for one path.
+///
+/// `Error::Io` already renders as `{path}: {source}`, so prefixing every reason
+/// with its path unconditionally prints the path twice in the only channel a
+/// user reads.
+pub fn note(path: &Path, reason: &str) -> String {
+    let path = path.display().to_string();
+    if reason.starts_with(&path) {
+        reason.to_owned()
+    } else {
+        format!("{path}: {reason}")
+    }
+}
+
 /// The one `runs` row a pass leaves behind (D-10).
 ///
 /// `runs.error` is the only textual channel this product has - there is no log
@@ -179,11 +193,8 @@ fn record_pass(
     fatal: Option<&crate::error::Error>,
 ) -> Result<()> {
     let mut notes: Vec<String> = Vec::new();
-    for (path, reason) in &summary.failures {
-        notes.push(format!("{}: {reason}", path.display()));
-    }
-    for (path, reason) in &summary.unreadable {
-        notes.push(format!("{}: {reason}", path.display()));
+    for (path, reason) in summary.failures.iter().chain(&summary.unreadable) {
+        notes.push(note(path, reason));
     }
     notes.extend(summary.recovery.lines());
     if let Some(e) = fatal {

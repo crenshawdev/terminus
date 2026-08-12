@@ -15,7 +15,8 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        ingest                archive every transcript under the configured roots\n  \
                        ingest <path.jsonl>   archive one transcript file\n  \
                        verify                check every blob against its checksum\n  \
-                       reindex               rebuild the derived tables from the blobs";
+                       reindex               rebuild the derived tables from the blobs\n  \
+                       status                sizes, counts, watermarks and the last ingest run";
 
 fn main() -> ExitCode {
     match run() {
@@ -70,6 +71,10 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         "reindex" => {
             no_more_arguments(parser)?;
             cmd::reindex::run()
+        }
+        "status" => {
+            no_more_arguments(parser)?;
+            cmd::status::run()
         }
         other => Err(Failure::Misuse(format!("unknown command '{other}'"))),
     }

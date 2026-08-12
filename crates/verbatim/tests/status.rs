@@ -1,0 +1,254 @@
+//! `verbatim status` at the process boundary (ING-09).
+//!
+//! Everything asserted here has to come out of the store: there is no log file
+//! by design, so a pass's failures are only ever visible because `runs` kept
+//! them and this command prints them.
+
+use std::path::PathBuf;
+use std::process::{Command, Output};
+
+use rusqlite::Connection;
+use verbatim_core::store::DB_FILE_NAME;
+use verbatim_core::testkit;
+
+const PROJECT: &str = "-data-projects-cadence";
+
+/// The same isolation `cli.rs` uses, and for the same reason: once bare
+/// `verbatim ingest` walks the configured roots, a spawn that sets only
+/// `VERBATIM_DATA_DIR` resolves the developer's real config and walks the live
+/// `~/.claude` tree. No test process may resolve a real transcript root.
+struct Bench {
+    _dir: tempfile::TempDir,
+    data_dir: PathBuf,
+    config_dir: PathBuf,
+    claude_dir: PathBuf,
+}
+
+fn bench() -> Bench {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let config_dir = dir.path().join("config");
+    let claude_dir = dir.path().join("claude");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
+    Bench {
+        _dir: dir,
+        data_dir,
+        config_dir,
+        claude_dir,
+    }
+}
+
+impl Bench {
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_verbatim"))
+            .args(args)
+            .env("VERBATIM_DATA_DIR", &self.data_dir)
+            .env("VERBATIM_CONFIG_DIR", &self.config_dir)
+            .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
+            .output()
+            .expect("spawn verbatim")
+    }
+
+    fn place(&self, name: &str, fixture: &str) -> PathBuf {
+        let dest = self.claude_dir.join("projects").join(PROJECT).join(name);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(testkit::fixture_path(fixture), &dest).unwrap();
+        dest.canonicalize().unwrap()
+    }
+
+    fn conn(&self) -> Connection {
+        Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
+    }
+}
+
+fn uuid(n: u8) -> String {
+    format!("{n:08x}-1111-4111-8111-111111111111")
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// An empty store is exit 0 with zeroes, not an error: it is what a machine
+/// looks like before the first hook has ever fired.
+#[test]
+fn status_on_an_empty_data_directory_exits_zero_with_zeroes() {
+    let bench = bench();
+    let out = bench.run(&["status"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("sessions       0"), "{text}");
+    assert!(text.contains("turns          0"), "{text}");
+    assert!(text.contains("last run       none"), "{text}");
+    assert!(
+        text.contains(DB_FILE_NAME),
+        "the store path must be named: {text}"
+    );
+}
+
+/// After a tree pass: the counts and the last-run line are the store's own
+/// numbers, matched against the `runs` row they were read from.
+#[test]
+fn status_reports_the_counts_and_the_last_runs_numbers() {
+    let bench = bench();
+    for (n, fixture) in [
+        "session-basic.jsonl",
+        "session-large-record.jsonl",
+        "session-continuation.jsonl",
+        "subagents/agent-alpha.jsonl",
+        "subagents/workflows/wf_demo/agent-deep.jsonl",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        bench.place(&format!("{}.jsonl", uuid(n as u8 + 1)), fixture);
+    }
+
+    let ingest = bench.run(&["ingest"]);
+    assert_eq!(ingest.status.code(), Some(0), "{}", stderr(&ingest));
+
+    let conn = bench.conn();
+    let sessions: i64 = conn
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    let turns: i64 = conn
+        .query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    let (seen, committed, failed, bytes, added): (i64, i64, i64, i64, i64) = conn
+        .query_row(
+            "SELECT files_seen, files_committed, files_failed, bytes_read, turns_added
+             FROM runs ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(sessions, 5, "the tree pass archived five transcripts");
+
+    let out = bench.run(&["status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+
+    assert!(
+        text.contains(&format!("sessions       {sessions}")),
+        "{text}"
+    );
+    assert!(text.contains(&format!("turns          {turns}")), "{text}");
+    assert!(
+        text.contains(&format!(
+            "files        {seen} walked, {committed} committed, {failed} failed"
+        )),
+        "{text}"
+    );
+    assert!(text.contains(&format!("bytes read   {bytes}")), "{text}");
+    assert!(text.contains(&format!("turns added  {added}")), "{text}");
+    assert!(
+        text.contains(&format!("watermarks     {sessions} covering")),
+        "every archived transcript carries a watermark: {text}"
+    );
+
+    // Size comes off the files on disk, so it cannot be zero here.
+    assert!(!text.contains("size           0 byte(s)"), "{text}");
+}
+
+/// AC7's reporting half. A tree with one damaged transcript: the pass still
+/// ingests the rest, and `status` names that file and its error.
+#[test]
+fn status_prints_the_damaged_files_path_and_error_from_the_last_run() {
+    let bench = bench();
+    let shrunk = bench.place(&format!("{}.jsonl", uuid(1)), "session-basic.jsonl");
+
+    // Archive it whole, then leave it shorter than its watermark - a transcript
+    // that was replaced under an archive that already holds more of it.
+    assert_eq!(bench.run(&["ingest"]).status.code(), Some(0));
+    std::fs::write(&shrunk, b"{}\n").unwrap();
+
+    // A healthy transcript that appears only now, so the second pass has one
+    // file to commit beside the one it must skip.
+    bench.place(&format!("{}.jsonl", uuid(2)), "session-continuation.jsonl");
+
+    let ingest = bench.run(&["ingest"]);
+    assert_eq!(
+        ingest.status.code(),
+        Some(0),
+        "a skipped file is not a failed pass: {}",
+        stderr(&ingest)
+    );
+    assert!(
+        stderr(&ingest).contains(shrunk.to_str().unwrap()),
+        "the skipped file must be named on stderr: {}",
+        stderr(&ingest)
+    );
+
+    let out = bench.run(&["status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+
+    assert!(
+        text.contains("  error"),
+        "the last run carried no error: {text}"
+    );
+    assert!(
+        text.contains(shrunk.to_str().unwrap()),
+        "status must name the damaged transcript: {text}"
+    );
+    assert!(
+        text.contains("watermark"),
+        "status must print the error in full: {text}"
+    );
+    assert!(
+        text.contains("files        2 walked, 1 committed, 1 failed"),
+        "{text}"
+    );
+
+    // The other transcript is still archived: one damaged file did not take
+    // the tree down with it.
+    let sessions: i64 = bench
+        .conn()
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sessions, 2);
+}
+
+/// No `--json` flag: RCL-06's stable shapes are phase 3, and an unadvertised
+/// flag accepted now becomes a shape to keep.
+#[test]
+fn status_json_is_misuse_and_prints_nothing_to_stdout() {
+    let bench = bench();
+    let out = bench.run(&["status", "--json"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+
+    // Any argument, not just that one.
+    let out = bench.run(&["status", "extra"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+}
+
+/// `status` takes no ingest lock: reading while a pass runs must work, which is
+/// what WAL is on for.
+#[test]
+fn status_reads_while_the_ingest_lock_is_held() {
+    let bench = bench();
+    bench.place(&format!("{}.jsonl", uuid(1)), "session-basic.jsonl");
+    assert_eq!(bench.run(&["ingest"]).status.code(), Some(0));
+
+    let guard = match verbatim_core::ingest::lock::try_acquire(&bench.data_dir).unwrap() {
+        verbatim_core::ingest::Attempt::Acquired(guard) => guard,
+        other => panic!("the lock should have been free: {other:?}"),
+    };
+    let out = bench.run(&["status"]);
+    drop(guard);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("sessions       1"),
+        "{}",
+        stdout(&out)
+    );
+}

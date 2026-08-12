@@ -1,4 +1,4 @@
-//! The subcommands. Phase 1 ships three: `ingest`, `verify`, `reindex`.
+//! The subcommands: `ingest`, `verify`, `reindex`, `status`.
 //!
 //! `--json` on data commands, stable output shapes and the full exit-code
 //! contract are RCL-06 in phase 3. What is here is only what the phase-1
@@ -7,6 +7,7 @@
 
 pub mod ingest;
 pub mod reindex;
+pub mod status;
 pub mod verify;
 
 use std::path::PathBuf;
