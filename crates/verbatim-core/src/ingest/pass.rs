@@ -17,6 +17,11 @@
 //! fix `3e5d9ff` closed for `reindex`, and it is worth more here: the tree is
 //! two thousand files.
 //!
+//! One of those two is also the only per-file failure that writes anything: a
+//! transcript shorter than its watermark leaves D-13's flag on that session, so
+//! the divergence reaches `verbatim verify` rather than living only in a `runs`
+//! row nobody diffs. The archive itself is still untouched.
+//!
 //! `ingest::run`'s single-file behaviour and its refusals are unchanged. The
 //! skip lives here, in the pass, and not in `ingest_locked` - a caller that
 //! named one file deserves the error it asked about.
@@ -171,7 +176,25 @@ fn walk(
             Err(e) => {
                 // Recorded and skipped. The tree is the unit of work; one
                 // damaged transcript is not a reason to archive none of it.
-                summary.failures.push((path.clone(), e.to_string()));
+                let mut reason = e.to_string();
+
+                // D-13, and the only per-file failure that leaves a mark on the
+                // store. Matched on the variant and never on the message: a
+                // transcript at a non-UTF-8 path fails with the same io kind
+                // and must flag nothing. The flag goes in a transaction of its
+                // own - the bare statement autocommits - because the file's own
+                // transaction has already rolled back, and it is what lets
+                // `verbatim verify` name the divergence instead of it living
+                // only in a `runs` row nobody diffs.
+                if matches!(e, crate::error::Error::TranscriptDiverged { .. }) {
+                    if let Err(flag) = crate::ingest::flag_divergence(store.conn(), path) {
+                        // Same note rather than a second failure: `files_failed`
+                        // counts files, and one file must not become two.
+                        reason.push_str(&format!(" (the flag could not be set: {flag})"));
+                    }
+                }
+
+                summary.failures.push((path.clone(), reason));
             }
         }
     }

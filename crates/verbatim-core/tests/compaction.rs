@@ -15,6 +15,12 @@
 //! block's absolute offset when the table grows), so the blob's bytes are
 //! *expected* to differ. What must not differ is a completed block: those are
 //! immutable once committed (D-07) and copied across untouched.
+//!
+//! The second half of the file is D-13, which is the same premise inverted: the
+//! file underneath an archived session got *shorter*. Both belong here because
+//! both are the live tree changing a session the archive already holds, and the
+//! two answers are opposite by design - the archive follows a file that grew
+//! and refuses a file that shrank.
 
 #![cfg(feature = "testkit")]
 
@@ -22,8 +28,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
+use verbatim_core::config::Config;
+use verbatim_core::ingest::pass;
 use verbatim_core::store::{schema, Store, DB_FILE_NAME};
-use verbatim_core::{blob, ingest, reindex, testkit};
+use verbatim_core::{blob, ingest, reindex, testkit, verify};
 
 /// A transcript large enough to fill at least one 64 KB block, so
 /// "every completed block is byte-identical" is a claim about something.
@@ -378,4 +386,378 @@ fn the_completed_block_helper_excludes_only_the_partial_tail() {
         "the fixture must fill at least one whole block"
     );
     assert_eq!(Path::new(&bench.session_key), bench.transcript);
+}
+
+// ---------------------------------------------------------------------------
+// D-13: the other thing a live tree does to an already-archived session - the
+// file underneath it gets *shorter*.
+//
+// The same premise as AC4 above, inverted. A compaction appends, so an archived
+// session's file growing is normal and the archive follows it. A file that
+// shrank is not that session's file any more, and there is no way to tell which
+// of its bytes are still the ones the blob holds. So the pass refuses, and the
+// refusal is the feature: re-reading from offset 0 would overwrite archived
+// bytes on the strength of an append-only property observed over one 25-day
+// corpus rather than documented anywhere.
+//
+// What has to be provable is that the refusal is *loud*. A skip that only
+// reaches a `runs` row is a skip nobody sees, so the pass flags the session and
+// `verbatim verify` reports it - and stops reporting it once the file is whole.
+// ---------------------------------------------------------------------------
+
+/// A tree the *pass* walks, rather than the single-file entry point.
+///
+/// D-13's flag is the pass's to set: `ingest::run` names one file and returns
+/// that file's error to the caller who asked about it. Two transcripts, so
+/// "names that session and no other" has something to be false about.
+struct Tree {
+    _dir: tempfile::TempDir,
+    data_dir: PathBuf,
+    claude_dir: PathBuf,
+    /// The transcript the tests damage.
+    subject: PathBuf,
+    /// Its original bytes, for putting back.
+    original: Vec<u8>,
+    /// The transcript they leave alone.
+    bystander: PathBuf,
+}
+
+const PROJECT: &str = "-data-code-verbatim";
+
+fn tree() -> Tree {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let claude_dir = dir.path().join("claude");
+    let project = claude_dir.join("projects").join(PROJECT);
+    std::fs::create_dir_all(&project).unwrap();
+
+    let subject = place(
+        &project,
+        "11111111-1111-4111-8111-111111111111.jsonl",
+        BIG_FIXTURE,
+    );
+    let bystander = place(
+        &project,
+        "22222222-2222-4222-8222-222222222222.jsonl",
+        "session-basic.jsonl",
+    );
+    let original = std::fs::read(&subject).unwrap();
+
+    Tree {
+        _dir: dir,
+        data_dir,
+        claude_dir,
+        subject,
+        original,
+        bystander,
+    }
+}
+
+fn place(project: &Path, name: &str, fixture: &str) -> PathBuf {
+    let dest = project.join(name);
+    std::fs::copy(testkit::fixture_path(fixture), &dest).unwrap();
+    dest.canonicalize().unwrap()
+}
+
+impl Tree {
+    fn conn(&self) -> Connection {
+        Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
+    }
+
+    fn pass(&self) -> pass::Summary {
+        match pass::run_with(
+            &self.data_dir,
+            &Config::from_parts(vec![self.claude_dir.clone()], Vec::new()),
+        )
+        .unwrap()
+        {
+            pass::PassOutcome::Ran(summary) => summary,
+            pass::PassOutcome::LockHeld => panic!("nothing else holds the lock"),
+        }
+    }
+
+    fn key(&self, path: &Path) -> String {
+        path.to_str().unwrap().to_owned()
+    }
+
+    /// Everything about a session that a refused pass must not have moved.
+    fn archived(&self, path: &Path) -> (Vec<u8>, Vec<u8>, i64, Vec<TurnRowValues>) {
+        let conn = self.conn();
+        let key = self.key(path);
+        let (blob, checksum): (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT s.blob, m.checksum FROM sessions s
+                 JOIN session_meta m USING (session_key) WHERE s.session_key = ?1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let watermark: i64 = conn
+            .query_row(
+                "SELECT byte_offset FROM watermarks WHERE transcript_path = ?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (blob, checksum, watermark, turn_rows(&conn))
+    }
+
+    fn diverged(&self, path: &Path) -> bool {
+        self.conn()
+            .query_row(
+                "SELECT coalesce(transcript_diverged, 0) <> 0
+                 FROM session_meta WHERE session_key = ?1",
+                [self.key(path)],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Every session key the store has flagged.
+    fn flagged(&self) -> Vec<String> {
+        self.conn()
+            .prepare(
+                "SELECT session_key FROM session_meta
+                 WHERE transcript_diverged IS NOT NULL ORDER BY session_key",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// The `error` text of the most recent `runs` row.
+    fn last_run_error(&self) -> Option<String> {
+        self.conn()
+            .query_row("SELECT error FROM runs ORDER BY id DESC LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    fn verify(&self) -> verify::Report {
+        let store = Store::open(&self.data_dir).unwrap();
+        verify::verify(&store).unwrap()
+    }
+
+    /// Cut the transcript back to half its length, below its watermark.
+    fn truncate(&self) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.subject)
+            .unwrap()
+            .set_len(self.original.len() as u64 / 2)
+            .unwrap();
+    }
+
+    fn restore(&self) {
+        std::fs::write(&self.subject, &self.original).unwrap();
+    }
+}
+
+/// D-13 end to end. A shortened transcript is skipped, the archive is left
+/// exactly as it was, and the session is flagged so `verify` says so.
+#[test]
+fn a_transcript_shorter_than_its_watermark_is_skipped_and_flagged() {
+    let tree = tree();
+    let first = tree.pass();
+    assert_eq!(first.files_committed, 2, "{first:?}");
+    assert!(first.failures.is_empty(), "{:?}", first.failures);
+    assert!(tree.flagged().is_empty(), "nothing is flagged yet");
+
+    let before = tree.archived(&tree.subject);
+    let bystander_before = tree.archived(&tree.bystander);
+    tree.truncate();
+
+    let second = tree.pass();
+    assert_eq!(
+        second.files_walked, 2,
+        "the walk did not stop at the bad file"
+    );
+    assert_eq!(second.files_committed, 0);
+    assert_eq!(second.failures.len(), 1, "{:?}", second.failures);
+    assert_eq!(second.failures[0].0, tree.subject);
+    assert!(
+        second.failures[0].1.contains("watermark"),
+        "{}",
+        second.failures[0].1
+    );
+
+    // Nothing archived moved: not the blob, not the checksum, not the turn
+    // rows, and above all not the watermark - a re-ingest from offset 0 would
+    // have reset it and rewritten the blob from the surviving half.
+    assert_eq!(
+        tree.archived(&tree.subject),
+        before,
+        "the archive was rewritten"
+    );
+    assert_eq!(tree.archived(&tree.bystander), bystander_before);
+
+    // The signal, in both places it has to appear.
+    assert_eq!(tree.flagged(), vec![tree.key(&tree.subject)]);
+    let run = tree.last_run_error().expect("the skip is in the runs row");
+    assert!(run.contains(tree.subject.to_str().unwrap()), "{run}");
+
+    let report = tree.verify();
+    assert!(!report.is_ok(), "verify passed a diverged store");
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(report.failures[0].session_key, tree.key(&tree.subject));
+    let text = report.render();
+    assert!(text.contains("shorter"), "{text}");
+    assert!(
+        !text.contains(tree.bystander.to_str().unwrap()),
+        "named the bystander: {text}"
+    );
+}
+
+/// The flag is a state, not a verdict: a file that was mid-write stops being
+/// reported once it is whole again. Without this, one interrupted write would
+/// make `verify` complain forever and the signal would stop meaning anything.
+#[test]
+fn restoring_the_transcript_clears_the_flag() {
+    let tree = tree();
+    tree.pass();
+    let before = tree.archived(&tree.subject);
+    tree.truncate();
+    tree.pass();
+    assert!(tree.diverged(&tree.subject));
+
+    tree.restore();
+    let third = tree.pass();
+    assert!(third.failures.is_empty(), "{:?}", third.failures);
+    // Nothing new past the watermark, so this commits nothing - which is the
+    // case the clearing has to survive, because it opens no transaction.
+    assert_eq!(third.files_committed, 0);
+    assert!(
+        !tree.diverged(&tree.subject),
+        "the flag outlived the damage"
+    );
+    assert_eq!(
+        tree.archived(&tree.subject),
+        before,
+        "the repaired file was re-ingested rather than left alone"
+    );
+
+    let report = tree.verify();
+    assert!(report.is_ok(), "{:?}", report.failures);
+    assert_eq!(report.render(), "");
+}
+
+/// A transcript that grows again after being flagged clears the flag too, and
+/// on the path that *does* open a transaction - the one the boundary rides in.
+#[test]
+fn a_flagged_transcript_that_grows_again_is_ingested_and_cleared() {
+    let tree = tree();
+    tree.pass();
+    let turns_before = turn_rows(&tree.conn()).len();
+    tree.truncate();
+    tree.pass();
+    assert!(tree.diverged(&tree.subject));
+
+    tree.restore();
+    let line = testkit::boundary_line();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&tree.subject)
+        .unwrap();
+    file.write_all(&line).unwrap();
+    file.write_all(b"\n").unwrap();
+    drop(file);
+
+    let summary = tree.pass();
+    assert_eq!(summary.files_committed, 1, "{summary:?}");
+    assert!(!tree.diverged(&tree.subject));
+    assert_eq!(turn_rows(&tree.conn()).len(), turns_before + 1);
+    assert_eq!(boundaries(&tree.conn()).len(), 1);
+    assert!(tree.verify().is_ok());
+}
+
+/// Half of the discrimination the dedicated error variant exists for: the
+/// failure D-13's refusal used to be indistinguishable from.
+///
+/// `path_key` refuses a non-UTF-8 transcript path with the same `InvalidData`
+/// io kind `read_tail` used to carry, so a pass that told the two apart by kind
+/// would flag a session for a failure that says nothing about the file's
+/// length. The failure is recorded like any other and the store's flag count
+/// stays zero.
+///
+/// This one cannot fail by itself if the pass flagged *every* failure, because
+/// a path that is not text has no session key to flag - which is exactly why
+/// `another_per_file_failure_flags_no_session` exists beside it.
+///
+/// Unix only: this needs a path that is bytes and not text, and Windows paths
+/// are UTF-16 where the equivalent is an unpaired surrogate.
+#[cfg(unix)]
+#[test]
+fn a_failure_that_is_not_a_divergence_flags_no_session() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let tree = tree();
+    tree.pass();
+    assert!(tree.flagged().is_empty());
+
+    // `agent-<0xff>.jsonl`: discovery matches on the lossy name, so it is
+    // picked up as a sidecar, and ingest then finds the real path is not text.
+    let project = tree.claude_dir.join("projects").join(PROJECT);
+    let name = std::ffi::OsStr::from_bytes(b"agent-\xff.jsonl");
+    let bad = project.join(name);
+    std::fs::copy(testkit::fixture_path("session-basic.jsonl"), &bad).unwrap();
+
+    let summary = tree.pass();
+    assert_eq!(summary.failures.len(), 1, "{:?}", summary.failures);
+    assert_eq!(summary.failures[0].0, bad);
+    let reason = &summary.failures[0].1;
+    assert!(reason.contains("not valid UTF-8"), "{reason}");
+    assert!(!reason.contains("watermark"), "{reason}");
+
+    assert!(
+        tree.flagged().is_empty(),
+        "a non-divergence failure flagged {:?}",
+        tree.flagged()
+    );
+    assert!(tree.verify().is_ok(), "{:?}", tree.verify().failures);
+    let run = tree
+        .last_run_error()
+        .expect("the failure is in the runs row");
+    assert!(run.contains("not valid UTF-8"), "{run}");
+}
+
+/// The other half, and the one that bites: a per-file failure at a perfectly
+/// good path, against a session that has a `session_meta` row to flag.
+///
+/// A pass that raised D-13's flag on any error rather than on the one variant
+/// would set it here, and the archive would be reported as diverged from a
+/// transcript that is sitting on disk at its full length.
+#[test]
+fn another_per_file_failure_flags_no_session() {
+    let tree = tree();
+    tree.pass();
+
+    // A stored checksum that is not 32 bytes. `Existing::read` refuses it
+    // before the file is even opened, so the failure is nothing to do with the
+    // transcript's length - and the session_meta row it would be flagged on is
+    // right there.
+    let changed = tree
+        .conn()
+        .execute(
+            "UPDATE session_meta SET checksum = x'0102030405' WHERE session_key = ?1",
+            [tree.key(&tree.subject)],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let summary = tree.pass();
+    assert_eq!(summary.failures.len(), 1, "{:?}", summary.failures);
+    assert_eq!(summary.failures[0].0, tree.subject);
+    assert!(
+        !summary.failures[0].1.contains("watermark"),
+        "{}",
+        summary.failures[0].1
+    );
+    assert!(
+        tree.flagged().is_empty(),
+        "a failure that is not a divergence flagged {:?}",
+        tree.flagged()
+    );
 }

@@ -10,6 +10,14 @@
 //! attribution, so it would ride alongside the named session and break AC3's
 //! "and no other" on a store that is otherwise fine.
 //!
+//! Phase 2 adds one further failure, and it passes the same test: D-13's
+//! divergence, raised when the transcript on disk turned out shorter than the
+//! bytes the archive holds. It is read off `session_meta.transcript_diverged`,
+//! which the pass sets against exactly one session, so it is attributed by
+//! `session_key` like every other failure here and names no other. It is a
+//! statement about the *file*, not about the blob - the blob is intact, and
+//! saying so is most of the message.
+//!
 //! # Which identifier names a failure
 //!
 //! The `session_key` - the canonical transcript path - and never the record's
@@ -72,9 +80,19 @@ pub fn verify(store: &Store) -> Result<Report> {
     walk(store.conn())
 }
 
+/// What a diverged session is told (D-13).
+///
+/// "The archive was left untouched" is the load-bearing half. The obvious
+/// response to `verify` naming a session is to re-run ingest, and for this
+/// failure that is neither necessary nor sufficient: the pass already refused
+/// to re-read the file from offset 0, on purpose, because doing so would
+/// overwrite archived bytes.
+const DIVERGED: &str = "the transcript on disk is shorter than the bytes the archive holds \
+                        for it; the archive was left untouched";
+
 fn walk(conn: &Connection) -> Result<Report> {
     let mut statement = conn.prepare(
-        "SELECT s.session_key, s.blob, m.checksum
+        "SELECT s.session_key, s.blob, m.checksum, m.transcript_diverged
          FROM sessions s LEFT JOIN session_meta m USING (session_key)
          ORDER BY s.session_key",
     )?;
@@ -83,17 +101,27 @@ fn walk(conn: &Connection) -> Result<Report> {
             r.get::<_, String>(0)?,
             r.get::<_, Vec<u8>>(1)?,
             r.get::<_, Option<Vec<u8>>>(2)?,
+            r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
         ))
     })?;
 
     let mut report = Report::default();
     for row in rows {
-        let (session_key, bytes, expected) = row?;
+        let (session_key, bytes, expected, diverged) = row?;
         report.checked += 1;
         if let Err(detail) = check(&bytes, expected.as_deref()) {
             report.failures.push(Failure {
-                session_key,
+                session_key: session_key.clone(),
                 detail,
+            });
+        }
+        // Independent of the checksum verdict, not an alternative to it. A
+        // session can have both a diverged transcript and a damaged blob, and
+        // collapsing them would report the lesser fact and hide the graver one.
+        if diverged {
+            report.failures.push(Failure {
+                session_key,
+                detail: DIVERGED.into(),
             });
         }
     }

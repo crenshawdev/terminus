@@ -126,6 +126,18 @@ pub(crate) fn ingest_locked(
 
     let existing = Existing::read(store.conn(), &session_key)?;
     let tail = read_tail(path, existing.watermark)?;
+
+    // `read_tail` returning at all is the proof the file is no shorter than the
+    // archive, which is exactly what the flag denies - so a session that was
+    // flagged stops being flagged here (D-13). Here and not inside the pass
+    // transaction below, because the state a repaired file lands in is
+    // `Outcome::UpToDate`, which opens no transaction and returns two lines
+    // down; and guarded on the flag being set, so a walk of two thousand
+    // healthy transcripts issues none of these writes.
+    if existing.diverged {
+        set_divergence(store.conn(), &session_key, false)?;
+    }
+
     let scan = parse::scan_from(&tail, existing.watermark, existing.turn_count);
     let consumed = scan.consumed(existing.watermark);
     if consumed == 0 {
@@ -295,6 +307,32 @@ fn read_agent_meta(transcript: &Path) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Raise D-13's divergence flag on the session this transcript belongs to.
+///
+/// Called by the pass, from outside any transaction: the file's own transaction
+/// has already rolled back by then, and this records a fact about the file on
+/// disk rather than about the archive - which is untouched, and is the point.
+///
+/// The path is the one `read_tail` refused, so it has already been through
+/// [`path_key`] and is UTF-8 by construction; deriving the key here rather than
+/// taking it keeps one definition of what keys a session (D-01).
+pub(crate) fn flag_divergence(conn: &Connection, path: &Path) -> Result<()> {
+    let session_key = path_key(path)?;
+    set_divergence(conn, &session_key, true)
+}
+
+/// `session_meta.transcript_diverged`, both directions.
+///
+/// Nulled rather than zeroed when it clears, so the column has two states and
+/// not three and every reader can test it the same way.
+fn set_divergence(conn: &Connection, session_key: &str, diverged: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE session_meta SET transcript_diverged = ?2 WHERE session_key = ?1",
+        rusqlite::params![session_key, diverged.then_some(1)],
+    )?;
+    Ok(())
+}
+
 /// The byte offset the next pass resumes from: just past the last `\n` (D-14).
 fn write_watermark(conn: &Connection, session_key: &str, offset: u64) -> Result<()> {
     conn.execute(
@@ -415,6 +453,11 @@ struct Existing {
     /// takes: a tail pass numbers on from here and a rebuild from 0 lands on
     /// the same numbers, because both count in byte order (D-02).
     turn_count: i64,
+    /// Whether a previous pass found this transcript shorter than its watermark
+    /// and flagged the session (D-13). Read so the flag can be *cleared* when
+    /// the file is whole again, and read here so the steady state costs no
+    /// extra query and no write at all.
+    diverged: bool,
     session: Option<ExistingSession>,
 }
 
@@ -433,14 +476,17 @@ impl Existing {
                 |r| r.get(0),
             )
             .optional()?;
-        let agent_meta_stored: bool = conn
+        // Both flags off the one `session_meta` row rather than two round
+        // trips: a pass reads this for every one of two thousand transcripts.
+        let (agent_meta_stored, diverged): (bool, bool) = conn
             .query_row(
-                "SELECT agent_meta IS NOT NULL FROM session_meta WHERE session_key = ?1",
+                "SELECT agent_meta IS NOT NULL, coalesce(transcript_diverged, 0) <> 0
+                 FROM session_meta WHERE session_key = ?1",
                 [session_key],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?
-            .unwrap_or(false);
+            .unwrap_or((false, false));
         let turn_count: i64 = conn.query_row(
             "SELECT count(*) FROM turns WHERE session_key = ?1",
             [session_key],
@@ -510,6 +556,7 @@ impl Existing {
             watermark: watermark.unwrap_or(0) as u64,
             agent_meta_stored,
             turn_count,
+            diverged,
             session,
         })
     }
@@ -540,14 +587,19 @@ fn read_tail(path: &Path, watermark: u64) -> Result<Vec<u8>> {
         // A transcript never shrinks: compaction appends to the same file
         // (`DESIGN-BRIEF.md:114`). A shorter file is a different file at the
         // same path, and guessing which bytes are still ours would corrupt the
-        // blob. Phase 2 owns re-identification; phase 1 refuses.
-        return Err(Error::io(
-            path,
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("is {len} bytes but its watermark is at {watermark}"),
-            ),
-        ));
+        // blob - so the refusal stands and there is deliberately no fallback to
+        // offset 0, which would overwrite archived bytes on the strength of an
+        // append-only property observed over one 25-day corpus rather than
+        // documented anywhere (D-13).
+        //
+        // What phase 2 adds is not a recovery but a signal: this variant is the
+        // one the pass matches on to flag the session, so `verbatim verify`
+        // can say the transcript and the archive have diverged.
+        return Err(Error::TranscriptDiverged {
+            path: path.to_path_buf(),
+            len,
+            watermark,
+        });
     }
     file.seek(SeekFrom::Start(watermark))
         .map_err(|e| Error::io(path, e))?;

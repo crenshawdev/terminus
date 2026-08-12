@@ -15,6 +15,24 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// D-13: the transcript on disk is shorter than the bytes the archive
+    /// already holds for it, so the pass skipped it and touched nothing.
+    ///
+    /// Its own variant rather than an [`Error::Io`] carrying a message, because
+    /// the pass has to tell this one failure apart from every other in order to
+    /// flag the session - and the kind discriminates nothing, since `path_key`
+    /// also raises `InvalidData` for a transcript path that is not UTF-8, while
+    /// matching on the message text breaks the first time the wording moves.
+    #[error(
+        "{path} is {len} bytes but its watermark is at {watermark}; \
+         the archive was left untouched"
+    )]
+    TranscriptDiverged {
+        path: PathBuf,
+        len: u64,
+        watermark: u64,
+    },
+
     /// STOR-05's refusal. Both integers are named because "unsupported store
     /// format" without them tells the user nothing about which side to move.
     #[error(

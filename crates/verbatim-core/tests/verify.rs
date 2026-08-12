@@ -87,6 +87,19 @@ impl Bench {
         .unwrap();
     }
 
+    /// Raise D-13's flag on one session, the way a pass over a shortened
+    /// transcript would.
+    fn flag_divergence(&self, key: &str) {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE session_meta SET transcript_diverged = 1 WHERE session_key = ?1",
+                [key],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "no session_meta row for {key}");
+    }
+
     /// Replace a session's stream with different bytes, validly compressed.
     ///
     /// The other half of the corruption space: `flip_a_byte` usually makes zstd
@@ -260,4 +273,98 @@ fn a_session_with_no_metadata_row_fails_rather_than_being_skipped() {
     assert_eq!(report.checked, 3);
     assert_eq!(report.failures.len(), 1);
     assert_eq!(report.failures[0].session_key, orphan);
+}
+
+/// D-13, at the level `verify` owns: the flag the pass sets is a per-session
+/// failure like every other, attributed by `session_key` and naming no other.
+///
+/// The flag is set with a direct UPDATE here on purpose. What the pass does to
+/// a truncated file, and what it leaves the archive looking like afterwards, is
+/// asserted end to end in `tests/compaction.rs`; the question here is only what
+/// `verify` reports off the column, and setting it directly is what keeps the
+/// two tests from proving the same half twice.
+#[test]
+fn a_diverged_session_is_named_and_no_other() {
+    let bench = bench();
+    let diverged = bench.keys[1].clone();
+    bench.flag_divergence(&diverged);
+
+    let report = verify::verify(&bench.store()).unwrap();
+    assert_eq!(report.checked, 3, "the walk visited every session");
+    assert!(!report.is_ok(), "a divergence is a failure");
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].session_key, diverged);
+
+    let text = report.render();
+    assert!(text.contains(&diverged), "{text}");
+    for other in others(&bench.keys, &[&diverged]) {
+        assert!(!text.contains(other.as_str()), "named {other}: {text}");
+    }
+}
+
+/// The message has to say the archive is intact, because the reflex `verify`
+/// provokes is to re-run ingest and that is exactly what must not happen here:
+/// re-reading a shortened file from offset 0 would overwrite archived bytes.
+#[test]
+fn the_divergence_says_the_archive_was_not_touched() {
+    let bench = bench();
+    bench.flag_divergence(&bench.keys[0].clone());
+
+    let text = report_text(&bench);
+    assert!(text.contains("shorter"), "{text}");
+    assert!(text.contains("archive was left untouched"), "{text}");
+    // Not a checksum complaint. The blob verified.
+    assert!(!text.contains("checksum"), "{text}");
+}
+
+/// Two independent facts about one session, and the graver one is not hidden by
+/// the lesser. A diverged transcript says nothing about whether the blob is
+/// intact, so a store where both are wrong must report both.
+#[test]
+fn a_diverged_session_with_a_damaged_blob_reports_both() {
+    let bench = bench();
+    let broken = bench.keys[0].clone();
+    bench.flag_divergence(&broken);
+    // `rewrite_the_stream` and not `flip_a_byte`: this fixture is small enough
+    // that a flipped byte often still decompresses, so which of the two blob
+    // verdicts fires would be incidental. This one always reaches the hash.
+    bench.rewrite_the_stream(&broken);
+
+    let report = verify::verify(&bench.store()).unwrap();
+    assert_eq!(report.failures.len(), 2, "{:?}", report.failures);
+    assert!(report.failures.iter().all(|f| f.session_key == broken));
+
+    let text = report.render();
+    assert!(text.contains("checksum mismatch"), "{text}");
+    assert!(text.contains("archive was left untouched"), "{text}");
+    for other in others(&bench.keys, &[&broken]) {
+        assert!(!text.contains(other.as_str()), "named {other}: {text}");
+    }
+}
+
+/// The control the new signal needs: clearing the column returns the store to
+/// silent. Without this, a flag that could never be cleared would still pass
+/// every assertion above.
+#[test]
+fn clearing_the_flag_makes_the_store_clean_again() {
+    let bench = bench();
+    let diverged = bench.keys[2].clone();
+    bench.flag_divergence(&diverged);
+    assert!(!verify::verify(&bench.store()).unwrap().is_ok());
+
+    bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET transcript_diverged = NULL WHERE session_key = ?1",
+            [&diverged],
+        )
+        .unwrap();
+
+    let report = verify::verify(&bench.store()).unwrap();
+    assert!(report.is_ok(), "{:?}", report.failures);
+    assert_eq!(report.render(), "");
+}
+
+fn report_text(bench: &Bench) -> String {
+    verify::verify(&bench.store()).unwrap().render()
 }
