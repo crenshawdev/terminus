@@ -83,7 +83,12 @@ impl<'a> BlobReader<'a> {
         let first = (offset / block_size) as usize;
         let last = ((end - 1) / block_size) as usize;
 
-        let mut out = Vec::with_capacity(len as usize);
+        // Capped, because `len` on a `read_all` comes straight off the header:
+        // reserving it outright makes a corrupt `uncompressed_len` an allocation
+        // request, and an allocation failure aborts rather than erroring. Past
+        // the cap the buffer grows as blocks actually decompress, so a header
+        // that lies runs out of payload and returns an error instead.
+        let mut out = Vec::with_capacity(len.min(super::MAX_RESERVE) as usize);
         for index in first..=last {
             let block = super::decompress_block(self.blob, &self.header, index)?;
             self.blocks_decompressed

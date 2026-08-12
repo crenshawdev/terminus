@@ -65,7 +65,21 @@ pub struct Appended {
 ///
 /// An existing block's uncompressed start offset is never moved, because `turns`
 /// rows already point at those coordinates.
-pub fn append(blob: &[u8], extra: &[u8]) -> Result<Appended> {
+///
+/// `expected` is the checksum already recorded for what `blob` holds
+/// (`session_meta.checksum`), and it is checked before anything is written. It
+/// is a parameter rather than an internal detail because there is no way to
+/// re-derive it: the checksum this call returns covers the appended stream, so
+/// an append that did not verify first would hash the corruption and hand back
+/// a blob that is self-consistent and wrong. zstd frames here carry no content
+/// checksum, so a flipped bit inside a completed block decodes cleanly to
+/// different bytes rather than failing, and completed blocks are copied across
+/// untouched - which means the append is the only place that damage can still
+/// be caught. Since a live session is appended to on every pass while it grows,
+/// the alternative is that the next pass certifies it forever and `verify` then
+/// compares a corrupt stream against a checksum minted from that same corrupt
+/// stream.
+pub fn append(blob: &[u8], expected: &[u8; 32], extra: &[u8]) -> Result<Appended> {
     let header = BlobHeader::parse(blob)?;
     if header.block_size as usize != BLOCK_SIZE {
         return Err(Error::BlobFormat {
@@ -73,6 +87,21 @@ pub fn append(blob: &[u8], extra: &[u8]) -> Result<Appended> {
                 "cannot append to a blob with block size {}; this build writes {BLOCK_SIZE}",
                 header.block_size
             ),
+        });
+    }
+
+    // Decompressing the whole stream is not new cost: the checksum is defined
+    // over the whole uncompressed stream (D-06) and BLAKE3 exposes no resumable
+    // state, so this read was already being paid to recompute it. Paying it
+    // here instead, on the stream going in, buys the verification as well - and
+    // hashing `existing || extra` afterwards means the new blob is never read
+    // back at all.
+    let existing = super::read_all(blob)?;
+    let actual = *blake3::hash(&existing).as_bytes();
+    if actual != *expected {
+        return Err(Error::BlobChecksumMismatch {
+            expected: hex(expected),
+            actual: hex(&actual),
         });
     }
 
@@ -98,10 +127,12 @@ pub fn append(blob: &[u8], extra: &[u8]) -> Result<Appended> {
         payload.extend_from_slice(&blob[from..to]);
     }
 
-    // Rebuild the stream from the partial tail onwards and compress that.
+    // Rebuild the stream from the partial tail onwards and compress that. The
+    // tail comes out of the stream just verified, not a second decompression of
+    // the same block.
     let mut rest = Vec::with_capacity(tail_len + extra.len());
     if tail_len > 0 {
-        rest.extend_from_slice(&super::decompress_block(blob, &header, complete)?);
+        rest.extend_from_slice(&existing[existing.len() - tail_len..]);
     }
     rest.extend_from_slice(extra);
 
@@ -115,9 +146,13 @@ pub fn append(blob: &[u8], extra: &[u8]) -> Result<Appended> {
     let uncompressed_len = header.uncompressed_len + extra.len() as u64;
     let written = finish_parts(uncompressed_len, blocks, payload);
 
-    // The checksum is over the whole uncompressed stream (D-06), so it has to
-    // be recomputed from the whole stream: BLAKE3 exposes no resumable state.
-    let checksum = *blake3::hash(&super::read_all(&written)?).as_bytes();
+    // Over the whole uncompressed stream (D-06). The appended stream is exactly
+    // the verified bytes followed by `extra`, so it is hashed from those rather
+    // than by decompressing the blob that was just built.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&existing);
+    hasher.update(extra);
+    let checksum = *hasher.finalize().as_bytes();
 
     Ok(Appended {
         bytes: written,
@@ -126,6 +161,11 @@ pub fn append(blob: &[u8], extra: &[u8]) -> Result<Appended> {
         blocks_compressed: compressed,
         blocks_recompressed: usize::from(tail_len > 0),
     })
+}
+
+/// A checksum as it appears in a message. Only ever used in error text.
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Cut `data` into blocks starting at uncompressed offset `start_at`, appending

@@ -49,6 +49,16 @@ pub enum Error {
         uncompressed_len: u64,
     },
 
+    /// A blob's stored stream does not hash to the checksum recorded for it.
+    ///
+    /// Raised before an append, never after: an append that trusted the bytes
+    /// it copied would mint a fresh checksum over the corruption and destroy
+    /// the only evidence that anything was ever wrong (D-06's checksum is the
+    /// evidence). A live session is re-ingested repeatedly as it grows, so the
+    /// very next append is what would certify the damage permanently.
+    #[error("session blob failed its recorded checksum: expected {expected}, found {actual}")]
+    BlobChecksumMismatch { expected: String, actual: String },
+
     /// zstd failed to compress or decompress a block.
     #[error("zstd {operation} failed: {source}")]
     Codec {

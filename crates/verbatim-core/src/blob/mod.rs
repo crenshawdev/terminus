@@ -55,6 +55,26 @@ pub const BLOCK_SIZE: usize = 65536;
 /// become part of an archive format that never migrates.
 pub const ZSTD_LEVEL: i32 = 3;
 
+/// Largest `block_size` a header may declare.
+///
+/// The field is header-controlled and every decompression buffer is sized from
+/// it, so an unbounded value turns a corrupt blob into a header-driven
+/// allocation: `u32::MAX` in a 45-byte blob asks for 4 GiB, and an allocation
+/// failure aborts the process rather than returning [`Error::BlobFormat`] -
+/// killing `verify` and `reindex`, the two commands whose whole job is to
+/// survive corruption and name it. 1024x this build's [`BLOCK_SIZE`] leaves a
+/// future block-size change all the room D-04 promises it while keeping the
+/// worst case a bounded allocation that fails as an error.
+const MAX_BLOCK_SIZE: u32 = 64 * 1024 * 1024;
+
+/// Largest buffer a read reserves up front from a header-declared length.
+///
+/// Sized above D-05's largest observed record (1,134,645 bytes) so every real
+/// turn read still reserves exactly once. Past it the buffer grows as blocks
+/// actually decompress, which is what keeps a bogus `uncompressed_len` from
+/// being an allocation request in its own right.
+const MAX_RESERVE: u64 = 4 * 1024 * 1024;
+
 const MAGIC: [u8; 4] = *b"VBLB";
 const CODEC_ZSTD: u16 = 1;
 const HEADER_LEN: usize = 24;
@@ -109,6 +129,13 @@ impl BlobHeader {
                 detail: "block size 0".into(),
             });
         }
+        if block_size > MAX_BLOCK_SIZE {
+            return Err(Error::BlobFormat {
+                detail: format!(
+                    "block size {block_size} exceeds the {MAX_BLOCK_SIZE} byte maximum"
+                ),
+            });
+        }
         let uncompressed_len = u64::from_le_bytes(blob[12..20].try_into().unwrap());
         let block_count = u32::from_le_bytes(blob[20..24].try_into().unwrap()) as usize;
 
@@ -140,6 +167,15 @@ impl BlobHeader {
             });
         }
 
+        // Blocks are written back to back and never overlap, so their compressed
+        // lengths have to fit in the payload region. Checking the sum, not just
+        // each extent, is what bounds `uncompressed_len` against bytes that are
+        // actually present: without it a small blob can declare a block table
+        // whose blocks all point at the same few bytes and claim gigabytes of
+        // stream behind them.
+        let payload_capacity = (blob.len() - table_end) as u64;
+        let mut payload_used: u64 = 0;
+
         let mut blocks = Vec::with_capacity(block_count);
         for i in 0..block_count {
             let at = HEADER_LEN + i * TABLE_ENTRY_LEN;
@@ -167,6 +203,16 @@ impl BlobHeader {
                     ),
                 });
             }
+            payload_used += u64::from(compressed_len);
+            if payload_used > payload_capacity {
+                return Err(Error::BlobFormat {
+                    detail: format!(
+                        "blocks 0..={i} claim {payload_used} compressed bytes, but the blob holds \
+                         {payload_capacity} bytes of payload"
+                    ),
+                });
+            }
+
             blocks.push(BlockEntry {
                 uncompressed_start,
                 compressed_offset,

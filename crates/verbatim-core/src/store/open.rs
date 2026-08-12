@@ -104,10 +104,18 @@ impl Store {
     }
 
     /// Write the tables and the version integers a fresh store carries.
+    ///
+    /// One transaction, and that is load-bearing rather than tidy. The tables
+    /// and the version integers are two statements, and a store that has the
+    /// first without the second is one the gate reads as `NotAStore` forever:
+    /// `open` only reaches `initialize` when the file is absent or empty, so a
+    /// crash between the two statements bricks the data directory with no
+    /// repair path. SQLite makes DDL transactional, so the whole thing either
+    /// lands or leaves a zero-length file behind.
     fn initialize(&self) -> Result<()> {
-        let conn = &self.conn;
-        conn.execute_batch(crate::store::schema::CREATE_SQL)?;
-        conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(crate::store::schema::CREATE_SQL)?;
+        tx.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2), (?3, ?4)",
             rusqlite::params![
                 META_ARCHIVE_FORMAT,
@@ -116,6 +124,7 @@ impl Store {
                 DERIVED_SCHEMA.to_string(),
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 

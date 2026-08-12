@@ -310,7 +310,9 @@ fn appending_a_kilobyte_at_a_time_matches_a_one_shot_write() {
     let data = textish(TOTAL);
     let one_shot = blob::write(&data).unwrap();
 
-    let mut incremental = blob::write(&[]).unwrap().bytes;
+    let empty = blob::write(&[]).unwrap();
+    let mut incremental = empty.bytes;
+    let mut checksum = empty.checksum;
     let mut total_compressions = 0usize;
 
     for chunk in data.chunks(STEP) {
@@ -318,7 +320,7 @@ fn appending_a_kilobyte_at_a_time_matches_a_one_shot_write() {
         let completed_before = (before.uncompressed_len / u64::from(before.block_size)) as usize;
         let extents_before = block_extents(&incremental);
 
-        let appended = blob::append(&incremental, chunk).unwrap();
+        let appended = blob::append(&incremental, &checksum, chunk).unwrap();
 
         assert!(
             appended.blocks_recompressed <= 1,
@@ -348,6 +350,7 @@ fn appending_a_kilobyte_at_a_time_matches_a_one_shot_write() {
         }
 
         incremental = appended.bytes;
+        checksum = appended.checksum;
     }
 
     // 200 appends, at most one extra compression when a block boundary falls
@@ -372,9 +375,13 @@ fn an_appended_blob_reads_ranges_exactly_like_a_one_shot_one() {
     let data = textish(200 * 1024);
     let one_shot = blob::write(&data).unwrap().bytes;
 
-    let mut incremental = blob::write(&[]).unwrap().bytes;
+    let empty = blob::write(&[]).unwrap();
+    let mut incremental = empty.bytes;
+    let mut checksum = empty.checksum;
     for chunk in data.chunks(7000) {
-        incremental = blob::append(&incremental, chunk).unwrap().bytes;
+        let appended = blob::append(&incremental, &checksum, chunk).unwrap();
+        incremental = appended.bytes;
+        checksum = appended.checksum;
     }
 
     let a = blob::BlobReader::open(&incremental).unwrap();
@@ -402,7 +409,7 @@ fn the_appended_checksum_covers_the_whole_stream() {
     let second = textish(50_000);
 
     let blob_one = blob::write(&first).unwrap();
-    let appended = blob::append(&blob_one.bytes, &second).unwrap();
+    let appended = blob::append(&blob_one.bytes, &blob_one.checksum, &second).unwrap();
 
     let mut whole = first.clone();
     whole.extend_from_slice(&second);
@@ -416,7 +423,7 @@ fn the_appended_checksum_covers_the_whole_stream() {
 fn appending_nothing_changes_nothing() {
     let data = textish(100_000);
     let written = blob::write(&data).unwrap();
-    let appended = blob::append(&written.bytes, &[]).unwrap();
+    let appended = blob::append(&written.bytes, &written.checksum, &[]).unwrap();
 
     assert!(appended.bytes == written.bytes);
     assert_eq!(appended.checksum, written.checksum);
@@ -427,7 +434,7 @@ fn appending_nothing_changes_nothing() {
 fn appending_onto_an_exact_block_boundary_recompresses_nothing() {
     let data = textish(2 * BLOCK_SIZE);
     let written = blob::write(&data).unwrap();
-    let appended = blob::append(&written.bytes, &textish(10)).unwrap();
+    let appended = blob::append(&written.bytes, &written.checksum, &textish(10)).unwrap();
 
     assert_eq!(
         appended.blocks_recompressed, 0,
@@ -440,7 +447,7 @@ fn appending_onto_an_exact_block_boundary_recompresses_nothing() {
 fn an_append_crossing_a_block_boundary_redoes_only_the_tail() {
     // A partial tail plus enough bytes to finish that block and start the next.
     let written = blob::write(&textish(BLOCK_SIZE - 100)).unwrap();
-    let appended = blob::append(&written.bytes, &textish(200)).unwrap();
+    let appended = blob::append(&written.bytes, &written.checksum, &textish(200)).unwrap();
 
     assert_eq!(
         appended.blocks_compressed, 2,
@@ -451,4 +458,108 @@ fn an_append_crossing_a_block_boundary_redoes_only_the_tail() {
         "exactly one of them redid bytes the blob already held"
     );
     assert_eq!(BlobHeader::parse(&appended.bytes).unwrap().blocks.len(), 2);
+}
+
+// --- refusing malformed and corrupted blobs -------------------------------
+
+/// A completed block's compressed bytes are copied across an append untouched,
+/// and zstd frames here carry no content checksum, so a flipped bit inside one
+/// decodes cleanly to *different* bytes rather than failing. Without a check
+/// against the recorded checksum, the append hashes what it copied and returns
+/// a blob that is self-consistent and wrong - and because a live session is
+/// appended to on every pass while it grows, that is the pass that certifies
+/// the damage permanently and leaves `verify` comparing a corrupt stream
+/// against a checksum minted from that same corrupt stream.
+#[test]
+fn an_append_onto_a_corrupted_blob_is_refused() {
+    let data = textish(200_000);
+    let written = blob::write(&data).unwrap();
+
+    let header = BlobHeader::parse(&written.bytes).unwrap();
+    let mut corrupt = written.bytes.clone();
+    let at = header.blocks[0].compressed_offset as usize + 40;
+    corrupt[at] ^= 0x01;
+
+    // The premise: the damage is silent on the way out.
+    let read_back = blob::read_all(&corrupt).unwrap();
+    assert!(
+        read_back != data,
+        "the flipped bit did not change the stream, so this test proves nothing"
+    );
+
+    let err = blob::append(&corrupt, &written.checksum, b"more").unwrap_err();
+    assert!(
+        matches!(err, verbatim_core::Error::BlobChecksumMismatch { .. }),
+        "appending onto a corrupt blob returned {err:?} instead of a checksum mismatch"
+    );
+}
+
+/// An append still has to work when the bytes are intact.
+#[test]
+fn an_append_onto_an_intact_blob_is_accepted() {
+    let data = textish(200_000);
+    let written = blob::write(&data).unwrap();
+    let appended = blob::append(&written.bytes, &written.checksum, b"more").unwrap();
+
+    let mut whole = data.clone();
+    whole.extend_from_slice(b"more");
+    assert_eq!(appended.checksum, *blake3::hash(&whole).as_bytes());
+    assert!(blob::read_all(&appended.bytes).unwrap() == whole);
+}
+
+/// Every decompression buffer is sized from header fields, so an unbounded
+/// `block_size` is an allocation request the header controls: `u32::MAX` in a
+/// 45-byte blob asks for 4 GiB, and an allocation failure aborts the process
+/// rather than returning an error - killing `verify` and `reindex`, the two
+/// commands whose whole job is to survive corruption and name it.
+#[test]
+fn a_header_declaring_an_absurd_block_size_is_refused() {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"VBLB");
+    blob.extend_from_slice(&1u16.to_le_bytes()); // format
+    blob.extend_from_slice(&1u16.to_le_bytes()); // codec: zstd
+    blob.extend_from_slice(&u32::MAX.to_le_bytes()); // block_size
+    blob.extend_from_slice(&(1u64 << 31).to_le_bytes()); // uncompressed_len
+    blob.extend_from_slice(&1u32.to_le_bytes()); // block_count
+    blob.extend_from_slice(&0u64.to_le_bytes()); // uncompressed_start
+    blob.extend_from_slice(&44u64.to_le_bytes()); // compressed_offset
+    blob.extend_from_slice(&1u32.to_le_bytes()); // compressed_len
+    blob.push(0);
+
+    let err = BlobHeader::parse(&blob).unwrap_err();
+    assert!(
+        matches!(err, verbatim_core::Error::BlobFormat { .. }),
+        "parse returned {err:?} instead of a format error"
+    );
+}
+
+/// The same allocation exposure reached without an absurd block size: a header
+/// may point every block at the same handful of payload bytes and claim
+/// gigabytes of stream behind them. Blocks are written back to back and never
+/// overlap, so their compressed lengths have to fit in the payload region.
+#[test]
+fn a_header_claiming_more_stream_than_its_payload_is_refused() {
+    const BLOCKS: u32 = 64;
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"VBLB");
+    blob.extend_from_slice(&1u16.to_le_bytes());
+    blob.extend_from_slice(&1u16.to_le_bytes());
+    blob.extend_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+    blob.extend_from_slice(&((BLOCKS as u64) * BLOCK_SIZE as u64).to_le_bytes());
+    blob.extend_from_slice(&BLOCKS.to_le_bytes());
+    let table_end = 24 + (BLOCKS as u64) * 20;
+    for i in 0..BLOCKS {
+        blob.extend_from_slice(&((i as u64) * BLOCK_SIZE as u64).to_le_bytes());
+        // Every block aimed at the same in-range byte: each extent passes on
+        // its own, and only the sum gives the lie away.
+        blob.extend_from_slice(&table_end.to_le_bytes());
+        blob.extend_from_slice(&64u32.to_le_bytes());
+    }
+    blob.resize(table_end as usize + 64, 0);
+
+    let err = BlobHeader::parse(&blob).unwrap_err();
+    assert!(
+        matches!(err, verbatim_core::Error::BlobFormat { .. }),
+        "parse returned {err:?} instead of a format error"
+    );
 }
