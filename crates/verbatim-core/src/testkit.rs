@@ -55,6 +55,41 @@ pub fn fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// SplitMix64. A test that generates its own inputs has to be reproducible
+/// from the seed it prints, and pulling a crate in for four lines is not worth
+/// it.
+pub struct Rng(pub u64);
+
+impl Rng {
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// A value in `0..bound`. Panics on a zero bound rather than dividing by it.
+    pub fn below(&mut self, bound: u64) -> u64 {
+        assert!(bound > 0, "below(0) has no value to return");
+        self.next_u64() % bound
+    }
+}
+
+/// A seed from the environment when reproducing a failure, otherwise the clock.
+/// Printed either way, which is what makes a randomized failure reproducible.
+pub fn seed(label: &str) -> u64 {
+    let seed = match std::env::var("VERBATIM_TEST_SEED") {
+        Ok(v) => v.parse().expect("VERBATIM_TEST_SEED must be a u64"),
+        Err(_) => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos() as u64,
+    };
+    println!("{label}: VERBATIM_TEST_SEED={seed}");
+    seed
+}
+
 /// Copy a fixture into `dir` (a temp dir, in every current caller) and return
 /// the path of the copy.
 ///

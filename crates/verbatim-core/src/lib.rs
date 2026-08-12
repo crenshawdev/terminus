@@ -8,6 +8,7 @@
 
 pub mod blob;
 pub mod error;
+pub mod parse;
 pub mod store;
 
 #[cfg(feature = "testkit")]
