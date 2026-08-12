@@ -13,8 +13,6 @@ use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::{ingest, testkit};
 
 const PROJECT: &str = "-data-projects-cadence";
-const SIBLING: &str = "-data-projects-cadence-research";
-const WORKTREE: &str = "-data-projects-cadence--claude-worktrees-wt-a";
 const SESSION_DIR: &str = "33333333-3333-4333-8333-333333333333";
 
 /// A data directory plus a Claude config directory whose `projects` tree the
@@ -206,35 +204,55 @@ fn one_damaged_transcript_does_not_stop_the_rest_of_the_tree() {
 fn an_excluded_project_is_never_opened_and_adds_no_row() {
     let bench = bench();
 
+    // The real tree the encoded project names describe. The pre-open test
+    // resolves an extension of an excluded name against the filesystem, so the
+    // repository has to exist for the sibling beside it to be told apart from a
+    // subdirectory of it.
+    let tmp = bench
+        .projects()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let repo = tmp.join("data").join("projects").join("cadence");
+    std::fs::create_dir_all(repo.join(".claude").join("worktrees").join("wt-a")).unwrap();
+    std::fs::create_dir_all(tmp.join("data").join("projects").join("cadence-research")).unwrap();
+
+    let encode = |path: &std::path::Path| verbatim_core::config::encode(path.to_str().unwrap());
+    let project = encode(&repo);
+    let sibling = encode(&tmp.join("data").join("projects").join("cadence-research"));
+    let worktree = encode(&repo.join(".claude").join("worktrees").join("wt-a"));
+
     let excluded = vec![
         bench.place(
-            PROJECT,
+            &project,
             &format!("{}.jsonl", uuid(1)),
             "session-basic.jsonl",
         ),
         bench.place(
-            PROJECT,
+            &project,
             &format!("{SESSION_DIR}/subagents/agent-a.jsonl"),
             "subagents/agent-alpha.jsonl",
         ),
         bench.place(
-            WORKTREE,
+            &worktree,
             &format!("{}.jsonl", uuid(2)),
             "session-continuation.jsonl",
         ),
     ];
     let kept = bench.place(
-        SIBLING,
+        &sibling,
         &format!("{}.jsonl", uuid(3)),
         "session-large-record.jsonl",
     );
 
-    let summary = bench.pass(&["/data/projects/cadence"]);
+    let summary = bench.pass(&[repo.to_str().unwrap()]);
     assert_eq!(summary.files_walked, 1, "only the sibling was walked");
     assert_eq!(summary.files_committed, 1);
     assert!(summary.failures.is_empty(), "{:?}", summary.failures);
 
-    for project in [PROJECT, WORKTREE] {
+    for project in [project.as_str(), worktree.as_str()] {
         let dir = bench.projects().join(project).canonicalize().unwrap();
         assert!(
             discover::opened::under(&dir).is_empty(),

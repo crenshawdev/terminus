@@ -54,12 +54,22 @@ pub const PROJECTS_SUBDIR: &str = "projects";
 /// The default Claude config directory, relative to the user's home.
 pub const DEFAULT_CLAUDE_DIR: &str = ".claude";
 
-/// What `/.claude/worktrees/` encodes to under D-07's rule.
+/// What a path separator encodes to under D-07's rule.
 ///
-/// A fixed literal segment, not an open-ended prefix extension: it is the one
-/// clause [`Config::excludes_encoded_dir`] can tolerate without reintroducing
-/// the ambiguity D-07 proved.
-const WORKTREE_INFIX: &str = "--claude-worktrees-";
+/// [`encode`] maps every non-alphanumeric character to this, so a subdirectory
+/// of an encoded path is that path, this, and the rest - and so is a sibling
+/// whose name merely contains a `-` or a `.`. Telling those two apart is what
+/// [`descends_to`] is for.
+const ENCODED_SEPARATOR: char = '-';
+
+/// How many directory entries [`descends_to`] may examine before it gives up
+/// and lets the caller fail safe.
+///
+/// The search is pruned to the branches whose encoding is still a prefix of the
+/// candidate, so a real tree costs a handful of entries; this only bounds a
+/// pathological one. Exhausting it is indistinguishable from an unreadable
+/// directory on purpose - both mean "could not resolve", and both exclude.
+const DIR_SCAN_BUDGET: usize = 4_096;
 
 /// What `verbatim.toml` may contain.
 ///
@@ -160,27 +170,45 @@ impl Config {
     /// The pre-open test (D-09, D-22): is this encoded project directory name
     /// excluded?
     ///
-    /// Exact equality against the encoded exclusion, or that plus the fixed
-    /// literal [`WORKTREE_INFIX`] and anything after it. The worktree clause is
-    /// not optional: D-06 folds a `cwd` of `<repo>/.claude/worktrees/<name>`
-    /// into `<repo>`, and that path shape encodes literally, so without the
-    /// clause excluding `/data/code/cadence` would still walk and archive every
-    /// one of its worktree sessions - and the read path would then be
-    /// filtering them out afterwards, which is the read-then-filter behaviour
-    /// ING-08 exists to forbid.
+    /// Exact equality against the encoded exclusion, or a name that extends it
+    /// past an encoded separator and is confirmed against the filesystem to be
+    /// a real subdirectory of the excluded path.
     ///
-    /// Known and accepted imprecision: `/data/code/jcrenshaw.dev` and
-    /// `/data/code/jcrenshaw-dev` encode identically, so they are the same test
-    /// here. [`Config::excludes_path`] tells them apart wherever a real path is
-    /// available.
+    /// The extension case is the ambiguity D-07 proved: `-` encodes the
+    /// separator and also a literal `-` or `.`, so `-data-code-foo-bar` is
+    /// `/data/code/foo/bar` and `/data/code/foo-bar` and
+    /// `/data/code/foo.bar` at once. D-09 asked for a segment-boundary match
+    /// and for `-data-projects-cadence-research` not to match
+    /// `-data-projects-cadence`, which are not both satisfiable in the encoded
+    /// space alone - so this resolves them outside it, by asking the filesystem
+    /// which of those paths exists ([`descends_to`]). That reads directory
+    /// entries and opens no transcript, which is what AC5 and D-22 constrain.
+    ///
+    /// Unresolvable means excluded: an excluded directory that is unreadable or
+    /// gone, or a tree too large to search, leaves the question open, and the
+    /// safe answer for an exclusion boundary is not to read. The cost of being
+    /// wrong that way is a project that goes unarchived and can be archived
+    /// later; the cost of the other way is bytes the user said never to read.
+    ///
+    /// This decides only whether to OPEN. [`Config::excludes_path`] is the
+    /// exact test, and it is what decides whether anything is hidden.
     pub fn excludes_encoded_dir(&self, dir_name: &str) -> bool {
         let name = fold(dir_name);
-        self.encoded_exclusions.iter().any(|encoded| {
-            name == *encoded
-                || name
+        self.exclusions
+            .iter()
+            .zip(&self.encoded_exclusions)
+            .any(|(excluded, encoded)| {
+                if name == *encoded {
+                    return true;
+                }
+                let extends = name
                     .strip_prefix(encoded.as_str())
-                    .is_some_and(|rest| rest.starts_with(WORKTREE_INFIX))
-        })
+                    .is_some_and(|rest| rest.starts_with(ENCODED_SEPARATOR));
+                if !extends {
+                    return false;
+                }
+                descends_to(Path::new(excluded), &name).unwrap_or(true)
+            })
     }
 
     /// The read-side test (D-23): is this real path inside an excluded project?
@@ -222,6 +250,48 @@ fn fold(s: &str) -> String {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn fold(s: &str) -> String {
     s.to_owned()
+}
+
+/// Does some real directory beneath `root` encode to `name`?
+///
+/// `Some(true)` when one does - `name` is a subdirectory of `root` and the
+/// caller excludes it. `Some(false)` when the tree was searched and none does -
+/// `name` is some other path that merely encodes the same way, and the caller
+/// leaves it alone. `None` when the question could not be answered: `root` is
+/// not a readable directory, or the search ran past [`DIR_SCAN_BUDGET`]. The
+/// caller treats `None` as excluded.
+///
+/// The walk descends only into directories whose own encoding is still a prefix
+/// of `name`, so it follows the one branch that can match rather than the tree.
+/// Symlinked entries are not descended into - `file_type` here does not follow
+/// them - which keeps a link loop out of the search and matches the read side,
+/// where a link is resolved as the path it is written as.
+fn descends_to(root: &Path, name: &str) -> Option<bool> {
+    if !root.is_dir() {
+        return None;
+    }
+    let mut budget = DIR_SCAN_BUDGET;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+            budget = budget.checked_sub(1)?;
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let child = entry.path();
+            let encoded = fold(&encode(&child.to_string_lossy()));
+            if encoded == name {
+                return Some(true);
+            }
+            if name
+                .strip_prefix(encoded.as_str())
+                .is_some_and(|rest| rest.starts_with(ENCODED_SEPARATOR))
+            {
+                stack.push(child);
+            }
+        }
+    }
+    Some(false)
 }
 
 /// A path as its comparable components, folded for the platform.

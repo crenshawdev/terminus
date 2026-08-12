@@ -11,8 +11,6 @@ use verbatim_core::config::Config;
 use verbatim_core::discover;
 
 const PROJECT: &str = "-data-projects-cadence";
-const SIBLING: &str = "-data-projects-cadence-research";
-const WORKTREE: &str = "-data-projects-cadence--claude-worktrees-wt-a";
 
 const UUID_A: &str = "11111111-1111-4111-8111-111111111111";
 const UUID_B: &str = "22222222-2222-4222-8222-222222222222";
@@ -156,31 +154,62 @@ fn every_path_begins_with_the_canonical_root_even_through_a_symlink() {
 
 /// D-22 and D-09 together: the excluded project yields nothing, and the sibling
 /// whose encoded name merely extends it is walked in full.
+///
+/// The excluded repository is built for real, because the pre-open test
+/// resolves an extension of an excluded name against the filesystem: with no
+/// `<repo>/research` on disk, the sibling's encoded name has exactly one real
+/// path behind it and that path is not excluded. An excluded path that does not
+/// exist cannot answer the question and excludes the sibling too, which is what
+/// `an_unresolvable_exclusion_still_excludes` in the config tests pins.
 #[test]
 fn an_excluded_project_yields_nothing_while_its_hyphenated_sibling_is_walked() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("claude").join("projects");
-    populate(&root.join(PROJECT));
-    populate(&root.join(SIBLING));
-    populate(&root.join(WORKTREE));
 
-    let config = Config::from_parts(vec![], vec!["/data/projects/cadence".to_owned()]);
+    // The real tree the encoded names above describe.
+    let repo = dir.path().join("data").join("projects").join("cadence");
+    std::fs::create_dir_all(repo.join(".claude").join("worktrees").join("wt-a")).unwrap();
+    std::fs::create_dir_all(
+        dir.path()
+            .join("data")
+            .join("projects")
+            .join("cadence-research"),
+    )
+    .unwrap();
+
+    let encoded = |path: &Path| verbatim_core::config::encode(path.to_str().unwrap());
+    let project = encoded(&repo);
+    let sibling_name = encoded(
+        &dir.path()
+            .join("data")
+            .join("projects")
+            .join("cadence-research"),
+    );
+    let worktree_name = encoded(&repo.join(".claude").join("worktrees").join("wt-a"));
+
+    populate(&root.join(&project));
+    populate(&root.join(&sibling_name));
+    populate(&root.join(&worktree_name));
+
+    let config = Config::from_parts(vec![], vec![repo.to_str().unwrap().to_owned()]);
     let found = discover::discover_root(&root, &config);
     let names = relative(&found.transcripts, &root);
 
     assert!(
-        !names.iter().any(|n| n.starts_with(&format!("{PROJECT}/"))),
+        !names.iter().any(|n| n.starts_with(&format!("{project}/"))),
         "the excluded project was walked: {names:?}"
     );
     assert!(
-        !names.iter().any(|n| n.starts_with(&format!("{WORKTREE}/"))),
+        !names
+            .iter()
+            .any(|n| n.starts_with(&format!("{worktree_name}/"))),
         "D-06 folds a worktree into its repo, so excluding the repo excludes it: {names:?}"
     );
 
     let sibling: Vec<String> = names
         .iter()
-        .filter(|n| n.starts_with(&format!("{SIBLING}/")))
-        .map(|n| n[SIBLING.len() + 1..].to_owned())
+        .filter(|n| n.starts_with(&format!("{sibling_name}/")))
+        .map(|n| n[sibling_name.len() + 1..].to_owned())
         .collect();
     assert_eq!(
         sibling,

@@ -153,27 +153,94 @@ fn excluding(paths: &[&str]) -> Config {
     Config::from_parts(vec![], paths.iter().map(|p| (*p).to_owned()).collect())
 }
 
-/// D-09 exactly: the encoded name matches, its worktree directories match, and
-/// a hyphenated sibling does not.
+/// The encoded name matches exactly, and an extension of it is resolved
+/// against the filesystem rather than guessed at.
+///
+/// D-07 proved the encoding cannot tell `<repo>/research` from
+/// `<repo>-research`, and D-09 asked for both a segment-boundary match and for
+/// the hyphenated sibling to be spared - not both satisfiable in the encoded
+/// space, so the ambiguity is resolved outside it. Real directories here, since
+/// that is now what the answer depends on.
 #[test]
-fn the_encoded_test_matches_the_project_and_its_worktrees_and_nothing_else() {
-    let config = excluding(&["/data/projects/cadence"]);
+fn an_extension_of_an_excluded_name_is_resolved_against_the_filesystem() {
+    let tree = tempfile::tempdir().unwrap();
+    let repo = tree.path().join("cadence");
+    std::fs::create_dir_all(repo.join("docs")).unwrap();
+    std::fs::create_dir_all(repo.join(".claude").join("worktrees").join("agent-a33a")).unwrap();
+    // A sibling with no colliding child under the repo: `cadence/research` does
+    // not exist, so this name resolves to exactly one real path.
+    std::fs::create_dir_all(tree.path().join("cadence-research")).unwrap();
 
-    assert!(config.excludes_encoded_dir("-data-projects-cadence"));
+    let config = excluding(&[repo.to_str().unwrap()]);
+    let encoded = |path: &Path| verbatim_core::config::encode(path.to_str().unwrap());
+
+    assert!(config.excludes_encoded_dir(&encoded(&repo)));
     assert!(
-        config.excludes_encoded_dir("-data-projects-cadence--claude-worktrees-agent-a33a"),
+        config.excludes_encoded_dir(&encoded(&repo.join("docs"))),
+        "a real subdirectory of the excluded repo must not be opened"
+    );
+    assert!(
+        config.excludes_encoded_dir(&encoded(
+            &repo.join(".claude").join("worktrees").join("agent-a33a")
+        )),
         "D-06 folds a worktree into its parent repo, so excluding the repo must \
          exclude the worktree before anything is opened"
     );
     assert!(
-        !config.excludes_encoded_dir("-data-projects-cadence-research"),
-        "D-07 proved the encoding is lossy here, so an extension-tolerant rule \
-         cannot tell a child directory from a hyphenated sibling"
+        !config.excludes_encoded_dir(&encoded(&tree.path().join("cadence-research"))),
+        "a hyphenated sibling with no colliding child under the repo resolves to \
+         one real path, and that path is not excluded"
     );
-    assert!(!config.excludes_encoded_dir("-data-projects-hindsight"));
+    assert!(!config.excludes_encoded_dir(&encoded(&tree.path().join("hindsight"))));
 
     // Nothing configured excludes nothing.
-    assert!(!excluding(&[]).excludes_encoded_dir("-data-projects-cadence"));
+    assert!(!excluding(&[]).excludes_encoded_dir(&encoded(&repo)));
+}
+
+/// When a child and a hyphenated sibling both exist, they are ONE encoded name
+/// and no test given only that name can separate them - so the pre-open test
+/// excludes, and the sibling's sessions are the price of not reading the
+/// child's. [`Config::excludes_path`] still sees two distinct paths and hides
+/// only the excluded one, so nothing already archived is lost.
+#[test]
+fn a_child_and_a_sibling_that_collide_resolve_to_excluded() {
+    let tree = tempfile::tempdir().unwrap();
+    let repo = tree.path().join("cadence");
+    std::fs::create_dir_all(repo.join("research")).unwrap();
+    std::fs::create_dir_all(tree.path().join("cadence-research")).unwrap();
+
+    let config = excluding(&[repo.to_str().unwrap()]);
+    let child = verbatim_core::config::encode(repo.join("research").to_str().unwrap());
+    let sibling =
+        verbatim_core::config::encode(tree.path().join("cadence-research").to_str().unwrap());
+
+    assert_eq!(child, sibling, "D-07: these are the same encoded name");
+    assert!(config.excludes_encoded_dir(&child));
+
+    assert!(config.excludes_path(&repo.join("research")));
+    assert!(
+        !config.excludes_path(&tree.path().join("cadence-research")),
+        "the read-side test has real paths and keeps them apart"
+    );
+}
+
+/// An exclusion that cannot be resolved excludes: the answer is unknown and the
+/// safe direction for a privacy boundary is not to read.
+#[test]
+fn an_unresolvable_exclusion_still_excludes() {
+    let config = excluding(&["/data/projects/cadence"]);
+
+    assert!(config.excludes_encoded_dir("-data-projects-cadence"));
+    assert!(
+        config.excludes_encoded_dir("-data-projects-cadence-research"),
+        "the excluded directory does not exist, so whether this is a child of \
+         it or a hyphenated sibling cannot be answered - and unresolved means \
+         unopened"
+    );
+    assert!(
+        !config.excludes_encoded_dir("-data-projects-hindsight"),
+        "a name that does not extend the exclusion at all is never ambiguous"
+    );
 }
 
 /// The read-side test keeps full subtree semantics, because a real path has no
