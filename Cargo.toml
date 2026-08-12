@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["crates/verbatim-core", "crates/verbatim"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/crenshawdev/verbatim"
+authors = ["John Crenshaw <john@jcrenshaw.dev>"]
+
+[workspace.dependencies]
+# Store. D-19: rusqlite pinned to the current release. D-19 also asserted that
+# FTS5 needs an `fts5` cargo feature; rusqlite 0.40 has no such feature and
+# never did - libsqlite3-sys `bundled` compiles the amalgamation with
+# -DSQLITE_ENABLE_FTS5 (libsqlite3-sys-0.38.1/build.rs:132), so `bundled` alone
+# is what puts FTS5 in. The claim is checked at runtime rather than trusted:
+# tests/sqlite_capabilities.rs builds a contentless_delete=1 FTS5 table.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Blob codec (D-08: zstd level 3, no dictionary) and per-blob checksum (D-06).
+zstd = "0.13"
+blake3 = "1.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# CLI argument parsing. lexopt has zero dependencies of its own; cold start is
+# the product (DESIGN-BRIEF.md:39) and every transitive crate is startup cost.
+lexopt = "0.3"
+
+verbatim-core = { path = "crates/verbatim-core" }
+
+# Cold start is the metric: the hook path pays for what is linked into it, so
+# the release profile trades build time for a smaller, faster-starting binary.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

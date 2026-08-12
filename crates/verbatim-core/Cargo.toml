@@ -1,0 +1,22 @@
+[package]
+name = "verbatim-core"
+description = "Verbatim archive core: store, block-framed blobs, ingest."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# Test-support code (fixture paths, temp-store helpers). Off by default so none
+# of it is compiled into the shipped binary.
+testkit = []
+
+[dependencies]
+rusqlite.workspace = true
+zstd.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

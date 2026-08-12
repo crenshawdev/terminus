@@ -1,0 +1,16 @@
+[package]
+name = "verbatim"
+description = "Persistent, cross-session memory for Claude Code."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "verbatim"
+path = "src/main.rs"
+
+[dependencies]
+verbatim-core.workspace = true
+lexopt.workspace = true
