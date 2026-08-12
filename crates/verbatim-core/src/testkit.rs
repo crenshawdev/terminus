@@ -257,7 +257,16 @@ pub fn fixture_bytes(name: &str) -> Vec<u8> {
 /// exactly one across the whole corpus. A query that matched nothing would make
 /// the comparison pass on an empty index, which is the failure this set exists
 /// to catch.
-pub const FIXED_QUERIES: &[&str] = &["brillig", "assistant", "cargo", "restart", "attachment"];
+///
+/// Three of the five entries changed in phase 3, and the reason is the point:
+/// `assistant`, `attachment` and `restart` matched `"type":"assistant"`,
+/// `"attachment":{...}` and `"gitBranch":"restart"` - JSON keys and field values
+/// no user would ever search for - so the comparison had been running over hits
+/// that existed only because the raw line was indexed (D-01). Each entry now
+/// reaches through a different arm of the projection: a message text block, a
+/// `system` record's top-level `content` and a `Bash` tool input, an
+/// `attachment` object's string leaf, and a `toolUseResult.stderr`.
+pub const FIXED_QUERIES: &[&str] = &["brillig", "cargo", "BRIEF", "SearchManager", "panicked"];
 
 /// Run [`FIXED_QUERIES`] plus a turn range and a turn-id lookup, serialized to
 /// JSON in a stable order so two runs are byte-comparable.

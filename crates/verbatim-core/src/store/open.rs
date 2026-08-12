@@ -24,7 +24,13 @@ pub const ARCHIVE_FORMAT: i64 = 1;
 /// the first ingest run against a store written by a phase 1 binary rebuilds
 /// every archived session from its blob, inside the ingest lock, before it
 /// walks anything.
-pub const DERIVED_SCHEMA: i64 = 2;
+///
+/// 3 as of phase 3 (D-17): `turns_fts.body` changed shape. It held the raw
+/// transcript line and now holds a per-record-type text projection plus RCL-01's
+/// expansion tokens, and `entities` and `paths` are filled for the first time.
+/// Without the bump a store written by a phase 2 binary would keep an index that
+/// matches JSON keys and holds no entity at all, and no integer would say so.
+pub const DERIVED_SCHEMA: i64 = 3;
 
 /// The store file inside the data directory.
 pub const DB_FILE_NAME: &str = "verbatim.db";

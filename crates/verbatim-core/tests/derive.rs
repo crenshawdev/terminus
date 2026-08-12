@@ -242,7 +242,12 @@ fn the_seam_writes_inside_the_callers_transaction() {
     )
     .unwrap();
 
-    let record = br#"{"type":"user","uuid":"u1","timestamp":"t","message":"quixotic"}"#;
+    // A real record shape rather than a bare `"message": "quixotic"`: the body
+    // is a projection of `message.content` and the three other subtrees D-01
+    // names (`crates/verbatim-core/src/index/text.rs`), so a string sitting
+    // where every real record carries an object projects to nothing and this
+    // test would assert the rollback of a row that was never written.
+    let record = br#"{"type":"user","uuid":"u1","timestamp":"t","message":{"role":"user","content":[{"type":"text","text":"quixotic"}]}}"#;
     let scan = parse::scan(&[record.as_slice(), b"\n"].concat());
     let (_, turn) = scan.turns().next().unwrap();
 

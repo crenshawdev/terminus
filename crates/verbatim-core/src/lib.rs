@@ -11,6 +11,7 @@ pub mod config;
 pub mod derive;
 pub mod discover;
 pub mod error;
+pub mod index;
 pub mod ingest;
 pub mod lineage;
 pub mod parse;

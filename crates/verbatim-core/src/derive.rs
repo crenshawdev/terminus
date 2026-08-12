@@ -6,14 +6,16 @@
 //! derived tables, and the cheapest way to keep that true is to give both paths
 //! one function.
 //!
-//! What the function *does* in this phase is deliberately thin: one `turns_fts`
-//! row per turn at rowid `turns.id`, carrying the turn's raw record line as
-//! text with no expansion, one `compaction_boundaries` row for the rare turn
-//! that is a boundary (D-21), and no `entities` or `paths` rows at all. That is
-//! the phase boundary and not a reduction - RCL-01's camel/snake/kebab and path
-//! expansion and RCL-02's entity extraction are phase 3 and replace the body of
-//! this one function. Phase 1 owns the tables, the seam and the rebuild path,
-//! not what fills them.
+//! What the function writes: one `turns_fts` row per turn at rowid `turns.id`,
+//! carrying [`crate::index::project`]'s text projection of the record rather
+//! than the record's raw line (D-01), and one `compaction_boundaries` row for
+//! the rare turn that is a boundary (D-21).
+//!
+//! The record is parsed to a `serde_json::Value` **here**, once, and handed to
+//! every rule that needs it. `parse::Record` deliberately does not keep the
+//! parsed value: a `Scan` holds every record of a session, and one `Value` each
+//! would hold the session's whole JSON tree in memory for the length of an
+//! ingest pass.
 //!
 //! Every write here is a delete followed by an insert at a **known** rowid,
 //! which is what `contentless_delete=1` exists for (D-10): re-deriving a turn
@@ -89,13 +91,24 @@ pub fn derive_turn(tx: &Connection, row: TurnRow<'_>) -> Result<i64> {
         ],
     )?;
 
+    // One parse, for every rule that reads the record's structure. A record
+    // that will not parse projects to empty text and never to the raw line:
+    // that path is unreachable for a turn - D-03 classifies a turn only when
+    // `uuid` and `timestamp` parsed out of it - and exists so no fallback can
+    // put JSON scaffolding back in the index (D-01).
+    let value: Option<serde_json::Value> = serde_json::from_slice(row.record).ok();
+    let body = value
+        .as_ref()
+        .map(crate::index::project)
+        .unwrap_or_default();
+
     // Delete before insert, at the rowid the turn id fixes. On a fresh insert
     // the delete is a no-op; on a re-derive it is what keeps the row count
     // stable instead of doubling the index.
     tx.execute("DELETE FROM turns_fts WHERE rowid = ?1", [id])?;
     tx.execute(
         "INSERT INTO turns_fts (rowid, body) VALUES (?1, ?2)",
-        rusqlite::params![id, String::from_utf8_lossy(row.record)],
+        rusqlite::params![id, body],
     )?;
 
     // No rows are written to either table in this phase, and they are still
