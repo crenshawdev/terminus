@@ -87,6 +87,29 @@ fn the_fixed_query_set_is_byte_identical_across_a_rebuild() {
     let hits: usize = before.matches(", ").count();
     assert!(hits > 10, "the query set returns too little to compare");
 
+    // And the same premise for the sections phase 3 added. Two empty sections
+    // compare byte-identically across a rebuild that extracted nothing at all,
+    // which is exactly the extractor failure AC3 is meant to catch.
+    let section = |name: &str| {
+        let body = before
+            .split_once(&format!("\"{name}\": [\n"))
+            .unwrap_or_else(|| panic!("no `{name}` section: {before}"))
+            .1;
+        body.split_once("\n  ]").expect("an unterminated section").0
+    };
+    for name in ["entities", "paths"] {
+        let rows = section(name).lines().count();
+        assert!(rows > 0, "the `{name}` section is empty");
+    }
+    // Every kind, so the comparison covers each extraction rule and not just
+    // the one that fires most often.
+    for kind in verbatim_core::index::KINDS {
+        assert!(
+            section("entities").contains(&format!("\"{kind}\"")),
+            "no `{kind}` entity in the query set"
+        );
+    }
+
     bench.drop_derived();
     let mut store = bench.store();
     let rebuilt = reindex::reindex(&mut store).unwrap();

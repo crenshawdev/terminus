@@ -268,12 +268,19 @@ pub fn fixture_bytes(name: &str) -> Vec<u8> {
 /// `attachment` object's string leaf, and a `toolUseResult.stderr`.
 pub const FIXED_QUERIES: &[&str] = &["brillig", "cargo", "BRIEF", "SearchManager", "panicked"];
 
-/// Run [`FIXED_QUERIES`] plus a turn range and a turn-id lookup, serialized to
-/// JSON in a stable order so two runs are byte-comparable.
+/// Run [`FIXED_QUERIES`] plus a turn range and a turn-id lookup, and read back
+/// every `entities` and `paths` row, serialized to JSON in a stable order so two
+/// runs are byte-comparable.
 ///
 /// The rows carry `turns.id` and each hit's coordinates, not just a count: a
 /// rebuild that renumbered turns would return the same number of hits pointing
 /// at different records, which is the exact failure D-10 exists to prevent.
+///
+/// The exact-match tables are in here for the same reason. AC3 compares this
+/// output across a rebuild, and until phase 3 it covered only `turns_fts` and
+/// the turn rows - so an extractor that rebuilt `entities` to different values,
+/// or to none at all, would have left the comparison byte-identical and the
+/// criterion asserting nothing about the tables it names.
 pub fn query_set_json(conn: &rusqlite::Connection) -> String {
     let mut out = String::from("{\n");
 
@@ -328,6 +335,48 @@ pub fn query_set_json(conn: &rusqlite::Connection) -> String {
         })
         .expect("run the turn scan")
         .map(|r| r.expect("read a turn row"))
+        .collect();
+    out.push_str(&rows.join(",\n"));
+    out.push_str("\n  ],\n");
+
+    // The exact-match half of recall (RCL-02, RCL-03). Ordered by the columns
+    // themselves rather than by rowid: two rebuilds have to agree on the VALUES,
+    // and an ordering that leaned on insertion order would hide a re-derive that
+    // emitted the same set in a different sequence.
+    out.push_str("  \"entities\": [\n");
+    let rows: Vec<String> = conn
+        .prepare(
+            "SELECT turn_id, kind, value_norm FROM entities
+             ORDER BY turn_id, kind, value_norm",
+        )
+        .expect("prepare the entity scan")
+        .query_map([], |r| {
+            Ok(format!(
+                "    [{}, {:?}, {:?}]",
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .expect("run the entity scan")
+        .map(|r| r.expect("read an entity row"))
+        .collect();
+    out.push_str(&rows.join(",\n"));
+    out.push_str("\n  ],\n");
+
+    out.push_str("  \"paths\": [\n");
+    let rows: Vec<String> = conn
+        .prepare("SELECT turn_id, path FROM paths ORDER BY turn_id, path")
+        .expect("prepare the path scan")
+        .query_map([], |r| {
+            Ok(format!(
+                "    [{}, {:?}]",
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+            ))
+        })
+        .expect("run the path scan")
+        .map(|r| r.expect("read a path row"))
         .collect();
     out.push_str(&rows.join(",\n"));
     out.push_str("\n  ]\n}\n");
