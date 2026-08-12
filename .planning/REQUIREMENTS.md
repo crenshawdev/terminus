@@ -11,7 +11,7 @@ Committed scope. Each maps to exactly one roadmap phase.
 
 ### Archive (STOR)
 
-- **STOR-01**: A session's turns are stored as one block-framed zstd blob, and reading a single turn decompresses only that turn's 64 KB block.
+- **STOR-01**: A session's turns are stored as one block-framed zstd blob, and reading a single turn decompresses only the 64 KB blocks that turn occupies.
 - **STOR-02**: An ingest commits blob, turn rows, FTS rows, entity rows and the watermark in a single transaction, so a killed process leaves no partially indexed session.
 - **STOR-03**: `verbatim verify` walks every blob, checks its per-blob checksum, and names the session ids that fail rather than declaring the store bad.
 - **STOR-04**: `verbatim reindex` rebuilds every derived table from blobs alone and produces the same query results as before the rebuild.
