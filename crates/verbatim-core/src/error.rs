@@ -32,6 +32,31 @@ pub enum Error {
     #[error("{path} exists but is not a verbatim store ({detail})")]
     NotAStore { path: PathBuf, detail: String },
 
+    /// The bytes in `sessions.blob` are not a blob this build can read.
+    #[error("malformed session blob: {detail}")]
+    BlobFormat { detail: String },
+
+    /// A read asked for bytes the session stream does not contain. Reading past
+    /// the end is an error, never a short read: a truncated turn would be
+    /// indistinguishable from a turn that really is short.
+    #[error(
+        "read of {len} bytes at offset {offset} runs past the end of a \
+         {uncompressed_len}-byte session stream"
+    )]
+    RangeOutOfBounds {
+        offset: u64,
+        len: u64,
+        uncompressed_len: u64,
+    },
+
+    /// zstd failed to compress or decompress a block.
+    #[error("zstd {operation} failed: {source}")]
+    Codec {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// No data directory could be resolved and none was given.
     #[error("cannot resolve a data directory: {detail}")]
     DataDirUnresolved { detail: String },
