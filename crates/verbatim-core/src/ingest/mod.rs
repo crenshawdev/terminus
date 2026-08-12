@@ -71,10 +71,14 @@ pub fn run(data_dir: &Path, transcript: &Path) -> Result<Outcome> {
         Attempt::Acquired(guard) => guard,
     };
 
-    // Not `Store::open`: a store older than this build has its derived tables
-    // rebuilt first (STOR-05), so a pass never appends turn rows in one shape
-    // beside rows written in another.
-    let mut store = crate::reindex::open_up_to_date(data_dir)?;
+    // Recovery first, under the lock, before this transcript is read (ING-03).
+    // `ingest::run` is a run: without this it would proceed against a watermark
+    // ahead of what this file's committed blob holds, `read_tail` would resume
+    // from an offset the archive never reached, and the gap would be lost from
+    // the blob in silence. It also brings a store older than this build forward
+    // (STOR-05), so a pass never appends turn rows in one shape beside rows
+    // written in another.
+    let (mut store, _recovered) = crate::recover::recover(data_dir)?;
     ingest_locked(&mut store, &canonical, started)
 }
 

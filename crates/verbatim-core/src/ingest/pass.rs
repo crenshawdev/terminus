@@ -46,6 +46,8 @@ pub struct Summary {
     pub unreadable: Vec<(PathBuf, String)>,
     /// Project directories the config excluded, never listed and never opened.
     pub excluded: Vec<PathBuf>,
+    /// What recovery repaired before the walk began (ING-03, D-24).
+    pub recovery: crate::recover::Recovered,
     pub duration: Duration,
 }
 
@@ -88,15 +90,16 @@ pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
         Attempt::Acquired(guard) => guard,
     };
 
-    // Not `Store::open`: a store older than this build has its derived tables
-    // rebuilt before a single transcript is read (STOR-05), so a walk never
-    // appends turn rows in one shape beside rows written in another.
-    let mut store = crate::reindex::open_up_to_date(data_dir)?;
+    // Recovery before discovery, and before anything is read (ING-03, D-24).
+    // It also brings a store older than this build forward (STOR-05), so a walk
+    // never appends turn rows in one shape beside rows written in another.
+    let (mut store, recovery) = crate::recover::recover(data_dir)?;
 
     let found = discover::discover(config);
     let mut summary = Summary {
         unreadable: found.unreadable,
         excluded: found.excluded,
+        recovery,
         ..Summary::default()
     };
 
