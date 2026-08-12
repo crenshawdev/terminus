@@ -140,3 +140,148 @@ fn a_damaged_header_is_refused_rather_than_guessed_at() {
         "bad block count accepted"
     );
 }
+
+// --- reading a range -----------------------------------------------------
+
+/// How many distinct 64 KB windows a range touches. The independent
+/// calculation the reader's counter is checked against.
+fn windows_touched(offset: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (offset + len - 1) / BLOCK_SIZE - offset / BLOCK_SIZE + 1
+}
+
+fn blob_of(len: usize) -> (Vec<u8>, Vec<u8>) {
+    let data = textish(len);
+    let written = blob::write(&data).expect("write");
+    (data, written.bytes)
+}
+
+#[test]
+fn a_range_inside_one_block_decompresses_exactly_one_block() {
+    let (data, bytes) = blob_of(200 * 1024);
+    let reader = blob::BlobReader::open(&bytes).unwrap();
+
+    let offset = 2 * BLOCK_SIZE + 1000;
+    reader.reset_block_counter();
+    let got = reader.read_range(offset as u64, 100).unwrap();
+
+    assert!(got == data[offset..offset + 100]);
+    assert_eq!(reader.blocks_decompressed(), 1);
+}
+
+#[test]
+fn a_range_spanning_three_blocks_decompresses_exactly_three() {
+    let (data, bytes) = blob_of(200 * 1024);
+    let reader = blob::BlobReader::open(&bytes).unwrap();
+
+    let offset = 10;
+    let end = 2 * BLOCK_SIZE + 10;
+    reader.reset_block_counter();
+    let got = reader
+        .read_range(offset as u64, (end - offset) as u64)
+        .unwrap();
+
+    assert!(got == data[offset..end]);
+    assert_eq!(reader.blocks_decompressed(), 3);
+}
+
+#[test]
+fn reading_the_whole_stream_decompresses_every_block() {
+    let (data, bytes) = blob_of(200 * 1024);
+    let reader = blob::BlobReader::open(&bytes).unwrap();
+    assert_eq!(reader.header().blocks.len(), 4);
+
+    reader.reset_block_counter();
+    let got = reader.read_all().unwrap();
+
+    assert!(got == data);
+    assert_eq!(reader.blocks_decompressed(), 4);
+}
+
+#[test]
+fn ranges_straddling_every_block_boundary_read_correctly() {
+    let (data, bytes) = blob_of(200 * 1024);
+    let reader = blob::BlobReader::open(&bytes).unwrap();
+    let total = data.len();
+
+    let mut checked = 0;
+    for boundary in (0..=total).step_by(BLOCK_SIZE) {
+        for span in [1usize, 2, 3, 17, 1024, BLOCK_SIZE, BLOCK_SIZE + 5] {
+            // A window centred on the boundary, clamped to the stream.
+            let offset = boundary.saturating_sub(span / 2);
+            let len = span.min(total - offset);
+            if len == 0 {
+                continue;
+            }
+
+            reader.reset_block_counter();
+            let got = reader.read_range(offset as u64, len as u64).unwrap();
+            assert!(
+                got == data[offset..offset + len],
+                "bytes differ at offset {offset} len {len}"
+            );
+            assert_eq!(
+                reader.blocks_decompressed(),
+                windows_touched(offset, len),
+                "block count for offset {offset} len {len}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 20, "only {checked} ranges checked");
+}
+
+#[test]
+fn the_block_count_matches_the_windows_touched_for_random_ranges() {
+    let mut rng = Rng(seed(
+        "the_block_count_matches_the_windows_touched_for_random_ranges",
+    ));
+    let (data, bytes) = blob_of(300 * 1024);
+    let reader = blob::BlobReader::open(&bytes).unwrap();
+    let total = data.len();
+
+    for _ in 0..200 {
+        let offset = rng.below(total as u64) as usize;
+        let len = rng.below((total - offset) as u64 + 1) as usize;
+        reader.reset_block_counter();
+        let got = reader.read_range(offset as u64, len as u64).unwrap();
+        assert!(
+            got == data[offset..offset + len],
+            "bytes differ at offset {offset} len {len}"
+        );
+        assert_eq!(
+            reader.blocks_decompressed(),
+            windows_touched(offset, len),
+            "block count for offset {offset} len {len}"
+        );
+    }
+}
+
+#[test]
+fn reading_past_the_end_is_an_error_not_a_short_read() {
+    let (_data, bytes) = blob_of(100_000);
+    let reader = blob::BlobReader::open(&bytes).unwrap();
+
+    assert!(reader.read_range(99_999, 2).is_err());
+    assert!(reader.read_range(100_001, 0).is_err());
+    assert!(reader.read_range(0, 100_001).is_err());
+    assert!(
+        reader.read_range(u64::MAX, 1).is_err(),
+        "overflow must not wrap"
+    );
+
+    // The exact end is not past it.
+    assert_eq!(reader.read_range(100_000, 0).unwrap().len(), 0);
+    assert_eq!(reader.read_range(99_999, 1).unwrap().len(), 1);
+}
+
+#[test]
+fn an_empty_range_decompresses_nothing() {
+    let (_data, bytes) = blob_of(200 * 1024);
+    let reader = blob::BlobReader::open(&bytes).unwrap();
+    reader.reset_block_counter();
+    assert!(reader.read_range(70_000, 0).unwrap().is_empty());
+    assert_eq!(reader.blocks_decompressed(), 0);
+}

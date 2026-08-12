@@ -33,8 +33,10 @@
 
 use crate::error::{Error, Result};
 
+mod reader;
 mod writer;
 
+pub use reader::BlobReader;
 pub use writer::{write, Written};
 
 /// Uncompressed bytes per block.
@@ -238,12 +240,7 @@ fn decompress_block(blob: &[u8], header: &BlobHeader, index: usize) -> Result<Ve
 ///
 /// Every block, by definition, so it is the one read that ignores the block
 /// table's whole purpose. `verify` and `reindex` want exactly this; a turn read
-/// wants [`crate::blob::BlobReader`] instead.
+/// wants [`BlobReader::read_range`] instead.
 pub fn read_all(blob: &[u8]) -> Result<Vec<u8>> {
-    let header = BlobHeader::parse(blob)?;
-    let mut out = Vec::with_capacity(header.uncompressed_len as usize);
-    for index in 0..header.blocks.len() {
-        out.extend_from_slice(&decompress_block(blob, &header, index)?);
-    }
-    Ok(out)
+    BlobReader::open(blob)?.read_all()
 }
