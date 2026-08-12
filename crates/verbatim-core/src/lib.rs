@@ -12,6 +12,7 @@ pub mod derive;
 pub mod discover;
 pub mod error;
 pub mod ingest;
+pub mod lineage;
 pub mod parse;
 pub mod project;
 pub mod recover;

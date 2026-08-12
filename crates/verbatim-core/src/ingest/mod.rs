@@ -26,6 +26,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::blob;
 use crate::derive;
 use crate::error::{Error, Result};
+use crate::lineage;
 use crate::parse::{self, Scan};
 use crate::project::{Project, Resolver};
 use crate::store::Store;
@@ -492,19 +493,18 @@ fn next_session_no(conn: &Connection) -> Result<i64> {
     )?)
 }
 
-/// D-11's lineage signal, in the session-id namespace.
+/// D-11's lineage signal, in the session-id namespace ([`lineage`]).
 ///
-/// The record's foreign `session_id` field is the reliable one: 187 of 1,221
-/// real top-level transcripts carry one, an order of magnitude above the 1.2%
-/// `parentUuid` resume rate. `parentUuid` is the fallback and only that - it is
-/// message-level threading, so it is resolved through `turns` to the session
-/// that holds the parent record, keeping this column in one namespace.
+/// The record's foreign `session_id` field is the reliable one: 169 of 1,253
+/// real top-level transcripts name another session that way, an order of
+/// magnitude above the 1.2% `parentUuid` resume rate. `parentUuid` is the
+/// fallback and only that - it is message-level threading, so it is resolved
+/// through `turns` to the session that holds the parent record, keeping this
+/// column in one namespace.
+///
+/// Both paths reject a link to this transcript's own session id (D-01).
 fn continues_from(conn: &Connection, session_key: &str, scan: &Scan) -> Result<Option<String>> {
-    if let Some(foreign) = scan
-        .records
-        .iter()
-        .find_map(|r| r.foreign_session_id.clone())
-    {
+    if let Some(foreign) = lineage::foreign_predecessor(scan) {
         return Ok(Some(foreign));
     }
 
@@ -520,7 +520,7 @@ fn continues_from(conn: &Connection, session_key: &str, scan: &Scan) -> Result<O
         return Ok(None);
     };
 
-    Ok(conn
+    let resolved: Option<String> = conn
         .query_row(
             "SELECT m.session_id
              FROM turns t JOIN session_meta m USING (session_key)
@@ -530,7 +530,11 @@ fn continues_from(conn: &Connection, session_key: &str, scan: &Scan) -> Result<O
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()?
-        .flatten())
+        .flatten();
+
+    // A different FILE may still report the same session id - every sidecar
+    // reports its parent's - so the self-link test applies to the fallback too.
+    Ok(resolved.filter(|id| !lineage::is_self_link(id, lineage::own_session_id(scan))))
 }
 
 /// Everything one `session_meta` upsert writes.
