@@ -11,6 +11,7 @@ pub mod derive;
 pub mod error;
 pub mod ingest;
 pub mod parse;
+pub mod reindex;
 pub mod store;
 pub mod verify;
 

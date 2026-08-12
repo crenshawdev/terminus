@@ -55,6 +55,106 @@ pub fn fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// The fixed query set AC4 compares before and after a rebuild.
+///
+/// Every one of these matches at least one fixture turn, and `brillig` matches
+/// exactly one across the whole corpus. A query that matched nothing would make
+/// the comparison pass on an empty index, which is the failure this set exists
+/// to catch.
+pub const FIXED_QUERIES: &[&str] = &["brillig", "assistant", "cargo", "restart", "attachment"];
+
+/// Run [`FIXED_QUERIES`] plus a turn range and a turn-id lookup, serialized to
+/// JSON in a stable order so two runs are byte-comparable.
+///
+/// The rows carry `turns.id` and each hit's coordinates, not just a count: a
+/// rebuild that renumbered turns would return the same number of hits pointing
+/// at different records, which is the exact failure D-10 exists to prevent.
+pub fn query_set_json(conn: &rusqlite::Connection) -> String {
+    let mut out = String::from("{\n");
+
+    out.push_str("  \"matches\": [\n");
+    for (index, query) in FIXED_QUERIES.iter().enumerate() {
+        let hits: Vec<i64> = conn
+            .prepare("SELECT rowid FROM turns_fts WHERE turns_fts MATCH ?1 ORDER BY rowid")
+            .expect("prepare the fts query")
+            .query_map([query], |r| r.get::<_, i64>(0))
+            .expect("run the fts query")
+            .map(|r| r.expect("read a rowid"))
+            .collect();
+        out.push_str(&format!("    {{\"q\": \"{query}\", \"hits\": ["));
+        out.push_str(
+            &hits
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push_str("]}");
+        out.push_str(if index + 1 == FIXED_QUERIES.len() {
+            "\n"
+        } else {
+            ",\n"
+        });
+    }
+    out.push_str("  ],\n");
+
+    // A turn range for one session, and one lookup by turn id: the two shapes
+    // recall reads with, beside the search shape above.
+    out.push_str("  \"turns\": [\n");
+    let rows: Vec<String> = conn
+        .prepare(
+            "SELECT id, session_key, turn_seq, record_type, coalesce(tool_name, ''),
+                    coalesce(ts, ''), stream_offset, byte_len
+             FROM turns ORDER BY id",
+        )
+        .expect("prepare the turn scan")
+        .query_map([], |r| {
+            Ok(format!(
+                "    [{}, {:?}, {}, {:?}, {:?}, {:?}, {}, {}]",
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+            ))
+        })
+        .expect("run the turn scan")
+        .map(|r| r.expect("read a turn row"))
+        .collect();
+    out.push_str(&rows.join(",\n"));
+    out.push_str("\n  ]\n}\n");
+    out
+}
+
+/// A digest over every `sessions` and `session_meta` row.
+///
+/// The archive is what a rebuild must not touch, so it gets a comparison of its
+/// own rather than being inferred from the derived tables looking right.
+pub fn archive_digest(conn: &rusqlite::Connection) -> String {
+    let mut hasher = blake3::Hasher::new();
+    let mut statement = conn
+        .prepare(
+            "SELECT s.session_key, s.session_no, s.blob, m.session_id, m.transcript_path,
+                    m.checksum, m.uncompressed_len, m.continues_from, m.first_turn_at,
+                    m.last_turn_at, m.cwd, m.branch
+             FROM sessions s LEFT JOIN session_meta m USING (session_key)
+             ORDER BY s.session_no",
+        )
+        .expect("prepare the archive scan");
+    let mut rows = statement.query([]).expect("run the archive scan");
+    while let Some(row) = rows.next().expect("read an archive row") {
+        for column in 0..12 {
+            let value: rusqlite::types::Value = row.get(column).expect("read an archive column");
+            hasher.update(format!("{value:?}\u{1f}").as_bytes());
+        }
+        hasher.update(b"\x1e");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Read one turn's bytes out of its session blob, reporting how many blocks
 /// had to be decompressed to do it.
 ///

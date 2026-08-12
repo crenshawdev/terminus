@@ -6,6 +6,7 @@
 //! 2 on misuse, data on stdout, errors on stderr.
 
 pub mod ingest;
+pub mod reindex;
 pub mod verify;
 
 use std::path::PathBuf;

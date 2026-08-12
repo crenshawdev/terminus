@@ -239,6 +239,40 @@ fn a_store_one_archive_format_ahead_is_refused_with_both_versions_named() {
     assert_eq!(derived, "1", "the refused open rewrote meta");
 }
 
+/// AC4, end to end through the command. Drop `turns`, `turns_fts`, `entities`
+/// and `paths`, run `verbatim reindex`, and the fixed query set's JSON is
+/// byte-identical to what it was before the drop.
+#[test]
+fn reindex_rebuilds_the_derived_tables_to_byte_identical_query_output() {
+    let bench = bench();
+    for fixture in testkit::TRANSCRIPT_FIXTURES {
+        bench.ingest(fixture);
+    }
+
+    let before = testkit::query_set_json(&bench.conn());
+    let archive_before = testkit::archive_digest(&bench.conn());
+    assert!(before.contains("\"hits\": ["));
+
+    {
+        let conn = bench.conn();
+        // Children first: the bundled SQLite enforces foreign keys.
+        for table in verbatim_core::store::DERIVED_TABLES.iter().rev() {
+            conn.execute_batch(&format!("DROP TABLE {table}")).unwrap();
+        }
+    }
+
+    let out = bench.run(&["reindex"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "reindex produces no data on stdout");
+
+    assert_eq!(testkit::query_set_json(&bench.conn()), before, "AC4");
+    assert_eq!(
+        testkit::archive_digest(&bench.conn()),
+        archive_before,
+        "the rebuild touched the archive"
+    );
+}
+
 /// The exit-code split phase 1 commits to: 2 is misuse, and it is not the same
 /// as an operational failure.
 #[test]
