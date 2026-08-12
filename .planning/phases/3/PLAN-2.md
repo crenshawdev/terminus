@@ -101,7 +101,14 @@ matched, and a chronological window around any hit.
   `pragma_update`. It still runs the existing `gate` function - `gate` is
   already read-only and already populates what `Store::rebuild_required`
   reports, which is what lets PLAN-3's read commands say a store predates this
-  build instead of silently querying an old-shape index (D-18). A data
+  build instead of silently querying an old-shape index (D-18). Dropping
+  `bring_forward` means the columns it adds are not guaranteed present:
+  `session_meta.project_pre_worktree`, `agent_meta` and `transcript_diverged`
+  are in `BRING_FORWARD_COLUMNS` (`store/schema.rs:255-262`), so a store last
+  written by a phase-1 binary lacks them and any read query naming one fails
+  with `no such column` on a connection that cannot ALTER. The read path
+  detects their absence and reports the store as predating this build - the
+  D-18 degraded read - rather than surfacing a SQLite error. A data
   directory or database file that is not there must be distinguishable by the
   caller without matching on message text, the way `Error::TranscriptDiverged`
   is a variant rather than a formatted string, so a caller can render it as an
@@ -146,7 +153,9 @@ matched, and a chronological window around any hit.
 - **Files:** crates/verbatim-core/src/recall/search.rs,
   crates/verbatim-core/src/recall/mod.rs, crates/verbatim-core/tests/recall.rs
 - **Action:** Build the search this phase exists for: `turns_fts MATCH` joined
-  to `turns` and `session_meta`, returning per hit the turn id, session key,
+  to `turns` and LEFT-joined to `session_meta` - an inner join drops every turn
+  of a session with no meta row, the damage `config::visible::sessions`
+  deliberately keeps visible (`config.rs:528-533`) - returning per hit the turn id, session key,
   timestamp, project and record type, ordered by relevance. Relevance is
   derived from `bm25(turns_fts)`, which SQLite returns as a NEGATIVE number
   where more negative is a better match - negate it once, in one place, and
@@ -210,6 +219,12 @@ matched, and a chronological window around any hit.
   name='idx_session_meta_project'` is 1 on a fresh store and 1 after a reindex
   of a store created without it.
 
+<!-- scoping note: a longest-prefix hit on `project_pre_worktree` resolves back
+to that row's `project` before scoping. Phase 2 D-06 folded a repo and its
+worktree into ONE key on purpose; scoping to the worktree key would show only
+sessions run from the worktree and hide the repo's own, which is the
+fragmentation D-12 exists to prevent. -->
+
 ### Task 5: Filter by tool, kind, path and time window
 
 - **Files:** crates/verbatim-core/src/recall/search.rs,
@@ -238,8 +253,14 @@ matched, and a chronological window around any hit.
 
 - **Files:** crates/verbatim-core/src/recall/search.rs,
   crates/verbatim-core/src/recall/query.rs, crates/verbatim-core/tests/recall.rs
-- **Action:** Close RCL-04's query-time half. For each query token that exactly
-  equals an `entities.value_norm`, compute its document frequency - the number
+- **Action:** Close RCL-04's query-time half. The match is between the query and
+  a stored `entities.value_norm`, NOT between a single query token and a whole
+  value: `path` and `error` values are multi-token by construction (PLAN-1 tasks
+  4 and 5 store `src/worker/S.ts` and a whole normalized stderr line), so a
+  token-equality rule can never fire for the two kinds this phase headlines.
+  Match a value whose own tokenization is covered by the query's token set, and
+  keep exact whole-string equality as the strongest case. For each matched
+  value, compute its document frequency - the number
   of distinct `turn_id` carrying that `(kind, value_norm)`, which
   `idx_entities_lookup` already covers - and add an inverse-document-frequency
   contribution to the relevance of every candidate turn carrying that entity,

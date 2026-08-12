@@ -108,6 +108,13 @@ value the earlier one already carries.
   `Read` `tool_use` block whose `file_path` names a file, and a separate
   assistant text turn naming that same path in prose and nothing else - those
   last two are AC3's structured-versus-prose pair and must be different turns.
+  Every existing fixture hardcodes `"cwd": "/data/code/verbatim"`, which makes
+  any project-scoped assertion pass only on a checkout at that literal path.
+  These four carry `cwd` values derived from the test's own temp root instead,
+  and at least two distinct project roots between them, so PLAN-2's default
+  scope and PLAN-4's `project: "*"` both have something to be true and false
+  about. Registration in `testkit` exposes the roots so a test can chdir into
+  one.
   `session-errors-a.jsonl` and `session-errors-b.jsonl` are two distinct
   sessions each carrying `tool_result` blocks with `is_error: true` and a
   top-level `toolUseResult` object with `stdout`, `stderr` and `interrupted`

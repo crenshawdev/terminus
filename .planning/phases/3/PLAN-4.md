@@ -103,7 +103,10 @@ disconnects.
   `readOnlyHint` true. Descriptions state what the tool returns and never
   instruct the model how to behave. A message with no `id` is a notification,
   including `notifications/initialized`, and gets no response ever: replying to
-  one is a protocol violation. An unparseable line, an unknown method or a
+  one is a protocol violation. `ping` is answered with an empty result: the
+  bundled client implements it on both sides (`PingRequestSchema`), and a
+  liveness probe answered `-32601` reads as an unhealthy server and gets the
+  connection torn down mid-session. An unparseable line, an unknown method or a
   malformed envelope gets a JSON-RPC error object with the standard code, and
   stdout carries nothing but JSON-RPC messages - every diagnostic goes to
   stderr, since stdout is the transport.
@@ -111,8 +114,8 @@ disconnects.
   built binary with `mcp`, writes `initialize` and `tools/list` on stdin,
   closes stdin, and shows: one response per request in order, exactly three
   tools, `annotations.readOnlyHint` true on each, no response emitted for
-  `notifications/initialized`, a `-32601` error for an unknown method, and exit
-  code 0.
+  `notifications/initialized`, an empty-result response to `ping`, a `-32601`
+  error for an unknown method, and exit code 0.
 
 ### Task 2: Wire `recall_search`
 
