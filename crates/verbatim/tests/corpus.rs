@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use verbatim_core::blob;
-use verbatim_core::store::{Store, DB_FILE_NAME, DERIVED_SCHEMA, META_DERIVED_SCHEMA};
+use verbatim_core::store::{DB_FILE_NAME, DERIVED_SCHEMA, META_DERIVED_SCHEMA};
 use verbatim_core::testkit::{self, LineSurvey};
 
 /// AC1, AC2, D-24 and D-25 against the real tree, in one pass.
@@ -281,9 +281,19 @@ fn time_a_forced_rebuild(data_dir: &Path) -> Duration {
             .unwrap();
         assert_eq!(changed, 1, "the store must carry a derived schema version");
     }
+    // `open_up_to_date` and not `Store::open`: opening a store is a read, and
+    // `Store::open` deliberately only REPORTS that a rebuild is due
+    // (`Store::rebuild_required`) rather than performing one. Timing it would
+    // time an open that does nothing and call the number a rebuild.
     let started = Instant::now();
-    let store = Store::open(data_dir).expect("an older store opens by rebuilding");
+    let store = verbatim_core::reindex::open_up_to_date(data_dir)
+        .expect("an older store opens by rebuilding");
     let elapsed = started.elapsed();
+
+    assert!(
+        store.rebuild_required().is_none(),
+        "the rebuild must leave the store stamped up to date"
+    );
     drop(store);
     elapsed
 }
