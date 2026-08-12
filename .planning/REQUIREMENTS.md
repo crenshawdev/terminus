@@ -150,12 +150,12 @@ Explicit exclusions. The reason prevents scope creep later.
 | STOR-04 | Phase 1 | Complete |
 | ING-01 | Phase 1 | Complete |
 | ING-02 | Phase 1 | Complete |
-| ING-03 | Phase 2 | Pending |
-| ING-04 | Phase 2 | Pending |
-| ING-08 | Phase 2 | Pending |
-| ING-09 | Phase 2 | Pending |
-| ING-05 | Phase 2 | Pending |
-| ING-06 | Phase 2 | Pending |
+| ING-03 | Phase 2 | Complete |
+| ING-04 | Phase 2 | Complete |
+| ING-08 | Phase 2 | Complete |
+| ING-09 | Phase 2 | Complete |
+| ING-05 | Phase 2 | Complete |
+| ING-06 | Phase 2 | Complete |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 

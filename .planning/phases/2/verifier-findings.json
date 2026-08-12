@@ -1,0 +1,117 @@
+{
+  "status": "gaps",
+  "score": "10/12",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "A cold start into an empty data directory boots clean, stamps derived_schema 2, and `verbatim status` afterwards prints real counts",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "CLI, fresh temp dirs: `VERBATIM_DATA_DIR=<tmp>/data VERBATIM_CONFIG_DIR=<tmp>/config CLAUDE_CONFIG_DIR=<tmp>/claude verbatim ingest` exit 0, then `verbatim status` -> `sessions 4 / turns 17 / watermarks 4 covering 9843 byte(s) / files 4 walked, 4 committed, 0 failed`. `select key,value from meta` on the new store -> [('archive_format','1'),('derived_schema','2')]; tables include compaction_boundaries, session_meta, runs, watermarks. The tree held 2 top-level transcripts, a depth-4 sidecar, a depth-6 sidecar and a journal.jsonl; exactly the 4 transcripts became sessions and the journal did not."
+    },
+    {
+      "n": 2,
+      "truth": "One no-arg pass over the real corpus ingests every <uuid>.jsonl and agent-*.jsonl at any depth, ingests nothing else, and reports zero unparseable lines and zero panics",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "`VERBATIM_TEST_CORPUS=/data/claude/.claude cargo test -p verbatim --test corpus -- --nocapture` -> `test result: ok. 2 passed` in 126.58s. Output: `walked 2137 transcripts before the pass, 2138 after, 2137 stable across it; pass took 61.845s` / `archived 2137 sessions` / `309904 lines over 972.7 MB of archived stream, 0 untyped` / 16 distinct record types. crates/verbatim/tests/corpus.rs asserts the set relation both ways: every stable transcript has a session (the only excusable miss is a file with no complete line, asserted by name not by slack), and every session key is a transcript by an AC1 rule written independently of discover.rs, with explicit assertions that no journal.jsonl, no .meta.json, no tool-results path and no non-.jsonl file became a session. Depth-6 sidecars are pinned separately by `the_depth_six_sidecar_is_reached` (tests/discover.rs, ok in the suite run)."
+    },
+    {
+      "n": 3,
+      "truth": "Session lineage links across files, no session links to itself, and a sidecar's parent comes from its path",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "Same corpus run: `continues_from: 190 linked, 0 self-linked`, asserted in corpus.rs against session_meta. Synthetic side: tests/lineage.rs 11 tests ok, including `over_a_tree_no_session_continues_from_itself_and_some_continue`, `a_transcript_naming_only_its_own_session_id_continues_from_nothing`, `one_predecessor_named_by_three_successors_produces_three_links`, `both_sidecar_depths_carry_their_parents_session_key`. Traced end to end through the binary, not only the test: after the cold-start CLI ingest, session_meta shows the continuation transcript carrying continues_from='11111111-...' and both sidecars carrying parent_session_key='<...>/-data-code-demo/11111111-....jsonl'."
+    },
+    {
+      "n": 4,
+      "truth": "A repo and a worktree beneath its .claude/worktrees/ resolve to one project key, while /x/a.b and /x/a-b stay two keys",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "tests/project.rs, all 11 ok in the workspace run, including `a_repo_and_its_worktree_land_on_one_project_key`, `two_cwds_that_encode_identically_stay_two_keys`, `two_cwds_in_one_encoded_directory_stay_two_project_keys`, `a_cwd_that_does_not_exist_resolves_to_itself`, `resolving_the_same_cwd_twice_runs_git_at_most_once`. Wired and traced through the binary: the cold-start CLI ingest wrote session_meta.project='/data/code/verbatim' for a fixture whose cwd is /data/code/verbatim, i.e. the git-toplevel resolution ran on the real ingest path, and crates/verbatim-core/src/ingest/pass.rs:113-121 builds one Resolver for the whole walk and passes it into ingest_locked."
+    },
+    {
+      "n": 5,
+      "truth": "Appending a compact_boundary to an already-archived transcript records the boundary with its compactMetadata verbatim and disturbs no earlier turn row or committed blob block",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "tests/compaction.rs `appending_a_boundary_records_it_and_disturbs_nothing_already_archived` ok in the workspace run, asserting completed blob blocks byte-identical (block level, since the blob header/table are rewritten on append) plus unchanged turn rows; `a_rebuild_reproduces_the_boundary_row_from_the_blob_alone` and `no_ordinary_turn_gets_a_boundary_row` ok beside it. Traced through the binary: `verbatim ingest` over tests/fixtures/session-compacted.jsonl produced compaction_boundaries(turn_id=3, metadata=<bytes>) whose bytes are byte-identical to the record's compactMetadata object in the fixture line."
+    },
+    {
+      "n": 6,
+      "truth": "A tree pass with a project excluded opens no file beneath it, adds no row for it, and still ingests a hyphenated sibling of the excluded name",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "tests/pass.rs `an_excluded_project_is_never_opened_and_adds_no_row` ok: it reads discover::opened::under(dir) - the counted-open log in discover.rs:224-260, which records the path before the open is attempted - and asserts it empty for both the excluded repo and its worktree directory, then asserts zero rows in sessions, session_meta, turns and watermarks for each excluded path, with the sibling committed. tests/discover.rs `an_excluded_project_yields_nothing_while_its_hyphenated_sibling_is_walked` ok. Confirmed through the binary: with exclude=[\"/data/code/demo\"] in verbatim.toml, a bare `verbatim ingest` over a tree of 4 transcripts under -data-code-demo archived 0 sessions and exited 0."
+    },
+    {
+      "n": 7,
+      "truth": "A pass killed at ten or more randomized points, on a first pass and on an append pass, converges on rerun to the uninterrupted store",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "crates/verbatim/tests/crash.rs `killing_a_tree_pass_converges_on_a_first_pass_and_on_an_append` ok in the workspace run. crash.rs:600-677 takes a reference snapshot of an uninterrupted tree pass, runs a kill spread (file-aimed, moment-aimed and timed) asserting `first_kills >= 10`, then grows every transcript, takes a second reference, asserts it differs from the first and that it added exactly the appended records, and asserts `append_kills >= 10` - each iteration resumed to completion and compared against the reference snapshot of blobs, turn rows and watermarks."
+    },
+    {
+      "n": 8,
+      "truth": "One damaged transcript is skipped with its error recorded while the rest of the tree is ingested, and `verbatim status` prints that run's error alongside sizes, counts and watermarks",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "End to end through the binary, not only the tests. A two-transcript tree ingested clean; one transcript then truncated to 200 bytes, the other appended to; the second `verbatim ingest` exits 0 printing '<path> is 200 bytes but its watermark is at 5656; the archive was left untouched' / '1 file(s) skipped', and `verbatim status` prints size, sessions 2, turns 12, watermarks 2 covering 7197 byte(s), 'files 2 walked, 1 committed, 1 failed' and the error text in full. `verbatim verify` then names that session and exits 1 (D-13 flag reaches verify). Backed by tests/pass.rs `one_damaged_transcript_does_not_stop_the_rest_of_the_tree`, `a_damaged_file_shows_up_in_the_passs_own_runs_row`, `one_pass_over_five_transcripts_writes_exactly_one_runs_row`, and tests/status.rs `status_prints_the_damaged_files_path_and_error_from_the_last_run`, all ok."
+    },
+    {
+      "n": 9,
+      "truth": "Recovery runs at the top of every run, before anything is discovered or read",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "crates/verbatim-core/src/ingest/pass.rs:99-102 calls crate::recover::recover(data_dir) under the lock and before discover::discover(config). tests/recover.rs 6 tests ok, including `single_file_ingest_recovers_before_it_reads_the_transcript`, `a_pass_lowers_an_overrun_watermark_and_drops_an_orphaned_one`, `a_store_needing_no_repair_has_no_watermark_touched`. The corpus run also timed the D-24 scale consequence: 'derived rebuild of 2137 sessions after a DERIVED_SCHEMA bump: 52.17s', inside the ingest lock."
+    },
+    {
+      "n": 10,
+      "truth": "Verbatim reads its own config (verbatim.toml under VERBATIM_CONFIG_DIR) for roots and exclusions and never the legacy config",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "tests/config.rs 11 tests ok, including `the_legacy_config_toml_beside_ours_is_never_read`, `a_config_naming_two_roots_yields_both_in_order`, `claude_config_dir_replaces_the_default_and_an_empty_value_does_not`, `a_missing_config_file_yields_the_default_single_root`. Confirmed live: writing exclude=[\"/data/code/demo\"] into <config>/verbatim.toml changed a bare `verbatim ingest` from archiving 4 sessions to archiving 0, so the loader is on the ingest path and not merely present."
+    },
+    {
+      "n": 11,
+      "truth": "Exclusion is honored on the ingest path as a whole (ING-08), never read-then-filtered",
+      "status": "FAILED",
+      "uat_item": null,
+      "evidence": "Two reproductions against the built binary. (a) Single-file entry point: with exclude=[\"/data/code/demo\"] configured and a bare pass having correctly archived 0 sessions, `verbatim ingest <path-to-that-excluded-transcript>` exits 0 and the store then holds 1 sessions row for it - crates/verbatim-core/src/ingest/mod.rs's run() applies no exclusion test; the test lives only in discover.rs. (b) Unnormalized exclusion string: with exclude=[\"/data/code/demo/\"] (trailing separator) the same bare pass archives all 4 sessions and `verbatim status` then prints both 'sessions 4' and 'excluded 1 project(s): /data/code/demo/' - the pre-open test is disabled by the trailing separator and the read-side filter does not compensate."
+    },
+    {
+      "n": 12,
+      "truth": "ROADMAP success criterion 4's 'boundary record with its dropped-turn set' is delivered",
+      "status": "FAILED",
+      "uat_item": null,
+      "evidence": "compaction_boundaries has exactly two columns, turn_id and metadata (PRAGMA table_info on a store written by `verbatim ingest`); no dropped-turn set is computed anywhere. This is a deliberate, measured deferral - CONTEXT D-08 shows the one real compact_boundary's preservedMessages.uuids (6) is a subset of allUuids (8) against 38,064 cumulativeDroppedTokens, so the metadata cannot enumerate the dropped turns - and phase 5 (INJ-05) owns the derivation. Recorded because it subtracts from the ROADMAP contract, not because the phase's own AC4 is unmet."
+    }
+  ],
+  "passes": [
+    { "k": 1, "name": "Cold start from scratch", "evidence": "Bare `verbatim ingest` into an empty VERBATIM_DATA_DIR exits 0; meta shows derived_schema=2 with no migration error; `verbatim status` prints sessions 4, turns 17, watermarks 4 covering 9843 bytes, files 4 walked / 4 committed / 0 failed. All four discovered transcripts (two top-level, a depth-4 sidecar, a depth-6 sidecar) became sessions; the journal.jsonl beside them did not." },
+    { "k": 2, "name": "Full tree pass over the real corpus", "evidence": "`VERBATIM_TEST_CORPUS=/data/claude/.claude cargo test -p verbatim --test corpus -- --nocapture` -> ok, 2 passed, 126.58s: 2137 transcripts stable across the pass, 2137 sessions archived, 309904 lines / 972.7 MB decompressed with 0 unparseable and 0 untyped, 16 record types, pass 61.8s, exit 0. corpus.rs asserts both halves (every stable transcript archived; no journal / .meta.json / tool-results / non-.jsonl session key) using an AC1 rule written independently of discover.rs. `the_depth_six_sidecar_is_reached` pins the depth-6 case." },
+    { "k": 3, "name": "Session lineage links, none self-linked", "evidence": "Corpus run: `continues_from: 190 linked, 0 self-linked`, asserted in corpus.rs. tests/lineage.rs 11 ok. A CLI ingest wrote continues_from and parent_session_key into session_meta, so the link is produced by the shipped path, not only by a unit test." },
+    { "k": 4, "name": "Worktree folds in, look-alike paths stay apart", "evidence": "tests/project.rs `a_repo_and_its_worktree_land_on_one_project_key` and `two_cwds_that_encode_identically_stay_two_keys` ok (11/11 in the file). Resolver is constructed once per pass in ingest/pass.rs:113 and a CLI ingest wrote session_meta.project as the git toplevel." },
+    { "k": 5, "name": "Appending a compact_boundary preserves earlier bytes", "evidence": "tests/compaction.rs `appending_a_boundary_records_it_and_disturbs_nothing_already_archived` ok (completed blob blocks byte-identical, turn rows unchanged), plus a CLI ingest of session-compacted.jsonl producing compaction_boundaries.metadata byte-identical to the record's compactMetadata object." },
+    { "k": 6, "name": "Exclusion opens nothing, sibling still ingested", "evidence": "tests/pass.rs `an_excluded_project_is_never_opened_and_adds_no_row` ok, reading the counted-open log (discover.rs open_transcript records the path before the open is attempted) for the excluded project and its worktree, then asserting zero rows in sessions/session_meta/turns/watermarks, with the hyphenated sibling committed. Confirmed live: a bare pass with the project excluded archived 0 sessions." },
+    { "k": 7, "name": "A killed pass converges on rerun", "evidence": "crates/verbatim/tests/crash.rs `killing_a_tree_pass_converges_on_a_first_pass_and_on_an_append` ok: >=10 kills against a first pass and >=10 against an append pass, each resumed and compared to the uninterrupted reference snapshot of blobs, turn rows and watermarks." },
+    { "k": 8, "name": "One damaged transcript does not stop the pass", "evidence": "Live CLI: one transcript truncated below its watermark, its sibling appended to; the pass exits 0, skips the damaged file with a named error, commits the sibling, and `verbatim status` prints sizes, counts, watermarks, '2 walked, 1 committed, 1 failed' and the error text. `verbatim verify` then names that session and exits 1. tests/pass.rs and tests/status.rs cover the same paths." }
+  ],
+  "gaps": [
+    {
+      "name": "Exclusion is bypassed by `verbatim ingest <path>` and by an exclusion string with a trailing separator",
+      "reason": "behavior wrong - ING-08 requires exclusion honored on the ingest path, never read-then-filtered; two entry conditions read and archive an excluded project",
+      "evidence": "crates/verbatim-core/src/ingest/mod.rs - run(), the single-file entry point, applies no exclusion test at all (the test lives only in crates/verbatim-core/src/discover.rs:96, Config::excludes_encoded_dir). Reproduced: with exclude=[\"/data/code/demo\"] a bare pass archived 0 sessions, then `verbatim ingest <that transcript>` exited 0 and left 1 sessions row. Second reproduction: crates/verbatim-core/src/config.rs does not normalize exclusion strings, so exclude=[\"/data/code/demo/\"] makes the same bare pass archive all 4 sessions while `verbatim status` prints 'sessions 4' and 'excluded 1 project(s): /data/code/demo/' in the same output.",
+      "severity": "major",
+      "missing": "Apply the exclusion predicate in ingest::run before the transcript is opened (the single-file path is what phase 4's hooks will call), and normalize configured exclusion strings - strip trailing separators, reject or canonicalize '/' - before both excludes_encoded_dir and excludes_path use them."
+    },
+    {
+      "name": "No dropped-turn set on the compaction boundary (ROADMAP phase 2 criterion 4)",
+      "reason": "missing - the boundary carries compactMetadata verbatim but no set of turns that fell out",
+      "evidence": "compaction_boundaries has columns (turn_id, metadata) only, on a store written by `verbatim ingest`. CONTEXT D-08 documents the deferral with the measurement that motivates it (the single real boundary's uuid lists describe the preserved segment and cannot enumerate ~38k dropped tokens) and assigns the derivation to phase 5 / INJ-05. REQUIREMENTS.md ING-06 and ROADMAP criterion 4 still read as though phase 2 delivers it.",
+      "severity": "minor",
+      "missing": "Either amend ROADMAP phase 2 criterion 4 and ING-06 to match D-08's split (verbatim metadata now, complement at query time in phase 5), or state the deferral explicitly in REQUIREMENTS.md so the row is not read as delivered."
+    }
+  ],
+  "human_checks": []
+}

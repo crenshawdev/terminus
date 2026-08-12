@@ -101,12 +101,6 @@ executors carried.
 - `record_run`'s single-file (`RunRow::PerFile`) path omits `files_committed` /
   `files_failed`, so a single-file ingest reports `0 committed` in `verbatim
   status`.
-- `ingest::run`, the single-file entry point, applies no exclusion test at all -
-  exclusion lives only in `discover`. `verbatim ingest <path>` on an excluded
-  transcript reads and archives it.
-- Exclusion strings are unnormalized: `/data/code/foo/` with a trailing
-  separator, or `/`, disables the pre-open test entirely while `excludes_path`
-  still hides the sessions - read-then-filter, the behaviour ING-08 forbids.
 - A session archived before 02592b5 keeps `project_pre_worktree = NULL`;
   `session_meta` is not derived, so no rebuild backfills it. D-23's retroactive
   promise does not hold for existing stores without a re-ingest.
@@ -146,6 +140,52 @@ executors carried.
 Both phase 1 open items this phase carried are closed by PLAN-3 task 4: the
 crash harness now kills an append/resume pass, and the watermark invariant
 asserts the record-boundary property rather than only containment.
+
+## UAT (2026-08-12)
+
+`/cad-verify 2` passed all 10 items. The deep verifier auto-verified the eight
+acceptance items and raised two gaps, both fixed and retested.
+
+- `a556897` closed the two exclusion bypasses this list carried: the single-file
+  `ingest::run` now loads the config and refuses an excluded transcript before
+  the lock, and exclusion strings are normalized once so the pre-open and
+  read-side predicates cannot disagree about a spelling. The risk-surface gate
+  fired twice on that fix and its two rounds found four `high` findings, all
+  fixed: a symlinked transcript reaching into an excluded project (twice, once
+  through the encoded directory name and once through the project's own path),
+  `..` and `~` spellings that matched nothing, and plain relative exclusions.
+- `9e078d0` corrected ING-06 and ROADMAP criterion 4 to D-08's split. The
+  behaviour was never the gap.
+
+What those two review rounds raised below the blocking bar, still open:
+
+- `ingest::run` now calls `Config::load()`, which errors when
+  `VERBATIM_CONFIG_DIR`, `XDG_CONFIG_HOME` and `HOME` are all unset - so
+  `verbatim ingest <path>`, the shape phase 4's hooks call, exits non-zero in a
+  stripped environment (systemd unit, cron, scrubbed container) where it
+  previously succeeded. Every test reaches the new `run_with` seam, which loads
+  no config, so nothing covers it.
+- `discover::open_transcript` records the path it was handed, not the file it
+  resolves to, so the counted-open log AC5 reads cannot see a read that reached
+  its target through a link. `path.canonicalize().unwrap_or(path)` would make
+  the instrument answer the question AC5 asks.
+- `config::is_filesystem_root` requires `RootDir` as the FIRST component, which
+  is right for `/` and wrong for a Windows drive or UNC root: `C:\` is
+  `[Prefix, RootDir]`, so it answers false, and the encoded extension rule
+  cannot reach it either - the two predicates disagree there, on a stated
+  target platform.
+- A `~`-prefixed exclusion is silently dropped when `HOME` is unset, which
+  contradicts the module's own "unresolvable means excluded" rule.
+  `Config::load_from` returns `Result` and could refuse instead.
+- `Config::exclusions()` is documented as "exactly as configured" and now
+  returns the normalized rewrite, omitting entries `normalize` dropped, so
+  `verbatim status` reports a list that is not what the user typed. That is
+  also the only channel that could tell a user an exclusion line was malformed,
+  and it says nothing.
+- `..` is resolved lexically (deliberately - the excluded directory is
+  frequently deleted, D-06), so it names a different subtree than the kernel
+  whenever a popped component is a symlink, with no report when the result
+  names a path that exists nowhere.
 
 ## Goal check
 

@@ -7,7 +7,7 @@ The archive is the product, so it is built first and everything else is built on
 ## Phases
 
 - [x] **Phase 1: Archive Core** - the store, the blob format, and single-transaction ingest of one transcript
-- [ ] **Phase 2: Ingest At Scale** - discovery, identity, exclusion and crash resilience over a real transcript tree
+- [x] **Phase 2: Ingest At Scale** - discovery, identity, exclusion and crash resilience over a real transcript tree
 - [ ] **Phase 3: Recall** - Rust-side expansion, entity extraction, terminal search, and the three MCP tools
 - [ ] **Phase 4: Hooks And Install** - detached hook spawn, npm install, backfill, doctor and uninstall
 - [ ] **Phase 5: Context Injection** - the SessionStart resume brief and precision-first prompt injection
