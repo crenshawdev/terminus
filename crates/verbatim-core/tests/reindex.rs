@@ -142,12 +142,41 @@ fn the_rebuild_reads_nothing_but_the_blobs() {
         .unwrap();
     }
 
+    // The invented rows are counted BEFORE the rebuild, so "they are gone" is a
+    // claim about these rows and not about the table being empty - which it no
+    // longer is, since phase 3 fills `paths` from the blobs like everything
+    // else.
+    let invented: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM paths WHERE path = '/invented'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(invented > 0, "the corruption did not take");
+
     let mut store = bench.store();
     reindex::reindex(&mut store).unwrap();
     drop(store);
 
     assert_eq!(testkit::query_set_json(&bench.conn()), reference);
-    assert_eq!(count(&bench.conn(), "paths"), 0, "an invented row survived");
+    assert_eq!(
+        bench
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM paths WHERE path = '/invented'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0,
+        "an invented row survived"
+    );
+    assert!(
+        count(&bench.conn(), "paths") > 0,
+        "the rebuild produced no path row at all, so the comparison above is empty"
+    );
 }
 
 /// STOR-05's older-format branch, in the caller rather than in `Store::open`:
@@ -210,10 +239,11 @@ fn an_ingest_brings_an_older_store_forward_first() {
             rusqlite::params![(DERIVED_SCHEMA - 1).to_string(), META_DERIVED_SCHEMA],
         )
         .unwrap();
-        // The child rows go first: a boundary row references `turns(id)` and
-        // the bundled SQLite enforces that.
-        conn.execute("DELETE FROM compaction_boundaries", [])
-            .unwrap();
+        // Every child row goes first: `compaction_boundaries`, `entities` and
+        // `paths` all reference `turns(id)` and the bundled SQLite enforces it.
+        for table in ["compaction_boundaries", "entities", "paths"] {
+            conn.execute(&format!("DELETE FROM {table}"), []).unwrap();
+        }
         conn.execute("DELETE FROM turns", []).unwrap();
     }
 

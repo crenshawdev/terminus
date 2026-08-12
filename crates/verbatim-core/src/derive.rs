@@ -111,11 +111,31 @@ pub fn derive_turn(tx: &Connection, row: TurnRow<'_>) -> Result<i64> {
         rusqlite::params![id, body],
     )?;
 
-    // No rows are written to either table in this phase, and they are still
-    // cleared: the seam owns every derived row for a turn, so phase 3 filling
-    // them in must not require finding a second place that forgot to.
+    // Cleared before anything is written, at a known turn id, which is what
+    // makes a re-derive idempotent by construction rather than by a uniqueness
+    // check the tables do not carry. A value that stopped being extracted must
+    // stop having a row.
     tx.execute("DELETE FROM entities WHERE turn_id = ?1", [id])?;
     tx.execute("DELETE FROM paths WHERE turn_id = ?1", [id])?;
+    for entity in value
+        .as_ref()
+        .map(crate::index::entities)
+        .unwrap_or_default()
+    {
+        tx.execute(
+            "INSERT INTO entities (turn_id, kind, value_norm) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, entity.kind, entity.value],
+        )?;
+        // `paths` exists for exactly this lookup - "which turns touched this
+        // file" - so a path entity without its row would leave the table
+        // describing a subset of what the index knows.
+        if entity.kind == crate::index::entity::PATH {
+            tx.execute(
+                "INSERT INTO paths (turn_id, path) VALUES (?1, ?2)",
+                rusqlite::params![id, entity.value],
+            )?;
+        }
+    }
 
     // The boundary row, on the same delete-then-insert footing as everything
     // above (D-21). Clearing first is what makes a re-derive idempotent by

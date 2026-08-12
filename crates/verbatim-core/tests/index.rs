@@ -322,3 +322,194 @@ fn the_expansion_rules_are_functions_with_answers() {
         "`Search` is already a token of the body"
     );
 }
+
+// --- RCL-02: entities --------------------------------------------------------
+
+/// Every `(kind, value_norm)` one turn carries, in `entities` order.
+fn entities_of(conn: &Connection, turn_id: i64) -> Vec<(String, String)> {
+    conn.prepare("SELECT kind, value_norm FROM entities WHERE turn_id = ?1 ORDER BY rowid")
+        .unwrap()
+        .query_map([turn_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn paths_of(conn: &Connection, turn_id: i64) -> Vec<String> {
+    conn.prepare("SELECT path FROM paths WHERE turn_id = ?1 ORDER BY rowid")
+        .unwrap()
+        .query_map([turn_id], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// The one turn whose record contains `needle`, or a failure naming how many
+/// there were.
+fn only_turn_containing(conn: &Connection, needle: &str) -> i64 {
+    let hits = turns_whose_record_contains(conn, needle);
+    assert_eq!(hits.len(), 1, "`{needle}` is in {} turns", hits.len());
+    hits[0]
+}
+
+/// AC3's structured-versus-prose pair, which is what "entities are not
+/// extracted from prose" has to mean to be worth anything.
+#[test]
+fn a_structured_path_becomes_an_entity_and_the_same_path_in_prose_does_not() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let structured = only_turn_containing(&conn, "\"file_path\":\"docs/RETRY.md\"");
+    assert!(entities_of(&conn, structured).contains(&("path".into(), "docs/RETRY.md".into())));
+    assert_eq!(paths_of(&conn, structured), ["docs/RETRY.md"]);
+
+    let prose = only_turn_containing(&conn, "docs/RETRY.md documents nothing");
+    assert_ne!(prose, structured);
+    assert_eq!(
+        entities_of(&conn, prose),
+        Vec::<(String, String)>::new(),
+        "a path named in prose became an entity"
+    );
+    assert_eq!(paths_of(&conn, prose), Vec::<String>::new());
+}
+
+/// The `tool` kind and `turns.tool_name` are the same value read twice, so a
+/// filter on either cannot disagree with the other (D-16).
+#[test]
+fn the_tool_entity_agrees_with_the_turn_column() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let rows: Vec<(i64, String)> = conn
+        .prepare("SELECT id, tool_name FROM turns WHERE tool_name IS NOT NULL ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(rows.len() >= 5, "the corpus must exercise several tools");
+
+    for (id, tool_name) in &rows {
+        let tools: Vec<String> = entities_of(&conn, *id)
+            .into_iter()
+            .filter(|(kind, _)| kind == "tool")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(tools, [tool_name.as_str()], "turn {id}");
+    }
+
+    // And the other direction: no turn carries a `tool` entity without the
+    // column, which is what a second extraction site would look like.
+    let orphans: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM entities e JOIN turns t ON t.id = e.turn_id
+             WHERE e.kind = 'tool' AND t.tool_name IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(orphans, 0);
+
+    let grep = only_turn_containing(&conn, "\"pattern\":\"block\"");
+    assert!(entities_of(&conn, grep).contains(&("tool".into(), "Grep".into())));
+}
+
+/// A `Bash` call leaves the program it ran, by basename.
+#[test]
+fn a_bash_call_leaves_the_program_it_ran() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    // Two turns, not one: `session-truncated.jsonl` is a byte prefix of
+    // `session-basic.jsonl` that reaches past this record, so both sessions
+    // hold it and both must extract the same thing.
+    let bash = turns_whose_record_contains(&conn, "\"command\":\"cargo test -p verbatim-core\"");
+    assert_eq!(bash.len(), 2);
+    for id in bash {
+        let entities = entities_of(&conn, id);
+        assert!(
+            entities.contains(&("command".into(), "cargo".into())),
+            "turn {id}: {entities:?}"
+        );
+        assert!(entities.contains(&("tool".into(), "Bash".into())));
+        // No path in that command line, and nothing invented for the
+        // subcommand or the `-p` value.
+        assert!(paths_of(&conn, id).is_empty());
+    }
+}
+
+/// A `Grep` pattern and an `Edit` string give symbols; an ordinary word does
+/// not. The shape test is the whole rule - both fields can hold prose.
+#[test]
+fn only_identifier_shaped_tokens_become_symbols() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let grep = only_turn_containing(&conn, "\"pattern\":\"retryBudget\"");
+    let symbols: Vec<String> = entities_of(&conn, grep)
+        .into_iter()
+        .filter(|(kind, _)| kind == "symbol")
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(symbols, ["retryBudget"]);
+
+    // The other Grep in the corpus searches for the ordinary word `block`, and
+    // an ordinary word is not a symbol.
+    let plain = only_turn_containing(&conn, "\"pattern\":\"block\"");
+    assert!(entities_of(&conn, plain)
+        .iter()
+        .all(|(kind, _)| kind != "symbol"));
+}
+
+/// The rules on their own, where the boundary cases are cheap to state.
+#[test]
+fn the_entity_rules_are_functions_with_answers() {
+    use verbatim_core::index::entity::{
+        is_identifier_shaped, normalize_path, path_words, program_of,
+    };
+
+    assert_eq!(
+        program_of("cargo test -p verbatim-core"),
+        Some("cargo".into())
+    );
+    assert_eq!(program_of("/usr/bin/env python3 x.py"), Some("env".into()));
+    assert_eq!(
+        program_of("RUST_LOG=debug cargo build"),
+        Some("cargo".into())
+    );
+    assert_eq!(program_of("  "), None);
+
+    assert_eq!(
+        path_words("cargo test -p verbatim-core"),
+        Vec::<String>::new()
+    );
+    assert_eq!(path_words("cat src/main.rs"), ["src/main.rs"]);
+    // A flag is skipped; a flag's VALUE is not, because telling the two apart
+    // needs per-tool argv knowledge this has no way to have, and `--config
+    // etc/x.toml` names a file exactly as much as a bare argument does.
+    assert_eq!(
+        path_words("rg --glob a/b.rs pattern crates/x/src"),
+        ["a/b.rs", "crates/x/src"]
+    );
+
+    // Kept exactly as written, minus quotes and a position suffix. Never
+    // canonicalized: 52% of the corpus's cwd directories are gone.
+    assert_eq!(
+        normalize_path("\"src/main.rs\""),
+        Some("src/main.rs".into())
+    );
+    assert_eq!(
+        normalize_path("src/main.rs:42:9"),
+        Some("src/main.rs".into())
+    );
+    assert_eq!(normalize_path("src/main.rs:42"), Some("src/main.rs".into()));
+    assert_eq!(normalize_path("../a/b.rs"), Some("../a/b.rs".into()));
+    assert_eq!(normalize_path("   "), None);
+
+    assert!(is_identifier_shaped("SearchManager"));
+    assert!(is_identifier_shaped("search_manager"));
+    assert!(is_identifier_shaped("retryBudget"));
+    assert!(!is_identifier_shaped("block"));
+    assert!(!is_identifier_shaped("Search"));
+    assert!(!is_identifier_shaped("_leading"));
+}

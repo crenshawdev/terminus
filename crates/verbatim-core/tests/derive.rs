@@ -134,28 +134,17 @@ fn state_records_contribute_no_fts_row() {
     );
 }
 
-/// D-10's idempotence, which is what makes AC4's rebuild safe: re-deriving a
-/// turn leaves the row count and the matching rowid unchanged.
-#[test]
-fn re_deriving_a_turn_changes_nothing() {
-    let bench = bench();
-    let conn = bench.conn();
-
-    let before_count = count(&conn, "turns_fts");
-    let before_hits = matching(&conn, testkit::UNIQUE_TOKEN);
-    let before_rows = turn_rows(&conn);
-
-    // Re-derive every turn from the blob, exactly as a rebuild would.
-    let stream = {
-        let raw: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&bench.session_key],
-                |r| r.get(0),
-            )
-            .unwrap();
-        blob::read_all(&raw).unwrap()
-    };
+/// Re-derive every turn of the bench session from its blob, exactly as a
+/// rebuild would: same seam, same ids, nothing read but the archive.
+fn re_derive_every_turn(bench: &Bench, conn: &Connection) {
+    let raw: Vec<u8> = conn
+        .query_row(
+            "SELECT blob FROM sessions WHERE session_key = ?1",
+            [&bench.session_key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let stream = blob::read_all(&raw).unwrap();
     let scan = parse::scan(&stream);
     let tx = conn.unchecked_transaction().unwrap();
     for (record, turn) in scan.turns() {
@@ -175,6 +164,20 @@ fn re_deriving_a_turn_changes_nothing() {
         .unwrap();
     }
     tx.commit().unwrap();
+}
+
+/// D-10's idempotence, which is what makes AC4's rebuild safe: re-deriving a
+/// turn leaves the row count and the matching rowid unchanged.
+#[test]
+fn re_deriving_a_turn_changes_nothing() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let before_count = count(&conn, "turns_fts");
+    let before_hits = matching(&conn, testkit::UNIQUE_TOKEN);
+    let before_rows = turn_rows(&conn);
+
+    re_derive_every_turn(&bench, &conn);
 
     assert_eq!(count(&conn, "turns_fts"), before_count);
     assert_eq!(matching(&conn, testkit::UNIQUE_TOKEN), before_hits);
@@ -219,13 +222,56 @@ fn the_seam_reproduces_what_ingest_wrote_for_one_turn() {
     assert_eq!(one_turn_row(&conn, id), ingested);
 }
 
-/// Phase 1 owns the entity tables and the rebuild path, not what fills them.
+/// The seam owns the entity tables too, and clears them at the turn id before
+/// it writes: re-deriving a turn must not double its rows, and a value that
+/// stopped being extracted must stop having one.
+///
+/// Phase 1 asserted the opposite here - that neither table ever gained a row -
+/// which was true of a phase that had no extractor. What survives from it is the
+/// half that still matters: no second writer exists, so every row in either
+/// table came through `derive_turn` and a rebuild reproduces it.
 #[test]
-fn no_entity_or_path_row_is_written_in_this_phase() {
+fn the_seam_owns_the_entity_and_path_rows() {
     let bench = bench();
     let conn = bench.conn();
-    assert_eq!(count(&conn, "entities"), 0);
-    assert_eq!(count(&conn, "paths"), 0);
+
+    // `session-basic.jsonl` holds one `Bash` tool_use, at turn 4 of its eight,
+    // so the rows are known exactly rather than merely non-empty.
+    let before: Vec<(i64, String, String)> = entity_rows(&conn);
+    assert_eq!(
+        before,
+        vec![
+            (
+                schema::turn_id(bench.session_no, 4),
+                "tool".to_owned(),
+                "Bash".to_owned()
+            ),
+            (
+                schema::turn_id(bench.session_no, 4),
+                "command".to_owned(),
+                "cargo".to_owned()
+            ),
+        ]
+    );
+    assert_eq!(count(&conn, "paths"), 0, "that command line names no file");
+
+    // Re-derive every turn, exactly as a rebuild would: the rows must be the
+    // same rows and not twice as many.
+    re_derive_every_turn(&bench, &conn);
+    assert_eq!(
+        entity_rows(&conn),
+        before,
+        "a re-derive doubled the entities"
+    );
+}
+
+fn entity_rows(conn: &Connection) -> Vec<(i64, String, String)> {
+    conn.prepare("SELECT turn_id, kind, value_norm FROM entities ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
 }
 
 /// The seam must not open a transaction of its own: ingest commits the blob,

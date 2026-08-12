@@ -11,9 +11,11 @@
 //! precisely so normalization stays in Rust where each rule can be called with
 //! an input and compared against an answer (`.planning/PROJECT.md`).
 
+pub mod entity;
 pub mod expand;
 pub mod text;
 
+pub use entity::{Entity, KINDS};
 pub use expand::MAX_EXPANSION_BYTES;
 pub use text::{MAX_BODY_BYTES, MAX_DEPTH};
 
@@ -30,4 +32,12 @@ pub fn project(record: &Value) -> String {
     let mut body = text::project(record);
     expand::append_to(&mut body);
     body
+}
+
+/// Every entity one turn record leaves behind (RCL-02, RCL-03), capped.
+///
+/// The same parsed record the body came from, so a turn is read once and every
+/// derived row for it comes out of that one read.
+pub fn entities(record: &Value) -> Vec<Entity> {
+    entity::extract(record)
 }
