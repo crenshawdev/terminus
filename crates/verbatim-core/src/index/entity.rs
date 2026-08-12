@@ -21,6 +21,7 @@
 use serde_json::Value;
 
 use super::expand::case_components;
+use super::text::floor_char_boundary;
 
 /// A file or directory named by a structured tool field.
 pub const PATH: &str = "path";
@@ -156,18 +157,271 @@ impl Collector {
         }
     }
 
-    /// One `tool_result` block. `error` is D-03's, and lands in the next task.
-    fn tool_result(&mut self, _block: &Value) {}
+    /// One `tool_result` block: half of D-03's error signal.
+    ///
+    /// `is_error: true` and nothing else - not the `interrupted` flag, which
+    /// says a `Bash` call was cut short rather than that it failed, and not an
+    /// exit code, because the transcript carries none.
+    fn tool_result(&mut self, block: &Value) {
+        if block.get("is_error").and_then(Value::as_bool) != Some(true) {
+            return;
+        }
+        if let Some(value) = normalize_error(&result_text(block)) {
+            self.push(ERROR, value);
+        }
+    }
 
     /// The top-level `toolUseResult`. `filePath` is the one path key it carries
-    /// (679 of the measured sample); `stderr` is D-03's and lands next.
+    /// (679 of the measured sample); a non-empty `stderr` is the other half of
+    /// D-03's error signal.
     fn tool_use_result(&mut self, result: &Value) {
         if let Some(raw) = result.get("filePath").and_then(Value::as_str) {
             if let Some(path) = normalize_path(raw) {
                 self.push(PATH, path);
             }
         }
+        if let Some(stderr) = result.get("stderr").and_then(Value::as_str) {
+            if let Some(value) = normalize_error(stderr) {
+                self.push(ERROR, value);
+            }
+        }
     }
+}
+
+/// A `tool_result` block's own text: a string, or the `text` blocks of an array.
+fn result_text(block: &Value) -> String {
+    match block.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// How many bytes of normalized error text one entity value may carry.
+///
+/// An entity value is a key an exact-match lookup compares whole, so a stderr
+/// dump of a failing test suite is not one value worth keeping - it is one value
+/// that will never recur, stored per turn. The head of a failure is the part
+/// that repeats; the whole of it stays in the blob either way.
+pub const MAX_ERROR_BYTES: usize = 512;
+
+/// What a UUID normalizes to.
+pub const UUID: &str = "<uuid>";
+/// What an ISO-8601 timestamp normalizes to.
+pub const TIMESTAMP: &str = "<ts>";
+/// What a `0x` hex address normalizes to.
+pub const ADDRESS: &str = "<addr>";
+/// What a `:line` or `:line:col` suffix normalizes to, colon included.
+pub const LINE_COL: &str = ":<line>";
+
+/// One error's text reduced to the value two occurrences of the same failure
+/// share (D-04).
+///
+/// Four substitutions and no more: UUIDs, ISO-8601 timestamps, `0x` addresses
+/// and `:line:col` suffixes. **Bare integers are deliberately kept.** Stripping
+/// them was measured and scores worse on the property the rule exists for: over
+/// a 400-file sample the four rules leave 46 error values recurring across
+/// sessions, and adding bare integers leaves 39 - the aggressive rule merges
+/// failures that are genuinely different faster than it merges ones that are the
+/// same.
+///
+/// Whitespace runs collapse to one space, so a value is single-line and two
+/// occurrences that differ only in wrapping or trailing space are one value.
+///
+/// `None` when nothing is left, which is how an empty `stderr` - the ordinary
+/// case on a successful call - contributes no entity.
+pub fn normalize_error(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = String::new();
+    let mut chunk = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // A match is only ever attempted at an ASCII byte, so `i` and `chunk`
+        // are always char boundaries and the slices below cannot split a
+        // character.
+        match placeholder_at(bytes, i) {
+            Some((len, placeholder)) => {
+                push_collapsed(&mut out, &raw[chunk..i]);
+                out.push_str(placeholder);
+                i += len;
+                chunk = i;
+            }
+            None => i += 1,
+        }
+    }
+    push_collapsed(&mut out, &raw[chunk..]);
+
+    let trimmed = out.trim_end();
+    let take = floor_char_boundary(trimmed, MAX_ERROR_BYTES.min(trimmed.len()));
+    (take > 0).then(|| trimmed[..take].to_owned())
+}
+
+/// Text appended with every whitespace run collapsed to a single space.
+fn push_collapsed(out: &mut String, text: &str) {
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+/// The variable part starting at `at`, if one does: its byte length and what it
+/// normalizes to.
+///
+/// Timestamp before line-col, because `09:14:22` inside `2026-08-12T09:14:22Z`
+/// is a time and not a source position.
+fn placeholder_at(bytes: &[u8], at: usize) -> Option<(usize, &'static str)> {
+    if let Some(len) = timestamp_at(bytes, at) {
+        return Some((len, TIMESTAMP));
+    }
+    if let Some(len) = uuid_at(bytes, at) {
+        return Some((len, UUID));
+    }
+    if let Some(len) = address_at(bytes, at) {
+        return Some((len, ADDRESS));
+    }
+    line_col_at(bytes, at).map(|len| (len, LINE_COL))
+}
+
+/// `NNNN-NN-NNTNN:NN:NN`, with the fractional seconds and the zone offset both
+/// optional - the corpus writes `.NNNZ` and a future producer may not.
+fn timestamp_at(bytes: &[u8], at: usize) -> Option<usize> {
+    if !starts_token(bytes, at) {
+        return None;
+    }
+    let mut i = at;
+    i = digits(bytes, i, 4)?;
+    i = byte(bytes, i, b'-')?;
+    i = digits(bytes, i, 2)?;
+    i = byte(bytes, i, b'-')?;
+    i = digits(bytes, i, 2)?;
+    i = byte(bytes, i, b'T')?;
+    i = digits(bytes, i, 2)?;
+    i = byte(bytes, i, b':')?;
+    i = digits(bytes, i, 2)?;
+    i = byte(bytes, i, b':')?;
+    i = digits(bytes, i, 2)?;
+    if let Some(next) = byte(bytes, i, b'.') {
+        i = digits_run(bytes, next)?;
+    }
+    match bytes.get(i) {
+        Some(b'Z') => i += 1,
+        Some(b'+') | Some(b'-') => {
+            let mut zone = digits(bytes, i + 1, 2)?;
+            if let Some(next) = byte(bytes, zone, b':') {
+                zone = digits(bytes, next, 2)?;
+            }
+            i = zone;
+        }
+        _ => {}
+    }
+    ends_token(bytes, i).then_some(i - at)
+}
+
+/// The 8-4-4-4-12 hex form, which is the only one the transcript and the tools
+/// under it write.
+fn uuid_at(bytes: &[u8], at: usize) -> Option<usize> {
+    if !starts_token(bytes, at) {
+        return None;
+    }
+    let mut i = at;
+    for (n, group) in [8, 4, 4, 4, 12].into_iter().enumerate() {
+        if n > 0 {
+            i = byte(bytes, i, b'-')?;
+        }
+        i = hex(bytes, i, group)?;
+    }
+    ends_token(bytes, i).then_some(i - at)
+}
+
+/// `0x` followed by hex digits.
+fn address_at(bytes: &[u8], at: usize) -> Option<usize> {
+    if !starts_token(bytes, at) || bytes.get(at) != Some(&b'0') || bytes.get(at + 1) != Some(&b'x')
+    {
+        return None;
+    }
+    let mut i = at + 2;
+    while bytes.get(i).is_some_and(u8::is_ascii_hexdigit) {
+        i += 1;
+    }
+    if i == at + 2 {
+        return None;
+    }
+    ends_token(bytes, i).then_some(i - at)
+}
+
+/// `:line` or `:line:col`, attached to the token before it.
+///
+/// The attachment is the test that keeps this off a bare number: a source
+/// position follows a file name (`reader.rs:214:9`), so the byte before the
+/// colon has to be part of a token.
+fn line_col_at(bytes: &[u8], at: usize) -> Option<usize> {
+    if bytes.get(at) != Some(&b':') {
+        return None;
+    }
+    if !bytes
+        .get(at.wrapping_sub(1))
+        .is_some_and(u8::is_ascii_alphanumeric)
+    {
+        return None;
+    }
+    let mut i = digits_run(bytes, at + 1)?;
+    if let Some(next) = byte(bytes, i, b':') {
+        if let Some(end) = digits_run(bytes, next) {
+            i = end;
+        }
+    }
+    ends_token(bytes, i).then_some(i - at)
+}
+
+/// Is `at` the start of a token rather than the middle of one? Keeps a match
+/// from landing on the tail of a longer word.
+fn starts_token(bytes: &[u8], at: usize) -> bool {
+    !bytes
+        .get(at.wrapping_sub(1))
+        .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+/// Is `at` past the end of a token?
+fn ends_token(bytes: &[u8], at: usize) -> bool {
+    !bytes.get(at).is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn byte(bytes: &[u8], at: usize, want: u8) -> Option<usize> {
+    (bytes.get(at) == Some(&want)).then_some(at + 1)
+}
+
+fn digits(bytes: &[u8], at: usize, count: usize) -> Option<usize> {
+    run(bytes, at, count, u8::is_ascii_digit)
+}
+
+fn hex(bytes: &[u8], at: usize, count: usize) -> Option<usize> {
+    run(bytes, at, count, u8::is_ascii_hexdigit)
+}
+
+fn run(bytes: &[u8], at: usize, count: usize, class: fn(&u8) -> bool) -> Option<usize> {
+    (0..count)
+        .all(|n| bytes.get(at + n).is_some_and(class))
+        .then_some(at + count)
+}
+
+/// One or more digits, however many.
+fn digits_run(bytes: &[u8], at: usize) -> Option<usize> {
+    let mut i = at;
+    while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+        i += 1;
+    }
+    (i > at).then_some(i)
 }
 
 /// A path as the record wrote it, minus surrounding quotes and a trailing

@@ -184,7 +184,7 @@ impl Projector {
 /// `str::floor_char_boundary` is unstable, and slicing a multi-byte character
 /// in half panics - so a turn whose text runs past the budget mid-emoji would
 /// take the ingest of the whole session with it.
-fn floor_char_boundary(text: &str, at: usize) -> usize {
+pub(super) fn floor_char_boundary(text: &str, at: usize) -> usize {
     if at >= text.len() {
         return text.len();
     }

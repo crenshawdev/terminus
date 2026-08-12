@@ -513,3 +513,117 @@ fn the_entity_rules_are_functions_with_answers() {
     assert!(!is_identifier_shaped("Search"));
     assert!(!is_identifier_shaped("_leading"));
 }
+
+// --- RCL-03: errors ----------------------------------------------------------
+
+/// Every `error` value one turn carries, in `entities` order.
+fn errors_of(conn: &Connection, turn_id: i64) -> Vec<String> {
+    entities_of(conn, turn_id)
+        .into_iter()
+        .filter(|(kind, _)| kind == "error")
+        .map(|(_, value)| value)
+        .collect()
+}
+
+/// AC2 in both directions: the four variable parts collapse and a bare integer
+/// does not.
+///
+/// The second half is the one that costs something to get right. Stripping bare
+/// integers too was measured over a 400-file sample and scores *worse* on
+/// recurrence - 39 recurring values against 46 - because it merges failures that
+/// differ in a count, an index or an exit status into one entity nobody can tell
+/// apart again.
+#[test]
+fn one_failure_seen_twice_is_one_value_and_a_different_integer_is_two() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    // The same panic in two sessions a week apart: different line, different
+    // address, different timestamp, different job id.
+    let a = only_turn_containing(&conn, "reader.rs:214:9");
+    let b = only_turn_containing(&conn, "reader.rs:317:5");
+    assert_eq!(
+        errors_of(&conn, a),
+        [
+            // The `tool_result` block's own text, on `is_error: true`.
+            "Bash command failed",
+            // And the `stderr` beside it, normalized.
+            "thread 'main' panicked at crates/verbatim-core/src/blob/reader.rs:<line> \
+             assertion failed at <addr> on <ts> for job <uuid>",
+        ]
+    );
+    assert_eq!(errors_of(&conn, a), errors_of(&conn, b));
+
+    // Two failures whose only difference is a count. Same shape, same length,
+    // no variable part any rule here touches - and they must stay apart.
+    let seven = only_turn_containing(&conn, "7 previous errors");
+    let nine = only_turn_containing(&conn, "9 previous errors");
+    assert_eq!(
+        errors_of(&conn, seven),
+        ["error: could not compile verbatim-core due to 7 previous errors"],
+        "a bare integer was stripped, or the stderr signal did not fire"
+    );
+    assert_ne!(errors_of(&conn, seven), errors_of(&conn, nine));
+
+    // D-03's negative: `interrupted` says a call was cut short, not that it
+    // failed, and an empty stderr is not a failure either.
+    let interrupted = only_turn_containing(&conn, "\"interrupted\":true");
+    assert!(record(&conn, interrupted).contains("the command was interrupted"));
+    assert_eq!(
+        errors_of(&conn, interrupted),
+        Vec::<String>::new(),
+        "an interrupted call was recorded as an error"
+    );
+}
+
+/// The normalization on its own, where the boundary cases are cheap to state.
+#[test]
+fn the_error_normalization_is_a_function_with_answers() {
+    use verbatim_core::index::entity::{normalize_error, MAX_ERROR_BYTES};
+
+    let norm = |raw: &str| normalize_error(raw).unwrap_or_default();
+
+    assert_eq!(
+        norm("panicked at src/main.rs:42:9"),
+        "panicked at src/main.rs:<line>"
+    );
+    assert_eq!(
+        norm("panicked at src/main.rs:42"),
+        "panicked at src/main.rs:<line>"
+    );
+    assert_eq!(norm("freed 0x7f3a1c2d4e00 twice"), "freed <addr> twice");
+    assert_eq!(
+        norm("at 2026-08-12T09:14:22.001Z and 2026-08-12T09:14:22+02:00"),
+        "at <ts> and <ts>"
+    );
+    assert_eq!(
+        norm("job 9f1c2b3a-4d5e-4f60-8a71-b2c3d4e5f601 failed"),
+        "job <uuid> failed"
+    );
+
+    // Kept: a bare integer, a version, a token that merely contains hex.
+    assert_eq!(norm("exit status 137"), "exit status 137");
+    assert_eq!(norm("rustc 1.89.0 rejected it"), "rustc 1.89.0 rejected it");
+    assert_eq!(norm("branch fix0xff"), "branch fix0xff");
+    // A colon that is not a position: nothing precedes it to be a file.
+    assert_eq!(norm("error: 42 things"), "error: 42 things");
+
+    // One line, whatever the input's wrapping, so two occurrences that differ
+    // only in whitespace are one value.
+    assert_eq!(
+        norm("  error:\n  two lines\t\tand a tab  "),
+        "error: two lines and a tab"
+    );
+
+    // Nothing left is no entity at all, which is how a successful call's empty
+    // stderr contributes none.
+    assert_eq!(normalize_error(""), None);
+    assert_eq!(normalize_error("   \n  "), None);
+
+    // Bounded, on a character boundary: an entity value is a key, and a whole
+    // test suite's stderr is a key that will never be looked up.
+    let huge = "e".repeat(MAX_ERROR_BYTES * 3);
+    assert_eq!(norm(&huge).len(), MAX_ERROR_BYTES);
+    let wide = "é".repeat(MAX_ERROR_BYTES);
+    assert!(norm(&wide).len() <= MAX_ERROR_BYTES);
+}
