@@ -17,6 +17,7 @@ files:
   - crates/verbatim-core/src/testkit.rs
   - crates/verbatim-core/tests/parse.rs
   - crates/verbatim-core/tests/derive.rs
+  - crates/verbatim-core/tests/reindex.rs
   - crates/verbatim-core/tests/compaction.rs
   - crates/verbatim-core/tests/verify.rs
   - crates/verbatim-core/tests/fixtures.rs
@@ -142,7 +143,7 @@ every Verify below uses `cargo test --workspace`.
 
 ### Task 2: A compaction boundary becomes a row, through the derive seam
 
-- **Files:** crates/verbatim-core/src/derive.rs, crates/verbatim-core/src/reindex.rs, crates/verbatim-core/tests/derive.rs, crates/verbatim-core/tests/compaction.rs
+- **Files:** crates/verbatim-core/src/derive.rs, crates/verbatim-core/src/reindex.rs, crates/verbatim-core/tests/derive.rs, crates/verbatim-core/tests/reindex.rs, crates/verbatim-core/tests/compaction.rs
 - **Action:** First carry the two fields task 1 parsed as far as the seam. The
   seam's input is `TurnRow { session_key, session_no, turn, stream_offset,
   byte_len, record }` (`derive.rs:29-41`) and task 1 put `subtype` and the
