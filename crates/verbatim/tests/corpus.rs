@@ -252,6 +252,84 @@ fn a_pass_over_the_real_corpus_archives_every_transcript_and_nothing_else() {
          make a resume brief cite the session it is opening"
     );
 
+    // --- AC3: the entities that pass derived, over the real tree. ---
+    //
+    // Every number here is printed and none is asserted: the corpus is live and
+    // grows during the run, so a count or a ratio would fail on data that is
+    // correct. What is asserted is a set relation - every kind present, nothing
+    // over the cap, every `paths` row backed by its entity - and the printed
+    // distribution is what a later phase tunes the cap and the query weights
+    // against.
+    let per_kind: Vec<(String, i64)> = conn
+        .prepare("SELECT kind, count(*) FROM entities GROUP BY kind ORDER BY kind")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    println!("entities by kind:");
+    for (kind, count) in &per_kind {
+        println!("  {count:>8}  {kind}");
+    }
+    for kind in verbatim_core::index::KINDS {
+        let count = per_kind
+            .iter()
+            .find(|(name, _)| name == kind)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        assert!(
+            count > 0,
+            "no `{kind}` entity in the whole corpus - the rule for that kind \
+             fires on synthetic fixtures and on nothing real"
+        );
+    }
+
+    // The per-turn distribution D-15 set the cap from, remeasured on this tree.
+    let mut counts: Vec<i64> = conn
+        .prepare("SELECT count(*) FROM entities GROUP BY turn_id")
+        .unwrap()
+        .query_map([], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    counts.sort_unstable();
+    assert!(!counts.is_empty(), "the corpus produced no entity at all");
+    let at = |q: f64| counts[((counts.len() - 1) as f64 * q) as usize];
+    println!(
+        "entities per emitting turn over {} turns: p50 {}, p90 {}, p99 {}, max {} (cap {})",
+        counts.len(),
+        at(0.50),
+        at(0.90),
+        at(0.99),
+        counts[counts.len() - 1],
+        verbatim_core::index::MAX_ENTITIES_PER_TURN,
+    );
+    assert!(
+        counts[counts.len() - 1] <= verbatim_core::index::MAX_ENTITIES_PER_TURN as i64,
+        "a turn carries more entities than the cap"
+    );
+
+    // `paths` is the lookup table for "which turns touched this file", so a row
+    // in it without the entity it came from would mean the two tables describe
+    // different sets and a path search and an entity search disagree.
+    let path_rows: i64 = conn
+        .query_row("SELECT count(*) FROM paths", [], |r| r.get(0))
+        .unwrap();
+    println!("{path_rows} path rows");
+    assert!(path_rows > 0, "no path entity survived the real corpus");
+    let unbacked: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM paths p
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM entities e
+                 WHERE e.turn_id = p.turn_id AND e.kind = 'path' AND e.value_norm = p.path
+             )",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unbacked, 0, "`paths` rows without a matching `path` entity");
+
     drop(rows);
     drop(statement);
     drop(conn);
