@@ -34,30 +34,6 @@ pub const META_DERIVED_SCHEMA: &str = "derived_schema";
 /// so a short overlap with a reader is not an error.
 const BUSY_TIMEOUT_MS: u32 = 5_000;
 
-/// The tables a fresh store starts with.
-///
-/// `meta` is the key/value table the gate reads; `runs` records one ingest pass
-/// and exists here because AC5 asserts a refused open leaves it untouched. The
-/// rest of the phase-1 schema arrives with `schema.rs` in the next task, which
-/// takes this constant over.
-const INIT_SQL: &str = "\
-CREATE TABLE IF NOT EXISTS meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS runs (
-    id           INTEGER PRIMARY KEY,
-    started_at   TEXT    NOT NULL,
-    finished_at  TEXT,
-    duration_ms  INTEGER,
-    files_seen   INTEGER NOT NULL DEFAULT 0,
-    bytes_read   INTEGER NOT NULL DEFAULT 0,
-    turns_added  INTEGER NOT NULL DEFAULT 0,
-    error        TEXT
-);
-";
-
 /// The store is older than this build and its derived tables need rebuilding.
 ///
 /// Returned as an inspectable outcome rather than acted on here: the rebuild
@@ -130,7 +106,7 @@ impl Store {
     /// Write the tables and the version integers a fresh store carries.
     fn initialize(&self) -> Result<()> {
         let conn = &self.conn;
-        conn.execute_batch(INIT_SQL)?;
+        conn.execute_batch(crate::store::schema::CREATE_SQL)?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2), (?3, ?4)",
             rusqlite::params![
