@@ -1,0 +1,106 @@
+{
+  "status": "delivered",
+  "score": "8/8",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "A cold data directory reaches a working store through the shipped binary: ingest creates it, the schema initializes, and a derived query returns real rows.",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "Live run against a fresh temp dir with the built binary: `VERBATIM_DATA_DIR=<tmp>/data verbatim ingest tests/fixtures/session-basic.jsonl` -> exit 0, creates `LOCK` + `verbatim.db` (110592 bytes); `verbatim reindex` -> exit 0, stderr `rebuilt 8 turn(s) across 1 session(s)`; `verbatim verify` -> exit 0, `1 session(s) checked, 0 failed`. Direct SQL on the resulting store: sessions=1, turns=8, `SELECT rowid FROM turns_fts WHERE turns_fts MATCH 'brillig'` -> 7, and turn rows carry real coordinates (id 0 user 542/409, id 1 assistant 952/493, id 2 attachment 1446/408). Store creation path: crates/verbatim-core/src/store/open.rs; schema: crates/verbatim-core/src/store/schema.rs."
+    },
+    {
+      "n": 2,
+      "truth": "Reading one turn decompresses exactly the blocks that turn occupies, counted by an instrument that is itself falsified rather than trusted.",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "`cargo test --workspace --test ingest` -> `reading_a_turn_decompresses_only_the_blocks_it_occupies ... ok` (13 passed). The test asserts blocks==4 for the oversized first record and blocks==1 for the small second record via `testkit::read_turn`, which reads through `BlobReader::blocks_decompressed` (crates/verbatim-core/src/blob/reader.rs:19,45,95 - the counter lives in the normal build, not behind a feature). The counter is independently checked: `cargo test --workspace --test blob` -> `the_block_count_matches_the_windows_touched_for_random_ranges ... ok`, plus `a_range_inside_one_block_decompresses_exactly_one_block` and `a_range_spanning_three_blocks_decompresses_exactly_three` (23 passed). `every_turn_row_addresses_its_own_record ... ok` generalizes the two spot checks over all five fixtures."
+    },
+    {
+      "n": 3,
+      "truth": "Killing ingest at 20+ randomized points leaves a store whose derived rows never outrun a checksum-matching blob and whose watermark never passes the committed bytes, and a completing pass converges on the uninterrupted result.",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "`cargo test --workspace --test crash` -> 2 passed in 2.26s: `killing_ingest_anywhere_leaves_a_store_that_converges ... ok` and `the_harness_catches_a_watermark_committed_outside_the_transaction ... ok`. crates/verbatim/tests/crash.rs runs 15 aimed SIGKILLs (5 fault points x 3 seed-shuffled rounds, crates/verbatim-core/src/ingest/mod.rs:224 `fault::POINTS`) plus 8 timed kills = 23, asserts kills>=20 and that at least 9 kills actually interrupted something, and `check_invariants` runs `verify::verify` plus orphan checks on turns/turns_fts/entities/paths plus the per-session `watermark > uncompressed_len` check. The negative test makes the check fail-capable. Fault points are `#[cfg(feature = \"testkit\")]` with inert `#[inline(always)]` stubs otherwise (ingest/mod.rs:241-268), and `testkit` is not in the binary's default features (crates/verbatim/Cargo.toml). Known narrowing, already a SUMMARY open item and carried to phase 2: every kill targets a first pass into a fresh data dir, so the append/resume path is completed but never itself killed."
+    },
+    {
+      "n": 4,
+      "truth": "`verbatim verify` exits non-zero on a store with one flipped byte, names that session on stdout, and names no other - on a fixture pair where two sessions report the same record-level session id.",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "`cargo test --workspace --test cli` -> `verify_names_the_corrupt_session_and_no_other ... ok`; `verify_exits_zero_and_says_nothing_on_a_clean_store ... ok` (6 passed). The test ingests D-01's colliding pair through the binary, XORs one byte at the midpoint of the sidecar's blob, and asserts exit code 1, stdout contains the sidecar key, stdout does not contain the parent key, and stdout never mentions `integrity_check`. Library half: `cargo test --workspace --test verify` -> `one_corrupt_session_is_named_and_no_other`, `two_corrupt_sessions_are_both_reported`, `a_sidecar_and_its_parent_are_told_apart`, `the_report_never_mentions_integrity_check` all ok (7 passed). Implementation: crates/verbatim-core/src/verify.rs walks every session, reports per-session rather than aborting, names by `session_key`; crates/verbatim/src/cmd/verify.rs prints `Report::render()` to stdout and returns `Failure::Silent` (exit 1)."
+    },
+    {
+      "n": 5,
+      "truth": "Dropping all four derived tables and running `verbatim reindex` reproduces byte-identical query output for a fixed query set, with the archive tables untouched.",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "`cargo test --workspace --test cli` -> `reindex_rebuilds_the_derived_tables_to_byte_identical_query_output ... ok`; `cargo test --workspace --test reindex` -> `the_fixed_query_set_is_byte_identical_across_a_rebuild`, `the_rebuild_reads_nothing_but_the_blobs`, `rebuilding_an_intact_index_changes_nothing`, `a_corrupt_blob_is_skipped_and_named_rather_than_stopping_the_rebuild` all ok (7 passed). The CLI test ingests all five fixtures, snapshots `testkit::query_set_json` and `testkit::archive_digest`, DROPs turns/turns_fts/entities/paths in reverse FK order, runs the real binary's `reindex` (exit 0, empty stdout), and asserts both snapshots are unchanged. The query set is five FTS queries carrying hit rowids plus a full turn scan with coordinates (crates/verbatim-core/src/testkit.rs `FIXED_QUERIES`/`query_set_json`), so a renumbering rebuild fails rather than matching on counts. Scope note, not a gap: AC4's literal `--json` flag does not exist in phase 1 - `--json` is RCL-06/phase 3 per crates/verbatim/src/cmd/mod.rs and the CONTEXT scope boundary, and `verify --json` is asserted as exit-2 misuse - so the fixed query set is serialized by the test harness against the same store the binary rebuilt. Rebuild reads only `sessions` (crates/verbatim-core/src/reindex.rs) and shares `derive::derive_turn` with ingest."
+    },
+    {
+      "n": 6,
+      "truth": "A store one archive format ahead is refused by every command that opens it, with both version numbers named, and the db file, its hot WAL, `runs` and `meta` are byte-for-byte unchanged.",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "`cargo test --workspace --test cli` -> `a_store_one_archive_format_ahead_is_refused_with_both_versions_named ... ok`; `cargo test --workspace --test store_open` -> `a_newer_archive_format_is_refused_without_touching_the_store ... ok` (9 passed, incl. `fresh_store_opens_in_wal_with_both_version_integers`, `an_older_archive_format_also_reports_a_rebuild`). The CLI test builds a store with a non-empty hot WAL and a `runs` row, asserts the WAL is non-empty first, then runs both `verify` and `ingest <fixture>` against it: each exits non-zero, stderr contains both ARCHIVE_FORMAT and ARCHIVE_FORMAT+1, and `verbatim.db` and the `-wal` file compare equal as raw bytes; `runs` count stays 1 and both `meta` values are unmoved. Mechanism: the version gate reads through a `SQLITE_OPEN_READ_ONLY` connection before any writable one (crates/verbatim-core/src/store/open.rs:195-209,241,270 `Error::ArchiveFormatTooNew`)."
+    },
+    {
+      "n": 7,
+      "truth": "A second `verbatim ingest` launched while the lock is held exits 0 in under 50 ms across 10 consecutive runs and changes no row in any table, on a store where an uncontended run demonstrably would.",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "`cargo test --workspace --test lock_race` -> `a_contended_ingest_exits_zero_fast_and_writes_nothing ... ok` (2 passed, 0.01s). crates/verbatim/tests/lock_race.rs holds the OS try-lock in-process, spawns the real binary 10 times, and asserts per run: exit 0, elapsed < 50 ms, and row counts across every table in `TABLES` unchanged; then drops the guard and asserts the control run does change the counts, so the ten silent runs are not vacuous. Lock is an immediate-fail OS lock on a dedicated LOCK file (crates/verbatim-core/src/ingest/lock.rs; the LOCK file was observed created in the cold-start run above). `reindex` takes the same lock and refuses non-zero instead of exiting 0 (crates/verbatim/src/cmd/reindex.rs; `reindex_refuses_while_another_process_holds_the_ingest_lock ... ok`). Known SUMMARY open item, orthogonal to AC6: `the_lock_is_released_by_process_death` acquires and drops a guard in-process and never kills a process, so the stale-lock-after-SIGKILL property that test is named for is asserted nowhere."
+    },
+    {
+      "n": 8,
+      "truth": "Every line of a fixture transcript, including the eleven state record types that produce no turn row, reads back from the blob byte-identical to the source file.",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "`cargo test --workspace --test ingest` -> `the_blob_reproduces_the_transcript_byte_for_byte ... ok` and `the_stored_checksum_is_blake3_over_the_uncompressed_stream ... ok` (13 passed). The test compares the fully decompressed stream against `std::fs::read` of the source for equality (whole-file, so every line including trailing bytes), then asserts all fifteen `\"type\":\"...\"` values are present in the archived stream while `turns` holds exactly 8 rows - the four turn types only. Fixture coverage is itself pinned: `cargo test --workspace --test fixtures` -> `session_basic_carries_all_fifteen_record_types`, `state_records_never_carry_both_identity_fields`, `line_endings_match_the_measured_corpus` ok (10 passed). `a_non_transcript_jsonl_archives_with_no_turns ... ok` covers D-12's journal file. Derived side: `cargo test --workspace --test derive` -> `state_records_contribute_no_fts_row ... ok` (7 passed)."
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "Cold start from scratch",
+      "evidence": "Live cold run of the built binary into an empty temp dir: `ingest` exit 0 creating LOCK + verbatim.db, `reindex` exit 0 (`rebuilt 8 turn(s) across 1 session(s)`), `verify` exit 0 (`1 session(s) checked, 0 failed`), and SQL on the result gives sessions=1, turns=8, FTS MATCH 'brillig' -> rowid 7, turn rows with real stream offsets/lengths."
+    },
+    {
+      "k": 2,
+      "name": "Turn read decompresses only the blocks it occupies",
+      "evidence": "`cargo test --workspace --test ingest --test blob`: `reading_a_turn_decompresses_only_the_blocks_it_occupies` (4 blocks for the oversized record, 1 for the small one) and `the_block_count_matches_the_windows_touched_for_random_ranges` over 200 random ranges, so the counter in blob/reader.rs is falsified rather than trusted. Also `every_turn_row_addresses_its_own_record` across all five fixtures."
+    },
+    {
+      "k": 3,
+      "name": "Crash at 20+ randomized points converges",
+      "evidence": "`cargo test --workspace --test crash` -> 2 passed: 23 SIGKILLs (15 aimed at named in-transaction fault points across 3 seeded rounds, 8 timed), each followed by full invariant checks (blob checksums via verify, orphan checks on turns/turns_fts/entities/paths, watermark <= committed bytes) and a convergence assertion against an uninterrupted reference snapshot; the negative test proves the check can fail. Fault points are testkit-gated and inert in the shipped build. Narrowing carried to phase 2: kills only ever hit a first pass into a fresh data dir, never an append/resume pass."
+    },
+    {
+      "k": 4,
+      "name": "verify names the corrupt session and no other",
+      "evidence": "`cargo test --workspace --test cli --test verify`: `verify_names_the_corrupt_session_and_no_other` flips one byte inside the sidecar's blob of D-01's colliding pair and asserts exit 1, stdout naming that session, not naming the parent, and never mentioning integrity_check; `verify_exits_zero_and_says_nothing_on_a_clean_store` is the control; the library suite adds two-corrupt-session and sidecar/parent discrimination cases."
+    },
+    {
+      "k": 5,
+      "name": "reindex rebuilds to byte-identical output",
+      "evidence": "`cargo test --workspace --test cli --test reindex`: all four derived tables dropped, `verbatim reindex` run as a process (exit 0, empty stdout), and both the fixed query set's serialized output (FTS hit rowids plus a full turn scan with coordinates) and a digest over sessions/session_meta compare equal to before. AC4's literal `--json` flag does not exist in phase 1 by scope (RCL-06 is phase 3, and `verify --json` is an asserted exit-2 misuse), so the query set is serialized by the harness against the store the binary rebuilt."
+    },
+    {
+      "k": 6,
+      "name": "A newer archive format is refused without touching the store",
+      "evidence": "`cargo test --workspace --test cli --test store_open`: both `verify` and `ingest` against a store one format ahead carrying a hot non-empty WAL exit non-zero with stderr naming both versions, and verbatim.db plus the WAL compare byte-for-byte equal afterwards, with `runs` still at 1 row and both meta integers unmoved. The gate reads through a SQLITE_OPEN_READ_ONLY connection before any writable one (store/open.rs:209,241,270)."
+    },
+    {
+      "k": 7,
+      "name": "Contended ingest exits fast and writes nothing",
+      "evidence": "`cargo test --workspace --test lock_race` -> `a_contended_ingest_exits_zero_fast_and_writes_nothing` passed: 10 consecutive spawns of the real binary against a held OS try-lock, each exit 0, each under the 50 ms budget, each leaving every table's row count unchanged, followed by a control run with the lock free that does change the counts."
+    },
+    {
+      "k": 8,
+      "name": "Every transcript line reads back byte-identical",
+      "evidence": "`cargo test --workspace --test ingest --test fixtures --test derive`: `the_blob_reproduces_the_transcript_byte_for_byte` compares the decompressed stream against the source file bytes and asserts all fifteen record types survive while only the four turn types produce turn rows (8 of them); the fixture suite independently pins that session-basic carries all fifteen types; `the_stored_checksum_is_blake3_over_the_uncompressed_stream` pins what D-06 hashes."
+    }
+  ],
+  "gaps": [],
+  "human_checks": []
+}
