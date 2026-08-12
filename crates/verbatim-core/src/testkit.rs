@@ -55,6 +55,46 @@ pub fn fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// Read one turn's bytes out of its session blob, reporting how many blocks
+/// had to be decompressed to do it.
+///
+/// The block count is AC1's instrument and STOR-01's whole claim: "reading a
+/// single turn decompresses only the blocks that turn occupies" is a statement
+/// about a number, so the number is measured rather than argued from the code.
+///
+/// Panics rather than returning an error: every caller is a test that named a
+/// turn it just wrote.
+pub fn read_turn(conn: &rusqlite::Connection, turn_id: i64) -> (Vec<u8>, usize) {
+    let (session_key, offset, len) = conn
+        .query_row(
+            "SELECT session_key, stream_offset, byte_len FROM turns WHERE id = ?1",
+            [turn_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap_or_else(|e| panic!("turn {turn_id}: {e}"));
+
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT blob FROM sessions WHERE session_key = ?1",
+            [&session_key],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("blob for {session_key}: {e}"));
+
+    let reader = crate::blob::BlobReader::open(&blob).expect("a stored blob parses");
+    reader.reset_block_counter();
+    let bytes = reader
+        .read_range(offset as u64, len as u64)
+        .expect("a turn's range is inside its own session stream");
+    (bytes, reader.blocks_decompressed())
+}
+
 /// SplitMix64. A test that generates its own inputs has to be reproducible
 /// from the seed it prints, and pulling a crate in for four lines is not worth
 /// it.

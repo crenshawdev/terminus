@@ -15,8 +15,9 @@ pub fn run(args: Args) -> Result<(), Failure> {
     let data_dir = super::data_dir()?;
     match ingest::run(&data_dir, &args.transcript)? {
         // Exit 0 with nothing on stdout. Losing the lock race is the expected
-        // outcome of a second hook spawn, not a failure to report (ING-02).
-        Outcome::LockHeld => Ok(()),
+        // outcome of a second hook spawn, not a failure to report (ING-02), and
+        // a transcript with no new complete record is the steady state.
+        Outcome::LockHeld | Outcome::UpToDate => Ok(()),
         Outcome::Committed(_) => Ok(()),
     }
 }
