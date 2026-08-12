@@ -78,13 +78,12 @@ impl Store {
         std::fs::create_dir_all(data_dir).map_err(|e| Error::io(data_dir, e))?;
         let path = data_dir.join(DB_FILE_NAME);
 
-        let existing = match std::fs::metadata(&path) {
-            Ok(m) => m.len() > 0,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(Error::io(&path, e)),
-        };
+        let state = inspect(&path)?;
 
-        let rebuild = if existing { Some(gate(&path)?) } else { None }.flatten();
+        let rebuild = match state {
+            StoreState::Initialized => gate(&path)?,
+            StoreState::Fresh => None,
+        };
 
         let conn = Connection::open(&path).map_err(Error::Sqlite)?;
         conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS.into()))?;
@@ -97,7 +96,7 @@ impl Store {
             path,
             rebuild,
         };
-        if !existing {
+        if state == StoreState::Fresh {
             store.initialize()?;
         }
         Ok(store)
@@ -107,11 +106,13 @@ impl Store {
     ///
     /// One transaction, and that is load-bearing rather than tidy. The tables
     /// and the version integers are two statements, and a store that has the
-    /// first without the second is one the gate reads as `NotAStore` forever:
-    /// `open` only reaches `initialize` when the file is absent or empty, so a
-    /// crash between the two statements bricks the data directory with no
-    /// repair path. SQLite makes DDL transactional, so the whole thing either
-    /// lands or leaves a zero-length file behind.
+    /// first without the second is one the gate reads as `NotAStore` forever.
+    /// SQLite makes DDL transactional, so an interrupted initialize rolls all
+    /// the way back to a database with no tables at all - which is exactly the
+    /// state [`inspect`] recognizes as [`StoreState::Fresh`] and retries. The
+    /// two halves are one fix: without the transaction the rollback could stop
+    /// half way and leave tables behind, and without `inspect` the rolled-back
+    /// file would still be non-empty and read as a store that lost its `meta`.
     fn initialize(&self) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute_batch(crate::store::schema::CREATE_SQL)?;
@@ -168,6 +169,68 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// What sits at the store path, as far as deciding whether to initialize goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreState {
+    /// Nothing is there, or a database with no tables in it at all. Initialize.
+    Fresh,
+    /// A store with its tables. Gate it, never write over it.
+    Initialized,
+}
+
+/// Decide whether the path holds a store, without writing a byte.
+///
+/// File length is not the test, and that is the whole point of this function.
+/// `open` sets `journal_mode=wal` on the writable connection, which stamps the
+/// database header and grows a brand-new file to 4096 bytes *before*
+/// `initialize` runs. So a crash - or a failed commit - anywhere inside
+/// `initialize` leaves a non-empty file holding no tables, and a length test
+/// calls that an existing store, sends it to [`gate`], and returns `NotAStore`
+/// from then on. The data directory is bricked with no repair path, for a
+/// database that contains nothing.
+///
+/// Presence of tables is the test instead. It reads `sqlite_master` over a
+/// **read-only** connection, so AC5's "a refused open leaves the store
+/// byte-for-byte unchanged" survives it.
+///
+/// A database holding tables but no `meta` is somebody else's SQLite file, not
+/// a half-built store: it is refused rather than initialized over. Initializing
+/// is only ever reached with nothing to lose.
+fn inspect(path: &Path) -> Result<StoreState> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() == 0 => return Ok(StoreState::Fresh),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(StoreState::Fresh),
+        Err(e) => return Err(Error::io(path, e)),
+    }
+
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags).map_err(|source| Error::NotAStore {
+        path: path.to_path_buf(),
+        detail: format!("cannot open it for reading: {source}"),
+    })?;
+    conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS.into()))?;
+
+    let tables: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|source| Error::NotAStore {
+            path: path.to_path_buf(),
+            // The usual cause is a file that is not a database at all: SQLite
+            // opens lazily, so the first statement is where that surfaces.
+            detail: format!("reading its table list: {source}"),
+        })?;
+
+    Ok(if tables == 0 {
+        StoreState::Fresh
+    } else {
+        StoreState::Initialized
+    })
 }
 
 /// Read the two version integers off an existing store and decide.

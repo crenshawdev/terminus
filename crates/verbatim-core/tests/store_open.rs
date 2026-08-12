@@ -216,3 +216,71 @@ fn runs_count(conn: &Connection) -> i64 {
     conn.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
         .unwrap()
 }
+
+/// `open` sets `journal_mode=wal` on the writable connection before
+/// `initialize` runs, and that pragma alone stamps the database header and
+/// grows a brand-new file to 4096 bytes. So an interruption anywhere inside
+/// `initialize` - a crash, a failed commit, a full disk - leaves a non-empty
+/// file holding no tables. Deciding "is this an existing store" by file length
+/// calls that a store, sends it to the gate, and returns `NotAStore` from then
+/// on: the data directory is bricked with no repair path, for a database that
+/// contains nothing. Presence of tables is the test instead, so this reopens
+/// and initializes.
+#[test]
+fn an_initialize_that_never_committed_reopens_instead_of_bricking() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(DB_FILE_NAME);
+
+    // Exactly what `open` does up to the point of no return, then rolled back.
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "wal").unwrap();
+        conn.pragma_update(None, "synchronous", "normal").unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch("CREATE TABLE scratch (x INTEGER)")
+            .unwrap();
+        tx.rollback().unwrap();
+    }
+
+    // The premise: the file is not empty, and it holds nothing.
+    assert!(
+        std::fs::metadata(&path).unwrap().len() > 0,
+        "the WAL pragma did not grow the file, so this test proves nothing"
+    );
+
+    let store = Store::open(dir.path()).expect("a database with no tables must re-initialize");
+    assert_eq!(
+        store.meta_int(META_ARCHIVE_FORMAT).unwrap(),
+        Some(ARCHIVE_FORMAT)
+    );
+    assert_eq!(
+        store.meta_int(META_DERIVED_SCHEMA).unwrap(),
+        Some(DERIVED_SCHEMA)
+    );
+}
+
+/// The other side of the same decision: a SQLite database that holds tables but
+/// none of ours is somebody else's file. Initializing over it would destroy
+/// data, so it is refused. `initialize` is only ever reached with nothing to
+/// lose.
+#[test]
+fn a_foreign_sqlite_database_is_refused_rather_than_initialized_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(DB_FILE_NAME);
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE somebody_elses (x INTEGER); INSERT INTO somebody_elses VALUES (1)",
+        )
+        .unwrap();
+    }
+
+    let err = Store::open(dir.path()).expect_err("a foreign database must not be opened");
+    assert!(matches!(err, Error::NotAStore { .. }), "{err:?}");
+
+    let conn = Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM somebody_elses", [], |r| r.get(0))
+        .expect("the refused open destroyed the foreign table");
+    assert_eq!(rows, 1, "the refused open wrote over somebody else's data");
+}
