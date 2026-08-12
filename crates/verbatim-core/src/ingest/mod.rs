@@ -127,14 +127,29 @@ pub(crate) fn ingest_locked(
     let existing = Existing::read(store.conn(), &session_key)?;
     let tail = read_tail(path, existing.watermark)?;
 
-    // `read_tail` returning at all is the proof the file is no shorter than the
-    // archive, which is exactly what the flag denies - so a session that was
-    // flagged stops being flagged here (D-13). Here and not inside the pass
-    // transaction below, because the state a repaired file lands in is
-    // `Outcome::UpToDate`, which opens no transaction and returns two lines
-    // down; and guarded on the flag being set, so a walk of two thousand
-    // healthy transcripts issues none of these writes.
+    // A flagged session stops being flagged only when the file is provably the
+    // one that was archived (D-13). `read_tail` returning proves the file is no
+    // shorter than the watermark and NOTHING about its contents: a transcript
+    // truncated to half its length and then written back past the old watermark
+    // passes that length test while every byte between the truncation point and
+    // the watermark is different. Clearing on length alone would then append at
+    // the stale offset - splicing a record fragment onto a blob whose middle no
+    // longer exists anywhere, permanently, with `verify` reporting it clean
+    // because the blob's own checksum still matches itself.
+    //
+    // So the archived prefix is compared against the file's. This costs a
+    // decompression and a re-read of the session, and it is paid only by a
+    // session that is actually flagged - the steady state reads the flag, finds
+    // it clear, and issues neither.
     if existing.diverged {
+        if !prefix_matches(path, &existing, existing.watermark)? {
+            // Still divergent, and now for a reason a length test cannot see.
+            // Skipped exactly like the shortened case, flag left set.
+            return Err(Error::TranscriptRewritten {
+                path: path.to_path_buf(),
+                watermark: existing.watermark,
+            });
+        }
         set_divergence(store.conn(), &session_key, false)?;
     }
 
@@ -609,6 +624,34 @@ fn path_key(path: &Path) -> Result<String> {
             ),
         )
     })
+}
+
+/// Are the file's first `watermark` bytes the ones already archived?
+///
+/// The question a length test cannot answer, asked only of a session that is
+/// already flagged. `false` means the file at this path is a different file
+/// that happens to be long enough - truncated and rewritten, or replaced
+/// outright - and the archive must not be appended to at the stale offset.
+///
+/// A session with no archived blob cannot disagree with one, so it is treated
+/// as matching: the flag was set for a session whose bytes are gone, and
+/// refusing forever would be a permanent failure with nothing to compare.
+fn prefix_matches(path: &Path, existing: &Existing, watermark: u64) -> Result<bool> {
+    let Some(session) = existing.session.as_ref() else {
+        return Ok(true);
+    };
+    let archived = crate::blob::read_all(&session.blob)?;
+    if (archived.len() as u64) < watermark {
+        // The blob is shorter than the watermark claims. That is a store
+        // inconsistency rather than a transcript one, and `verify` is the
+        // command that reports it - here it simply is not a match.
+        return Ok(false);
+    }
+
+    let mut file = crate::discover::open_transcript(path).map_err(|e| Error::io(path, e))?;
+    let mut head = vec![0u8; watermark as usize];
+    file.read_exact(&mut head).map_err(|e| Error::io(path, e))?;
+    Ok(head == archived[..watermark as usize])
 }
 
 /// Read from the stored watermark to the end of the file.

@@ -191,7 +191,11 @@ fn walk(
                 // transaction has already rolled back, and it is what lets
                 // `verbatim verify` name the divergence instead of it living
                 // only in a `runs` row nobody diffs.
-                if matches!(e, crate::error::Error::TranscriptDiverged { .. }) {
+                if matches!(
+                    e,
+                    crate::error::Error::TranscriptDiverged { .. }
+                        | crate::error::Error::TranscriptRewritten { .. }
+                ) {
                     if let Err(flag) = crate::ingest::flag_divergence(store.conn(), path) {
                         // Same note rather than a second failure: `files_failed`
                         // counts files, and one file must not become two.

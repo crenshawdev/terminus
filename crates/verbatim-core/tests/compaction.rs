@@ -673,6 +673,64 @@ fn a_flagged_transcript_that_grows_again_is_ingested_and_cleared() {
     assert!(tree.verify().is_ok());
 }
 
+/// A file that is long enough and is not the file that was archived stays
+/// flagged, and the archive stays exactly as it was.
+///
+/// The case a length test cannot see. A transcript truncated to half its length
+/// and then written back past its old watermark satisfies "no shorter than the
+/// archive" while every byte between the truncation point and the watermark is
+/// different. Clearing the flag on that would append at the stale offset, so the
+/// archived stream would carry the first half of one file, a hole, and a
+/// fragment of a record - permanently, with `verify` reporting it clean because
+/// the blob still matches its own checksum.
+#[test]
+fn a_transcript_rewritten_under_its_watermark_stays_flagged() {
+    let tree = tree();
+    tree.pass();
+    let before = tree.archived(&tree.subject);
+    tree.truncate();
+    tree.pass();
+    assert!(tree.diverged(&tree.subject));
+
+    // Not `restore`: different bytes, and more of them than the watermark, so
+    // the file passes the length test and fails on content.
+    let mut rewritten = Vec::new();
+    for _ in 0..(tree.original.len() / 40 + 20) {
+        rewritten.extend_from_slice(&testkit::boundary_line());
+        rewritten.push(b'\n');
+    }
+    assert!(
+        rewritten.len() > tree.original.len(),
+        "the rewritten file must clear the watermark, or this tests the length \
+         path instead"
+    );
+    std::fs::write(&tree.subject, &rewritten).unwrap();
+
+    let summary = tree.pass();
+    assert_eq!(
+        summary.files_committed, 0,
+        "a file that is not the archived one must not be appended to: {summary:?}"
+    );
+    assert_eq!(summary.failures.len(), 1, "{summary:?}");
+    assert!(
+        tree.diverged(&tree.subject),
+        "the flag was cleared on a length test alone"
+    );
+    assert_eq!(
+        tree.archived(&tree.subject),
+        before,
+        "the archive moved for a file whose earlier bytes are gone"
+    );
+
+    // The message names the content, not a length the user would check and
+    // find correct.
+    let error = tree.last_run_error().unwrap_or_default();
+    assert!(
+        error.contains("are not the ones archived"),
+        "the failure must say the bytes differ: {error}"
+    );
+}
+
 /// Half of the discrimination the dedicated error variant exists for: the
 /// failure D-13's refusal used to be indistinguishable from.
 ///

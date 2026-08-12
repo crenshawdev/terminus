@@ -33,6 +33,18 @@ pub enum Error {
         watermark: u64,
     },
 
+    /// D-13's other half: the file is long enough but is not the file that was
+    /// archived. A separate variant from [`Error::TranscriptDiverged`] because
+    /// that one's message is about a length, and a transcript that was
+    /// truncated and then written back past its old watermark has the right
+    /// length and the wrong bytes - reporting it as a length mismatch would
+    /// name a number the user can check and find correct.
+    #[error(
+        "{path} is long enough for its watermark at {watermark} but its first \
+         {watermark} bytes are not the ones archived; the archive was left untouched"
+    )]
+    TranscriptRewritten { path: PathBuf, watermark: u64 },
+
     /// STOR-05's refusal. Both integers are named because "unsupported store
     /// format" without them tells the user nothing about which side to move.
     #[error(
