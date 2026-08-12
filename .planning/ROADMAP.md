@@ -13,7 +13,7 @@ The archive is the product, so it is built first and everything else is built on
 - [ ] **Phase 5: Context Injection** - the SessionStart resume brief and precision-first prompt injection
 - [ ] **Phase 6: Feedback Loop** - decision logging, outcome labels, offline replay, and stats that prove precision
 - [ ] **Phase 7: Observations** - mechanical facts, opt-in LLM judgment, and the egress boundary
-- [ ] **Phase 8: Retention And Lifecycle** - retention actions, compaction, usage, snapshots, export and relocation
+- [ ] **Phase 8: Retention And Lifecycle** - retention actions, capture mode, compaction, usage, snapshots, export and relocation
 
 ## Phase Details
 
@@ -32,7 +32,7 @@ The archive is the product, so it is built first and everything else is built on
 ### Phase 2: Ingest At Scale
 **Goal:** Ingest that runs against the real 1,896-file transcript tree: finding every session including subagent sidecars, keying projects correctly, honoring exclusions, and reporting what it did.
 **Depends on:** Phase 1
-**Requirements:** ING-03, ING-04, ING-05, ING-06, ING-07, ING-08, ING-09
+**Requirements:** ING-03, ING-04, ING-05, ING-06, ING-08, ING-09
 **Success Criteria:**
 1. A full pass over the real corpus parses every record with zero panics and zero unparseable lines, and the run's session count includes the 214 subagent sidecar directories a top-level glob misses.
 2. Sessions continued across files are linked, and the count of `continues_from` links is non-zero on the real corpus (the measured rate is 1.2%).
@@ -100,9 +100,9 @@ The archive is the product, so it is built first and everything else is built on
 6. A full run with judgment disabled opens no network connection, shown by a socket-level trace; with judgment enabled against a remote provider, the payload is filtered at egress while the local-provider path filters nothing.
 
 ### Phase 8: Retention And Lifecycle
-**Goal:** A store that can be aged, shrunk, measured, snapshotted, exported and relocated, so it stays healthy over years without manual surgery.
+**Goal:** A store that can be aged, shrunk, measured, snapshotted, exported and relocated, and that can be told how much of each record to keep, so it stays healthy over years without manual surgery.
 **Depends on:** Phase 2
-**Requirements:** RET-01, RET-02, RET-03, RET-04, RET-05, STOR-06, STOR-07, PRIV-04
+**Requirements:** RET-01, RET-02, RET-03, RET-04, RET-05, ING-07, STOR-06, STOR-07, PRIV-04
 **Success Criteria:**
 1. With retention unset, an ingest pass over a corpus older than any plausible default deletes and evicts nothing.
 2. An evicted session still appears in `verbatim sessions` and still matches a search, and `recall_get` on its turns returns `body_evicted`; a deleted session appears in neither.
@@ -110,3 +110,4 @@ The archive is the product, so it is built first and everything else is built on
 4. `verbatim compact` after a delete pass reduces the on-disk store size, and `verbatim usage` reports per-project and per-month byte totals that sum to it.
 5. `verbatim data move` relocates the store to a new path, after which the hooks and MCP server read the new location with no settings.json change.
 6. A snapshot taken during an active ingest opens as a valid store and passes `verbatim verify`.
+7. Ingesting one transcript under each capture mode stores progressively fewer bytes, every elided record carries a mark saying so, and a store ingested under `full` still reproduces the transcript byte for byte. (Moved here from phase 2: eliding at ingest contradicts D-13 and breaks phase 1's byte-for-byte blob invariant in the phase that first ingests the real corpus, and elision is already this phase's subject.)
