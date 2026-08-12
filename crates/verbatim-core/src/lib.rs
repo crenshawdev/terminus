@@ -8,6 +8,7 @@
 
 pub mod blob;
 pub mod error;
+pub mod ingest;
 pub mod parse;
 pub mod store;
 

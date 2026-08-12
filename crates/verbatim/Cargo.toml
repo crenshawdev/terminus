@@ -14,3 +14,11 @@ path = "src/main.rs"
 [dependencies]
 verbatim-core.workspace = true
 lexopt.workspace = true
+
+[dev-dependencies]
+# The binary tests need the fixture corpus and the seeded Rng the library's
+# testkit already owns; a `tests/common` module duplicated per test binary was
+# the alternative (`.planning/phases/1/PLAN-1.md`, task 2).
+verbatim-core = { workspace = true, features = ["testkit"] }
+rusqlite.workspace = true
+tempfile = "3"

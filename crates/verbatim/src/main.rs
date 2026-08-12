@@ -5,12 +5,23 @@
 
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: verbatim [--version]";
+mod cmd;
+
+use cmd::Failure;
+
+const USAGE: &str = "usage: verbatim [--version] <command>\n\
+                     \n\
+                     commands:\n  \
+                       ingest <path.jsonl>   archive one transcript file";
 
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(Misuse(msg)) => {
+        Err(Failure::Operational(msg)) => {
+            eprintln!("verbatim: {msg}");
+            ExitCode::from(1)
+        }
+        Err(Failure::Misuse(msg)) => {
             eprintln!("verbatim: {msg}");
             eprintln!("{USAGE}");
             ExitCode::from(2)
@@ -18,23 +29,22 @@ fn main() -> ExitCode {
     }
 }
 
-/// A misuse of the command line. Exit code 2, message on stderr, stdout empty.
-struct Misuse(String);
-
-fn run() -> Result<(), Misuse> {
+fn run() -> Result<(), Failure> {
     use lexopt::prelude::*;
 
     let mut parser = lexopt::Parser::from_env();
     let mut show_version = false;
-    while let Some(arg) = parser.next().map_err(|e| Misuse(e.to_string()))? {
+    while let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
         match arg {
             Short('V') | Long("version") => show_version = true,
             // Usage is what this binary prints with no subcommand, so `--help`
             // needs no arm of its own beyond being accepted.
             Short('h') | Long("help") => {}
-            // Subcommands arrive one per task in PLAN-2 (`ingest`, `verify`,
-            // `reindex`); until then every value is an unrecognized argument.
-            other => return Err(Misuse(unexpected(other))),
+            // A subcommand takes over the rest of the command line: the parser
+            // is handed on rather than re-created, so `ingest -- --odd-name`
+            // reaches the subcommand's own rules.
+            Value(name) => return dispatch(&name.to_string_lossy(), &mut parser),
+            other => return Err(Failure::Misuse(unexpected(other))),
         }
     }
 
@@ -46,7 +56,14 @@ fn run() -> Result<(), Misuse> {
     Ok(())
 }
 
-fn unexpected(arg: lexopt::Arg<'_>) -> String {
+fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
+    match name {
+        "ingest" => cmd::ingest::run(cmd::ingest::parse(parser)?),
+        other => Err(Failure::Misuse(format!("unknown command '{other}'"))),
+    }
+}
+
+pub(crate) fn unexpected(arg: lexopt::Arg<'_>) -> String {
     match arg {
         lexopt::Arg::Short(c) => format!("unexpected argument '-{c}'"),
         lexopt::Arg::Long(name) => format!("unexpected argument '--{name}'"),

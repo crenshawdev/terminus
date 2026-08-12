@@ -431,6 +431,8 @@ name = "verbatim"
 version = "0.1.0"
 dependencies = [
  "lexopt",
+ "rusqlite",
+ "tempfile",
  "verbatim-core",
 ]
 
