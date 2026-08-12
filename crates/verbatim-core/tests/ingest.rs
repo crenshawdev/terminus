@@ -158,7 +158,10 @@ fn a_sidecar_reporting_its_parents_session_id_gets_its_own_row() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(ids.len(), 2);
-    assert_eq!(ids[0], ids[1], "the fixture pair must collide on session_id");
+    assert_eq!(
+        ids[0], ids[1],
+        "the fixture pair must collide on session_id"
+    );
 }
 
 /// AC1 / STOR-01. A turn that fits in one block costs one block; the 200 KB
@@ -307,7 +310,10 @@ fn resuming_from_a_mid_line_watermark_converges_on_a_single_pass() {
         .map(Result::unwrap)
         .collect()
     };
-    assert_eq!(turns_of(&second.session_key), turns_of(&reference.session_key));
+    assert_eq!(
+        turns_of(&second.session_key),
+        turns_of(&reference.session_key)
+    );
     assert_eq!(turns_of(&second.session_key).len(), 8);
 
     assert_eq!(
@@ -336,7 +342,10 @@ fn two_paths_to_one_transcript_produce_one_session() {
         .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
         .unwrap();
     assert_eq!(sessions, 1, "the symlinked path opened a second session");
-    assert_eq!(first.session_key, path.canonicalize().unwrap().to_str().unwrap());
+    assert_eq!(
+        first.session_key,
+        path.canonicalize().unwrap().to_str().unwrap()
+    );
 }
 
 /// D-11. `continues_from` comes from the record's foreign `session_id`, which
@@ -488,5 +497,82 @@ fn a_pass_moves_the_session_its_turns_and_its_watermark_together() {
             "runs"
         ],
         "a pass must move exactly these tables"
+    );
+}
+
+/// An archived session whose `session_meta` row is missing is DAMAGED, not
+/// absent, and re-ingesting it must refuse rather than start over.
+///
+/// The lookup used an inner join, so "no metadata row" and "never ingested"
+/// were the same answer. A pass over a grown transcript then wrote the tail as
+/// the whole blob - destroying every archived byte before it - allocated a
+/// second `session_no` that no longer matched the `sessions` row, and left the
+/// watermark ahead of the committed blob, which is the one state STOR-02 says
+/// a store must never reach. It exited 0, and `verify` certified it, because
+/// the checksum had been minted over the truncated stream. The obvious
+/// response to `verify` naming a session - re-run ingest - was what destroyed
+/// the archive.
+#[test]
+fn a_session_that_lost_its_metadata_row_is_refused_rather_than_re_ingested() {
+    let bench = bench();
+    let path = testkit::copy_fixture_into("session-truncated.jsonl", &bench.work);
+    match ingest::run(&bench.data_dir, &path).unwrap() {
+        Outcome::Committed(_) => {}
+        other => panic!("{other:?}"),
+    }
+
+    let db = bench.data_dir.join(DB_FILE_NAME);
+    let (blob_before, watermark_before, session_no_before) = {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("DELETE FROM session_meta", []).unwrap();
+        let blob: Vec<u8> = conn
+            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        let watermark: i64 = conn
+            .query_row("SELECT byte_offset FROM watermarks", [], |r| r.get(0))
+            .unwrap();
+        let session_no: i64 = conn
+            .query_row("SELECT session_no FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        (blob, watermark, session_no)
+    };
+
+    // Grow the transcript, exactly as a live session grows between passes.
+    std::fs::write(&path, testkit::fixture_bytes("session-basic.jsonl")).unwrap();
+    let err = ingest::run(&bench.data_dir, &path)
+        .expect_err("re-ingesting a session with no metadata row must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("session_meta"),
+        "the refusal must name what is missing: {message}"
+    );
+
+    // The archive is exactly as it was.
+    let conn = Connection::open(&db).unwrap();
+    let blob_after: Vec<u8> = conn
+        .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        blob_after == blob_before,
+        "the refused pass rewrote the blob"
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "the refused pass added a second session row"
+    );
+    assert_eq!(
+        conn.query_row("SELECT session_no FROM sessions", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        session_no_before
+    );
+    assert_eq!(
+        conn.query_row("SELECT byte_offset FROM watermarks", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        watermark_before,
+        "the refused pass moved the watermark past the committed blob"
     );
 }

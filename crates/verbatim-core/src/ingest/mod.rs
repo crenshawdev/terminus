@@ -103,11 +103,7 @@ pub(crate) fn ingest_locked(store: &mut Store, path: &Path, started: Instant) ->
     let (bytes, checksum, uncompressed_len) = match &existing.session {
         Some(session) => {
             let appended = blob::append(&session.blob, &session.checksum, fresh)?;
-            (
-                appended.bytes,
-                appended.checksum,
-                appended.uncompressed_len,
-            )
+            (appended.bytes, appended.checksum, appended.uncompressed_len)
         }
         None => {
             let written = blob::write(fresh)?;
@@ -303,21 +299,50 @@ impl Existing {
             |r| r.get(0),
         )?;
 
+        // LEFT JOIN, and the difference is the archive. An inner join returns
+        // no row in two very different situations - this transcript has never
+        // been ingested, and this transcript IS archived but lost its
+        // `session_meta` row - and the caller reads "no row" as "brand new". A
+        // pass over a grown transcript then wrote the TAIL as the whole blob,
+        // destroying every archived byte before it, allocated a second
+        // `session_no` that no longer matched the `sessions` row, and left the
+        // watermark ahead of the committed blob: the one state STOR-02 says a
+        // store must never reach, reached by a pass that exits 0. `verify` then
+        // certified it, because the checksum had been minted over the truncated
+        // stream - so the obvious response to `verify` naming a session (re-run
+        // ingest) was what destroyed it.
         let session = conn
             .query_row(
                 "SELECT s.session_no, s.blob, m.checksum
-                 FROM sessions s JOIN session_meta m USING (session_key)
+                 FROM sessions s LEFT JOIN session_meta m USING (session_key)
                  WHERE s.session_key = ?1",
                 [session_key],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
                         r.get::<_, Vec<u8>>(1)?,
-                        r.get::<_, Vec<u8>>(2)?,
+                        r.get::<_, Option<Vec<u8>>>(2)?,
                     ))
                 },
             )
             .optional()?;
+
+        // An archived session with no metadata row is damaged, not absent.
+        // Phase 1 refuses rather than guessing: there is no checksum to verify
+        // the stored bytes against, and `blob::append` requires one precisely
+        // so that a growing session cannot have corruption written into it.
+        let session = match session {
+            Some((_, _, None)) => {
+                return Err(Error::NotAStore {
+                    path: session_key.into(),
+                    detail: "session is archived but has no session_meta row; \
+                             run `verbatim verify` - refusing to overwrite its blob"
+                        .into(),
+                })
+            }
+            Some((session_no, blob, Some(checksum))) => Some((session_no, blob, checksum)),
+            None => None,
+        };
 
         let session = match session {
             Some((session_no, blob, checksum)) => Some(ExistingSession {
@@ -374,7 +399,8 @@ fn read_tail(path: &Path, watermark: u64) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(watermark))
         .map_err(|e| Error::io(path, e))?;
     let mut buffer = Vec::with_capacity((len - watermark) as usize);
-    file.read_to_end(&mut buffer).map_err(|e| Error::io(path, e))?;
+    file.read_to_end(&mut buffer)
+        .map_err(|e| Error::io(path, e))?;
     Ok(buffer)
 }
 

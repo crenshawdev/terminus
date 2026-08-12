@@ -25,10 +25,21 @@ use crate::store::{
 };
 
 /// What a rebuild produced.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rebuilt {
     pub sessions: usize,
     pub turns: usize,
+    /// Sessions whose blob would not decompress, and why.
+    ///
+    /// Skipped rather than fatal, and that distinction is the whole of
+    /// `DESIGN-BRIEF.md:98`: one damaged session means "this session is
+    /// damaged", never "the store is gone". A `?` here aborted the entire
+    /// rebuild on the first bad blob, named no session, and - because
+    /// [`open_up_to_date`] runs on the ingest path - stopped every future
+    /// ingest of every other transcript the moment `DERIVED_SCHEMA` was
+    /// bumped. The archive is truth and a corrupt blob is not recoverable
+    /// here, so the rebuild carries on and reports.
+    pub failed: Vec<(String, String)>,
 }
 
 /// Drop every derived table and rebuild it from the session blobs.
@@ -62,7 +73,16 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
     let mut rebuilt = Rebuilt::default();
     for (session_key, session_no, bytes) in sessions {
         rebuilt.sessions += 1;
-        let stream = blob::read_all(&bytes)?;
+        let stream = match blob::read_all(&bytes) {
+            Ok(stream) => stream,
+            Err(e) => {
+                // Named and skipped. `verify` is the command that reports this
+                // in detail; a rebuild that stopped here would take every
+                // undamaged session down with it.
+                rebuilt.failed.push((session_key, e.to_string()));
+                continue;
+            }
+        };
         let scan = parse::scan(&stream);
         for (record, turn) in scan.turns() {
             let from = record.offset as usize;

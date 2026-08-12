@@ -119,10 +119,16 @@ fn the_rebuild_reads_nothing_but_the_blobs() {
     // any of this would carry it forward.
     {
         let conn = bench.conn();
-        conn.execute("UPDATE turns SET record_type = 'wrong', ts = 'nonsense'", [])
-            .unwrap();
-        conn.execute("DELETE FROM turns_fts WHERE rowid IN (SELECT id FROM turns)", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE turns SET record_type = 'wrong', ts = 'nonsense'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM turns_fts WHERE rowid IN (SELECT id FROM turns)",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO paths (turn_id, path) SELECT id, '/invented' FROM turns",
             [],
@@ -211,9 +217,12 @@ fn an_ingest_brings_an_older_store_forward_first() {
 
     let conn = bench.conn();
     assert_eq!(
-        conn.query_row("SELECT value FROM meta WHERE key = ?1", [META_DERIVED_SCHEMA], |r| r
-            .get::<_, String>(0))
-            .unwrap(),
+        conn.query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [META_DERIVED_SCHEMA],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
         DERIVED_SCHEMA.to_string()
     );
     // The rebuild restored the turns the setup deleted, and the new file added
@@ -247,5 +256,82 @@ fn the_version_integers_move_with_the_rebuild() {
     assert_eq!(
         store.meta_int(META_DERIVED_SCHEMA).unwrap(),
         Some(DERIVED_SCHEMA)
+    );
+}
+
+/// One damaged blob must not take every undamaged session down with it.
+///
+/// A `?` on the decompression aborted the whole rebuild on the first bad blob
+/// and named no session. Worse, `open_up_to_date` runs on the ingest path, so
+/// once `DERIVED_SCHEMA` was bumped a single corrupt session stopped every
+/// future ingest of every other transcript, with no repair path in phase 1.
+/// `DESIGN-BRIEF.md:98`: "this session is damaged", never "the store is gone".
+#[test]
+fn a_corrupt_blob_is_skipped_and_named_rather_than_stopping_the_rebuild() {
+    let bench = bench();
+    let db = bench.data_dir.join(DB_FILE_NAME);
+
+    let (damaged, undamaged): (String, i64) = {
+        let conn = Connection::open(&db).unwrap();
+        let key: String = conn
+            .query_row(
+                "SELECT session_key FROM sessions ORDER BY session_no",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let others: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE session_key <> ?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(others > 0, "this test needs more than one ingested session");
+
+        let mut blob: Vec<u8> = conn
+            .query_row(
+                "SELECT blob FROM sessions WHERE session_key = ?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Inside the payload, so the header still parses and the failure lands
+        // where a real bit-rot would: in the decompressor.
+        for byte in blob.iter_mut().skip(60).take(150) {
+            *byte = 0;
+        }
+        conn.execute(
+            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
+            rusqlite::params![blob, &key],
+        )
+        .unwrap();
+        (key, others)
+    };
+
+    let mut store = Store::open(&bench.data_dir).unwrap();
+    let rebuilt =
+        reindex::reindex(&mut store).expect("one damaged session must not fail the rebuild");
+
+    assert_eq!(
+        rebuilt.failed.len(),
+        1,
+        "expected exactly one skipped session"
+    );
+    assert_eq!(
+        rebuilt.failed[0].0, damaged,
+        "the skipped session must be named"
+    );
+    assert!(rebuilt.turns > 0, "the undamaged sessions were not rebuilt");
+
+    let sessions_with_turns: i64 = store
+        .conn()
+        .query_row("SELECT count(DISTINCT session_key) FROM turns", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        sessions_with_turns, undamaged,
+        "every session but the damaged one must have its turns back"
     );
 }

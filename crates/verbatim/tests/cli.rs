@@ -116,7 +116,10 @@ fn verify_names_the_corrupt_session_and_no_other() {
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
 
     let text = stdout(&out);
-    assert!(text.contains(&sidecar), "stdout must name the corrupt session: {text}");
+    assert!(
+        text.contains(&sidecar),
+        "stdout must name the corrupt session: {text}"
+    );
     assert!(
         !text.contains(&parent),
         "stdout named a session that verified: {text}"
@@ -293,4 +296,64 @@ fn misuse_exits_two_with_an_empty_stdout() {
         );
         assert_eq!(stdout(&out), "", "misuse must print nothing to stdout");
     }
+}
+
+/// `reindex` drops and recreates all four derived tables, which is the most
+/// destructive thing phase 1 does, and it was running without the ingest lock.
+/// That made false the invariant `ingest` rests on - that the LOCK guard makes
+/// it the only writer, so nothing changes the store between its read and its
+/// write. The race runs both ways: a reindex could drop the tables under a
+/// hook-spawned ingest, or lose the SQLite write lock to one and die on the
+/// busy timeout with a raw "database is locked", which is the wait D-15 exists
+/// to avoid.
+#[test]
+fn reindex_refuses_while_another_process_holds_the_ingest_lock() {
+    let bench = bench();
+    bench.ingest("session-basic.jsonl");
+
+    let turns_before = {
+        let conn = Connection::open(bench.data_dir.join(DB_FILE_NAME)).unwrap();
+        conn.query_row("SELECT count(*) FROM turns", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    assert!(turns_before > 0, "this test needs turn rows to protect");
+
+    let guard = match verbatim_core::ingest::lock::try_acquire(&bench.data_dir).unwrap() {
+        verbatim_core::ingest::Attempt::Acquired(guard) => guard,
+        other => panic!("the lock should have been free: {other:?}"),
+    };
+
+    let out = bench.run(&["reindex"]);
+    assert!(
+        !out.status.success(),
+        "reindex ran while the ingest lock was held: {}",
+        stderr(&out)
+    );
+    let message = stderr(&out);
+    assert!(
+        message.contains("LOCK"),
+        "the refusal must name the lock: {message}"
+    );
+    assert!(
+        !message.contains("database is locked"),
+        "reindex waited on the SQLite busy handler instead of the lock: {message}"
+    );
+
+    // Nothing was dropped.
+    let conn = Connection::open(bench.data_dir.join(DB_FILE_NAME)).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM turns", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        turns_before,
+        "the refused reindex still dropped the derived tables"
+    );
+
+    // And it works again once the lock is free.
+    drop(guard);
+    let out = bench.run(&["reindex"]);
+    assert!(
+        out.status.success(),
+        "reindex failed with the lock free: {}",
+        stderr(&out)
+    );
 }
