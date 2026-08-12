@@ -20,6 +20,18 @@ pub fn run(args: Args) -> Result<(), Failure> {
             // (ING-02), and a transcript with no new complete record is the
             // steady state.
             Outcome::LockHeld | Outcome::UpToDate | Outcome::Committed(_) => Ok(()),
+            // Named on stderr, and exit 0: nothing was read and nothing is
+            // wrong. A user who names a file by hand is owed the reason it
+            // produced no archive, where the hook spawning this per file is
+            // owed silence on stdout.
+            Outcome::Excluded(project) => {
+                eprintln!(
+                    "skipped {}: inside the excluded project {}",
+                    transcript.display(),
+                    project.display()
+                );
+                Ok(())
+            }
         },
         Args::Tree => tree(&data_dir),
     }

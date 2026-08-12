@@ -318,3 +318,99 @@ fn the_path_test_covers_the_subtree_and_stops_at_a_segment_boundary() {
     assert!(excluding(&["/data/projects/cadence/"])
         .excludes_path(Path::new("/data/projects/cadence/sub")));
 }
+
+/// The two entry points read the same configured string, so they must agree
+/// about which projects it names.
+///
+/// `excludes_path` compares components and has always been indifferent to how
+/// a path is spelled; `excludes_encoded_dir` compares a string the encoding
+/// produced, where every spelling is a different name and only one can equal a
+/// real project directory's. Unnormalized, a trailing separator is the whole
+/// ING-08 failure: the pre-open test never matches, so every file in the
+/// project is opened and archived, and only the read path hides it afterwards.
+#[test]
+fn a_differently_spelled_exclusion_is_the_same_exclusion_to_both_tests() {
+    for spelling in [
+        "/data/projects/cadence/",
+        "/data/projects//cadence",
+        "/data/projects/./cadence",
+    ] {
+        let config = excluding(&[spelling]);
+        assert!(
+            config.excludes_encoded_dir("-data-projects-cadence"),
+            "the pre-open test lost `{spelling}`, so the project would be read"
+        );
+        assert!(
+            config.excludes_path(Path::new("/data/projects/cadence/sub")),
+            "the read test lost `{spelling}`"
+        );
+        assert_eq!(
+            config.exclusions(),
+            ["/data/projects/cadence"],
+            "`{spelling}` is reported to the user in the form both tests use"
+        );
+    }
+}
+
+/// An exclusion naming nothing is dropped rather than kept as an empty string,
+/// which every encoded name has as a prefix.
+#[test]
+fn an_exclusion_that_names_nothing_is_dropped() {
+    let config = excluding(&["", "/data/projects/cadence"]);
+
+    assert_eq!(config.exclusions(), ["/data/projects/cadence"]);
+    assert!(!config.excludes_encoded_dir("-data-projects-hindsight"));
+    assert!(!config.excludes_path(Path::new("/data/projects/hindsight")));
+}
+
+/// Excluding the filesystem root means "read nothing", and both tests say so.
+///
+/// The encoded test needs this stated: root encodes to a bare separator, and
+/// `-data` extends `-` with no second separator between them, because for root
+/// the separator IS the encoding. `excludes_path` already reads `/` this way,
+/// so without it the one exclusion that means "read nothing" would be the one
+/// that reads everything and hides it afterwards.
+#[test]
+fn excluding_the_root_excludes_every_project() {
+    let config = excluding(&["/"]);
+
+    assert!(config.excludes_encoded_dir("-data-projects-cadence"));
+    assert!(config.excludes_encoded_dir("-home-john--claude"));
+    assert!(config.excludes_path(Path::new("/data/projects/cadence")));
+}
+
+/// `..` and a leading `~` are spellings a user writes, and neither predicate
+/// can match either one left standing.
+///
+/// This is worse than the trailing separator above rather than the same bug: a
+/// trailing separator at least still hid the sessions on the read path, while
+/// an exclusion carrying `..` matches nothing anywhere, so the project is read,
+/// archived and searchable with nothing anywhere reporting that the exclusion
+/// did not take.
+#[test]
+fn an_exclusion_spelled_with_a_parent_or_a_tilde_still_names_its_project() {
+    let config = excluding(&["/data/projects/../projects/cadence"]);
+    assert_eq!(config.exclusions(), ["/data/projects/cadence"]);
+    assert!(config.excludes_encoded_dir("-data-projects-cadence"));
+    assert!(config.excludes_path(Path::new("/data/projects/cadence/sub")));
+
+    let encoded = |path: &Path| verbatim_core::config::encode(path.to_str().unwrap());
+    let home = home();
+    let config = excluding(&["~/code/demo"]);
+    assert_eq!(
+        config.exclusions(),
+        [home.join("code").join("demo").to_str().unwrap()]
+    );
+    assert!(config.excludes_encoded_dir(&encoded(&home.join("code").join("demo"))));
+    assert!(config.excludes_path(&home.join("code").join("demo").join("sub")));
+
+    // A relative exclusion names no project - a project directory encodes a
+    // `cwd`, which is always absolute - so it is dropped rather than kept as an
+    // exclusion that silently matches nothing.
+    for relative in ["../cadence", "code/demo", "cadence", "~john/code/demo"] {
+        assert!(
+            excluding(&[relative]).exclusions().is_empty(),
+            "`{relative}` was kept as an exclusion no path can match"
+        );
+    }
+}

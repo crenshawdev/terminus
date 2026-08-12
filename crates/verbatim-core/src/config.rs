@@ -26,6 +26,12 @@
 //! [`Config::excludes_path`] answers wherever a real filesystem path is
 //! available, and there it is an ordinary subtree match on path components,
 //! which is unambiguous. That is the read-side predicate (D-23).
+//!
+//! Both read the same configured strings, so those strings are normalized once
+//! ([`normalize`]) before either sees them. The component test is indifferent
+//! to a trailing separator and the encoded test is not, and two predicates that
+//! disagree about which projects are excluded is precisely the read-then-filter
+//! ING-08 forbids.
 
 use std::path::{Path, PathBuf};
 
@@ -131,6 +137,7 @@ impl Config {
     /// A config built in memory, for callers that have no file. Test support
     /// and nothing else uses this today.
     pub fn from_parts(roots: Vec<PathBuf>, exclusions: Vec<String>) -> Config {
+        let exclusions: Vec<String> = exclusions.iter().filter_map(|e| normalize(e)).collect();
         let encoded_exclusions = exclusions.iter().map(|e| fold(&encode(e))).collect();
         Config {
             roots,
@@ -167,6 +174,18 @@ impl Config {
         &self.exclusions
     }
 
+    /// Does the config exclude every project there can be?
+    ///
+    /// True only for an exclusion that is the filesystem root, which is the one
+    /// the encoded test cannot express on its own: root encodes to a bare
+    /// separator, and `-data` extends `-` with no second separator between them
+    /// because for root the separator IS the encoding. [`Config::excludes_path`]
+    /// already reads `/` as the whole tree, so without this the two predicates
+    /// would disagree on the single exclusion that means "read nothing".
+    pub fn excludes_everything(&self) -> bool {
+        self.exclusions.iter().any(|e| is_filesystem_root(e))
+    }
+
     /// The pre-open test (D-09, D-22): is this encoded project directory name
     /// excluded?
     ///
@@ -198,6 +217,9 @@ impl Config {
             .iter()
             .zip(&self.encoded_exclusions)
             .any(|(excluded, encoded)| {
+                if is_filesystem_root(excluded) {
+                    return true;
+                }
                 if name == *encoded {
                     return true;
                 }
@@ -227,6 +249,80 @@ impl Config {
                 && candidate[..prefix.len()] == prefix[..]
         })
     }
+}
+
+/// One configured exclusion, reduced to the single spelling both predicates
+/// agree on - or `None` when it names nothing.
+///
+/// The two entry points disagree about spelling unless something makes them
+/// agree here. [`Config::excludes_path`] compares path *components*, so
+/// `/data/code/demo/`, `/data/code//demo` and `/data/code/./demo` are all the
+/// same subtree to it. [`Config::excludes_encoded_dir`] compares an *encoded
+/// string*, where each of those encodes to a different name and only one of
+/// them can equal a real project directory's. Left unnormalized, a trailing
+/// separator is the whole read-then-filter failure ING-08 forbids: the
+/// pre-open test never matches, every file in the project is opened and
+/// archived, and only the read path hides it afterwards.
+///
+/// Walking the components rebuilds the path in the form `excludes_path`
+/// already reads, which is what makes the encoding of it meaningful. `..` is
+/// resolved here rather than left standing, and a leading `~` is expanded:
+/// both are spellings a user writes and neither can ever match, so left alone
+/// they are an exclusion that fails silently OPEN - strictly worse than the
+/// trailing separator above, which at least still hid the sessions.
+///
+/// Resolving `..` lexically rather than through the filesystem is deliberate.
+/// The excluded directory is frequently gone - the whole worktree case is
+/// exactly that (D-06) - and an exclusion must not stop meaning what it says
+/// because the directory it names was deleted.
+///
+/// An exclusion that reduces to nothing at all is dropped rather than kept as
+/// an empty string, which prefixes every name there is.
+fn normalize(raw: &str) -> Option<String> {
+    let expanded = match raw.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            home_dir().ok()?.join(rest.trim_start_matches('/'))
+        }
+        _ => PathBuf::from(raw),
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in expanded.components() {
+        match component {
+            // `/a/../b` is `/b`, and `/..` is `/`: popping nothing at the root
+            // is what the kernel does too.
+            std::path::Component::ParentDir => {
+                if !normalized.pop() && normalized.as_os_str().is_empty() {
+                    return None;
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => normalized.push(other),
+        }
+    }
+
+    // A relative exclusion names no project. Both predicates compare against
+    // absolute paths - a project directory encodes a `cwd`, which is always
+    // absolute - so `code/demo` matches nothing, anywhere, forever. Dropping it
+    // is not worse than keeping it and is at least one consistent answer.
+    if !normalized.has_root() {
+        return None;
+    }
+
+    let text = normalized.into_os_string().into_string().ok()?;
+    (!text.is_empty()).then_some(text)
+}
+
+/// Is this exclusion the filesystem root - the one that means "read nothing"?
+///
+/// `RootDir` and nothing else. Not `Path::parent().is_none()`, which is also
+/// true of a Windows prefix with no directory below it (`C:`,
+/// `\\server\share`): those name a real subtree that [`Config::excludes_path`]
+/// matches component-wise, so answering "everything" for them would put the two
+/// predicates back into exactly the disagreement [`normalize`] exists to end.
+fn is_filesystem_root(path: &str) -> bool {
+    let mut components = Path::new(path).components();
+    components.next() == Some(std::path::Component::RootDir) && components.next().is_none()
 }
 
 /// D-07's encoding: every character outside `[A-Za-z0-9]` becomes `-`.

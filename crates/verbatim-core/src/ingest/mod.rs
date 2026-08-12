@@ -41,6 +41,12 @@ pub enum Outcome {
     /// The transcript has no complete record past the stored watermark. No row
     /// is added anywhere, not even to `runs`.
     UpToDate,
+    /// The transcript is inside a project the config excludes, named with the
+    /// directory that excluded it. Nothing was opened and nothing was written.
+    ///
+    /// Only [`run`] produces this: `ingest_locked` is reached from the pass
+    /// only for a file discovery already cleared.
+    Excluded(PathBuf),
     /// The pass committed.
     Committed(Pass),
 }
@@ -56,8 +62,22 @@ pub struct Pass {
     pub watermark: u64,
 }
 
-/// Ingest one transcript into the store under `data_dir`.
+/// Ingest one transcript into the store under `data_dir`, honoring the
+/// configured exclusions.
 pub fn run(data_dir: &Path, transcript: &Path) -> Result<Outcome> {
+    let config = crate::config::Config::load()?;
+    run_with(data_dir, transcript, &config)
+}
+
+/// The single-file ingest, against a config the caller already has.
+///
+/// The seam tests use, mirroring [`pass::run_with`], so a test never has to
+/// place a `verbatim.toml` to say which projects are off limits.
+pub fn run_with(
+    data_dir: &Path,
+    transcript: &Path,
+    config: &crate::config::Config,
+) -> Result<Outcome> {
     let started = Instant::now();
 
     // Before anything else, and resolving symlinks: `~/.claude` is a symlink
@@ -67,6 +87,14 @@ pub fn run(data_dir: &Path, transcript: &Path) -> Result<Outcome> {
     let canonical = transcript
         .canonicalize()
         .map_err(|e| Error::io(transcript, e))?;
+
+    // Before the lock, and long before the open. The tree pass decides this at
+    // the project directory it declines to descend into (D-22); named one file,
+    // there is no walk to decide it, and skipping the test here would make
+    // `verbatim ingest <path>` the way around an exclusion the pass honors.
+    if let Some(project) = crate::discover::excluded_project_of(config, &canonical) {
+        return Ok(Outcome::Excluded(project));
+    }
 
     let _guard = match lock::try_acquire(data_dir)? {
         Attempt::Held => return Ok(Outcome::LockHeld),

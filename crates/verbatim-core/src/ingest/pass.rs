@@ -175,9 +175,10 @@ fn walk(
                 // small transcripts nearly never.
                 crate::ingest::fault::stall_after_files(summary.files_committed);
             }
-            // Nothing new past the watermark, or - unreachable here, since this
-            // pass holds the lock - a lock this process already owns.
-            Ok(Outcome::UpToDate) | Ok(Outcome::LockHeld) => {}
+            // Nothing new past the watermark, or - both unreachable here - a
+            // lock this process already owns, and an exclusion only the
+            // single-file entry point tests, on files this walk never yielded.
+            Ok(Outcome::UpToDate | Outcome::LockHeld | Outcome::Excluded(_)) => {}
             Err(e) => {
                 // Recorded and skipped. The tree is the unit of work; one
                 // damaged transcript is not a reason to archive none of it.

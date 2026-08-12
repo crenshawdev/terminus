@@ -483,3 +483,98 @@ fn a_damaged_file_shows_up_in_the_passs_own_runs_row() {
     assert!(error.contains(shrunk.to_str().unwrap()), "{error}");
     assert!(error.contains("watermark"), "{error}");
 }
+
+/// The exclusion the pass honors is not one `verbatim ingest <path>` walks
+/// around.
+///
+/// The tree pass decides exclusion at the project directory it declines to
+/// descend into, and the single-file entry point has no walk behind it to
+/// decide anything. Left to discovery alone, naming the file by hand - which is
+/// the shape phase 4's hooks call - reads and archives a project the user said
+/// never to read, and only the read path hides it afterwards. That is
+/// read-then-filter, which ING-08 forbids.
+#[test]
+fn naming_an_excluded_transcript_by_hand_reads_nothing() {
+    let bench = bench();
+    let path = bench.place(
+        PROJECT,
+        &format!("{}.jsonl", uuid(1)),
+        "session-basic.jsonl",
+    );
+
+    let config = bench.config(&["/data/projects/cadence"]);
+    assert_eq!(
+        ingest::run_with(&bench.data_dir, &path, &config).unwrap(),
+        ingest::Outcome::Excluded(bench.projects().canonicalize().unwrap().join(PROJECT)),
+    );
+
+    assert!(
+        discover::opened::under(&path).is_empty(),
+        "the transcript was opened: {:?}",
+        discover::opened::under(&path)
+    );
+    assert!(
+        !bench.data_dir.join(DB_FILE_NAME).exists(),
+        "an excluded transcript wrote a store"
+    );
+
+    // The same call with nothing excluded is the control: the file is a real
+    // transcript and the refusal above is the exclusion, not the fixture.
+    match ingest::run_with(&bench.data_dir, &path, &bench.config(&[])).unwrap() {
+        ingest::Outcome::Committed(_) => {}
+        other => panic!("the same transcript did not commit unexcluded: {other:?}"),
+    }
+    assert!(!discover::opened::under(&path).is_empty());
+}
+
+/// A transcript outside every configured root is still tested, by name, at each
+/// of its ancestors.
+///
+/// There is no project directory to identify when nothing is under a root, and
+/// the crash harness and the lock race both name files in temporary
+/// directories. Imprecise toward "do not read" is the direction the pre-open
+/// test already chose.
+#[test]
+fn an_excluded_transcript_under_no_configured_root_is_still_refused() {
+    let bench = bench();
+    let outside = bench.data_dir.parent().unwrap().join("elsewhere");
+    let project = outside.join(PROJECT);
+    std::fs::create_dir_all(&project).unwrap();
+    let path = project.join(format!("{}.jsonl", uuid(1)));
+    std::fs::copy(testkit::fixture_path("session-basic.jsonl"), &path).unwrap();
+    let path = path.canonicalize().unwrap();
+
+    let config = bench.config(&["/data/projects/cadence"]);
+    assert!(matches!(
+        ingest::run_with(&bench.data_dir, &path, &config).unwrap(),
+        ingest::Outcome::Excluded(_)
+    ));
+    assert!(discover::opened::under(&path).is_empty());
+}
+
+/// An exclusion spelled with a trailing separator is the same exclusion.
+///
+/// It is `excludes_path`'s spelling either way, so before normalization this
+/// pass archived the project in full while every read path hid it - the exact
+/// write-then-hide split `.planning/PROJECT.md` names the incumbent for.
+#[test]
+fn an_exclusion_with_a_trailing_separator_is_honored_before_the_open() {
+    let bench = bench();
+    let path = bench.place(
+        PROJECT,
+        &format!("{}.jsonl", uuid(1)),
+        "session-basic.jsonl",
+    );
+
+    let summary = bench.pass(&["/data/projects/cadence/"]);
+    assert_eq!(summary.files_walked, 0, "the excluded project was walked");
+    assert_eq!(
+        summary.excluded,
+        vec![bench.projects().canonicalize().unwrap().join(PROJECT)]
+    );
+    assert!(
+        discover::opened::under(&path).is_empty(),
+        "the transcript was opened: {:?}",
+        discover::opened::under(&path)
+    );
+}

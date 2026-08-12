@@ -287,3 +287,135 @@ fn opening_a_transcript_records_its_path() {
     assert!(discover::open_transcript(&missing).is_err());
     assert_eq!(discover::opened::under(&root), vec![path, missing]);
 }
+
+/// A link is not a way into an excluded project.
+///
+/// The project directory's name is what the pre-open test sees, and a symlink's
+/// name says nothing about where its bytes live. `entries` reads `is_dir`
+/// without following links precisely so a symlinked directory is never
+/// descended - which leaves a symlinked FILE looking like an ordinary
+/// transcript sitting in a project the config permits, while `File::open`
+/// follows it into one the config forbids.
+#[test]
+fn a_symlinked_transcript_reaching_into_an_excluded_project_is_not_yielded() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("claude").join("projects");
+    let repo = dir.path().join("data").join("projects").join("cadence");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let encoded = |path: &Path| verbatim_core::config::encode(path.to_str().unwrap());
+    let excluded = root.join(encoded(&repo));
+    let permitted = root.join(encoded(
+        &dir.path().join("data").join("projects").join("hindsight"),
+    ));
+    touch(&excluded.join(format!("{UUID_A}.jsonl")));
+    std::fs::create_dir_all(&permitted).unwrap();
+
+    // The link sits at project depth in a project nothing excludes, under a
+    // name that is a transcript's, and points at the excluded project's file.
+    let link = permitted.join(format!("{UUID_B}.jsonl"));
+    std::os::unix::fs::symlink(excluded.join(format!("{UUID_A}.jsonl")), &link).unwrap();
+    // And an ordinary transcript beside it, so the assertion below is about the
+    // link rather than about the project being skipped wholesale.
+    touch(&permitted.join(format!("{UUID_A}.jsonl")));
+
+    let config = Config::from_parts(
+        vec![dir.path().join("claude")],
+        vec![repo.to_str().unwrap().to_owned()],
+    );
+    let found = discover::discover_root(&root, &config);
+
+    assert!(
+        !found.transcripts.contains(&link),
+        "a link into the excluded project was yielded: {:?}",
+        found.transcripts
+    );
+    assert!(found.excluded.contains(&link), "and it was reported");
+    assert_eq!(
+        found.transcripts,
+        vec![permitted.join(format!("{UUID_A}.jsonl"))],
+        "the real transcript beside the link is still walked"
+    );
+}
+
+/// A link whose target cannot be resolved is not followed either: an
+/// unanswerable question at an exclusion boundary is answered "do not read".
+#[test]
+fn a_broken_symlinked_transcript_is_reported_rather_than_yielded() {
+    let (dir, root) = tree();
+    let link = root
+        .join(PROJECT)
+        .join("44444444-4444-4444-8444-444444444444.jsonl");
+    std::os::unix::fs::symlink(dir.path().join("gone.jsonl"), &link).unwrap();
+
+    let found = discover::discover_root(&root, &no_exclusions());
+
+    assert!(!found.transcripts.contains(&link));
+    assert!(found.unreadable.iter().any(|(p, _)| *p == link));
+}
+
+/// The single-file entry point honors a root exclusion at every depth,
+/// including a transcript whose only ancestor is the root - which has no
+/// directory name for the ancestor test to read.
+#[test]
+fn a_transcript_directly_in_an_excluded_root_is_still_refused() {
+    let config = Config::from_parts(vec![], vec!["/".to_owned()]);
+
+    assert_eq!(
+        discover::excluded_project_of(&config, Path::new("/x.jsonl")),
+        Some(PathBuf::from("/"))
+    );
+    assert!(discover::excluded_project_of(&config, Path::new("/a/b/x.jsonl")).is_some());
+    assert!(
+        discover::excluded_project_of(&no_exclusions(), Path::new("/x.jsonl")).is_none(),
+        "nothing excluded, nothing refused"
+    );
+}
+
+/// A link into the excluded project's REAL directory is refused too.
+///
+/// The encoded tests only ever see a project directory name, and an excluded
+/// project's own path - `/data/projects/cadence/archive/keep.jsonl` - is not
+/// one. The exact test is the one that answers where a real path is available
+/// (D-23), which is exactly the situation a resolved link is in.
+#[test]
+fn a_symlink_into_the_excluded_projects_own_directory_is_not_yielded() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("claude").join("projects");
+    let repo = dir.path().join("data").join("projects").join("cadence");
+    let target = repo.join("archive").join("keep.jsonl");
+    touch(&target);
+
+    let permitted = root.join(verbatim_core::config::encode(
+        dir.path()
+            .join("data")
+            .join("projects")
+            .join("hindsight")
+            .to_str()
+            .unwrap(),
+    ));
+    let link = permitted.join(format!("{UUID_B}.jsonl"));
+    std::fs::create_dir_all(&permitted).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    touch(&permitted.join(format!("{UUID_A}.jsonl")));
+
+    let config = Config::from_parts(
+        vec![dir.path().join("claude")],
+        vec![repo.to_str().unwrap().to_owned()],
+    );
+
+    assert!(
+        discover::excluded_project_of(&config, &target.canonicalize().unwrap()).is_some(),
+        "naming the file by hand must be refused too"
+    );
+    let found = discover::discover_root(&root, &config);
+    assert!(
+        !found.transcripts.contains(&link),
+        "a link into the excluded project's own directory was yielded: {:?}",
+        found.transcripts
+    );
+    assert_eq!(
+        found.transcripts,
+        vec![permitted.join(format!("{UUID_A}.jsonl"))]
+    );
+}

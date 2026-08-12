@@ -38,8 +38,9 @@ pub struct Discovered {
     /// Directories that could not be listed, with why. Reported and skipped -
     /// one unreadable directory is not a reason to archive nothing.
     pub unreadable: Vec<(PathBuf, String)>,
-    /// Project directories the config excluded. Listed for reporting only;
-    /// nothing inside them was listed, and nothing inside them was opened.
+    /// Project directories the config excluded, plus any symlinked transcript
+    /// that reached into one. Listed for reporting only; nothing named here was
+    /// listed, and nothing named here was opened.
     pub excluded: Vec<PathBuf>,
 }
 
@@ -98,7 +99,7 @@ pub fn discover_root(root: &Path, config: &Config) -> Discovered {
             found.excluded.push(entry.path);
             continue;
         }
-        walk_project(&entry.path, &mut found);
+        walk_project(&entry.path, config, &mut found);
     }
 
     // Sorted once, at the end: the traversal order is an implementation detail
@@ -107,11 +108,82 @@ pub fn discover_root(root: &Path, config: &Config) -> Discovered {
     found
 }
 
+/// The excluded project directory a named transcript sits inside, if any.
+///
+/// The walk above answers this at the project directory it is about to descend
+/// into, and never looks again. `ingest::run` is handed one path with no walk
+/// behind it, so it has to find that directory itself - and it has to, because
+/// exclusion that holds only on the tree pass is exclusion a single
+/// `verbatim ingest <path>` walks around, which is the read-then-filter ING-08
+/// forbids.
+///
+/// A project directory is an entry directly inside a configured transcript
+/// root, so that is where the name comes from when the transcript is under one.
+/// When it is under none - the crash harness and the lock race both name files
+/// in temporary directories - every ancestor's name is tested instead. That
+/// cannot be more precise, and being imprecise toward "do not read" is the
+/// direction [`Config::excludes_encoded_dir`] already chose.
+///
+/// Reads no transcript and opens nothing: directory names and, inside the
+/// encoded test, directory entries.
+pub fn excluded_project_of(config: &Config, transcript: &Path) -> Option<PathBuf> {
+    // A real filesystem path is available here, so the exact test answers first
+    // (D-23). The encoded tests below only ever see a project DIRECTORY name -
+    // `-data-projects-cadence` - and a path that is literally inside the
+    // excluded project, which is what a link resolves to and what a user names
+    // by hand, matches none of them.
+    if config.excludes_path(transcript) {
+        return transcript.parent().map(Path::to_path_buf);
+    }
+
+    for root in config.transcript_roots() {
+        let Ok(canonical) = root.canonicalize() else {
+            continue;
+        };
+        let Ok(rest) = transcript.strip_prefix(&canonical) else {
+            continue;
+        };
+        let Some(project) = rest.components().next() else {
+            continue;
+        };
+        // Under a root, the project directory is the only candidate: whatever
+        // the encoded test says about it is the answer, negative included.
+        let name = project.as_os_str().to_string_lossy();
+        return config
+            .excludes_encoded_dir(&name)
+            .then(|| canonical.join(project));
+    }
+
+    // The ancestor test below reads directory NAMES, and the filesystem root
+    // has none - so the one exclusion that means "read nothing" is the one that
+    // would slip through a transcript sitting directly in it.
+    if config.excludes_everything() {
+        return transcript.parent().map(Path::to_path_buf);
+    }
+
+    // `ancestors()` starts at the path itself, which is the transcript file.
+    transcript
+        .ancestors()
+        .skip(1)
+        .find(|dir| {
+            dir.file_name()
+                .is_some_and(|name| config.excludes_encoded_dir(&name.to_string_lossy()))
+        })
+        .map(Path::to_path_buf)
+}
+
 /// Everything inside one project directory.
 ///
 /// The project's own level is where a `<uuid>.jsonl` counts; below it only
 /// `agent-*.jsonl` does.
-fn walk_project(project: &Path, found: &mut Discovered) {
+///
+/// The config comes along for the symlinks. A project directory's exclusion is
+/// decided from its name before this is called, which is sound for every entry
+/// whose bytes are actually inside it - and a symlinked transcript's are not.
+/// A `<uuid>.jsonl` link in an unexcluded project pointing at a transcript in
+/// an excluded one is otherwise walked, opened and archived, because the name
+/// that was tested is the link's.
+fn walk_project(project: &Path, config: &Config, found: &mut Discovered) {
     let listing = match entries(project) {
         Ok(listing) => listing,
         Err(e) => {
@@ -130,7 +202,7 @@ fn walk_project(project: &Path, found: &mut Discovered) {
         if entry.is_dir {
             below.push(entry.path);
         } else if is_transcript_name(&entry.name, true) {
-            found.transcripts.push(entry.path);
+            keep_transcript(entry, config, found);
         }
     }
 
@@ -146,9 +218,32 @@ fn walk_project(project: &Path, found: &mut Discovered) {
             if entry.is_dir {
                 below.push(entry.path);
             } else if is_transcript_name(&entry.name, false) {
-                found.transcripts.push(entry.path);
+                keep_transcript(entry, config, found);
             }
         }
+    }
+}
+
+/// Yield one transcript, unless it is a link into a project the config
+/// excludes.
+///
+/// Only a link is resolved. Canonicalizing every transcript would be two
+/// thousand syscalls for an answer D-17 already has - the root is canonical and
+/// the walk joined onto it - and the real tree contains zero symlinks, so this
+/// costs nothing there. A link that cannot be resolved is not followed: an
+/// unanswerable question at an exclusion boundary is the one
+/// [`Config::excludes_encoded_dir`] already answers "do not read".
+fn keep_transcript(entry: Entry, config: &Config, found: &mut Discovered) {
+    if !entry.is_symlink {
+        found.transcripts.push(entry.path);
+        return;
+    }
+    match entry.path.canonicalize() {
+        Ok(target) => match excluded_project_of(config, &target) {
+            Some(_) => found.excluded.push(entry.path),
+            None => found.transcripts.push(entry.path),
+        },
+        Err(e) => found.unreadable.push((entry.path, e.to_string())),
     }
 }
 
@@ -191,6 +286,12 @@ fn is_uuid(s: &str) -> bool {
 struct Entry {
     name: String,
     is_dir: bool,
+    /// The entry is itself a link. `is_dir` is read WITHOUT following it, so a
+    /// symlink to a directory is not descended (that is what keeps the walk
+    /// free of cycles) and a symlink to a file still looks like a file - which
+    /// is the one way a path outside this project directory can be reached
+    /// from inside it.
+    is_symlink: bool,
     path: PathBuf,
 }
 
@@ -208,10 +309,13 @@ fn entries(dir: &Path) -> std::io::Result<Vec<Entry>> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let file_type = entry.file_type();
+        let is_dir = file_type.as_ref().map(|t| t.is_dir()).unwrap_or(false);
+        let is_symlink = file_type.as_ref().map(|t| t.is_symlink()).unwrap_or(true);
         out.push(Entry {
             name,
             is_dir,
+            is_symlink,
             path: entry.path(),
         });
     }
