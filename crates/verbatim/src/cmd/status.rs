@@ -11,11 +11,19 @@
 //! on it, and a read command is not a reason to put a second SQL dependency in
 //! the hook path's build. The connection comes from `Store::conn` and every
 //! query's error is mapped by [`read`].
+//!
+//! The session, turn and watermark numbers come from `config::visible`, not
+//! from `count(*)`: an excluded project must be invisible on read as well as
+//! never read on ingest (ING-08, D-23), including for sessions archived before
+//! the exclusion was configured. This is the phase's only read command, so it
+//! is also the proof that the boundary phase 3's search will reuse is real.
 
 use std::fmt::Display;
 use std::path::Path;
 
+use verbatim_core::config::visible;
 use verbatim_core::store::{Store, DB_FILE_NAME};
+use verbatim_core::Config;
 
 use super::Failure;
 
@@ -26,22 +34,29 @@ fn read<T, E: Display>(result: std::result::Result<T, E>) -> Result<T, Failure> 
 
 pub fn run() -> Result<(), Failure> {
     let data_dir = super::data_dir()?;
+    let config = Config::load()?;
     let store = Store::open(&data_dir)?;
     let conn = store.conn();
 
-    let sessions: i64 = read(conn.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0)))?;
-    let turns: i64 = read(conn.query_row("SELECT count(*) FROM turns", [], |r| r.get(0)))?;
-    let (watermarks, covered): (i64, i64) = read(conn.query_row(
-        "SELECT count(*), coalesce(sum(byte_offset), 0) FROM watermarks",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    ))?;
+    let counts = read(visible::counts(conn, &config))?;
 
     println!("store          {}", store.path().display());
     println!("size           {}", size(&data_dir));
-    println!("sessions       {sessions}");
-    println!("turns          {turns}");
-    println!("watermarks     {watermarks} covering {covered} byte(s)");
+    println!("sessions       {}", counts.sessions);
+    println!("turns          {}", counts.turns);
+    println!(
+        "watermarks     {} covering {} byte(s)",
+        counts.watermarks, counts.watermark_bytes
+    );
+    if !config.exclusions().is_empty() {
+        // Named, because a count that dropped without explanation is a bug
+        // report. The excluded sessions are still archived; they are not listed.
+        println!(
+            "excluded       {} project(s): {}",
+            config.exclusions().len(),
+            config.exclusions().join(", ")
+        );
+    }
 
     // Counted first rather than reached for with an optional row, so that "no
     // run yet" and "the query failed" stay two different answers.

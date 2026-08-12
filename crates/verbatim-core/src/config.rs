@@ -282,3 +282,114 @@ fn non_empty_var(name: &str) -> Option<std::ffi::OsString> {
         _ => None,
     }
 }
+
+/// The read side of ING-08: the one way a read path lists sessions.
+///
+/// **Every future read path is required to go through this module** rather than
+/// querying `session_meta` directly. Phase 3's search, phase 5's injection and
+/// the MCP tools all reuse it; a query that reaches past it is how an excluded
+/// project becomes visible again.
+///
+/// The failure this exists to prevent is named in `.planning/PROJECT.md`: the
+/// incumbent honors exclusion on write and ignores it on read. Verbatim honors
+/// it on both, and honors it **retroactively** - which is why no per-session
+/// flag is written at ingest (D-23). A flag would say what was true when the
+/// session was archived, and the case that matters is precisely the session
+/// archived *before* its project was excluded. The predicate is re-applied on
+/// every read instead.
+///
+/// It is applied to `session_meta.project` **and** to
+/// `session_meta.project_pre_worktree`, because either one alone leaks: a
+/// worktree session carries the folded parent repo in `project` and the
+/// worktree path in the pre-mapping column, and a user may reasonably exclude
+/// either path.
+///
+/// A session whose `project` is null - one real transcript carries no `cwd` at
+/// all - is visible, because nothing can say it is excluded.
+pub mod visible {
+    use rusqlite::Connection;
+
+    use super::Config;
+    use crate::error::Result;
+
+    /// One session a read path may see.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Session {
+        /// The canonical transcript path, which is what `sessions` is keyed on.
+        pub session_key: String,
+        pub session_no: i64,
+        pub project: Option<String>,
+        pub project_pre_worktree: Option<String>,
+        /// Turn rows this session contributed.
+        pub turns: i64,
+        /// The byte offset ingest will resume from, when one is recorded.
+        pub watermark: Option<i64>,
+    }
+
+    /// What the visible sessions add up to.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct Counts {
+        pub sessions: i64,
+        pub turns: i64,
+        pub watermarks: i64,
+        /// Bytes those watermarks cover.
+        pub watermark_bytes: i64,
+    }
+
+    /// Every session the config does not exclude, in ingest order.
+    ///
+    /// A `LEFT JOIN`, so a session archived without a `session_meta` row is
+    /// still listed rather than silently dropped: `verbatim verify` is what
+    /// reports that damage, and a read path that hid it would hide the evidence.
+    pub fn sessions(conn: &Connection, config: &Config) -> Result<Vec<Session>> {
+        let mut statement = conn.prepare(
+            "SELECT s.session_key, s.session_no, m.project, m.project_pre_worktree,
+                    (SELECT count(*) FROM turns t WHERE t.session_key = s.session_key),
+                    (SELECT w.byte_offset FROM watermarks w
+                      WHERE w.transcript_path = s.session_key)
+             FROM sessions s LEFT JOIN session_meta m USING (session_key)
+             ORDER BY s.session_no",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok(Session {
+                session_key: r.get(0)?,
+                session_no: r.get(1)?,
+                project: r.get(2)?,
+                project_pre_worktree: r.get(3)?,
+                turns: r.get(4)?,
+                watermark: r.get(5)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for session in rows {
+            let session = session?;
+            if !is_excluded(config, &session) {
+                out.push(session);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The counts `verbatim status` prints, over exactly the visible sessions.
+    pub fn counts(conn: &Connection, config: &Config) -> Result<Counts> {
+        let mut counts = Counts::default();
+        for session in sessions(conn, config)? {
+            counts.sessions += 1;
+            counts.turns += session.turns;
+            if let Some(offset) = session.watermark {
+                counts.watermarks += 1;
+                counts.watermark_bytes += offset;
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Is this session inside an excluded project, under either of its keys?
+    pub fn is_excluded(config: &Config, session: &Session) -> bool {
+        [&session.project, &session.project_pre_worktree]
+            .into_iter()
+            .flatten()
+            .any(|key| config.excludes_path(std::path::Path::new(key)))
+    }
+}

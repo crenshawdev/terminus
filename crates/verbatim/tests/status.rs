@@ -57,6 +57,34 @@ impl Bench {
         dest.canonicalize().unwrap()
     }
 
+    /// A one-record transcript whose `cwd` is the caller's, in the project
+    /// directory that `cwd` encodes to.
+    fn write(&self, n: u8, cwd: &str) -> PathBuf {
+        let dir = self
+            .claude_dir
+            .join("projects")
+            .join(verbatim_core::config::encode(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", uuid(n)));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"cccccccc-0000-4000-8000-0000000000{n:02x}\",\
+                  \"timestamp\":\"2026-08-12T10:00:{n:02}.000Z\",\
+                  \"sessionId\":\"{n:08x}-2222-4222-8222-222222222222\",\"cwd\":\"{cwd}\",\
+                  \"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hi\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    /// Write `verbatim.toml` into the config directory this bench points the
+    /// binary at.
+    fn config(&self, text: &str) {
+        std::fs::write(self.config_dir.join("verbatim.toml"), text).unwrap();
+    }
+
     fn conn(&self) -> Connection {
         Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
     }
@@ -251,4 +279,56 @@ fn status_reads_while_the_ingest_lock_is_held() {
         "{}",
         stdout(&out)
     );
+}
+
+/// ING-08's read half at the process boundary. Two projects are archived with
+/// no exclusions configured; one is excluded afterwards and `status` stops
+/// counting it, without a re-ingest and without the rows leaving the store.
+///
+/// This is the case a flag written at ingest could never cover, and the
+/// behaviour `.planning/PROJECT.md` names the incumbent for: exclusion honored
+/// on write and ignored on read.
+#[test]
+fn status_stops_counting_a_project_excluded_after_it_was_archived() {
+    let bench = bench();
+    let hidden = bench.write(1, "/data/projects/hidden");
+    bench.write(2, "/data/projects/kept");
+    // Its encoded name extends the excluded one, so it must stay visible.
+    bench.write(3, "/data/projects/hidden-research");
+
+    assert_eq!(bench.run(&["ingest"]).status.code(), Some(0));
+    let text = stdout(&bench.run(&["status"]));
+    assert!(text.contains("sessions       3"), "{text}");
+    assert!(!text.contains("excluded"), "{text}");
+
+    let turns_before: i64 = bench
+        .conn()
+        .query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+
+    bench.config("exclude = [\"/data/projects/hidden\"]\n");
+
+    let out = bench.run(&["status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("sessions       2"), "{text}");
+    assert!(
+        text.contains(&format!("turns          {}", turns_before - 1)),
+        "the excluded project's turns went with it: {text}"
+    );
+    assert!(
+        text.contains("excluded       1 project(s): /data/projects/hidden"),
+        "a count that drops without explanation is a bug report: {text}"
+    );
+
+    // Hidden on read, still archived: nothing was deleted and no re-ingest ran.
+    let rows: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM session_meta WHERE session_key = ?1",
+            [hidden.to_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1, "exclusion hides a session, it does not delete it");
 }
