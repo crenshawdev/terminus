@@ -8,7 +8,8 @@
 //!
 //! What the function *does* in this phase is deliberately thin: one `turns_fts`
 //! row per turn at rowid `turns.id`, carrying the turn's raw record line as
-//! text with no expansion, and no `entities` or `paths` rows at all. That is
+//! text with no expansion, one `compaction_boundaries` row for the rare turn
+//! that is a boundary (D-21), and no `entities` or `paths` rows at all. That is
 //! the phase boundary and not a reduction - RCL-01's camel/snake/kebab and path
 //! expansion and RCL-02's entity extraction are phase 3 and replace the body of
 //! this one function. Phase 1 owns the tables, the seam and the rebuild path,
@@ -38,6 +39,22 @@ pub struct TurnRow<'a> {
     pub byte_len: u64,
     /// The record's own bytes, exactly as they sit in the blob.
     pub record: &'a [u8],
+    /// The record's `subtype`, from [`crate::parse::Record`] (D-21).
+    ///
+    /// Carried in rather than re-read out of [`TurnRow::record`] here: the
+    /// parser is the one place a line's fields are extracted, and a second parse
+    /// site inside the seam would be a second place for ingest and rebuild to
+    /// disagree about what the same bytes mean.
+    pub subtype: Option<&'a str>,
+    /// The record's `compactMetadata` bytes, verbatim (D-08).
+    pub compact_metadata: Option<&'a [u8]>,
+}
+
+impl TurnRow<'_> {
+    /// D-21: is this turn the record a compaction left behind?
+    fn is_compact_boundary(&self) -> bool {
+        self.subtype == Some(crate::parse::COMPACT_BOUNDARY)
+    }
 }
 
 /// Write a turn and everything derived from it, returning `turns.id`.
@@ -86,6 +103,24 @@ pub fn derive_turn(tx: &Connection, row: TurnRow<'_>) -> Result<i64> {
     // them in must not require finding a second place that forgot to.
     tx.execute("DELETE FROM entities WHERE turn_id = ?1", [id])?;
     tx.execute("DELETE FROM paths WHERE turn_id = ?1", [id])?;
+
+    // The boundary row, on the same delete-then-insert footing as everything
+    // above (D-21). Clearing first is what makes a re-derive idempotent by
+    // construction rather than by an upsert that has to guess: a turn that is
+    // no longer a boundary must not keep a row saying it is.
+    //
+    // The metadata goes in as the bytes the parser lifted out of the line, and
+    // nothing here reads them (D-08). No dropped-turn set is computed: the
+    // complement of `preservedMessages.uuids` is derived at query time in phase
+    // 5 (INJ-05), where a wrong reading of an upstream format that has exactly
+    // one real example costs a query and not a reingest.
+    tx.execute("DELETE FROM compaction_boundaries WHERE turn_id = ?1", [id])?;
+    if row.is_compact_boundary() {
+        tx.execute(
+            "INSERT INTO compaction_boundaries (turn_id, metadata) VALUES (?1, ?2)",
+            rusqlite::params![id, row.compact_metadata],
+        )?;
+    }
 
     Ok(id)
 }

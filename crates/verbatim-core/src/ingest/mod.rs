@@ -239,6 +239,8 @@ pub(crate) fn ingest_locked(
                 stream_offset: record.offset,
                 byte_len: record.len,
                 record: &fresh[from..from + record.len as usize],
+                subtype: record.subtype.as_deref(),
+                compact_metadata: record.compact_metadata.as_deref(),
             },
         )?;
     }

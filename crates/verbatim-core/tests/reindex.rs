@@ -53,10 +53,16 @@ impl Bench {
         Store::open(&self.data_dir).unwrap()
     }
 
-    /// Drop the four derived tables outright, as AC4 specifies.
+    /// Drop every derived table outright, as AC4 specifies.
+    ///
+    /// Children first, so in reverse: `DERIVED_TABLES` is in creation order and
+    /// the bundled SQLite enforces foreign keys, so dropping `turns` while
+    /// `compaction_boundaries` still holds a row for one of its ids fails with a
+    /// constraint violation. `reindex` itself drops in this order for the same
+    /// reason.
     fn drop_derived(&self) {
         let conn = self.conn();
-        for table in schema::DERIVED_TABLES {
+        for table in schema::DERIVED_TABLES.iter().rev() {
             conn.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))
                 .unwrap();
         }
@@ -204,6 +210,10 @@ fn an_ingest_brings_an_older_store_forward_first() {
             rusqlite::params![(DERIVED_SCHEMA - 1).to_string(), META_DERIVED_SCHEMA],
         )
         .unwrap();
+        // The child rows go first: a boundary row references `turns(id)` and
+        // the bundled SQLite enforces that.
+        conn.execute("DELETE FROM compaction_boundaries", [])
+            .unwrap();
         conn.execute("DELETE FROM turns", []).unwrap();
     }
 

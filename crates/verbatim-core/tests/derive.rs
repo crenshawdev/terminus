@@ -168,6 +168,8 @@ fn re_deriving_a_turn_changes_nothing() {
                 stream_offset: record.offset,
                 byte_len: record.len,
                 record: &stream[record.offset as usize..(record.offset + record.len) as usize],
+                subtype: record.subtype.as_deref(),
+                compact_metadata: record.compact_metadata.as_deref(),
             },
         )
         .unwrap();
@@ -207,6 +209,8 @@ fn the_seam_reproduces_what_ingest_wrote_for_one_turn() {
             stream_offset: record.offset,
             byte_len: record.len,
             record: &source[record.offset as usize..(record.offset + record.len) as usize],
+            subtype: record.subtype.as_deref(),
+            compact_metadata: record.compact_metadata.as_deref(),
         },
     )
     .unwrap();
@@ -252,6 +256,8 @@ fn the_seam_writes_inside_the_callers_transaction() {
             stream_offset: 0,
             byte_len: record.len() as u64,
             record,
+            subtype: None,
+            compact_metadata: None,
         },
     )
     .unwrap();
@@ -281,4 +287,70 @@ fn one_turn_row(conn: &Connection, id: i64) -> (i64, i64, String, i64, i64) {
         .into_iter()
         .find(|row| row.0 == id)
         .unwrap_or_else(|| panic!("no turn row {id}"))
+}
+
+/// D-21 through the seam itself: the boundary row is written by `derive_turn`
+/// and by nothing else, and it is cleared the same way `entities` and `paths`
+/// are - so a turn that stops being a boundary stops having one.
+///
+/// The clearing arm is not hypothetical bookkeeping. A rebuild re-derives every
+/// turn at a *known* id, so a row left behind by an earlier derive would
+/// survive as a claim about bytes the blob no longer holds.
+#[test]
+fn the_seam_owns_the_boundary_row_and_clears_it_when_the_turn_is_not_one() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let line = testkit::boundary_line();
+    let scan = parse::scan(&[line.as_slice(), b"\n"].concat());
+    let (record, turn) = scan.turns().next().unwrap();
+    // Past the fixture's own turns, so this adds a turn rather than replacing
+    // one, and its id is predictable.
+    let seq = count(&conn, "turns");
+    let turn = parse::Turn {
+        turn_seq: seq,
+        ..turn.clone()
+    };
+    let id = schema::turn_id(bench.session_no, seq);
+
+    let row = TurnRow {
+        session_key: &bench.session_key,
+        session_no: bench.session_no,
+        turn: &turn,
+        stream_offset: 0,
+        byte_len: line.len() as u64,
+        record: &line,
+        subtype: record.subtype.as_deref(),
+        compact_metadata: record.compact_metadata.as_deref(),
+    };
+    assert_eq!(derive::derive_turn(&conn, row).unwrap(), id);
+
+    let stored: Vec<u8> = conn
+        .query_row(
+            "SELECT metadata FROM compaction_boundaries WHERE turn_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count(&conn, "compaction_boundaries"), 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&stored).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(&line).unwrap()["compactMetadata"]
+    );
+
+    // Re-derive the same turn as an ordinary record: the row goes.
+    derive::derive_turn(
+        &conn,
+        TurnRow {
+            subtype: None,
+            compact_metadata: None,
+            ..row
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        count(&conn, "compaction_boundaries"),
+        0,
+        "the boundary row outlived the turn being one"
+    );
 }

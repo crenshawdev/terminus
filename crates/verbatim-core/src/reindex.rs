@@ -109,6 +109,13 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
                     stream_offset: record.offset,
                     byte_len: record.len,
                     record: &stream[from..from + record.len as usize],
+                    // The rebuild reads these off the blob's own bytes, exactly
+                    // as ingest read them off the file's. Dropping them here
+                    // would make a `reindex` silently lose every boundary row,
+                    // which is the one way "derived and rebuildable" could be
+                    // false while every count still matched.
+                    subtype: record.subtype.as_deref(),
+                    compact_metadata: record.compact_metadata.as_deref(),
                 },
             )?;
             rebuilt.turns += 1;
