@@ -240,3 +240,85 @@ fn an_unparseable_record_projects_to_nothing() {
         .unwrap();
     assert_eq!(body, 1, "the row itself must still exist, empty");
 }
+
+// --- RCL-01: expansion -------------------------------------------------------
+
+/// AC1's first half, and D-13's measured claim: case splitting is the rule that
+/// changes recall.
+///
+/// The second assertion is the falsifying one. `MATCH 'worker'` passes with no
+/// expansion written at all, because `unicode61` splits on `/` by itself - a
+/// phase that shipped only path expansion would look half correct on this
+/// criterion and be none of it. `MATCH 'manager'` is the half that can only
+/// pass if the camel rule ran.
+#[test]
+fn a_component_query_finds_the_whole_token() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let whole = matching(&conn, "SearchManager");
+    assert_eq!(whole.len(), 1, "one turn carries `SearchManager`");
+    assert_eq!(
+        matching(&conn, "manager"),
+        whole,
+        "the camel component does not find the token, so no expansion was written"
+    );
+    // The other component of the same token. Not an equality: a sidecar turn
+    // says "search the tree for block framing" in prose, so `search` is a word
+    // the corpus already has and expansion adds this turn to its hits.
+    assert!(matching(&conn, "search").contains(&whole[0]));
+    assert!(record(&conn, whole[0]).contains("SearchManager"));
+
+    let pathy = matching(&conn, "worker");
+    assert_eq!(pathy.len(), 1);
+    assert!(record(&conn, pathy[0]).contains("src/worker/S.ts"));
+
+    // The same rule over a tool input rather than a message text block.
+    let camel_input = matching(&conn, "retryBudget");
+    assert!(!camel_input.is_empty());
+    assert!(matching(&conn, "budget").len() > camel_input.len());
+}
+
+/// The rules on their own, where a boundary case is cheap to state.
+#[test]
+fn the_expansion_rules_are_functions_with_answers() {
+    use verbatim_core::index::expand::{case_components, expansion_tokens, separator_components};
+
+    assert_eq!(case_components("SearchManager"), ["Search", "Manager"]);
+    assert_eq!(case_components("searchManager"), ["search", "Manager"]);
+    assert_eq!(case_components("HTTPServer"), ["HTTP", "Server"]);
+    assert_eq!(case_components("S3Client"), ["S3", "Client"]);
+    // Digits stay attached: nothing in this phase specifies bare-integer
+    // handling, and splitting them puts every version number in twice.
+    assert_eq!(case_components("v2"), ["v2"]);
+    assert_eq!(case_components("plain"), ["plain"]);
+    assert_eq!(case_components(""), [""]);
+
+    assert_eq!(
+        separator_components("src/worker/S.ts").collect::<Vec<_>>(),
+        ["src", "worker", "S", "ts"]
+    );
+    assert_eq!(
+        separator_components("search_manager_new").collect::<Vec<_>>(),
+        ["search", "manager", "new"]
+    );
+
+    // Nothing already reachable is emitted a second time: `unicode61` splits on
+    // every separator, so the snake, kebab and path rules add no bytes (D-13),
+    // and the case rule adds only what is genuinely new.
+    assert!(expansion_tokens("search_manager_new").is_empty());
+    assert!(expansion_tokens("src/worker/S.ts").is_empty());
+    assert!(expansion_tokens("--setting-sources").is_empty());
+    assert_eq!(expansion_tokens("SearchManager"), ["Search", "Manager"]);
+    // Deduplicated per body, and in text order, which is what makes a rebuild
+    // reproduce a byte-identical row.
+    assert_eq!(
+        expansion_tokens("SearchManager and SearchManager again"),
+        ["Search", "Manager"]
+    );
+    assert_eq!(
+        expansion_tokens("searchManager Search"),
+        ["Manager"],
+        "`Search` is already a token of the body"
+    );
+}

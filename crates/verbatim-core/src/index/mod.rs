@@ -11,6 +11,23 @@
 //! precisely so normalization stays in Rust where each rule can be called with
 //! an input and compared against an answer (`.planning/PROJECT.md`).
 
+pub mod expand;
 pub mod text;
 
-pub use text::{project, MAX_BODY_BYTES, MAX_DEPTH};
+pub use expand::MAX_EXPANSION_BYTES;
+pub use text::{MAX_BODY_BYTES, MAX_DEPTH};
+
+use serde_json::Value;
+
+/// The whole `turns_fts.body` value for one turn record: D-01's text projection
+/// followed by RCL-01's expansion tokens.
+///
+/// One column and not two. A second FTS column would change the table
+/// declaration at `crates/verbatim-core/src/store/schema.rs` and the
+/// `contentless_delete=1` rebuild property with it, for a separation nothing
+/// queries against.
+pub fn project(record: &Value) -> String {
+    let mut body = text::project(record);
+    expand::append_to(&mut body);
+    body
+}
