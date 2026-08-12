@@ -23,6 +23,12 @@ blake3 = "1.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Verbatim's own config file (D-15). Default features off: `display` is the
+# *writer* half and nothing here ever writes a config, so it is dead weight on a
+# binary whose cold start is the product. `parse` + `serde` pull toml_parser,
+# winnow, serde_core, toml_datetime and serde_spanned - no async runtime, no
+# HTTP client, no thread pool.
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 # CLI argument parsing. lexopt has zero dependencies of its own; cold start is
 # the product (DESIGN-BRIEF.md:39) and every transitive crate is startup cost.
 lexopt = "0.3"

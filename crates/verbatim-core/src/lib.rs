@@ -7,6 +7,7 @@
 //! a runtime it does not use (`DESIGN-BRIEF.md:39`).
 
 pub mod blob;
+pub mod config;
 pub mod derive;
 pub mod error;
 pub mod ingest;
@@ -18,5 +19,6 @@ pub mod verify;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
+pub use config::{config_dir, Config};
 pub use error::{Error, Result};
 pub use store::{data_dir, RebuildRequired, Store, ARCHIVE_FORMAT, DERIVED_SCHEMA};

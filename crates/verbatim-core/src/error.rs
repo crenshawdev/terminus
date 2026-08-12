@@ -70,6 +70,19 @@ pub enum Error {
     /// No data directory could be resolved and none was given.
     #[error("cannot resolve a data directory: {detail}")]
     DataDirUnresolved { detail: String },
+
+    /// A config file exists and does not parse.
+    ///
+    /// Named rather than swallowed: a file the user wrote and verbatim could
+    /// not read means verbatim would walk a tree nobody asked for and honor no
+    /// exclusion at all, which is the one failure that must not be silent. The
+    /// detail carries the parser's own position.
+    #[error("{path} is not valid TOML: {detail}")]
+    ConfigParse { path: PathBuf, detail: String },
+
+    /// No config directory, or no home directory to derive one from.
+    #[error("cannot resolve a config directory: {detail}")]
+    ConfigUnresolved { detail: String },
 }
 
 impl Error {
