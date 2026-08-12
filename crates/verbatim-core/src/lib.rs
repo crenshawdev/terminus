@@ -7,6 +7,7 @@
 //! a runtime it does not use (`DESIGN-BRIEF.md:39`).
 
 pub mod blob;
+pub mod derive;
 pub mod error;
 pub mod ingest;
 pub mod parse;

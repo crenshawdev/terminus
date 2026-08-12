@@ -479,7 +479,14 @@ fn a_pass_moves_the_session_its_turns_and_its_watermark_together() {
         .collect();
     assert_eq!(
         moved,
-        vec!["sessions", "session_meta", "turns", "watermarks", "runs"],
+        vec![
+            "sessions",
+            "session_meta",
+            "turns",
+            "turns_fts",
+            "watermarks",
+            "runs"
+        ],
         "a pass must move exactly these tables"
     );
 }

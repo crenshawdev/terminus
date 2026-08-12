@@ -23,9 +23,10 @@ pub use lock::{Attempt, IngestLock, LOCK_FILE_NAME};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::blob;
+use crate::derive;
 use crate::error::{Error, Result};
 use crate::parse::{self, Scan};
-use crate::store::{schema, Store};
+use crate::store::Store;
 
 /// What one invocation of [`run`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,29 +142,21 @@ pub(crate) fn ingest_locked(store: &mut Store, path: &Path, started: Instant) ->
         &scan,
     )?;
     for (record, turn) in scan.turns() {
-        let id = schema::turn_id(session_no, turn.turn_seq);
-        tx.execute(
-            "INSERT INTO turns (
-                id, session_key, turn_seq, uuid, parent_uuid, record_type, tool_name, ts,
-                stream_offset, byte_len
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(id) DO UPDATE SET
-                uuid = excluded.uuid, parent_uuid = excluded.parent_uuid,
-                record_type = excluded.record_type, tool_name = excluded.tool_name,
-                ts = excluded.ts, stream_offset = excluded.stream_offset,
-                byte_len = excluded.byte_len",
-            rusqlite::params![
-                id,
-                session_key,
-                turn.turn_seq,
-                turn.uuid,
-                turn.parent_uuid,
-                turn.record_type,
-                turn.tool_name,
-                turn.timestamp,
-                record.offset as i64,
-                record.len as i64,
-            ],
+        // The seam, not an insert of our own: the rebuild path calls the same
+        // function, which is what stops it from drifting from what ingest wrote
+        // (STOR-04). `fresh` starts at the watermark, so a record's stream
+        // offset has to be rebased to index it.
+        let from = (record.offset - existing.watermark) as usize;
+        derive::derive_turn(
+            &tx,
+            derive::TurnRow {
+                session_key: &session_key,
+                session_no,
+                turn,
+                stream_offset: record.offset,
+                byte_len: record.len,
+                record: &fresh[from..from + record.len as usize],
+            },
         )?;
     }
     tx.execute(
