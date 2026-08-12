@@ -298,3 +298,71 @@ fn the_agent_meta_fixture_is_one_json_object_and_not_a_transcript() {
         "the meta file must sit beside a sidecar fixture"
     );
 }
+
+/// D-21 + D-08: the compacted fixture ends with a real-shaped boundary record.
+///
+/// Shape, position and the subset relation are all load-bearing. Two later
+/// tests append this file's **last line** to another transcript, so a record
+/// added after it would silently make them append the wrong bytes.
+#[test]
+fn the_compacted_fixture_ends_with_a_real_shaped_boundary() {
+    let recs = records(testkit::COMPACTED_FIXTURE);
+    assert!(recs.len() >= 2, "a boundary needs turns to come after");
+
+    let boundary = recs.last().unwrap();
+    assert_eq!(boundary["type"], "system");
+    assert_eq!(boundary["subtype"], "compact_boundary");
+    for field in ["uuid", "timestamp", "logicalParentUuid", "compactMetadata"] {
+        assert!(boundary.get(field).is_some(), "boundary lacks {field}");
+    }
+    // No earlier record is one, so "the last line" is unambiguous.
+    for r in &recs[..recs.len() - 1] {
+        assert_ne!(r["subtype"], "compact_boundary");
+    }
+
+    let meta = &boundary["compactMetadata"];
+    for field in ["preTokens", "postTokens", "cumulativeDroppedTokens"] {
+        assert!(meta[field].is_number(), "compactMetadata lacks {field}");
+    }
+
+    // The measured fact D-08 rests on: 6 preserved uuids of 8, against 38,064
+    // dropped tokens - the lists describe what survived, so no dropped-turn set
+    // can be computed from them.
+    let uuids: BTreeSet<&str> = meta["preservedMessages"]["uuids"]
+        .as_array()
+        .expect("preservedMessages.uuids is a list")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let all: BTreeSet<&str> = meta["preservedMessages"]["allUuids"]
+        .as_array()
+        .expect("preservedMessages.allUuids is a list")
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(uuids.is_subset(&all), "uuids is not a subset of allUuids");
+    assert!(uuids.len() < all.len(), "the subset must be proper");
+
+    // `compactMetadata` is not the last key, so nothing may extract it by
+    // position, and the fixture keeps the real record's key order.
+    let text = String::from_utf8(testkit::fixture_bytes(testkit::COMPACTED_FIXTURE)).unwrap();
+    let last = text.lines().last().unwrap();
+    let at = last.find("\"compactMetadata\"").expect("the key is there");
+    assert!(
+        last[at..].contains("\"uuid\""),
+        "compactMetadata must not be the final key"
+    );
+}
+
+/// [`testkit::boundary_line`] returns exactly that last record, with no
+/// newline: it is what the compaction tests append to another transcript.
+#[test]
+fn the_boundary_line_helper_returns_the_last_whole_record() {
+    let line = testkit::boundary_line();
+    assert!(!line.contains(&b'\n'), "the helper must return one line");
+    let value: serde_json::Value = serde_json::from_slice(&line).expect("one whole record");
+    assert_eq!(value["subtype"], "compact_boundary");
+
+    let bytes = testkit::fixture_bytes(testkit::COMPACTED_FIXTURE);
+    assert!(bytes.ends_with(&[line.as_slice(), b"\n"].concat()));
+}

@@ -16,6 +16,7 @@ by hand without re-deriving the others will fail
 | `session-large-record.jsonl` | D-05: a turn larger than one 64 KB block |
 | `session-continuation.jsonl` | D-11: file-level lineage through a foreign `session_id` |
 | `session-truncated.jsonl` | D-14: a watermark that must stop at the last `\n`, not at end-of-file |
+| `session-compacted.jsonl` | D-21/D-08: a session ending in a `compact_boundary` record whose `compactMetadata` bytes are stored verbatim |
 | `subagents/agent-alpha.jsonl` | D-01: a sidecar reporting its *parent's* `sessionId` |
 | `subagents/workflows/wf_demo/agent-deep.jsonl` | D-16: a sidecar two directories deeper than the usual one, which only an unbounded walk reaches |
 | `subagents/workflows/wf_demo/journal.jsonl` | D-12: a `.jsonl` in the tree that is not a transcript at all |
@@ -64,6 +65,26 @@ with no trailing newline: nine complete records plus a partial one. It is the
 its last `\n` (2,995), strictly less than the file length. Appending the rest of
 the cut line and the remaining records must produce a store identical to
 ingesting the complete file in one pass.
+
+**`session-compacted.jsonl`** is three ordinary turns followed by the record a
+compaction leaves behind: `type: "system"`, `subtype: "compact_boundary"`, with
+a `uuid`, a `timestamp`, a `logicalParentUuid` and a `compactMetadata` object.
+D-21 is what it pins - `system` is already a turn type and the record carries
+both identity fields, so the boundary is an ordinary turn plus a derived row,
+never a new record class. Its keys sit in the same order as the one real
+boundary record in the corpus, and `compactMetadata` deliberately does **not**
+sit last, so nothing may extract it by position.
+
+The metadata reproduces the measured numbers: `preTokens` 45,500, `postTokens`
+7,436, `cumulativeDroppedTokens` 38,064, and a `preservedMessages` whose `uuids`
+list is a *proper* subset of its `allUuids` list. That subset relation is the
+fact D-08 rests on: the uuid lists describe the preserved segment and cannot
+enumerate the ~38k dropped tokens, which contradicts `DESIGN-BRIEF.md:140`. The
+bytes are therefore stored verbatim and nothing in this phase interprets them.
+
+The boundary is the **last** line of the file, so a test can append that one
+record to an already-ingested transcript and watch a boundary row appear under a
+session that had none. Adding a line after it breaks that.
 
 **`subagents/agent-alpha.jsonl`** reports `session-basic.jsonl`'s `sessionId` on
 every record with `isSidechain: true`. This is D-01's collision case: 812 real

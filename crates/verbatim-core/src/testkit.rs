@@ -17,9 +17,29 @@ pub const TRANSCRIPT_FIXTURES: &[&str] = &[
     "session-large-record.jsonl",
     "session-continuation.jsonl",
     "session-truncated.jsonl",
+    "session-compacted.jsonl",
     "subagents/agent-alpha.jsonl",
     "subagents/workflows/wf_demo/agent-deep.jsonl",
 ];
+
+/// The fixture whose **last** line is a compaction boundary (D-21).
+///
+/// Named rather than spelled at each site because two phases' tests append that
+/// one line to another transcript to make a boundary appear under an
+/// already-archived session, which is what AC4 asks about.
+pub const COMPACTED_FIXTURE: &str = "session-compacted.jsonl";
+
+/// The last line of [`COMPACTED_FIXTURE`], without its newline: one whole
+/// `compact_boundary` record.
+pub fn boundary_line() -> Vec<u8> {
+    let bytes = fixture_bytes(COMPACTED_FIXTURE);
+    let start = bytes[..bytes.len() - 1]
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|i| i + 1)
+        .expect("the fixture holds more than one record");
+    bytes[start..bytes.len() - 1].to_vec()
+}
 
 /// A `.jsonl` file in the transcript tree that is not a transcript (D-12).
 pub const NON_TRANSCRIPT_FIXTURE: &str = "subagents/workflows/wf_demo/journal.jsonl";
