@@ -6,5 +6,11 @@
 //! runtime, no HTTP client and no thread pool: the hook path must not pay for
 //! a runtime it does not use (`DESIGN-BRIEF.md:39`).
 
+pub mod error;
+pub mod store;
+
 #[cfg(feature = "testkit")]
 pub mod testkit;
+
+pub use error::{Error, Result};
+pub use store::{data_dir, RebuildRequired, Store, ARCHIVE_FORMAT, DERIVED_SCHEMA};
