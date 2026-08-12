@@ -37,7 +37,7 @@ The archive is the product, so it is built first and everything else is built on
 1. A full pass over the real corpus parses every record with zero panics and zero unparseable lines, and the run's session count includes the 214 subagent sidecar directories a top-level glob misses.
 2. Sessions continued across files are linked, and the count of `continues_from` links is non-zero on the real corpus (the measured rate is 1.2%).
 3. Two transcripts whose `cwd` values are a repo and its worktree resolve to the same project key, and a project path containing a literal `-` is not confused with a path separator.
-4. Appending a compaction to an already-ingested transcript and rerunning ingest adds the boundary record with its dropped-turn set, without rewriting any earlier turn.
+4. Appending a compaction to an already-ingested transcript and rerunning ingest adds the boundary record carrying its `compactMetadata` verbatim, without rewriting any earlier turn. The dropped-turn set is DERIVED from that metadata at query time in Phase 5 (INJ-05), not stored here: the one real boundary in the corpus describes its preserved segment and cannot enumerate what fell out (D-08).
 5. A transcript under an excluded prefix produces no read of that file, shown by a syscall or instrumented-open trace, and no rows in any table.
 6. Killing ingest mid-pass and rerunning converges to the same store contents as an uninterrupted pass, and `verbatim status` shows the failed run and its error.
 

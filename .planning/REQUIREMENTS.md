@@ -26,7 +26,7 @@ Committed scope. Each maps to exactly one roadmap phase.
 - **ING-03**: Ingest performs its recovery at the top of every run, with no repair command and no external supervisor, and a rerun after a kill at any point converges to a consistent store.
 - **ING-04**: Ingest discovers nested subagent sidecar transcripts and links sessions that continue across files into one thread.
 - **ING-05**: A session's project is the canonical git toplevel derived from the record's `cwd`, with worktrees mapped to the parent repo and both keys stored; the encoded directory name and `basename()` are never used for identity.
-- **ING-06**: A compaction appended to a live transcript is ingested as a boundary carrying the set of turns that fell out of the model's context.
+- **ING-06**: A compaction appended to a live transcript is ingested as a boundary carrying the record's compaction metadata verbatim. The set of turns that fell out of the model's context is derived from that metadata at query time (INJ-05, Phase 5) - the metadata describes the preserved segment, so the complement is a query and not a stored column (Phase 2 D-08).
 - **ING-07**: Capture mode (`full`, `lean`, `minimal`) controls how much of each record is stored, and every elision is marked in the stored record.
 - **ING-08**: An excluded project is never read rather than read-then-filtered, and the exclusion is honored on the ingest path and every read path alike.
 - **ING-09**: `verbatim status` reports sizes, counts, watermarks and the last ingest run with its error, sourced from the `runs` table rather than a log file.
