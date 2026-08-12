@@ -67,14 +67,26 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
     // definition of the schema, rather than a second copy that can drift.
     tx.execute_batch(schema::CREATE_SQL)?;
 
-    let sessions: Vec<(String, i64, Vec<u8>)> = tx
-        .prepare("SELECT session_key, session_no, blob FROM sessions ORDER BY session_no")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    // Keys first, blobs one at a time. Selecting `blob` here too would hold the
+    // whole archive in memory at once - 895 MB of it today and growing with
+    // every session ever archived - and this runs inside the ingest lock on the
+    // first hook-spawned pass after an upgrade, where an allocation failure
+    // rolls the rebuild back, leaves `derived_schema` behind, and takes the
+    // pass with it before `record_pass` can say so. One blob at a time bounds
+    // it to the largest single session.
+    let keys: Vec<(String, i64)> = tx
+        .prepare("SELECT session_key, session_no FROM sessions ORDER BY session_no")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<std::result::Result<_, _>>()?;
 
     let mut rebuilt = Rebuilt::default();
-    for (session_key, session_no, bytes) in sessions {
+    for (session_key, session_no) in keys {
         rebuilt.sessions += 1;
+        let bytes: Vec<u8> = tx.query_row(
+            "SELECT blob FROM sessions WHERE session_no = ?1",
+            [session_no],
+            |r| r.get(0),
+        )?;
         let stream = match blob::read_all(&bytes) {
             Ok(stream) => stream,
             Err(e) => {
