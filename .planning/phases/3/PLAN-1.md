@@ -16,6 +16,7 @@ files:
   - crates/verbatim-core/src/store/open.rs
   - crates/verbatim-core/src/testkit.rs
   - crates/verbatim-core/tests/index.rs
+  - crates/verbatim-core/tests/ingest.rs
   - crates/verbatim-core/tests/derive.rs
   - crates/verbatim-core/tests/fixtures.rs
   - crates/verbatim-core/tests/reindex.rs
