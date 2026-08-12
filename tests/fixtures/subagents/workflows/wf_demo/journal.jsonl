@@ -1,0 +1,3 @@
+{"agentId":"agent-alpha","key":"step","result":"started","type":"journal"}
+{"agentId":"agent-alpha","key":"step","result":"completed","type":"journal"}
+{"agentId":"agent-alpha","key":"summary","result":"3 files scanned","type":"journal"}
