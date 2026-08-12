@@ -370,6 +370,42 @@ pub mod fault {
     /// Only reachable under [`SPLIT`]: the watermark committed on its own.
     pub const AFTER_SPLIT_WATERMARK: &str = "after-split-watermark";
 
+    /// The pass level, and the only point that is about the *walk* rather than
+    /// about one file: [`AFTER_FILES_COUNT`] files have committed and the next
+    /// has not been opened.
+    ///
+    /// It is not in [`POINTS`], because it is not interchangeable with them: it
+    /// needs a count as well as a name, and a pass that never commits that many
+    /// files never reaches it. The per-file points still fire underneath it, in
+    /// whichever file is in flight, so between the two a kill can be aimed at
+    /// any (file, moment) pair rather than only at a moment.
+    pub const AFTER_FILES: &str = "after-files";
+
+    /// How many files must have committed before [`AFTER_FILES`] fires.
+    ///
+    /// An environment variable and not a file in the data directory, unlike
+    /// [`PASS_FAIL_AFTER_FILE`]: this point is reached through [`stall`], which
+    /// is already aimed by [`AT`] on the child's own environment, so the count
+    /// travels the same way the name does and a fault aimed at one child still
+    /// cannot reach another.
+    pub const AFTER_FILES_COUNT: &str = "VERBATIM_FAULT_AFTER_FILES";
+
+    /// Stall the walk once `committed` files have committed, if a kill is aimed
+    /// there. Inert without the count, and inert without [`AT`].
+    #[cfg(feature = "testkit")]
+    pub fn stall_after_files(committed: usize) {
+        let aimed: Option<usize> = std::env::var(AFTER_FILES_COUNT)
+            .ok()
+            .and_then(|v| v.parse().ok());
+        if aimed == Some(committed) {
+            stall(AFTER_FILES);
+        }
+    }
+
+    #[cfg(not(feature = "testkit"))]
+    #[inline(always)]
+    pub fn stall_after_files(_committed: usize) {}
+
     /// A file inside the data directory holding a file count. The tree pass
     /// fails its walk once it has walked that many transcripts, which is how
     /// D-14's "a pass that died still leaves its `runs` row" becomes testable.

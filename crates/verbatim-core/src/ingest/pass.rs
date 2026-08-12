@@ -169,6 +169,11 @@ fn walk(
                 summary.files_committed += 1;
                 summary.bytes_read += pass.bytes_read;
                 summary.turns_added += pass.turns_added;
+                // The pass-level fault point: a kill aimed here lands between
+                // two files, with the walk half done and the store consistent.
+                // Timed kills reach this region only by luck, and on a tree of
+                // small transcripts nearly never.
+                crate::ingest::fault::stall_after_files(summary.files_committed);
             }
             // Nothing new past the watermark, or - unreachable here, since this
             // pass holds the lock - a lock this process already owns.
