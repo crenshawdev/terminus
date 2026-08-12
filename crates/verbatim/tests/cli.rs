@@ -6,7 +6,7 @@
 //! `verbatim`. Hardcoding `target/debug/verbatim` would be wrong twice over: it
 //! ignores `CARGO_TARGET_DIR` and it names the wrong profile under `--release`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use rusqlite::Connection;
@@ -15,27 +15,51 @@ use verbatim_core::store::{
 };
 use verbatim_core::testkit;
 
+/// Every directory a spawned `verbatim` may touch, all of them temporary.
+///
+/// The config directory and the Claude directory are as load-bearing as the
+/// data directory, and they are new here. Once bare `verbatim ingest` walks the
+/// configured roots, a spawn that sets only `VERBATIM_DATA_DIR` resolves the
+/// developer's real config and walks the live `~/.claude` tree - 2,000+ private
+/// transcripts and ~988 MB ingested into a temp dir on every `cargo test`. No
+/// test process may resolve a real transcript root.
 struct Bench {
     _dir: tempfile::TempDir,
     data_dir: PathBuf,
     work: PathBuf,
+    /// Holds no `verbatim.toml`, so the loader yields defaults.
+    config_dir: PathBuf,
+    /// `<claude_dir>/projects` is the only tree a spawn can reach.
+    claude_dir: PathBuf,
 }
 
 fn bench() -> Bench {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     let work = dir.path().join("work");
+    let config_dir = dir.path().join("config");
+    let claude_dir = dir.path().join("claude");
     std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
     Bench {
         _dir: dir,
         data_dir,
         work,
+        config_dir,
+        claude_dir,
     }
 }
 
 impl Bench {
     fn run(&self, args: &[&str]) -> Output {
-        verbatim(&self.data_dir, args)
+        Command::new(env!("CARGO_BIN_EXE_verbatim"))
+            .args(args)
+            .env("VERBATIM_DATA_DIR", &self.data_dir)
+            .env("VERBATIM_CONFIG_DIR", &self.config_dir)
+            .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
+            .output()
+            .expect("spawn verbatim")
     }
 
     /// Ingest a fixture through the binary, returning its session key.
@@ -50,17 +74,18 @@ impl Bench {
         path.canonicalize().unwrap().to_str().unwrap().to_owned()
     }
 
+    /// Put a fixture into the temporary transcript tree under a
+    /// transcript-shaped name, so the tree pass discovers it.
+    fn place(&self, project: &str, name: &str, fixture: &str) -> PathBuf {
+        let dest = self.claude_dir.join("projects").join(project).join(name);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(testkit::fixture_path(fixture), &dest).unwrap();
+        dest.canonicalize().unwrap()
+    }
+
     fn conn(&self) -> Connection {
         Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
     }
-}
-
-fn verbatim(data_dir: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_verbatim"))
-        .args(args)
-        .env("VERBATIM_DATA_DIR", data_dir)
-        .output()
-        .expect("spawn verbatim")
 }
 
 fn stdout(output: &Output) -> String {
@@ -187,7 +212,7 @@ fn a_store_one_archive_format_ahead_is_refused_with_both_versions_named() {
     let fixture = testkit::fixture_path("session-basic.jsonl");
     let fixture = fixture.to_str().unwrap().to_owned();
     for args in [vec!["verify"], vec!["ingest", fixture.as_str()]] {
-        let out = verbatim(&target.data_dir, &args);
+        let out = target.run(&args);
         assert_ne!(
             out.status.code(),
             Some(0),
@@ -282,14 +307,15 @@ fn reindex_rebuilds_the_derived_tables_to_byte_identical_query_output() {
 
 /// The exit-code split phase 1 commits to: 2 is misuse, and it is not the same
 /// as an operational failure.
+///
+/// `ingest` with no path is deliberately absent from this list. It exited 2 in
+/// phase 1 and is the tree pass now, which is an intended change to a shipped
+/// contract; `bare_ingest_walks_only_the_configured_temporary_root` is the
+/// assertion that replaced it.
 #[test]
 fn misuse_exits_two_with_an_empty_stdout() {
     let bench = bench();
-    for args in [
-        vec!["ingest"],
-        vec!["verify", "--json"],
-        vec!["no-such-command"],
-    ] {
+    for args in [vec!["verify", "--json"], vec!["no-such-command"]] {
         let out = bench.run(&args);
         assert_eq!(
             out.status.code(),
@@ -360,4 +386,65 @@ fn reindex_refuses_while_another_process_holds_the_ingest_lock() {
         "reindex failed with the lock free: {}",
         stderr(&out)
     );
+}
+
+/// Bare `verbatim ingest` is the tree pass now: exit 0, and it walks the
+/// configured root and nothing else.
+///
+/// The second half is the isolation assertion, and it is not decoration. If the
+/// spawn resolved a real root this store would hold thousands of sessions from
+/// `~/.claude` rather than the two placed here, so "every archived transcript
+/// path sits inside this test's temporary tree" is the property that says no
+/// test process reached the developer's own transcripts.
+#[test]
+fn bare_ingest_walks_only_the_configured_temporary_root() {
+    let bench = bench();
+    let project = "-data-projects-cadence";
+    let top = bench.place(
+        project,
+        "11111111-1111-4111-8111-111111111111.jsonl",
+        "session-basic.jsonl",
+    );
+    let sidecar = bench.place(
+        project,
+        "33333333-3333-4333-8333-333333333333/subagents/agent-a.jsonl",
+        "subagents/agent-alpha.jsonl",
+    );
+
+    let out = bench.run(&["ingest"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "the tree pass produces no data on stdout");
+
+    let conn = bench.conn();
+    let keys: Vec<String> = conn
+        .prepare("SELECT session_key FROM sessions ORDER BY session_key")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    let mut expected = vec![
+        top.to_str().unwrap().to_owned(),
+        sidecar.to_str().unwrap().to_owned(),
+    ];
+    expected.sort();
+    assert_eq!(keys, expected, "the pass walked a tree it was not given");
+
+    let root = bench.claude_dir.canonicalize().unwrap();
+    for key in &keys {
+        assert!(
+            std::path::Path::new(key).starts_with(&root),
+            "{key} is outside this test's temporary transcript root"
+        );
+    }
+
+    // A rerun is the steady state: still exit 0, still the same two sessions.
+    let again = bench.run(&["ingest"]);
+    assert_eq!(again.status.code(), Some(0), "{}", stderr(&again));
+    let after: i64 = bench
+        .conn()
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 2);
 }

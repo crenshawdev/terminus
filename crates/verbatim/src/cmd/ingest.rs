@@ -1,31 +1,61 @@
-//! `verbatim ingest <path.jsonl>`: one explicit transcript file.
+//! `verbatim ingest`: the whole configured tree, or one named transcript file.
 //!
-//! One file and not a tree, deliberately (D-18). The no-arg walk over
-//! `~/.claude/projects` is phase 2 (ING-05); keeping phase 1 on one named file
-//! is what puts the crash harness (AC2) and the lock race (AC6) on a small
-//! fixture instead of the real 962 MB tree.
+//! With no argument it walks every configured transcript root (ING-05). With a
+//! path it ingests that one file, which is the shape phase 1 shipped and the
+//! shape the crash harness and the lock race still use.
 
 use std::path::PathBuf;
 
+use verbatim_core::ingest::pass::{self, PassOutcome};
 use verbatim_core::ingest::{self, Outcome};
 
 use super::Failure;
 
 pub fn run(args: Args) -> Result<(), Failure> {
     let data_dir = super::data_dir()?;
-    match ingest::run(&data_dir, &args.transcript)? {
-        // Exit 0 with nothing on stdout. Losing the lock race is the expected
-        // outcome of a second hook spawn, not a failure to report (ING-02), and
-        // a transcript with no new complete record is the steady state.
-        Outcome::LockHeld | Outcome::UpToDate => Ok(()),
-        Outcome::Committed(_) => Ok(()),
+    match args {
+        Args::One(transcript) => match ingest::run(&data_dir, &transcript)? {
+            // Exit 0 with nothing on stdout. Losing the lock race is the
+            // expected outcome of a second hook spawn, not a failure to report
+            // (ING-02), and a transcript with no new complete record is the
+            // steady state.
+            Outcome::LockHeld | Outcome::UpToDate | Outcome::Committed(_) => Ok(()),
+        },
+        Args::Tree => tree(&data_dir),
     }
 }
 
+fn tree(data_dir: &std::path::Path) -> Result<(), Failure> {
+    let summary = match pass::run(data_dir)? {
+        PassOutcome::LockHeld => return Ok(()),
+        PassOutcome::Ran(summary) => summary,
+    };
+
+    // Named on stderr, and exit 0. The tree WAS ingested: a pass that skipped
+    // one damaged transcript out of two thousand did the work it was asked to
+    // do, and failing the command would make the next hook spawn look broken
+    // for as long as the damaged file sits there (D-12). A pass that could not
+    // run at all is a different thing and reaches `Failure::Operational`
+    // through the `?` above.
+    for (path, reason) in &summary.failures {
+        eprintln!("{}: {reason}", path.display());
+    }
+    for (path, reason) in &summary.unreadable {
+        eprintln!("{}: {reason}", path.display());
+    }
+    if !summary.failures.is_empty() {
+        eprintln!("{} file(s) skipped", summary.failures.len());
+    }
+    Ok(())
+}
+
 /// The parsed command line for `ingest`.
-#[derive(Debug)]
-pub struct Args {
-    pub transcript: PathBuf,
+#[derive(Debug, PartialEq, Eq)]
+pub enum Args {
+    /// No argument: walk every configured transcript root.
+    Tree,
+    /// One named transcript file.
+    One(PathBuf),
 }
 
 pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
@@ -39,8 +69,10 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
         }
     }
 
-    let transcript = transcript.ok_or_else(|| {
-        Failure::Misuse("ingest needs a transcript path: verbatim ingest <path.jsonl>".into())
-    })?;
-    Ok(Args { transcript })
+    // No path is no longer misuse: it is the tree pass. That is an intended
+    // change to a shipped contract - `ingest` exited 2 in phase 1.
+    Ok(match transcript {
+        Some(path) => Args::One(path),
+        None => Args::Tree,
+    })
 }

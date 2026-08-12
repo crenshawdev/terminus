@@ -1,4 +1,4 @@
-//! One ingest pass over one named transcript.
+//! Ingest: one named transcript here, a whole tree in [`pass`].
 //!
 //! The order of the first steps is the design. The path is canonicalized before
 //! anything else, the lock is taken **before** the store is opened (D-15), and
@@ -13,6 +13,7 @@
 //! rejected (`DESIGN-BRIEF.md:83`).
 
 pub mod lock;
+pub mod pass;
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -380,8 +381,12 @@ fn path_key(path: &Path) -> Result<String> {
 }
 
 /// Read from the stored watermark to the end of the file.
+///
+/// Through `discover::open_transcript` and not `File::open`, so the pass's
+/// opens are the number AC5 measures: "zero opens of any file under an excluded
+/// directory" has to be a fact a test can read off a log.
 fn read_tail(path: &Path, watermark: u64) -> Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
+    let mut file = crate::discover::open_transcript(path).map_err(|e| Error::io(path, e))?;
     let len = file.metadata().map_err(|e| Error::io(path, e))?.len();
     if len < watermark {
         // A transcript never shrinks: compaction appends to the same file

@@ -12,6 +12,7 @@ use cmd::Failure;
 const USAGE: &str = "usage: verbatim [--version] <command>\n\
                      \n\
                      commands:\n  \
+                       ingest                archive every transcript under the configured roots\n  \
                        ingest <path.jsonl>   archive one transcript file\n  \
                        verify                check every blob against its checksum\n  \
                        reindex               rebuild the derived tables from the blobs";
