@@ -12,7 +12,8 @@ use cmd::Failure;
 const USAGE: &str = "usage: verbatim [--version] <command>\n\
                      \n\
                      commands:\n  \
-                       ingest <path.jsonl>   archive one transcript file";
+                       ingest <path.jsonl>   archive one transcript file\n  \
+                       verify                check every blob against its checksum";
 
 fn main() -> ExitCode {
     match run() {
@@ -21,6 +22,7 @@ fn main() -> ExitCode {
             eprintln!("verbatim: {msg}");
             ExitCode::from(1)
         }
+        Err(Failure::Silent) => ExitCode::from(1),
         Err(Failure::Misuse(msg)) => {
             eprintln!("verbatim: {msg}");
             eprintln!("{USAGE}");
@@ -59,7 +61,20 @@ fn run() -> Result<(), Failure> {
 fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
     match name {
         "ingest" => cmd::ingest::run(cmd::ingest::parse(parser)?),
+        "verify" => {
+            no_more_arguments(parser)?;
+            cmd::verify::run()
+        }
         other => Err(Failure::Misuse(format!("unknown command '{other}'"))),
+    }
+}
+
+/// A subcommand that takes no arguments still has to reject the ones it was
+/// given: silently ignoring them is how `verify --json` comes to look supported.
+fn no_more_arguments(parser: &mut lexopt::Parser) -> Result<(), Failure> {
+    match parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
+        None => Ok(()),
+        Some(arg) => Err(Failure::Misuse(unexpected(arg))),
     }
 }
 

@@ -12,6 +12,7 @@ pub mod error;
 pub mod ingest;
 pub mod parse;
 pub mod store;
+pub mod verify;
 
 #[cfg(feature = "testkit")]
 pub mod testkit;

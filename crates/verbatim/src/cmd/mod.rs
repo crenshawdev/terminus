@@ -6,6 +6,7 @@
 //! 2 on misuse, data on stdout, errors on stderr.
 
 pub mod ingest;
+pub mod verify;
 
 use std::path::PathBuf;
 
@@ -18,6 +19,10 @@ use std::path::PathBuf;
 pub enum Failure {
     /// Exit 1: the work was attempted and did not succeed.
     Operational(String),
+    /// Exit 1, with nothing more to say. `verify` has already printed the
+    /// sessions that failed; a trailing "verbatim: ..." line would be a second
+    /// account of the same thing.
+    Silent,
     /// Exit 2: the command line does not name work that could be attempted.
     Misuse(String),
 }
