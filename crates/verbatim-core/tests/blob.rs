@@ -285,3 +285,170 @@ fn an_empty_range_decompresses_nothing() {
     assert!(reader.read_range(70_000, 0).unwrap().is_empty());
     assert_eq!(reader.blocks_decompressed(), 0);
 }
+
+// --- appending -----------------------------------------------------------
+
+/// The compressed bytes of each block, sliced out of a blob by its own table.
+fn block_extents(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let header = BlobHeader::parse(bytes).unwrap();
+    header
+        .blocks
+        .iter()
+        .map(|b| {
+            let from = b.compressed_offset as usize;
+            bytes[from..from + b.compressed_len as usize].to_vec()
+        })
+        .collect()
+}
+
+/// Build a 200 KB blob 1 KB at a time and hold it to the one-shot blob.
+#[test]
+fn appending_a_kilobyte_at_a_time_matches_a_one_shot_write() {
+    const STEP: usize = 1024;
+    const TOTAL: usize = 200 * 1024;
+
+    let data = textish(TOTAL);
+    let one_shot = blob::write(&data).unwrap();
+
+    let mut incremental = blob::write(&[]).unwrap().bytes;
+    let mut total_compressions = 0usize;
+
+    for chunk in data.chunks(STEP) {
+        let before = BlobHeader::parse(&incremental).unwrap();
+        let completed_before = (before.uncompressed_len / u64::from(before.block_size)) as usize;
+        let extents_before = block_extents(&incremental);
+
+        let appended = blob::append(&incremental, chunk).unwrap();
+
+        assert!(
+            appended.blocks_recompressed <= 1,
+            "an append recompressed {} blocks; D-07 allows the trailing one",
+            appended.blocks_recompressed
+        );
+        assert!(
+            appended.blocks_compressed <= 2,
+            "an append made {} compression calls",
+            appended.blocks_compressed
+        );
+        total_compressions += appended.blocks_compressed;
+
+        // Completed blocks are immutable: same compressed bytes, same
+        // uncompressed start, before and after.
+        let extents_after = block_extents(&appended.bytes);
+        let after = BlobHeader::parse(&appended.bytes).unwrap();
+        for i in 0..completed_before {
+            assert!(
+                extents_after[i] == extents_before[i],
+                "append rewrote completed block {i}"
+            );
+            assert_eq!(
+                after.blocks[i].uncompressed_start, before.blocks[i].uncompressed_start,
+                "append moved block {i}"
+            );
+        }
+
+        incremental = appended.bytes;
+    }
+
+    // 200 appends, at most one extra compression when a block boundary falls
+    // inside a chunk. Recompressing the whole stream each time would be ~416.
+    println!("total zstd compressions across the incremental build: {total_compressions}");
+    assert!(
+        total_compressions <= 210,
+        "{total_compressions} compressions is whole-stream work, not tail work"
+    );
+
+    // The stream itself is identical to the one-shot write, byte for byte.
+    assert!(blob::read_all(&incremental).unwrap() == data);
+    assert!(block_extents(&incremental) == block_extents(&one_shot.bytes));
+    assert!(incremental == one_shot.bytes, "blobs differ byte for byte");
+}
+
+#[test]
+fn an_appended_blob_reads_ranges_exactly_like_a_one_shot_one() {
+    let mut rng = Rng(seed(
+        "an_appended_blob_reads_ranges_exactly_like_a_one_shot_one",
+    ));
+    let data = textish(200 * 1024);
+    let one_shot = blob::write(&data).unwrap().bytes;
+
+    let mut incremental = blob::write(&[]).unwrap().bytes;
+    for chunk in data.chunks(7000) {
+        incremental = blob::append(&incremental, chunk).unwrap().bytes;
+    }
+
+    let a = blob::BlobReader::open(&incremental).unwrap();
+    let b = blob::BlobReader::open(&one_shot).unwrap();
+    for _ in 0..100 {
+        let offset = rng.below(data.len() as u64);
+        let len = rng.below(data.len() as u64 - offset + 1);
+        a.reset_block_counter();
+        b.reset_block_counter();
+        assert!(
+            a.read_range(offset, len).unwrap() == b.read_range(offset, len).unwrap(),
+            "bytes differ at offset {offset} len {len}"
+        );
+        assert_eq!(
+            a.blocks_decompressed(),
+            b.blocks_decompressed(),
+            "block count differs at offset {offset} len {len}"
+        );
+    }
+}
+
+#[test]
+fn the_appended_checksum_covers_the_whole_stream() {
+    let first = textish(100_000);
+    let second = textish(50_000);
+
+    let blob_one = blob::write(&first).unwrap();
+    let appended = blob::append(&blob_one.bytes, &second).unwrap();
+
+    let mut whole = first.clone();
+    whole.extend_from_slice(&second);
+
+    assert_eq!(appended.uncompressed_len, whole.len() as u64);
+    assert_eq!(appended.checksum, *blake3::hash(&whole).as_bytes());
+    assert!(blob::read_all(&appended.bytes).unwrap() == whole);
+}
+
+#[test]
+fn appending_nothing_changes_nothing() {
+    let data = textish(100_000);
+    let written = blob::write(&data).unwrap();
+    let appended = blob::append(&written.bytes, &[]).unwrap();
+
+    assert!(appended.bytes == written.bytes);
+    assert_eq!(appended.checksum, written.checksum);
+    assert_eq!(appended.uncompressed_len, written.uncompressed_len);
+}
+
+#[test]
+fn appending_onto_an_exact_block_boundary_recompresses_nothing() {
+    let data = textish(2 * BLOCK_SIZE);
+    let written = blob::write(&data).unwrap();
+    let appended = blob::append(&written.bytes, &textish(10)).unwrap();
+
+    assert_eq!(
+        appended.blocks_recompressed, 0,
+        "a stream ending on a block boundary has no partial tail to redo"
+    );
+    assert_eq!(appended.blocks_compressed, 1);
+}
+
+#[test]
+fn an_append_crossing_a_block_boundary_redoes_only_the_tail() {
+    // A partial tail plus enough bytes to finish that block and start the next.
+    let written = blob::write(&textish(BLOCK_SIZE - 100)).unwrap();
+    let appended = blob::append(&written.bytes, &textish(200)).unwrap();
+
+    assert_eq!(
+        appended.blocks_compressed, 2,
+        "finishing one block and starting the next is two compressions"
+    );
+    assert_eq!(
+        appended.blocks_recompressed, 1,
+        "exactly one of them redid bytes the blob already held"
+    );
+    assert_eq!(BlobHeader::parse(&appended.bytes).unwrap().blocks.len(), 2);
+}

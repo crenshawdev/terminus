@@ -37,7 +37,7 @@ mod reader;
 mod writer;
 
 pub use reader::BlobReader;
-pub use writer::{write, Written};
+pub use writer::{append, write, Appended, Written};
 
 /// Uncompressed bytes per block.
 ///
