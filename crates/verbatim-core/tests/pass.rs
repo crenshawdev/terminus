@@ -326,3 +326,142 @@ fn a_pass_reports_the_lock_rather_than_waiting_for_it() {
     let summary = bench.pass(&[]);
     assert_eq!(summary.files_committed, 1);
 }
+
+fn runs(conn: &Connection) -> Vec<(i64, i64, i64, i64, Option<String>)> {
+    conn.prepare(
+        "SELECT files_seen, files_committed, files_failed, turns_added, error
+         FROM runs ORDER BY id",
+    )
+    .unwrap()
+    .query_map([], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// Five transcripts in, exactly one `runs` row out (D-10).
+///
+/// Phase 1's `record_run` inserts a literal `1` for `files_seen` from inside
+/// the per-file transaction; reused unchanged by a tree walk it would write
+/// roughly 2,071 rows per hook-triggered pass, and ING-09's "the last ingest
+/// run" would name one file rather than the pass.
+#[test]
+fn one_pass_over_five_transcripts_writes_exactly_one_runs_row() {
+    let bench = bench();
+    for (n, fixture) in [
+        "session-basic.jsonl",
+        "session-large-record.jsonl",
+        "session-continuation.jsonl",
+        "subagents/agent-alpha.jsonl",
+        "subagents/workflows/wf_demo/agent-deep.jsonl",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        bench.place(PROJECT, &format!("{}.jsonl", uuid(n as u8 + 1)), fixture);
+    }
+
+    let summary = bench.pass(&[]);
+    assert_eq!((summary.files_walked, summary.files_committed), (5, 5));
+
+    let rows = runs(&bench.conn());
+    assert_eq!(rows.len(), 1, "one row per pass, whatever the file count");
+    let (seen, committed, failed, turns, error) = rows[0].clone();
+    assert_eq!(seen, 5, "files_seen is what the pass walked");
+    assert_eq!(committed, 5);
+    assert_eq!(failed, 0);
+    assert_eq!(turns as usize, summary.turns_added);
+    assert_eq!(error, None, "a clean pass has nothing to say");
+
+    // A second pass finds nothing new and still moves "the last ingest run".
+    bench.pass(&[]);
+    let rows = runs(&bench.conn());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1].0, 5, "walked again");
+    assert_eq!(rows[1].1, 0, "committed nothing");
+}
+
+/// D-14. A pass that dies mid-walk still leaves one `runs` row carrying its
+/// error - with no log file by design, that row is the only place the failure
+/// can be seen.
+#[test]
+fn a_pass_that_dies_mid_walk_still_leaves_its_runs_row() {
+    let bench = bench();
+    for n in 1..=4u8 {
+        bench.place(
+            PROJECT,
+            &format!("{}.jsonl", uuid(n)),
+            "session-basic.jsonl",
+        );
+    }
+
+    // The fault lives in this bench's own data directory, so it cannot reach a
+    // test running beside it.
+    std::fs::create_dir_all(&bench.data_dir).unwrap();
+    std::fs::write(
+        bench
+            .data_dir
+            .join(verbatim_core::ingest::fault::PASS_FAIL_AFTER_FILE),
+        b"2",
+    )
+    .unwrap();
+
+    let err = pass::run_with(&bench.data_dir, &bench.config(&[]))
+        .expect_err("the armed fault must fail the pass");
+    assert!(err.to_string().contains("pass fault"), "{err}");
+
+    let rows = runs(&bench.conn());
+    assert_eq!(rows.len(), 1, "the dead pass wrote no row");
+    let (seen, committed, _, _, error) = rows[0].clone();
+    assert_eq!(seen, 2, "it walked two files before it died");
+    assert_eq!(committed, 2);
+    let error = error.expect("a failed pass must carry its error");
+    assert!(error.contains("pass failed"), "{error}");
+    assert!(error.contains("pass fault"), "{error}");
+
+    // And the two files it did commit are archived: the row is written after
+    // the per-file transactions, not instead of them.
+    let sessions: i64 = bench
+        .conn()
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sessions, 2);
+}
+
+/// A tree with one damaged file: one row, its error naming that path, and a
+/// committed count one short of the walked count.
+#[test]
+fn a_damaged_file_shows_up_in_the_passs_own_runs_row() {
+    let bench = bench();
+    let shrunk = bench.place(
+        PROJECT,
+        &format!("{}.jsonl", uuid(1)),
+        "session-basic.jsonl",
+    );
+    match ingest::run(&bench.data_dir, &shrunk).unwrap() {
+        ingest::Outcome::Committed(_) => {}
+        other => panic!("{other:?}"),
+    }
+    std::fs::write(&shrunk, b"{}\n").unwrap();
+    bench.place(
+        PROJECT,
+        &format!("{}.jsonl", uuid(2)),
+        "session-continuation.jsonl",
+    );
+
+    let before = runs(&bench.conn()).len();
+    let summary = bench.pass(&[]);
+    assert_eq!(summary.failures.len(), 1);
+
+    let rows = runs(&bench.conn());
+    assert_eq!(rows.len(), before + 1, "one row for the pass");
+    let (seen, committed, failed, _, error) = rows.last().unwrap().clone();
+    assert_eq!(seen, 2);
+    assert_eq!(committed, seen - 1, "one file short of what was walked");
+    assert_eq!(failed, 1);
+    let error = error.expect("a skipped file must be named");
+    assert!(error.contains(shrunk.to_str().unwrap()), "{error}");
+    assert!(error.contains("watermark"), "{error}");
+}

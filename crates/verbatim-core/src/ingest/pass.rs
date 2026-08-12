@@ -28,7 +28,7 @@ use crate::config::Config;
 use crate::discover;
 use crate::error::Result;
 use crate::ingest::lock::{self, Attempt};
-use crate::ingest::Outcome;
+use crate::ingest::{Outcome, RunRow};
 
 /// What one pass over the tree did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -103,12 +103,50 @@ pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
         ..Summary::default()
     };
 
-    for path in &found.transcripts {
+    let walked = walk(&mut store, data_dir, &found.transcripts, &mut summary);
+    summary.duration = started.elapsed();
+
+    // One row, whatever happened (D-10, D-14). A pass that died writes it in a
+    // transaction of its own, after the per-file transaction it was inside has
+    // rolled back - with no log file by design, this row is the only place the
+    // failure can be seen. A pass that walked a tree and found nothing new
+    // writes one too, because "the last ingest run" has to move.
+    let recorded = record_pass(store.conn(), &summary, walked.as_ref().err());
+
+    match walked {
+        Ok(()) => {
+            recorded?;
+            Ok(PassOutcome::Ran(summary))
+        }
+        // The walk's error is the one worth returning. If the row could not be
+        // written either, the store is unwritable and that is the same fact
+        // said twice.
+        Err(e) => Err(e),
+    }
+}
+
+/// The walk itself. Every per-file failure is recorded and skipped; only a
+/// failure of the pass as a whole comes back as `Err`.
+fn walk(
+    store: &mut crate::store::Store,
+    data_dir: &Path,
+    transcripts: &[PathBuf],
+    summary: &mut Summary,
+) -> Result<()> {
+    for path in transcripts {
+        if let Some(after) = crate::ingest::fault::pass_fails_after(data_dir) {
+            if summary.files_walked >= after {
+                return Err(crate::error::Error::io(
+                    data_dir.join(crate::ingest::fault::PASS_FAIL_AFTER_FILE),
+                    std::io::Error::other(format!("pass fault: failed after {after} file(s)")),
+                ));
+            }
+        }
+
         summary.files_walked += 1;
-        // A fresh `Instant` per file: `record_run` measures the file's own pass
-        // today, and task 6 moves that row to the pass. Neither reading wants
-        // the whole walk's elapsed time attributed to the last file.
-        match crate::ingest::ingest_locked(&mut store, path, Instant::now()) {
+        // A fresh `Instant` per file: the elapsed time the pass reports is the
+        // walk's, measured by the caller, not this file's.
+        match crate::ingest::ingest_locked(store, path, Instant::now(), RunRow::PassOwns) {
             Ok(Outcome::Committed(pass)) => {
                 summary.files_committed += 1;
                 summary.bytes_read += pass.bytes_read;
@@ -124,7 +162,59 @@ pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
             }
         }
     }
+    Ok(())
+}
 
-    summary.duration = started.elapsed();
-    Ok(PassOutcome::Ran(summary))
+/// The one `runs` row a pass leaves behind (D-10).
+///
+/// `runs.error` is the only textual channel this product has - there is no log
+/// file, by design, and `verbatim status` surfaces this table - so everything
+/// worth a human's attention goes in it: the path and reason of every file that
+/// was skipped, every directory that could not be listed, every watermark
+/// recovery had to repair, and the failure that ended the pass if one did. It
+/// stays null when there is genuinely nothing to say.
+fn record_pass(
+    conn: &rusqlite::Connection,
+    summary: &Summary,
+    fatal: Option<&crate::error::Error>,
+) -> Result<()> {
+    let mut notes: Vec<String> = Vec::new();
+    for (path, reason) in &summary.failures {
+        notes.push(format!("{}: {reason}", path.display()));
+    }
+    for (path, reason) in &summary.unreadable {
+        notes.push(format!("{}: {reason}", path.display()));
+    }
+    notes.extend(summary.recovery.lines());
+    if let Some(e) = fatal {
+        notes.push(format!("pass failed: {e}"));
+    }
+    let error = if notes.is_empty() {
+        None
+    } else {
+        Some(notes.join("\n"))
+    };
+
+    let elapsed = summary.duration;
+    conn.execute(
+        "INSERT INTO runs (
+            started_at, finished_at, duration_ms, files_seen, bytes_read,
+            turns_added, error, files_committed, files_failed
+         ) VALUES (
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            ?2, ?3, ?4, ?5, ?6, ?7, ?8
+         )",
+        rusqlite::params![
+            format!("-{} seconds", elapsed.as_secs_f64()),
+            elapsed.as_millis() as i64,
+            summary.files_walked as i64,
+            summary.bytes_read as i64,
+            summary.turns_added as i64,
+            error,
+            summary.files_committed as i64,
+            summary.failures.len() as i64,
+        ],
+    )?;
+    Ok(())
 }

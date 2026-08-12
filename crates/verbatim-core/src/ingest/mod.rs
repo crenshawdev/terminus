@@ -79,11 +79,32 @@ pub fn run(data_dir: &Path, transcript: &Path) -> Result<Outcome> {
     // (STOR-05), so a pass never appends turn rows in one shape beside rows
     // written in another.
     let (mut store, _recovered) = crate::recover::recover(data_dir)?;
-    ingest_locked(&mut store, &canonical, started)
+    ingest_locked(&mut store, &canonical, started, RunRow::PerFile)
+}
+
+/// Who owns the `runs` row for this file's transaction.
+///
+/// D-10: one row per pass, not per file. `record_run` inserts a literal `1` for
+/// `files_seen` from inside the per-file transaction, which is right for a
+/// caller that named one file and wrong for a tree walk - reused unchanged it
+/// would write roughly 2,071 rows per hook-triggered pass, and ING-09's "the
+/// last ingest run" would name one file rather than the pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunRow {
+    /// `ingest::run`: this file IS the run, and its row commits in the same
+    /// transaction as the pass (STOR-02).
+    PerFile,
+    /// The tree pass owns the row and writes one after the whole walk.
+    PassOwns,
 }
 
 /// The pass itself, with the lock already held and the store already open.
-pub(crate) fn ingest_locked(store: &mut Store, path: &Path, started: Instant) -> Result<Outcome> {
+pub(crate) fn ingest_locked(
+    store: &mut Store,
+    path: &Path,
+    started: Instant,
+    run_row: RunRow,
+) -> Result<Outcome> {
     // The session is keyed on the transcript FILE identity, never on the
     // record's session id (D-01): 812 real sidecar files report their parent's
     // sessionId, and keying on that overwrites a parent session's blob with a
@@ -180,7 +201,9 @@ pub(crate) fn ingest_locked(store: &mut Store, path: &Path, started: Instant) ->
     }
     fault::stall(fault::IN_TX_AFTER_TURNS);
     write_watermark(&tx, &session_key, pass.watermark)?;
-    record_run(&tx, &pass, started.elapsed())?;
+    if run_row == RunRow::PerFile {
+        record_run(&tx, &pass, started.elapsed())?;
+    }
     fault::stall(fault::IN_TX_BEFORE_COMMIT);
     tx.commit()?;
     fault::stall(fault::AFTER_COMMIT);
@@ -224,6 +247,31 @@ pub mod fault {
     pub const AFTER_COMMIT: &str = "after-commit";
     /// Only reachable under [`SPLIT`]: the watermark committed on its own.
     pub const AFTER_SPLIT_WATERMARK: &str = "after-split-watermark";
+
+    /// A file inside the data directory holding a file count. The tree pass
+    /// fails its walk once it has walked that many transcripts, which is how
+    /// D-14's "a pass that died still leaves its `runs` row" becomes testable.
+    ///
+    /// A file rather than an environment variable on purpose: every test owns
+    /// its own data directory, so a fault aimed at one pass cannot reach a test
+    /// running beside it. An env var is process-global and would.
+    pub const PASS_FAIL_AFTER_FILE: &str = "FAULT_PASS_FAIL_AFTER";
+
+    /// How many files the pass may walk before it fails, if a fault is armed.
+    #[cfg(feature = "testkit")]
+    pub fn pass_fails_after(data_dir: &std::path::Path) -> Option<usize> {
+        std::fs::read_to_string(data_dir.join(PASS_FAIL_AFTER_FILE))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    #[cfg(not(feature = "testkit"))]
+    #[inline(always)]
+    pub fn pass_fails_after(_data_dir: &std::path::Path) -> Option<usize> {
+        None
+    }
 
     /// Every point a kill may be aimed at, in the order a pass reaches them.
     pub const POINTS: &[&str] = &[
