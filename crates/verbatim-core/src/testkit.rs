@@ -18,6 +18,7 @@ pub const TRANSCRIPT_FIXTURES: &[&str] = &[
     "session-continuation.jsonl",
     "session-truncated.jsonl",
     "subagents/agent-alpha.jsonl",
+    "subagents/workflows/wf_demo/agent-deep.jsonl",
 ];
 
 /// A `.jsonl` file in the transcript tree that is not a transcript (D-12).

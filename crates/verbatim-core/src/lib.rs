@@ -9,6 +9,7 @@
 pub mod blob;
 pub mod config;
 pub mod derive;
+pub mod discover;
 pub mod error;
 pub mod ingest;
 pub mod parse;

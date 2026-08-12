@@ -17,6 +17,7 @@ by hand without re-deriving the others will fail
 | `session-continuation.jsonl` | D-11: file-level lineage through a foreign `session_id` |
 | `session-truncated.jsonl` | D-14: a watermark that must stop at the last `\n`, not at end-of-file |
 | `subagents/agent-alpha.jsonl` | D-01: a sidecar reporting its *parent's* `sessionId` |
+| `subagents/workflows/wf_demo/agent-deep.jsonl` | D-16: a sidecar two directories deeper than the usual one, which only an unbounded walk reaches |
 | `subagents/workflows/wf_demo/journal.jsonl` | D-12: a `.jsonl` in the tree that is not a transcript at all |
 
 ## What each one pins
@@ -67,6 +68,15 @@ ingesting the complete file in one pass.
 every record with `isSidechain: true`. This is D-01's collision case: 812 real
 sidecar files do exactly this, so a `sessions` table keyed on the record's
 `sessionId` would overwrite the parent's blob with a small agent transcript.
+
+**`subagents/workflows/wf_demo/agent-deep.jsonl`** is a sidecar at the deep
+position. Real sidecars sit at two depths: 781 at
+`<project>/<sessionId>/subagents/agent-*.jsonl` and 41 two levels further down
+at `<project>/<sessionId>/subagents/workflows/wf_*/agent-*.jsonl` (D-16). A
+depth-limited walk finds `agent-alpha.jsonl` and silently drops this one, and
+without a fixture in the deep position no test on the synthetic corpus catches
+that. Like `agent-alpha.jsonl` it reports the parent's `sessionId` with
+`isSidechain: true`.
 
 **`subagents/workflows/wf_demo/journal.jsonl`** is not a transcript. Its records
 are `{agentId, key, result, type}` with none of `sessionId`, `uuid`, `timestamp`
