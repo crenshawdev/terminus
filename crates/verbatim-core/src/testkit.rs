@@ -58,6 +58,91 @@ pub const TRUNCATED_FIXTURE: &str = "session-truncated.jsonl";
 /// A token appearing in exactly one turn across the whole fixture set.
 pub const UNIQUE_TOKEN: &str = "brillig";
 
+/// Names a **real** Claude config directory whose `projects` subdirectory is a
+/// transcript tree to measure against.
+///
+/// PROJECT.md's testing constraint is a private real-corpus fixture reached by
+/// an environment variable, and this is it. Nothing in the repo can hold that
+/// tree: it is 1,896+ private transcripts and ~988 MB. A test that reads it
+/// skips, loudly, when this is unset, so CI stays green without it.
+///
+/// It names the *config* directory and not the `projects` tree, so it is the
+/// same shape as [`crate::config::CLAUDE_CONFIG_DIR_ENV`] and a run can be
+/// pointed at a real tree by copying one value between them.
+pub const CORPUS_DIR_ENV: &str = "VERBATIM_TEST_CORPUS";
+
+/// The corpus directory, or `None` with the reason already printed.
+///
+/// Printed rather than silent: a test that skips without saying so is a test
+/// everyone believes is running.
+pub fn corpus_dir() -> Option<PathBuf> {
+    let Some(value) = std::env::var_os(CORPUS_DIR_ENV).filter(|v| !v.is_empty()) else {
+        println!("skipping: {CORPUS_DIR_ENV} is unset, so there is no real corpus to measure");
+        return None;
+    };
+    let dir = PathBuf::from(value);
+    let projects = dir.join("projects");
+    assert!(
+        projects.is_dir(),
+        "{CORPUS_DIR_ENV} is set to {}, which has no `projects` directory; \
+         it must name a Claude config directory, not the tree itself",
+        dir.display()
+    );
+    Some(dir)
+}
+
+/// What a walk of a JSONL stream found: how many lines, which top-level
+/// `type` values, and which lines `serde_json` refused.
+///
+/// The counted failures are the point. `Record::parse` deliberately keeps a
+/// non-JSON line as a record with no fields rather than erroring, because a
+/// transcript is archived verbatim whatever it holds - so "zero unparseable
+/// lines" is a claim the product code structurally cannot make for a test, and
+/// this is the independent reader that can.
+#[derive(Debug, Default)]
+pub struct LineSurvey {
+    pub lines: usize,
+    /// Top-level `type` values and how many lines carried each. Counted and
+    /// never asserted as a closed set (D-25): 16 distinct types were measured,
+    /// the set grows upstream, and an exact assertion fails on correct data.
+    pub types: std::collections::BTreeMap<String, usize>,
+    /// Lines with no `type` at all. Not a failure - the schema is upstream's.
+    pub untyped: usize,
+    /// Every line `serde_json` could not parse, as `(session, line number)`,
+    /// capped so a pathological corpus cannot exhaust memory.
+    pub unparseable: Vec<(String, usize)>,
+    pub unparseable_total: usize,
+}
+
+impl LineSurvey {
+    /// How many unparseable lines are kept for the failure message.
+    const KEPT: usize = 20;
+
+    /// Absorb one session's decompressed stream, attributed to `session`.
+    pub fn absorb(&mut self, session: &str, stream: &[u8]) {
+        for (index, line) in stream.split(|b| *b == b'\n').enumerate() {
+            // A trailing newline yields one empty tail slice, which is not a
+            // line. An empty line anywhere else is not one either.
+            if line.is_empty() {
+                continue;
+            }
+            self.lines += 1;
+            match serde_json::from_slice::<serde_json::Value>(line) {
+                Ok(value) => match value.get("type").and_then(|t| t.as_str()) {
+                    Some(kind) => *self.types.entry(kind.to_owned()).or_insert(0) += 1,
+                    None => self.untyped += 1,
+                },
+                Err(_) => {
+                    self.unparseable_total += 1;
+                    if self.unparseable.len() < Self::KEPT {
+                        self.unparseable.push((session.to_owned(), index + 1));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// `tests/fixtures` at the workspace root.
 pub fn fixture_dir() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
