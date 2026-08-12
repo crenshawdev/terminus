@@ -24,6 +24,14 @@ pub const TRANSCRIPT_FIXTURES: &[&str] = &[
 /// A `.jsonl` file in the transcript tree that is not a transcript (D-12).
 pub const NON_TRANSCRIPT_FIXTURE: &str = "subagents/workflows/wf_demo/journal.jsonl";
 
+/// The `agent-*.meta.json` beside `subagents/agent-alpha.jsonl` (D-04).
+///
+/// Deliberately NOT in [`TRANSCRIPT_FIXTURES`]: it is one JSON object rather
+/// than JSONL, discovery's filename filter must keep excluding it, and it must
+/// never become a session. Ingest reads it only as opaque bytes for
+/// `session_meta.agent_meta`.
+pub const AGENT_META_FIXTURE: &str = "subagents/agent-alpha.meta.json";
+
 /// The one fixture with no trailing newline: a transcript still being written.
 pub const TRUNCATED_FIXTURE: &str = "session-truncated.jsonl";
 

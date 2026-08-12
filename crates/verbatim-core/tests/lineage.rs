@@ -4,6 +4,8 @@
 //! `continues_from` equals their own session id must be zero while the count of
 //! non-null `continues_from` values must not be.
 
+#![cfg(feature = "testkit")]
+
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
@@ -353,4 +355,120 @@ fn a_sidecar_ingested_before_its_parent_records_the_same_key() {
     assert_eq!(tree.pass().files_committed, 1);
     assert_eq!(parent.to_str(), Some(&*expected));
     assert_eq!(tree.parent_of(&orphan).as_deref(), Some(&*expected));
+}
+
+// ---------------------------------------------------------------------------
+// The sidecar's `agent-*.meta.json`, stored unparsed (D-04).
+// ---------------------------------------------------------------------------
+
+impl Tree {
+    /// Copy a fixture into the tree under a name of the caller's choosing.
+    fn place(&self, name: &str, fixture: &str) -> PathBuf {
+        let path = self.projects().join(PROJECT).join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(verbatim_core::testkit::fixture_path(fixture), &path).unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    fn agent_meta_of(&self, path: &Path) -> Option<Vec<u8>> {
+        self.conn()
+            .query_row(
+                "SELECT agent_meta FROM session_meta WHERE session_key = ?1",
+                [path.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    fn blob_of(&self, path: &Path) -> Vec<u8> {
+        let bytes: Vec<u8> = self
+            .conn()
+            .query_row(
+                "SELECT blob FROM sessions WHERE session_key = ?1",
+                [path.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        verbatim_core::blob::read_all(&bytes).unwrap()
+    }
+}
+
+/// D-04. The meta file's bytes land in `session_meta.agent_meta` unparsed, the
+/// meta file itself never becomes a session, and the blob still holds only
+/// transcript bytes (D-13).
+#[test]
+fn a_sidecars_meta_file_is_stored_verbatim_and_never_becomes_a_session() {
+    let tree = tree();
+    let dir = format!("{}/subagents", uuid(1));
+    let sidecar = tree.place(
+        &format!("{dir}/agent-alpha.jsonl"),
+        "subagents/agent-alpha.jsonl",
+    );
+    let meta = tree.place(
+        &format!("{dir}/agent-alpha.meta.json"),
+        verbatim_core::testkit::AGENT_META_FIXTURE,
+    );
+
+    let summary = tree.pass();
+    assert_eq!(
+        (summary.files_walked, summary.files_committed),
+        (1, 1),
+        "the meta file is not a transcript and is not walked"
+    );
+
+    let expected =
+        verbatim_core::testkit::fixture_bytes(verbatim_core::testkit::AGENT_META_FIXTURE);
+    assert_eq!(tree.agent_meta_of(&sidecar), Some(expected));
+
+    let rows: i64 = tree
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE session_key = ?1",
+            [meta.to_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "the meta file must never become a session");
+
+    assert_eq!(
+        tree.blob_of(&sidecar),
+        verbatim_core::testkit::fixture_bytes("subagents/agent-alpha.jsonl"),
+        "the blob holds the transcript bytes and nothing else"
+    );
+
+    // A second pass rereads nothing: the bytes never change, and 818 real
+    // sidecars would otherwise be reopened on every hook-spawned run.
+    verbatim_core::discover::opened::reset();
+    assert_eq!(tree.pass().files_committed, 0);
+    assert!(
+        verbatim_core::discover::opened::under(&meta).is_empty(),
+        "a stored meta file must not be reopened: {:?}",
+        verbatim_core::discover::opened::paths()
+    );
+}
+
+/// Coverage is 816 meta files against 818 sidecars, so a missing one is normal:
+/// null column, no error, nothing recorded.
+#[test]
+fn a_sidecar_with_no_meta_file_leaves_the_column_null() {
+    let tree = tree();
+    let sidecar = tree.place(
+        &format!("{}/subagents/agent-alpha.jsonl", uuid(1)),
+        "subagents/agent-alpha.jsonl",
+    );
+
+    let summary = tree.pass();
+    assert_eq!(summary.files_committed, 1);
+    assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+    assert_eq!(tree.agent_meta_of(&sidecar), None);
+}
+
+/// A top-level transcript is not a sidecar: nothing looks for a meta file
+/// beside it, and the column stays null.
+#[test]
+fn a_top_level_transcript_has_no_agent_meta() {
+    let tree = tree();
+    let path = tree.transcript(1, &session(1), None);
+    assert_eq!(tree.pass().files_committed, 1);
+    assert_eq!(tree.agent_meta_of(&path), None);
 }

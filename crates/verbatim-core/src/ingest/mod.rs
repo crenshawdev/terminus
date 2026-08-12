@@ -16,7 +16,7 @@ pub mod lock;
 pub mod pass;
 
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub use lock::{Attempt, IngestLock, LOCK_FILE_NAME};
@@ -172,6 +172,15 @@ pub(crate) fn ingest_locked(
     let parent_session_key =
         lineage::sidecar_parent(path).map(|p| p.to_string_lossy().into_owned());
 
+    // Read once per session, not once per pass: the bytes never change, and a
+    // steady-state pass over 818 real sidecars would otherwise reopen 818 meta
+    // files to store what it already has.
+    let agent_meta = if existing.agent_meta_stored {
+        None
+    } else {
+        read_agent_meta(path)
+    };
+
     let pass = Pass {
         session_key: session_key.clone(),
         bytes_read: consumed as u64,
@@ -210,6 +219,7 @@ pub(crate) fn ingest_locked(
             continues_from: continues_from.as_deref(),
             project: project.as_ref(),
             parent_session_key: parent_session_key.as_deref(),
+            agent_meta: agent_meta.as_deref(),
             scan: &scan,
         },
     )?;
@@ -242,6 +252,45 @@ pub(crate) fn ingest_locked(
     fault::stall(fault::AFTER_COMMIT);
 
     Ok(Outcome::Committed(pass))
+}
+
+/// The `agent-*.meta.json` that would sit beside a sidecar transcript (D-04).
+///
+/// Same directory, same stem, a different extension - which is exactly why
+/// discovery's filename filter never picks it up and it can never become a
+/// session of its own (D-16). `None` for anything that is not an
+/// `agent-*.jsonl`.
+fn agent_meta_path(transcript: &Path) -> Option<PathBuf> {
+    let stem = transcript
+        .file_name()?
+        .to_str()?
+        .strip_suffix(".jsonl")?
+        .to_owned();
+    if !stem.starts_with("agent-") {
+        return None;
+    }
+    Some(transcript.with_file_name(format!("{stem}.meta.json")))
+}
+
+/// A sidecar's meta bytes, read verbatim and never parsed (D-04).
+///
+/// 816 such files carry `agentType`, `description`, `toolUseId`, `spawnDepth`
+/// and `model` against 818 sidecar transcripts, so a missing one is normal:
+/// the column stays null and nothing is recorded. The format is undocumented
+/// and may drift, which is the whole reason the bytes are stored rather than
+/// typed columns - phase 3 can extract `description` for ranking without a
+/// reingest, and the blob stays transcript bytes only (D-13).
+///
+/// Through the counted open, like every other read of the transcript tree, so
+/// an excluded project's meta files are counted the same way its transcripts
+/// are. Any read error is the same answer as an absent file: this is metadata
+/// about a session, not the session, and it must not fail the file.
+fn read_agent_meta(transcript: &Path) -> Option<Vec<u8>> {
+    let path = agent_meta_path(transcript)?;
+    let mut file = crate::discover::open_transcript(&path).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 /// The byte offset the next pass resumes from: just past the last `\n` (D-14).
@@ -357,6 +406,9 @@ pub mod fault {
 /// What the store already holds for this transcript.
 struct Existing {
     watermark: u64,
+    /// Whether `session_meta.agent_meta` already holds this sidecar's meta
+    /// bytes, so a steady-state pass reopens nothing to rewrite them (D-04).
+    agent_meta_stored: bool,
     /// Turns already stored for this session, which is the ordinal the next one
     /// takes: a tail pass numbers on from here and a rebuild from 0 lands on
     /// the same numbers, because both count in byte order (D-02).
@@ -379,6 +431,14 @@ impl Existing {
                 |r| r.get(0),
             )
             .optional()?;
+        let agent_meta_stored: bool = conn
+            .query_row(
+                "SELECT agent_meta IS NOT NULL FROM session_meta WHERE session_key = ?1",
+                [session_key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
         let turn_count: i64 = conn.query_row(
             "SELECT count(*) FROM turns WHERE session_key = ?1",
             [session_key],
@@ -446,6 +506,7 @@ impl Existing {
 
         Ok(Existing {
             watermark: watermark.unwrap_or(0) as u64,
+            agent_meta_stored,
             turn_count,
             session,
         })
@@ -566,6 +627,8 @@ struct MetaRow<'a> {
     /// `None` for a top-level transcript. In the session-KEY namespace, unlike
     /// [`MetaRow::continues_from`].
     parent_session_key: Option<&'a str>,
+    /// The bytes of the sidecar's `agent-*.meta.json`, stored opaquely (D-04).
+    agent_meta: Option<&'a [u8]>,
     scan: &'a Scan,
 }
 
@@ -599,8 +662,8 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
         "INSERT INTO session_meta (
             session_key, session_id, transcript_path, checksum, uncompressed_len,
             continues_from, first_turn_at, last_turn_at, cwd, branch,
-            project, project_pre_worktree, parent_session_key
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            project, project_pre_worktree, parent_session_key, agent_meta
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(session_key) DO UPDATE SET
             session_id = coalesce(session_meta.session_id, excluded.session_id),
             transcript_path = excluded.transcript_path,
@@ -615,7 +678,8 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
             project_pre_worktree = coalesce(
                 session_meta.project_pre_worktree, excluded.project_pre_worktree),
             parent_session_key = coalesce(
-                session_meta.parent_session_key, excluded.parent_session_key)",
+                session_meta.parent_session_key, excluded.parent_session_key),
+            agent_meta = coalesce(session_meta.agent_meta, excluded.agent_meta)",
         rusqlite::params![
             row.session_key,
             session_id,
@@ -630,6 +694,7 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
             project,
             pre_worktree,
             row.parent_session_key,
+            row.agent_meta,
         ],
     )?;
     Ok(())

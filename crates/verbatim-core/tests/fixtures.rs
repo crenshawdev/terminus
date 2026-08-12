@@ -258,3 +258,43 @@ fn unique_token_appears_exactly_once_across_the_corpus() {
         .sum();
     assert_eq!(total, 1, "`{}` must be unique", testkit::UNIQUE_TOKEN);
 }
+
+/// D-04: the meta fixture is one JSON object carrying the five fields every
+/// real `agent-*.meta.json` carries, and it is not a transcript.
+///
+/// It sits outside [`testkit::TRANSCRIPT_FIXTURES`] on purpose: the JSONL and
+/// trailing-newline assertions above do not describe it, and discovery's
+/// filename filter must keep it out of the archive entirely.
+#[test]
+fn the_agent_meta_fixture_is_one_json_object_and_not_a_transcript() {
+    assert!(
+        !testkit::TRANSCRIPT_FIXTURES.contains(&testkit::AGENT_META_FIXTURE),
+        "the meta file is not a transcript"
+    );
+    assert!(
+        testkit::AGENT_META_FIXTURE.ends_with(".meta.json"),
+        "the extension is what keeps discovery from picking it up"
+    );
+
+    let bytes = testkit::fixture_bytes(testkit::AGENT_META_FIXTURE);
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("one JSON object");
+    for field in [
+        "agentType",
+        "description",
+        "toolUseId",
+        "spawnDepth",
+        "model",
+    ] {
+        assert!(
+            value.get(field).is_some(),
+            "meta file lacks {field}: {value}"
+        );
+    }
+
+    // Its stem matches the sidecar it belongs to, which is how ingest finds it.
+    let sidecar = testkit::AGENT_META_FIXTURE.replace(".meta.json", ".jsonl");
+    assert!(
+        testkit::TRANSCRIPT_FIXTURES.contains(&sidecar.as_str()),
+        "the meta file must sit beside a sidecar fixture"
+    );
+}

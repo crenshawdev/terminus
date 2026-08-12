@@ -19,6 +19,7 @@ by hand without re-deriving the others will fail
 | `subagents/agent-alpha.jsonl` | D-01: a sidecar reporting its *parent's* `sessionId` |
 | `subagents/workflows/wf_demo/agent-deep.jsonl` | D-16: a sidecar two directories deeper than the usual one, which only an unbounded walk reaches |
 | `subagents/workflows/wf_demo/journal.jsonl` | D-12: a `.jsonl` in the tree that is not a transcript at all |
+| `subagents/agent-alpha.meta.json` | D-04: the sidecar metadata file, stored as opaque bytes and never a session |
 
 ## What each one pins
 
@@ -83,5 +84,20 @@ are `{agentId, key, result, type}` with none of `sessionId`, `uuid`, `timestamp`
 or `cwd`. Four such files exist in the real tree, and recursive discovery with
 `dot: true` reaches them, so the parser must tolerate them without erroring.
 
-Every file except `session-truncated.jsonl` ends with a trailing `\n`, and no
-file contains a `\r` byte (D-14).
+**`subagents/agent-alpha.meta.json`** is the meta file Claude Code writes
+beside a sidecar transcript: same directory, same stem, a different extension.
+816 real ones exist against 818 sidecars, so a missing one is normal and the
+column simply stays null. It carries the five fields every real one carries -
+`agentType`, `description`, `toolUseId`, `spawnDepth`, `model` - and its
+`toolUseId` names the `tool_use` block in `session-basic.jsonl` that spawned the
+agent, so the fixture set stays internally coherent.
+
+Ingest stores its **bytes**, unparsed (D-04): the format is undocumented and may
+drift, and keeping the bytes lets phase 3 extract `description` for ranking
+without a reingest. It is not a transcript, so it is not in
+`TRANSCRIPT_FIXTURES` and the JSONL assertions below do not apply to it -
+discovery's filename filter excludes it on the extension, which is what keeps it
+from ever becoming a session.
+
+Every transcript fixture except `session-truncated.jsonl` ends with a trailing
+`\n`, and no fixture contains a `\r` byte (D-14).
