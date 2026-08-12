@@ -255,43 +255,64 @@ fn fold(s: &str) -> String {
 /// Does some real directory beneath `root` encode to `name`?
 ///
 /// `Some(true)` when one does - `name` is a subdirectory of `root` and the
-/// caller excludes it. `Some(false)` when the tree was searched and none does -
-/// `name` is some other path that merely encodes the same way, and the caller
-/// leaves it alone. `None` when the question could not be answered: `root` is
-/// not a readable directory, or the search ran past [`DIR_SCAN_BUDGET`]. The
-/// caller treats `None` as excluded.
+/// caller excludes it. `Some(false)` only when the search was COMPLETE and
+/// nothing on the way to `name` exists at all, which is what a path that merely
+/// encodes the same way looks like; the caller leaves that one alone. `None`
+/// whenever the question could not be answered, and the caller treats `None` as
+/// excluded.
 ///
 /// The walk descends only into directories whose own encoding is still a prefix
 /// of `name`, so it follows the one branch that can match rather than the tree.
-/// Symlinked entries are not descended into - `file_type` here does not follow
-/// them - which keeps a link loop out of the search and matches the read side,
-/// where a link is resolved as the path it is written as.
+///
+/// **A partial match is unresolved, not a negative.** Descending a branch means
+/// the leading components of `name` are real directories under `root`; failing
+/// to find the leaf under them means the leaf is GONE, not that `name` names
+/// something else. Worktrees are this case and are the majority of it: a
+/// worktree directory is deleted when the worktree is, while `<repo>/.claude/
+/// worktrees` survives empty, so every archived worktree session's project
+/// directory has a live prefix and a dead leaf. Answering `Some(false)` there
+/// would open exactly the transcripts D-06 folds into the excluded repo.
+///
+/// Unreadable entries and symlinks are unresolved for the same reason. A
+/// symlinked branch is not followed - a link loop would not terminate - so when
+/// one could still lead to `name` the answer is `None` rather than a negative
+/// reached by not looking.
 fn descends_to(root: &Path, name: &str) -> Option<bool> {
     if !root.is_dir() {
         return None;
     }
     let mut budget = DIR_SCAN_BUDGET;
     let mut stack = vec![root.to_path_buf()];
+    let mut descended = false;
     while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        for entry in std::fs::read_dir(&dir).ok()? {
             budget = budget.checked_sub(1)?;
-            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-                continue;
-            }
+            let entry = entry.ok()?;
             let child = entry.path();
             let encoded = fold(&encode(&child.to_string_lossy()));
+            let leads_to_name = name
+                .strip_prefix(encoded.as_str())
+                .is_some_and(|rest| rest.starts_with(ENCODED_SEPARATOR));
+            if !encoded.eq(name) && !leads_to_name {
+                continue;
+            }
+            // Only entries that could still be `name` are typed, so an
+            // unreadable type on an unrelated file never decides anything.
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() {
+                return None;
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
             if encoded == name {
                 return Some(true);
             }
-            if name
-                .strip_prefix(encoded.as_str())
-                .is_some_and(|rest| rest.starts_with(ENCODED_SEPARATOR))
-            {
-                stack.push(child);
-            }
+            descended = true;
+            stack.push(child);
         }
     }
-    Some(false)
+    (!descended).then_some(false)
 }
 
 /// A path as its comparable components, folded for the platform.

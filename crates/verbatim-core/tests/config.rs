@@ -224,6 +224,62 @@ fn a_child_and_a_sibling_that_collide_resolve_to_excluded() {
     );
 }
 
+/// The shape the real corpus is actually in: the worktree is gone, its parent
+/// `worktrees` directory survives empty, and the archived sessions are still
+/// there under the deleted worktree's encoded name.
+///
+/// A live prefix with a dead leaf means the leaf was deleted, not that the name
+/// belongs to some other path - so it stays excluded. Every worktree project
+/// directory on the development machine is this case (all three
+/// `.claude/worktrees` directories there are empty), which is why a search that
+/// answered "not a child" here would reopen the ING-08 violation rather than
+/// close it.
+#[test]
+fn a_deleted_worktree_under_a_live_repo_is_still_excluded() {
+    let tree = tempfile::tempdir().unwrap();
+    let repo = tree.path().join("cadence");
+    // The worktree itself is NOT created - it was deleted, like every one of
+    // them on the real machine.
+    std::fs::create_dir_all(repo.join(".claude").join("worktrees")).unwrap();
+
+    let config = excluding(&[repo.to_str().unwrap()]);
+    let worktree = verbatim_core::config::encode(
+        repo.join(".claude")
+            .join("worktrees")
+            .join("agent-a33a")
+            .to_str()
+            .unwrap(),
+    );
+
+    assert!(
+        config.excludes_encoded_dir(&worktree),
+        "the worktree directory is gone but its sessions are archived under this \
+         name, and D-06 folds them into the excluded repo"
+    );
+}
+
+/// A branch that could still lead to the name but cannot be followed leaves the
+/// question open rather than answering it by not looking.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_branch_is_unresolved_rather_than_absent() {
+    let tree = tempfile::tempdir().unwrap();
+    let repo = tree.path().join("cadence");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(tree.path().join("elsewhere").join("vendor")).unwrap();
+    std::os::unix::fs::symlink(tree.path().join("elsewhere"), repo.join("linked")).unwrap();
+
+    let config = excluding(&[repo.to_str().unwrap()]);
+    let through_link =
+        verbatim_core::config::encode(repo.join("linked").join("vendor").to_str().unwrap());
+
+    assert!(
+        config.excludes_encoded_dir(&through_link),
+        "the link is not followed, so whether this is under the excluded repo is \
+         unknown - and unknown is not read"
+    );
+}
+
 /// An exclusion that cannot be resolved excludes: the answer is unknown and the
 /// safe direction for a privacy boundary is not to read.
 #[test]
