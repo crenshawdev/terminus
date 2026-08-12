@@ -46,7 +46,10 @@ fn big_transcript(dir: &Path) -> PathBuf {
     }
     let path = dir.join("crash-corpus.jsonl");
     std::fs::write(&path, &bytes).unwrap();
-    assert!(bytes.len() > 4 * 1024 * 1024, "the corpus must be worth killing");
+    assert!(
+        bytes.len() > 4 * 1024 * 1024,
+        "the corpus must be worth killing"
+    );
     path
 }
 
@@ -150,7 +153,14 @@ impl Snapshot {
                 )
                 .unwrap()
                 .query_map([], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
                 })
                 .unwrap()
                 .map(Result::unwrap)
@@ -301,9 +311,14 @@ fn killing_ingest_anywhere_leaves_a_store_that_converges() {
     let pass_time = started.elapsed();
     let reference = Snapshot::of(&reference_dir);
     assert!(!reference.turns.is_empty());
-    println!("uninterrupted pass: {pass_time:?}, {} turns", reference.turns.len());
+    println!(
+        "uninterrupted pass: {pass_time:?}, {} turns",
+        reference.turns.len()
+    );
 
-    let mut rng = Rng(testkit::seed("killing_ingest_anywhere_leaves_a_store_that_converges"));
+    let mut rng = Rng(testkit::seed(
+        "killing_ingest_anywhere_leaves_a_store_that_converges",
+    ));
     let mut kills = 0usize;
     let mut incomplete = 0usize;
 
@@ -351,7 +366,10 @@ fn killing_ingest_anywhere_leaves_a_store_that_converges() {
         iteration(&data_dir, &mut kills, &mut incomplete);
     }
 
-    assert!(kills >= 20, "AC2 asks for 20 or more kill points, ran {kills}");
+    assert!(
+        kills >= 20,
+        "AC2 asks for 20 or more kill points, ran {kills}"
+    );
     assert!(
         incomplete >= ROUNDS * 3,
         "only {incomplete} of {kills} kills interrupted anything; the harness is testing \

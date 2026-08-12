@@ -34,7 +34,10 @@ fn only_the_four_turn_types_become_turns() {
     assert_eq!(scan.records.len(), 19, "one record per line of the fixture");
 
     for record in &scan.records {
-        let kind = record.record_type.as_deref().expect("every line has a type");
+        let kind = record
+            .record_type
+            .as_deref()
+            .expect("every line has a type");
         if record.is_turn() {
             assert!(
                 TURN_TYPES.contains(&kind),
@@ -117,7 +120,10 @@ fn a_turn_carries_the_fields_ingest_and_derive_need() {
     let scan = parse::scan(&bytes);
     let turns: Vec<_> = scan.turns().collect();
 
-    assert_eq!(turns[0].1.parent_uuid, None, "the first turn threads nothing");
+    assert_eq!(
+        turns[0].1.parent_uuid, None,
+        "the first turn threads nothing"
+    );
     for window in turns.windows(2) {
         assert_eq!(
             window[1].1.parent_uuid.as_deref(),

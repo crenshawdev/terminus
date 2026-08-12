@@ -118,10 +118,7 @@ fn the_lock_is_released_by_process_death() {
             Attempt::Held => panic!("a fresh data dir cannot be locked already"),
         };
         assert!(
-            matches!(
-                ingest::lock::try_acquire(&data_dir).unwrap(),
-                Attempt::Held
-            ),
+            matches!(ingest::lock::try_acquire(&data_dir).unwrap(), Attempt::Held),
             "a second attempt must fail immediately rather than wait"
         );
         drop(guard);

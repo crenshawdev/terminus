@@ -117,7 +117,9 @@ impl Bench {
 /// Session keys other than the ones named, so "and no other" can be checked
 /// against the text the command actually prints.
 fn others<'a>(keys: &'a [String], named: &[&str]) -> Vec<&'a String> {
-    keys.iter().filter(|k| !named.contains(&k.as_str())).collect()
+    keys.iter()
+        .filter(|k| !named.contains(&k.as_str()))
+        .collect()
 }
 
 #[test]

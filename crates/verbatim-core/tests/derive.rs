@@ -192,7 +192,8 @@ fn the_seam_reproduces_what_ingest_wrote_for_one_turn() {
     let id = schema::turn_id(bench.session_no, turn.turn_seq);
 
     let ingested = one_turn_row(&conn, id);
-    conn.execute("DELETE FROM turns WHERE id = ?1", [id]).unwrap();
+    conn.execute("DELETE FROM turns WHERE id = ?1", [id])
+        .unwrap();
     conn.execute("DELETE FROM turns_fts WHERE rowid = ?1", [id])
         .unwrap();
     assert!(matching(&conn, testkit::UNIQUE_TOKEN).len() <= 1);
