@@ -11,6 +11,15 @@ authors.workspace = true
 name = "verbatim"
 path = "src/main.rs"
 
+[features]
+default = []
+# Builds the binary with `verbatim-core`'s fault-injection points compiled in.
+# The crash harness spawns this binary and needs a kill to land *inside* the
+# ingest transaction; without this the points are inert and a release pass over
+# a small fixture commits before any kill can arrive. Never enabled for a
+# release build of the shipped binary.
+testkit = ["verbatim-core/testkit"]
+
 [dependencies]
 verbatim-core.workspace = true
 lexopt.workspace = true

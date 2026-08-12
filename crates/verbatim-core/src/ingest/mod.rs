@@ -128,6 +128,20 @@ pub(crate) fn ingest_locked(store: &mut Store, path: &Path, started: Instant) ->
         watermark: scan.resume_offset,
     };
 
+    fault::stall(fault::AFTER_BLOB);
+
+    // The fault the crash harness must be able to catch, and the reason that
+    // harness is worth anything: with this on, the watermark commits in a
+    // transaction of its own *before* the pass, so a kill in between leaves a
+    // store claiming bytes its blob does not hold. Compiled only under
+    // `testkit`; the shipped binary has no such branch.
+    if fault::split_watermark() {
+        let early = store.conn_mut().transaction()?;
+        write_watermark(&early, &session_key, pass.watermark)?;
+        early.commit()?;
+        fault::stall(fault::AFTER_SPLIT_WATERMARK);
+    }
+
     // One transaction, and nothing outside it mutates the store (STOR-02).
     let tx = store.conn_mut().transaction()?;
     tx.execute(
@@ -144,6 +158,7 @@ pub(crate) fn ingest_locked(store: &mut Store, path: &Path, started: Instant) ->
         continues_from.as_deref(),
         &scan,
     )?;
+    fault::stall(fault::IN_TX_AFTER_SESSION);
     for (record, turn) in scan.turns() {
         // The seam, not an insert of our own: the rebuild path calls the same
         // function, which is what stops it from drifting from what ingest wrote
@@ -162,17 +177,99 @@ pub(crate) fn ingest_locked(store: &mut Store, path: &Path, started: Instant) ->
             },
         )?;
     }
-    tx.execute(
+    fault::stall(fault::IN_TX_AFTER_TURNS);
+    write_watermark(&tx, &session_key, pass.watermark)?;
+    record_run(&tx, &pass, started.elapsed())?;
+    fault::stall(fault::IN_TX_BEFORE_COMMIT);
+    tx.commit()?;
+    fault::stall(fault::AFTER_COMMIT);
+
+    Ok(Outcome::Committed(pass))
+}
+
+/// The byte offset the next pass resumes from: just past the last `\n` (D-14).
+fn write_watermark(conn: &Connection, session_key: &str, offset: u64) -> Result<()> {
+    conn.execute(
         "INSERT INTO watermarks (transcript_path, byte_offset, updated_at)
          VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(transcript_path) DO UPDATE SET
             byte_offset = excluded.byte_offset, updated_at = excluded.updated_at",
-        rusqlite::params![session_key, pass.watermark as i64],
+        rusqlite::params![session_key, offset as i64],
     )?;
-    record_run(&tx, &pass, started.elapsed())?;
-    tx.commit()?;
+    Ok(())
+}
 
-    Ok(Outcome::Committed(pass))
+/// Where a kill can be aimed, so the crash harness hits the inside of the
+/// transaction instead of relying on a race it cannot win.
+///
+/// A release ingest of a few-KB fixture finishes in single-digit milliseconds,
+/// so a harness that only randomizes on elapsed time lands nearly every kill
+/// after the commit and passes vacuously. The stall is the fix: the child
+/// announces that it has reached a named point, then waits there to be killed,
+/// which makes "killed inside the transaction" a fact rather than a hope.
+///
+/// The whole module is inert without the `testkit` feature - the shipped binary
+/// reads no environment variable and takes no branch.
+pub mod fault {
+    /// Compression and hashing are done; nothing is written yet.
+    pub const AFTER_BLOB: &str = "after-blob";
+    /// Inside the transaction, after `sessions` and `session_meta`.
+    pub const IN_TX_AFTER_SESSION: &str = "in-tx-after-session";
+    /// Inside the transaction, after every turn and its derived rows.
+    pub const IN_TX_AFTER_TURNS: &str = "in-tx-after-turns";
+    /// Inside the transaction, with everything written and nothing committed.
+    pub const IN_TX_BEFORE_COMMIT: &str = "in-tx-before-commit";
+    /// The pass committed; the process has not exited.
+    pub const AFTER_COMMIT: &str = "after-commit";
+    /// Only reachable under [`SPLIT`]: the watermark committed on its own.
+    pub const AFTER_SPLIT_WATERMARK: &str = "after-split-watermark";
+
+    /// Every point a kill may be aimed at, in the order a pass reaches them.
+    pub const POINTS: &[&str] = &[
+        AFTER_BLOB,
+        IN_TX_AFTER_SESSION,
+        IN_TX_AFTER_TURNS,
+        IN_TX_BEFORE_COMMIT,
+        AFTER_COMMIT,
+    ];
+
+    /// Names the point to stall at.
+    pub const AT: &str = "VERBATIM_FAULT_AT";
+    /// Names a file to create on arrival, which is what the parent polls for.
+    pub const READY: &str = "VERBATIM_FAULT_READY";
+    /// Moves the watermark into its own earlier transaction.
+    pub const SPLIT: &str = "VERBATIM_FAULT_SPLIT_WATERMARK";
+
+    /// Long enough that the parent always gets to kill first, short enough that
+    /// a harness bug times out instead of hanging a test run forever.
+    #[cfg(feature = "testkit")]
+    const STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[cfg(feature = "testkit")]
+    pub fn stall(point: &str) {
+        if std::env::var(AT).ok().as_deref() != Some(point) {
+            return;
+        }
+        if let Ok(path) = std::env::var(READY) {
+            let _ = std::fs::write(path, point.as_bytes());
+        }
+        std::thread::sleep(STALL);
+    }
+
+    #[cfg(not(feature = "testkit"))]
+    #[inline(always)]
+    pub fn stall(_point: &str) {}
+
+    #[cfg(feature = "testkit")]
+    pub fn split_watermark() -> bool {
+        std::env::var_os(SPLIT).is_some_and(|v| !v.is_empty())
+    }
+
+    #[cfg(not(feature = "testkit"))]
+    #[inline(always)]
+    pub fn split_watermark() -> bool {
+        false
+    }
 }
 
 /// What the store already holds for this transcript.
