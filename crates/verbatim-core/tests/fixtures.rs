@@ -366,3 +366,352 @@ fn the_boundary_line_helper_returns_the_last_whole_record() {
     let bytes = testkit::fixture_bytes(testkit::COMPACTED_FIXTURE);
     assert!(bytes.ends_with(&[line.as_slice(), b"\n"].concat()));
 }
+
+// --- Phase 3 -----------------------------------------------------------------
+
+/// Concatenate a record's `message.content` text blocks, which is all a phase 3
+/// assertion ever needs off a turn.
+fn message_text(record: &serde_json::Value) -> String {
+    let Some(blocks) = record["message"]["content"].as_array() else {
+        return record["message"]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+    };
+    blocks
+        .iter()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The phase 3 fixtures carry a root the test owns rather than this checkout's
+/// path, and they carry two projects between them.
+///
+/// The phase 1 and 2 fixtures hardcode `/data/code/verbatim`. A project-scoped
+/// assertion over those is true only on a checkout at that literal path, and on
+/// that checkout it is true for the wrong reason: the directory exists, so
+/// `git rev-parse` answers and the key is whatever the developer's tree is.
+#[test]
+fn the_rooted_fixtures_name_a_test_owned_root_and_two_projects() {
+    let mut projects = BTreeSet::new();
+    for (name, project) in testkit::ROOTED_FIXTURES {
+        assert!(
+            testkit::TRANSCRIPT_FIXTURES.contains(name),
+            "{name} is rooted but not registered as a transcript"
+        );
+        projects.insert(*project);
+
+        let expected = format!("{}/{project}", testkit::FIXTURE_ROOT_TOKEN);
+        let recs = records(name);
+        assert!(!recs.is_empty());
+        for r in &recs {
+            assert_eq!(
+                r["cwd"].as_str(),
+                Some(expected.as_str()),
+                "{name} carries a cwd that is not the rooted one"
+            );
+        }
+        let text = String::from_utf8(testkit::fixture_bytes(name)).unwrap();
+        assert!(
+            !text.contains("/data/code/verbatim"),
+            "{name} hardcodes this checkout's path"
+        );
+    }
+    assert!(
+        projects.len() >= 2,
+        "one project between the rooted fixtures leaves scoping nothing to be false about"
+    );
+}
+
+/// AC1's two probes and AC3's structured-versus-prose pair, all in one fixture.
+///
+/// The pair is the part that is easy to get wrong by accident: the `Read`
+/// `tool_use` and the prose mention must name the **same** path and sit in
+/// **different** turns, or the assertion that one emits a `path` entity and the
+/// other emits none is comparing a turn with itself.
+#[test]
+fn session_recall_carries_the_expansion_probes_and_the_prose_pair() {
+    let recs = records("session-recall.jsonl");
+
+    let camel: Vec<usize> = recs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| message_text(r).contains("SearchManager"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(camel.len(), 1, "exactly one turn carries `SearchManager`");
+
+    let pathy: Vec<usize> = recs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| message_text(r).contains("src/worker/S.ts"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(pathy.len(), 1, "exactly one turn carries `src/worker/S.ts`");
+
+    // The structured half: a `Read` whose `file_path` names the file.
+    let mut structured = Vec::new();
+    for (index, r) in recs.iter().enumerate() {
+        let Some(blocks) = r["message"]["content"].as_array() else {
+            continue;
+        };
+        for block in blocks {
+            if block["type"] == "tool_use" && block["name"] == "Read" {
+                structured.push((
+                    index,
+                    block["input"]["file_path"]
+                        .as_str()
+                        .expect("a Read names a file_path")
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    assert_eq!(structured.len(), 1, "exactly one Read tool_use");
+    let (structured_at, file) = &structured[0];
+
+    // The prose half: the same path, in a turn with no tool_use at all.
+    let prose: Vec<usize> = recs
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| message_text(r).contains(file.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(prose.len(), 1, "exactly one turn names {file} in prose");
+    assert_ne!(
+        prose[0], *structured_at,
+        "the structured and prose mentions must be different turns"
+    );
+    assert!(
+        recs[prose[0]]["message"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] == "text"),
+        "the prose turn must carry no structured block"
+    );
+
+    // The symbol probe, from the one field RCL-02 reads symbols out of.
+    let patterns: Vec<&str> = recs
+        .iter()
+        .filter_map(|r| r["message"]["content"].as_array())
+        .flatten()
+        .filter(|b| b["type"] == "tool_use" && b["name"] == "Grep")
+        .filter_map(|b| b["input"]["pattern"].as_str())
+        .collect();
+    assert_eq!(patterns, ["retryBudget"]);
+}
+
+/// Every `tool_result` and `toolUseResult` in the error fixtures, as
+/// `(is_error, stderr, interrupted)`.
+fn error_results(name: &str) -> Vec<(bool, String, bool)> {
+    let mut out = Vec::new();
+    for r in records(name) {
+        let Some(blocks) = r["message"]["content"].as_array() else {
+            continue;
+        };
+        let Some(block) = blocks.iter().find(|b| b["type"] == "tool_result") else {
+            continue;
+        };
+        let result = &r["toolUseResult"];
+        assert!(
+            result.is_object(),
+            "{name}: a tool_result with no toolUseResult object"
+        );
+        for key in ["stdout", "stderr", "interrupted"] {
+            assert!(
+                result.get(key).is_some(),
+                "{name}: toolUseResult lacks {key}, which 2,920 real Bash results carry"
+            );
+        }
+        out.push((
+            block["is_error"].as_bool().expect("is_error is a bool"),
+            result["stderr"]
+                .as_str()
+                .expect("stderr is a string")
+                .into(),
+            result["interrupted"].as_bool().expect("a bool"),
+        ));
+    }
+    out
+}
+
+fn looks_like_uuid(token: &str) -> bool {
+    let widths = [8usize, 4, 4, 4, 12];
+    let groups: Vec<&str> = token.split('-').collect();
+    groups.len() == widths.len()
+        && groups
+            .iter()
+            .zip(widths)
+            .all(|(g, w)| g.len() == w && g.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn looks_like_timestamp(token: &str) -> bool {
+    token.len() == 24
+        && token.as_bytes()[10] == b'T'
+        && token.ends_with('Z')
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'-' | b':' | b'.' | b'T' | b'Z'))
+}
+
+fn looks_like_line_col(token: &str) -> bool {
+    let mut parts = token.rsplit(':');
+    let (col, line) = (parts.next(), parts.next());
+    matches!((line, col), (Some(l), Some(c))
+        if !l.is_empty() && !c.is_empty()
+            && l.bytes().all(|b| b.is_ascii_digit())
+            && c.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// AC2's whole premise, pinned in the bytes rather than in the extractor.
+///
+/// One pair across the two sessions differs *only* in the four things D-04
+/// normalizes away, and the other differs *only* in a bare integer D-04
+/// deliberately keeps. Neither claim is checkable once the extractor has run:
+/// by then both pairs are just values, and a rule that collapsed everything and
+/// a rule that collapsed nothing both look plausible.
+#[test]
+fn the_error_fixtures_hold_one_collapsing_pair_and_one_that_must_not() {
+    let a = error_results("session-errors-a.jsonl");
+    let b = error_results("session-errors-b.jsonl");
+    assert!(!a.is_empty() && !b.is_empty());
+
+    // Pair one: flagged, and differing only in the four variable kinds.
+    let flagged = |rows: &[(bool, String, bool)]| -> String {
+        let hits: Vec<String> = rows
+            .iter()
+            .filter(|(is_error, _, _)| *is_error)
+            .map(|(_, stderr, _)| stderr.clone())
+            .collect();
+        assert_eq!(hits.len(), 1, "exactly one is_error result per file");
+        hits.into_iter().next().unwrap()
+    };
+    let (one_a, one_b) = (flagged(&a), flagged(&b));
+    assert_ne!(one_a, one_b, "the pair must not be literally identical");
+
+    let (tokens_a, tokens_b): (Vec<&str>, Vec<&str>) = (
+        one_a.split_whitespace().collect(),
+        one_b.split_whitespace().collect(),
+    );
+    assert_eq!(
+        tokens_a.len(),
+        tokens_b.len(),
+        "the pair must align token for token"
+    );
+    let differing: Vec<(&str, &str)> = tokens_a
+        .iter()
+        .zip(&tokens_b)
+        .filter(|(x, y)| x != y)
+        .map(|(x, y)| (*x, *y))
+        .collect();
+    assert_eq!(differing.len(), 4, "four differences, one of each kind");
+    let mut kinds: BTreeSet<&str> = BTreeSet::new();
+    for (x, y) in &differing {
+        let kind = if looks_like_uuid(x) && looks_like_uuid(y) {
+            "uuid"
+        } else if looks_like_timestamp(x) && looks_like_timestamp(y) {
+            "timestamp"
+        } else if x.starts_with("0x") && y.starts_with("0x") {
+            "address"
+        } else if looks_like_line_col(x) && looks_like_line_col(y) {
+            "line:col"
+        } else {
+            panic!("the pair differs in something D-04 does not normalize: {x} vs {y}");
+        };
+        kinds.insert(kind);
+    }
+    assert_eq!(
+        kinds.len(),
+        4,
+        "one difference of each kind, not four of one"
+    );
+    assert!(
+        tokens_a.len() > differing.len(),
+        "the pair is entirely variable, so collapsing it proves nothing"
+    );
+
+    // Pair two: unflagged, non-empty stderr - D-03's other arm - and differing
+    // in exactly one digit, which is the bare integer D-04 must not strip.
+    let bare = |rows: &[(bool, String, bool)]| -> String {
+        let hits: Vec<String> = rows
+            .iter()
+            .filter(|(is_error, stderr, _)| !*is_error && !stderr.is_empty())
+            .map(|(_, stderr, _)| stderr.clone())
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one unflagged non-empty stderr per file"
+        );
+        hits.into_iter().next().unwrap()
+    };
+    let (two_a, two_b) = (bare(&a), bare(&b));
+    assert_eq!(two_a.len(), two_b.len());
+    let at: Vec<usize> = two_a
+        .bytes()
+        .zip(two_b.bytes())
+        .enumerate()
+        .filter(|(_, (x, y))| x != y)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1, "the second pair must differ in one byte");
+    let index = at[0];
+    assert!(
+        two_a.as_bytes()[index].is_ascii_digit() && two_b.as_bytes()[index].is_ascii_digit(),
+        "the one difference must be a digit"
+    );
+    // And that digit must not read as a line number, or D-04's `:line:col` rule
+    // would collapse this pair for a reason that has nothing to do with it.
+    assert!(
+        !two_a[..index].ends_with(':'),
+        "the bare integer must not sit after a colon"
+    );
+
+    // The control: an interruption with an empty stderr and no error flag is
+    // not an error, and one file carries one so the extractor can prove it.
+    assert!(
+        a.iter()
+            .any(|(is_error, stderr, interrupted)| !*is_error && stderr.is_empty() && *interrupted),
+        "no interrupted-but-not-failed result to control against"
+    );
+}
+
+/// D-07's equal-score case: the sidechain turn and a top-level turn say exactly
+/// the same thing, so BM25 cannot break the tie and the tiebreak under test is
+/// the only thing left that can.
+#[test]
+fn the_echo_sidecar_repeats_a_top_level_turn_word_for_word() {
+    let parent = records("session-recall.jsonl");
+    let parent_id = parent[0]["sessionId"].as_str().unwrap().to_owned();
+
+    let echo = records("subagents/agent-echo.jsonl");
+    assert!(!echo.is_empty());
+    for r in &echo {
+        assert_eq!(r["sessionId"].as_str(), Some(parent_id.as_str()));
+        assert_eq!(r["isSidechain"], serde_json::Value::Bool(true));
+    }
+
+    let shared: Vec<String> = echo
+        .iter()
+        .map(message_text)
+        .filter(|text| parent.iter().any(|p| message_text(p) == *text))
+        .collect();
+    assert_eq!(
+        shared.len(),
+        1,
+        "exactly one echoed turn, or the equal-score comparison is ambiguous"
+    );
+    assert!(!shared[0].is_empty());
+
+    // No meta file beside it, which is the normal case for 2 of 818 real
+    // sidecars and keeps `session_meta.agent_meta` null on this one.
+    assert!(
+        !testkit::fixture_dir()
+            .join("subagents/agent-echo.meta.json")
+            .exists(),
+        "the echo sidecar is the no-meta case"
+    );
+}

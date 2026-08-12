@@ -20,7 +20,89 @@ pub const TRANSCRIPT_FIXTURES: &[&str] = &[
     "session-compacted.jsonl",
     "subagents/agent-alpha.jsonl",
     "subagents/workflows/wf_demo/agent-deep.jsonl",
+    "session-recall.jsonl",
+    "session-errors-a.jsonl",
+    "session-errors-b.jsonl",
+    "subagents/agent-echo.jsonl",
 ];
+
+/// The token the phase 3 fixtures carry where a real transcript carries an
+/// absolute `cwd`.
+///
+/// The phase 1 and 2 fixtures hardcode `/data/code/verbatim`, which makes any
+/// project-scoped assertion over them true only on a checkout at that literal
+/// path - and, worse, true for the wrong reason on this one, since `git
+/// rev-parse` answers for a directory that really is there. The phase 3
+/// fixtures name a root the test owns instead, so a project key is whatever the
+/// test built and nothing else.
+pub const FIXTURE_ROOT_TOKEN: &str = "{{ROOT}}";
+
+/// The fixtures carrying [`FIXTURE_ROOT_TOKEN`], and the project directory each
+/// one's `cwd` names beneath the substituted root.
+///
+/// Two distinct projects across the four, which is what lets a scoped search
+/// have something to be both true and false about.
+pub const ROOTED_FIXTURES: &[(&str, &str)] = &[
+    ("session-recall.jsonl", "project-alpha"),
+    ("subagents/agent-echo.jsonl", "project-alpha"),
+    ("session-errors-a.jsonl", "project-beta"),
+    ("session-errors-b.jsonl", "project-beta"),
+];
+
+/// The project directory one rooted fixture's `cwd` names beneath `root`.
+///
+/// Panics for a fixture that is not in [`ROOTED_FIXTURES`]: a test asking where
+/// a fixture's project lives, for a fixture that hardcodes its `cwd`, is a
+/// broken test rather than a runtime condition.
+pub fn fixture_project(name: &str, root: &Path) -> PathBuf {
+    let (_, project) = ROOTED_FIXTURES
+        .iter()
+        .find(|(fixture, _)| *fixture == name)
+        .unwrap_or_else(|| panic!("{name} is not a rooted fixture"));
+    root.join(project)
+}
+
+/// Every project directory [`ROOTED_FIXTURES`] names beneath `root`, in
+/// declaration order and without repeats.
+pub fn fixture_projects(root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for (_, project) in ROOTED_FIXTURES {
+        let path = root.join(project);
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Copy a rooted fixture into `dir` with [`FIXTURE_ROOT_TOKEN`] rewritten to
+/// `root`, creating the project directory the `cwd` names.
+///
+/// The directory is created and not merely named: project identity resolves
+/// through git for a `cwd` that still exists, and the read-side tests chdir into
+/// it. `root` should therefore be somewhere the test owns and no repository
+/// contains, so the key degrades to the path itself on every machine.
+///
+/// Backslashes are doubled on the way in because the substitution lands inside
+/// a JSON string literal, where a Windows root would otherwise be an invalid
+/// escape and the whole record would stop parsing.
+pub fn copy_rooted_fixture_into(name: &str, dir: &Path, root: &Path) -> PathBuf {
+    let project = fixture_project(name, root);
+    std::fs::create_dir_all(&project)
+        .unwrap_or_else(|e| panic!("create {}: {e}", project.display()));
+
+    let text = String::from_utf8(fixture_bytes(name)).expect("fixtures are UTF-8");
+    let replacement = root.to_string_lossy().replace('\\', "\\\\");
+    let rooted = text.replace(FIXTURE_ROOT_TOKEN, &replacement);
+
+    let dest = dir.join(name);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("create {}: {e}", parent.display()));
+    }
+    std::fs::write(&dest, rooted).unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
+    dest
+}
 
 /// The fixture whose **last** line is a compaction boundary (D-21).
 ///
