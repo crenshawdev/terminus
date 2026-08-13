@@ -19,7 +19,8 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        sessions              list every archived session a read path may see\n  \
                        verify                check every blob against its checksum\n  \
                        reindex               rebuild the derived tables from the blobs\n  \
-                       status                sizes, counts, watermarks and the last ingest run\n\
+                       status                sizes, counts, watermarks and the last ingest run\n  \
+                       mcp                   serve the three recall tools over stdio (for Claude Code)\n\
                      \n\
                      every data command accepts --json: one JSON document on stdout,\n\
                      every diagnostic on stderr, exit 0 on success including an empty result.";
@@ -80,6 +81,11 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         "verify" => cmd::verify::run(cmd::json_flag(parser)?),
         "reindex" => cmd::reindex::run(cmd::json_flag(parser)?),
         "status" => cmd::status::run(cmd::json_flag(parser)?),
+        // D-26: the MCP server is this binary, not a second artifact to place
+        // and keep in version lockstep. It takes no arguments - a client spawns
+        // it, nobody types it - and it writes JSON-RPC on stdout rather than
+        // anything the `--json` contract above describes.
+        "mcp" => cmd::mcp::run(cmd::mcp::parse(parser)?),
         other => Err(Failure::Misuse(format!("unknown command '{other}'"))),
     }
 }

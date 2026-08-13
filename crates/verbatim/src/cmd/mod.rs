@@ -1,5 +1,13 @@
 //! The subcommands: `ingest`, `search`, `show`, `sessions`, `verify`, `reindex`,
-//! `status`.
+//! `status`, `mcp`.
+//!
+//! `mcp` is the one that keeps none of what follows. It is not a data command
+//! typed at a terminal: it is a JSON-RPC server spawned by Claude Code, its
+//! stdout is the transport rather than a stream of results, and its wire format
+//! is the MCP one and not the `{command, ok, reason, data}` envelope below.
+//! What it does share is the read path - the same read-only open, the same
+//! scoping, the same exclusion - because two definitions of what a read may see
+//! is exactly the drift this module exists to prevent.
 //!
 //! # The contract every data command keeps (RCL-06)
 //!
@@ -27,6 +35,7 @@
 
 pub mod ingest;
 pub mod json;
+pub mod mcp;
 pub mod read;
 pub mod reindex;
 pub mod search;
