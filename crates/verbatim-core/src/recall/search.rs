@@ -27,6 +27,29 @@ pub const MAX_RESULTS: usize = 50;
 /// wants more asks for more, up to [`MAX_RESULTS`].
 pub const DEFAULT_RESULTS: usize = 20;
 
+/// RCL-07's filters: everything that narrows a search without changing what it
+/// is asking for.
+///
+/// Each one is independently optional and they combine conjunctively, so a
+/// default [`Filters`] narrows nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filters {
+    /// `turns.tool_name`. D-16 measured exactly one `tool_use` block on every
+    /// tool-bearing record of a 19,809-turn sample, so the column is the whole
+    /// tool filter and not a first guess at one.
+    pub tool: Option<String>,
+    /// `turns.record_type`: `user`, `assistant`, `system`, `attachment`.
+    pub kind: Option<String>,
+    /// Turns carrying any of these in the `paths` table. Structural, not
+    /// textual: a turn that merely names a path in prose has no `paths` row and
+    /// is not a match here.
+    pub paths: Vec<String>,
+    /// Inclusive lower bound on `turns.ts`.
+    pub since: Option<String>,
+    /// Inclusive upper bound on `turns.ts`.
+    pub until: Option<String>,
+}
+
 /// One search, as asked for.
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -35,6 +58,7 @@ pub struct Request {
     /// is standing in, which is the only default that makes `verbatim search`
     /// answer about the work in front of the user.
     pub scope: Scope,
+    pub filters: Filters,
     /// How many hits the caller wants. Silently clamped to [`MAX_RESULTS`] -
     /// see [`Request::effective_limit`].
     pub limit: usize,
@@ -53,12 +77,18 @@ impl Request {
         Request {
             query,
             scope,
+            filters: Filters::default(),
             limit: DEFAULT_RESULTS,
         }
     }
 
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    pub fn filters(mut self, filters: Filters) -> Self {
+        self.filters = filters;
         self
     }
 
@@ -176,6 +206,7 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
         "m.project_pre_worktree",
         scoped.excluded_pre_worktree(),
     );
+    request.filters.push_onto(&mut sql, &mut params)?;
     sql.push_str(TAIL);
     params.push(Box::new(request.effective_limit() as i64));
 
@@ -195,6 +226,102 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
         .collect::<rusqlite::Result<Vec<Hit>>>()?;
 
     Ok(Response { hits, reason: None })
+}
+
+impl Filters {
+    /// Append every filter that is set, conjunctively.
+    fn push_onto(
+        &self,
+        sql: &mut String,
+        params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    ) -> Result<()> {
+        if let Some(tool) = &self.tool {
+            sql.push_str(" AND t.tool_name = ?\n");
+            params.push(Box::new(tool.clone()));
+        }
+        if let Some(kind) = &self.kind {
+            sql.push_str(" AND t.record_type = ?\n");
+            params.push(Box::new(kind.clone()));
+        }
+        if !self.paths.is_empty() {
+            // EXISTS rather than a join: a turn carrying three of the named
+            // paths is still one hit, and a join would return it three times
+            // and spend three excerpt reads saying so.
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM paths p WHERE p.turn_id = t.id AND p.path IN (",
+            );
+            for (index, path) in self.paths.iter().enumerate() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                params.push(Box::new(path.clone()));
+            }
+            sql.push_str("))\n");
+        }
+        // A turn with no timestamp is outside every window, because SQL's
+        // `NULL >= x` is NULL. That is the wanted answer: a turn that cannot say
+        // when it happened cannot be shown as evidence of when something did.
+        if let Some(since) = &self.since {
+            sql.push_str(" AND t.ts >= ?\n");
+            params.push(Box::new(bound(FIELD_SINCE, since)?));
+        }
+        if let Some(until) = &self.until {
+            sql.push_str(" AND t.ts <= ?\n");
+            params.push(Box::new(bound(FIELD_UNTIL, until)?));
+        }
+        Ok(())
+    }
+}
+
+const FIELD_SINCE: &str = "since";
+const FIELD_UNTIL: &str = "until";
+
+/// One end of a time window, as a string that can be compared against
+/// `turns.ts` directly.
+///
+/// D-23: the comparison is lexicographic and there is no date parsing on the
+/// stored side. All 22,412 turns of a 180-file sample carry exactly the shape
+/// `NNNN-NN-NNTNN:NN:NN.NNNZ` - one format, UTC only - and `turns(ts)` is
+/// already indexed, so a text comparison is both correct and the fast plan.
+///
+/// A bare `YYYY-MM-DD` is extended to the first instant of that day for `since`
+/// and the last for `until`, which is what makes a one-day window include its
+/// own day. Extending both ends to midnight would make `--since 2026-08-12
+/// --until 2026-08-12` return the single turn that happened at exactly
+/// 00:00:00.000 and look like an empty day.
+///
+/// Anything else is a caller error. Comparing it would succeed - every string
+/// orders against every other - and return an answer that looks right.
+fn bound(field: &'static str, raw: &str) -> Result<String> {
+    if is_shaped(raw, "NNNN-NN-NNTNN:NN:NN.NNNZ") {
+        return Ok(raw.to_owned());
+    }
+    if is_shaped(raw, "NNNN-NN-NN") {
+        let tail = if field == FIELD_SINCE {
+            "T00:00:00.000Z"
+        } else {
+            "T23:59:59.999Z"
+        };
+        return Ok(format!("{raw}{tail}"));
+    }
+    Err(crate::error::Error::InvalidTimeFilter {
+        field,
+        value: raw.to_owned(),
+    })
+}
+
+/// Does `value` match `shape`, where `N` stands for one ASCII digit and every
+/// other character stands for itself?
+fn is_shaped(value: &str, shape: &str) -> bool {
+    value.len() == shape.len()
+        && value
+            .bytes()
+            .zip(shape.bytes())
+            .all(|(byte, expected)| match expected {
+                b'N' => byte.is_ascii_digit(),
+                other => byte == other,
+            })
 }
 
 /// Hide every session whose `column` names an excluded project.

@@ -86,6 +86,20 @@ pub enum Error {
     #[error("cannot read the verbatim store at {path}: {detail}")]
     StoreUnreadable { path: PathBuf, detail: String },
 
+    /// A `since` or `until` filter that is neither a whole transcript timestamp
+    /// nor a bare date (D-23).
+    ///
+    /// A caller error rather than an empty result, and that is the point: all
+    /// 22,412 sampled turns carry exactly one timestamp shape and the
+    /// comparison is lexicographic with no date parsing on the stored side, so
+    /// a value of any other shape would compare cleanly against every row and
+    /// return a plausible wrong answer instead of failing.
+    #[error(
+        "{field} value {value:?} is not a time; \
+         expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS.mmmZ"
+    )]
+    InvalidTimeFilter { field: &'static str, value: String },
+
     /// The bytes in `sessions.blob` are not a blob this build can read.
     #[error("malformed session blob: {detail}")]
     BlobFormat { detail: String },

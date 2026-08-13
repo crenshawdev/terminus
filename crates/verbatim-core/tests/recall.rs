@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use verbatim_core::config::Config;
 use verbatim_core::recall::{
-    search, Hit, Query, Reason, Request, Response, Scope, MAX_QUERY_TOKENS, MAX_RESULTS,
+    search, Filters, Hit, Query, Reason, Request, Response, Scope, MAX_QUERY_TOKENS, MAX_RESULTS,
 };
 use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::{ingest, testkit};
@@ -545,4 +545,276 @@ fn standing_in_an_excluded_project_says_so() {
     assert_eq!(everywhere.reason, None);
     assert!(!everywhere.hits.is_empty());
     assert!(!projects_of(&everywhere).contains(&alpha_key));
+}
+
+/// One filtered search over every project.
+fn narrowed(conn: &Connection, raw: &str, filters: Filters) -> verbatim_core::Result<Response> {
+    search::run(
+        conn,
+        &config(&[]),
+        &Request::new(Query::parse(raw), Scope::Everything)
+            .filters(filters)
+            .limit(MAX_RESULTS),
+    )
+}
+
+/// The timestamps a response answered with, in the order it answered.
+fn stamps(response: &Response) -> Vec<String> {
+    response
+        .hits
+        .iter()
+        .map(|hit| hit.ts.clone().expect("every fixture turn carries a ts"))
+        .collect()
+}
+
+/// One turn's `tool_name`, straight off the row.
+fn tool_of(conn: &Connection, turn_id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT tool_name FROM turns WHERE id = ?1",
+        [turn_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// D-16: `turns.tool_name` is the whole tool filter.
+#[test]
+fn a_tool_filter_returns_only_that_tools_turns() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    // The control: this query reaches turns that are not tool calls at all, so
+    // a filtered result being all-Bash is the filter and not the corpus.
+    let unfiltered = ranked(&conn, "cargo", MAX_RESULTS);
+    assert!(unfiltered
+        .iter()
+        .any(|hit| tool_of(&conn, hit.turn_id).is_none()));
+
+    let bash = narrowed(
+        &conn,
+        "cargo",
+        Filters {
+            tool: Some("Bash".into()),
+            ..Filters::default()
+        },
+    )
+    .unwrap();
+    assert!(!bash.hits.is_empty());
+    assert!(bash.hits.len() < unfiltered.len());
+    for hit in &bash.hits {
+        assert_eq!(tool_of(&conn, hit.turn_id).as_deref(), Some("Bash"));
+    }
+
+    // A tool nothing in the corpus ran is an empty result, not an error.
+    let none = narrowed(
+        &conn,
+        "cargo",
+        Filters {
+            tool: Some("WebFetch".into()),
+            ..Filters::default()
+        },
+    )
+    .unwrap();
+    assert!(none.hits.is_empty());
+    assert_eq!(none.reason, None);
+}
+
+#[test]
+fn a_kind_filter_returns_only_that_record_type() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let unfiltered = ranked(&conn, "the", MAX_RESULTS);
+    assert!(unfiltered.iter().any(|hit| hit.record_type != "user"));
+
+    let users = narrowed(
+        &conn,
+        "the",
+        Filters {
+            kind: Some("user".into()),
+            ..Filters::default()
+        },
+    )
+    .unwrap();
+    assert!(!users.hits.is_empty());
+    assert!(users.hits.iter().all(|hit| hit.record_type == "user"));
+}
+
+/// The path filter is structural: it reads the `paths` table, so a turn that
+/// merely names the path in prose is not a hit.
+///
+/// Both turns match the query as text - one is the `Read` that opened the file,
+/// the other is the sentence about what was in it - which is what makes this a
+/// test of where the filter reads rather than of what the query matched.
+#[test]
+fn a_path_filter_is_structural_and_not_textual() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let textual = ranked(&conn, "docs/RETRY.md", MAX_RESULTS);
+    assert_eq!(textual.len(), 2, "{textual:?}");
+
+    let structural = narrowed(
+        &conn,
+        "docs/RETRY.md",
+        Filters {
+            paths: vec!["docs/RETRY.md".into()],
+            ..Filters::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(structural.hits.len(), 1);
+    assert_eq!(
+        tool_of(&conn, structural.hits[0].turn_id).as_deref(),
+        Some("Read"),
+        "the surviving hit should be the tool call that opened the file"
+    );
+
+    // Several paths are a union, and a turn carrying two of them is still one
+    // hit rather than one per row.
+    let union = narrowed(
+        &conn,
+        "the",
+        Filters {
+            paths: vec!["docs/RETRY.md".into(), "src".into()],
+            ..Filters::default()
+        },
+    )
+    .unwrap();
+    let mut ids: Vec<i64> = union.hits.iter().map(|hit| hit.turn_id).collect();
+    let unique = {
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    };
+    assert_eq!(unique, union.hits.len(), "a turn came back twice");
+}
+
+/// D-23: the window is a lexicographic comparison against `turns.ts`, and a
+/// bare date covers its own whole day.
+#[test]
+fn a_time_window_includes_and_excludes_by_timestamp() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let everything = stamps(&narrowed(&conn, "cargo", Filters::default()).unwrap());
+    assert!(everything.iter().any(|ts| ts.starts_with("2026-08-12")));
+    assert!(
+        everything.iter().any(|ts| ts.starts_with("2026-08-19")),
+        "the corpus needs turns on two days for a window to exclude anything"
+    );
+
+    // The bare-date case that discriminates: `until` on a day whose turns
+    // happen in the afternoon. Compared as written, `2026-08-12` sorts BEFORE
+    // every timestamp on 2026-08-12, so an unextended bound would return
+    // nothing at all from that day.
+    let until_day = stamps(
+        &narrowed(
+            &conn,
+            "cargo",
+            Filters {
+                until: Some("2026-08-12".into()),
+                ..Filters::default()
+            },
+        )
+        .unwrap(),
+    );
+    assert!(!until_day.is_empty());
+    assert!(until_day.iter().all(|ts| ts.starts_with("2026-08-12")));
+    assert!(until_day.iter().any(|ts| ts.as_str() > "2026-08-12T12:00"));
+
+    let since_day = stamps(
+        &narrowed(
+            &conn,
+            "cargo",
+            Filters {
+                since: Some("2026-08-19".into()),
+                ..Filters::default()
+            },
+        )
+        .unwrap(),
+    );
+    assert!(!since_day.is_empty());
+    assert!(since_day.iter().all(|ts| ts.starts_with("2026-08-19")));
+
+    // A full timestamp is used as written.
+    let afternoon = stamps(
+        &narrowed(
+            &conn,
+            "cargo",
+            Filters {
+                since: Some("2026-08-12T14:00:00.000Z".into()),
+                until: Some("2026-08-12T23:59:59.999Z".into()),
+                ..Filters::default()
+            },
+        )
+        .unwrap(),
+    );
+    assert!(!afternoon.is_empty());
+    assert!(afternoon
+        .iter()
+        .all(|ts| ts.as_str() >= "2026-08-12T14:00:00.000Z" && ts.starts_with("2026-08-12")));
+    assert!(
+        afternoon.len() < until_day.len(),
+        "the morning turns should have dropped out: {afternoon:?}"
+    );
+
+    // Both ends, one day.
+    let one_day = stamps(
+        &narrowed(
+            &conn,
+            "cargo",
+            Filters {
+                since: Some("2026-08-12".into()),
+                until: Some("2026-08-12".into()),
+                ..Filters::default()
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(one_day, until_day);
+}
+
+/// A time of any other shape is a caller error, not an empty result.
+///
+/// Every string compares cleanly against every other, so a malformed bound
+/// would return a plausible wrong answer and nothing would say so.
+#[test]
+fn a_malformed_time_is_a_caller_error() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    for raw in [
+        "2026-8-1",
+        "12/08/2026",
+        "yesterday",
+        "2026-08-12T14:00:00Z",
+        "2026-08-12 14:00:00.000Z",
+        "",
+    ] {
+        for (field, filters) in [
+            (
+                "since",
+                Filters {
+                    since: Some(raw.into()),
+                    ..Filters::default()
+                },
+            ),
+            (
+                "until",
+                Filters {
+                    until: Some(raw.into()),
+                    ..Filters::default()
+                },
+            ),
+        ] {
+            match narrowed(&conn, "cargo", filters) {
+                Err(verbatim_core::Error::InvalidTimeFilter { field: got, value }) => {
+                    assert_eq!(got, field);
+                    assert_eq!(value, raw);
+                }
+                other => panic!("`{raw}` as {field} was not a caller error: {other:?}"),
+            }
+        }
+    }
 }
