@@ -83,6 +83,8 @@ pub enum Reason {
     /// The config excludes the filesystem root, so no read path may see
     /// anything at all.
     EverythingExcluded,
+    /// A context window was asked about a turn the archive does not hold.
+    NoSuchTurn { turn_id: i64 },
 }
 
 impl std::fmt::Display for Reason {
@@ -98,6 +100,7 @@ impl std::fmt::Display for Reason {
             Reason::EverythingExcluded => {
                 write!(f, "the configured exclusions cover the filesystem root")
             }
+            Reason::NoSuchTurn { turn_id } => write!(f, "no turn {turn_id} is archived"),
         }
     }
 }

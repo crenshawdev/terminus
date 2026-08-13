@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use verbatim_core::config::Config;
 use verbatim_core::recall::{
-    search, EntityMatch, Filters, Hit, Query, Reason, Request, Response, Scope, MAX_QUERY_TOKENS,
-    MAX_RESULTS,
+    context, search, EntityMatch, Filters, Hit, Query, Reason, Request, Response, Scope, Window,
+    MAX_CONTEXT_SIDE, MAX_QUERY_TOKENS, MAX_RESULTS,
 };
 use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::{ingest, testkit};
@@ -119,6 +119,33 @@ impl Bench {
                         "name": "Read",
                         "input": {"file_path": file},
                     }],
+                },
+            });
+            body.push_str(&line.to_string());
+            body.push('\n');
+        }
+        self.archive(name, &body)
+    }
+
+    /// A session whose records carry the given timestamps, in the given order.
+    ///
+    /// Written so a test can hand it a clock that goes backwards: 31 of 62 real
+    /// transcripts carry a record whose timestamp does, which is the whole of
+    /// why D-22 orders a context window by `turn_seq`.
+    fn timeline(&self, name: &str, stamps: &[&str]) -> PathBuf {
+        let mut body = String::new();
+        for (n, stamp) in stamps.iter().enumerate() {
+            let line = serde_json::json!({
+                "parentUuid": null,
+                "isSidechain": false,
+                "cwd": self.work.join("timeline").to_string_lossy(),
+                "sessionId": "99999999-9999-4999-8999-999999999999",
+                "type": "user",
+                "uuid": format!("ffffffff-0000-4000-8000-{n:012}"),
+                "timestamp": stamp,
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": format!("timeline step {n}")}],
                 },
             });
             body.push_str(&line.to_string());
@@ -1101,4 +1128,157 @@ fn a_damaged_blob_leaves_an_empty_excerpt_and_a_whole_hit() {
             assert!(!hit.excerpt.is_empty(), "{hit:?}");
         }
     }
+}
+
+/// The turn at `seq` of the fixture whose file name ends with `fixture`.
+fn turn_at(conn: &Connection, fixture: &str, seq: i64) -> i64 {
+    conn.query_row(
+        "SELECT id FROM turns WHERE session_key LIKE '%' || ?1 AND turn_seq = ?2",
+        rusqlite::params![fixture, seq],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|e| panic!("{fixture} turn {seq}: {e}"))
+}
+
+fn around(
+    conn: &Connection,
+    exclusions: &[&str],
+    anchor: i64,
+    before: usize,
+    after: usize,
+) -> Window {
+    context::window(conn, &config(exclusions), anchor, before, after).unwrap()
+}
+
+/// RCL-08: the turns on either side of a hit, in `turn_seq` order.
+#[test]
+fn a_window_returns_the_requested_turns_in_turn_seq_order() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let anchor = turn_at(&conn, "session-recall.jsonl", 2);
+    let window = around(&conn, &[], anchor, 2, 2);
+
+    assert_eq!(window.reason, None);
+    let seqs: Vec<i64> = window.turns.iter().map(|turn| turn.turn_seq).collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
+    assert_eq!(window.turns.iter().filter(|turn| turn.is_anchor).count(), 1);
+    assert_eq!(window.turns[2].turn_id, anchor);
+    assert!(window.at_session_start, "seq 0 is the session's first turn");
+    assert!(!window.at_session_end, "seq 5 is still ahead");
+
+    // The text comes with them, projected the way the index projected it.
+    assert!(window
+        .turns
+        .iter()
+        .all(|turn| !turn.text.is_empty() && !turn.text.contains("\"type\"")));
+
+    // Asking for more than the session holds is a short window, not an error.
+    let whole = around(&conn, &[], anchor, MAX_CONTEXT_SIDE, MAX_CONTEXT_SIDE);
+    assert!(whole.at_session_start && whole.at_session_end);
+    assert_eq!(whole.turns.len(), 6);
+}
+
+/// D-22: `turn_seq` order, never timestamp order.
+///
+/// Half of all real sessions carry a record whose timestamp goes backwards, so
+/// a timestamp sort would show a reply before the prompt it answers in half the
+/// archive. This session's clock runs backwards on purpose.
+#[test]
+fn a_window_is_ordered_by_turn_seq_and_not_by_timestamp() {
+    let bench = bench();
+    bench.timeline(
+        "backwards.jsonl",
+        &[
+            "2026-08-12T23:00:04.000Z",
+            "2026-08-12T23:00:03.000Z",
+            "2026-08-12T23:00:02.000Z",
+            "2026-08-12T23:00:01.000Z",
+            "2026-08-12T23:00:00.000Z",
+        ],
+    );
+    let conn = bench.conn();
+
+    let anchor = turn_at(&conn, "backwards.jsonl", 2);
+    let window = around(&conn, &[], anchor, 2, 2);
+
+    let seqs: Vec<i64> = window.turns.iter().map(|turn| turn.turn_seq).collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
+
+    let stamps: Vec<&str> = window
+        .turns
+        .iter()
+        .map(|turn| turn.ts.as_deref().unwrap())
+        .collect();
+    let mut sorted = stamps.clone();
+    sorted.sort_unstable();
+    assert_ne!(
+        stamps, sorted,
+        "the fixture's clock must go backwards or this asserts nothing"
+    );
+}
+
+/// D-06: the window stops at the session and hands back the link it did not
+/// follow.
+#[test]
+fn a_window_stops_at_the_session_boundary() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let first = turn_at(&conn, "session-continuation.jsonl", 0);
+    let window = around(&conn, &[], first, 5, 1);
+
+    assert!(window.at_session_start);
+    assert_eq!(window.turns[0].turn_id, first);
+    assert!(
+        window.turns[0].is_anchor,
+        "nothing before the first turn of the file, however much was asked for"
+    );
+    assert!(
+        window.turns.iter().all(|turn| turn.turn_seq >= 0),
+        "{:?}",
+        window.turns
+    );
+    assert!(
+        window.continues_from.is_some(),
+        "this fixture continues another session, and the window returns the link \
+         rather than walking it"
+    );
+    // Every returned turn belongs to the one session.
+    let ids: Vec<i64> = window.turns.iter().map(|turn| turn.turn_id).collect();
+    for id in ids {
+        let key: String = conn
+            .query_row("SELECT session_key FROM turns WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(key.ends_with("session-continuation.jsonl"), "{key}");
+    }
+}
+
+/// A turn of an excluded project has no window, and says why.
+#[test]
+fn a_window_into_an_excluded_project_is_empty_with_a_reason() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let alpha = testkit::fixture_project("session-recall.jsonl", &bench.root);
+    let alpha_key = alpha.to_string_lossy().into_owned();
+    let anchor = turn_at(&conn, "session-recall.jsonl", 2);
+
+    assert!(!around(&conn, &[], anchor, 1, 1).turns.is_empty());
+
+    let hidden = around(&conn, &[&alpha_key], anchor, 1, 1);
+    assert!(hidden.turns.is_empty());
+    assert_eq!(
+        hidden.reason,
+        Some(Reason::ProjectExcluded {
+            project: alpha_key.clone()
+        })
+    );
+
+    // And a turn that is not archived at all is a reason too, not a panic.
+    let missing = around(&conn, &[], -1, 1, 1);
+    assert!(missing.turns.is_empty());
+    assert_eq!(missing.reason, Some(Reason::NoSuchTurn { turn_id: -1 }));
 }

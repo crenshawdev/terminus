@@ -103,7 +103,7 @@ pub fn attach(conn: &Connection, query: &Query, hits: &mut [Hit]) -> Result<Read
             let Ok(bytes) = reader.read_range(*offset as u64, *len as u64) else {
                 continue;
             };
-            hits[index].excerpt = from_record(query, &bytes);
+            hits[index].excerpt = of_record(query, &bytes);
         }
     }
 
@@ -137,7 +137,10 @@ fn coordinates(conn: &Connection, hits: &[Hit]) -> Result<BTreeMap<i64, (i64, i6
 }
 
 /// One record's bytes, as the sentence a reader should see.
-fn from_record(query: &Query, record: &[u8]) -> String {
+///
+/// Public because a context window projects its turns the same way (RCL-08):
+/// one rule for what a turn said, whatever asked for it.
+pub fn of_record(query: &Query, record: &[u8]) -> String {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(record) else {
         // A line that is not JSON is archived verbatim all the same (D-13), and
         // it has no projection. Nothing to excerpt is an empty excerpt.
