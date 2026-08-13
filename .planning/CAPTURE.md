@@ -68,6 +68,26 @@
 - [ ] (phase 2) AC2's linkage rate: 188 `continues_from` links is 8.8% of
       sessions against CONTEXT's measured 1.2% of files; the denominators have
       not been reconciled.
+- [ ] (phase 3) `index/text.rs` MAX_BODY_BYTES does not bound the projected body: the newline separator is uncharged and `take` is 0 when the budget is below the next leaf's first char, so the short-circuit never fires
+- [ ] (phase 3) `index/entity.rs` path/command/symbol entity values carry no length bound; only `error` does
+- [ ] (phase 3) `index/entity.rs` splitting a command on `;&|<>()` cuts a real path containing one of them, and splitting on `|` multiplies BRE-escape debris (24.7% of unique Bash-derived path entities)
+- [ ] (phase 3) `index/entity.rs` normalize_error leaves a rejected timestamp's date or hour in the value, so one failure logged twice can normalize two ways
+- [ ] (phase 3) `index/entity.rs` program_of returns the first argv word, so a compound command records the wrapper (`cd` for 17.8% of Bash calls)
+- [ ] (phase 3) `index/entity.rs` identifier_tokens glues a regex escape's letter onto the symbol (`\\bsearch_manager` -> `bsearch_manager`)
+- [ ] (phase 3) `recall/excerpt.rs` first_token indexes the lowercased string while window slices the source, so the excerpt is displaced for any char whose lowercase changes length
+- [ ] (phase 3) `recall/excerpt.rs` excerpt cutting is unbounded in one record's size: two Vec<char> materializations per hit to produce 240 chars
+- [ ] (phase 3) `recall/search.rs` the per-value document-frequency query builds a temp b-tree (15.5-16.7 ms on a 250k-turn store) on the default search path
+- [ ] (phase 3) `recall/query.rs` a token of characters Rust calls alphanumeric but unicode61 does not index becomes a zero-term phrase and silently returns zero hits
+- [ ] (phase 3) `recall/search.rs` a query that reduces to no tokens returns no reason, so an unsearchable query cannot be told from an empty archive
+- [ ] (phase 3) `cmd/json.rs` Document::emit uses println!, which panics with exit 101 on a closed stdout pipe; the human path has broken_pipe and the JSON path does not
+- [ ] (phase 3) `cmd/mod.rs` time_bound validates shape but not the calendar, so `--since 2026-08-32` is accepted and silently hides the month with exit 0
+- [ ] (phase 3) `cmd/show.rs` a closed stdout in human mode maps to Failure::Silent (exit 1), indistinguishable from an operational failure under pipefail
+- [ ] (phase 3) `recall/get.rs` the exclusion arm names an excluded project's absolute path in a reason, where the scope arm answers NoSuchTurn so as not to confirm the id exists
+- [ ] (phase 3) `docs/json-shapes.md` the sessions shape documents nullability nowhere, though five of its eleven fields are null in ordinary states
+- [ ] (phase 3) the MCP tool result shape is pinned in no document; docs/json-shapes.md is the CLI contract only
+- [ ] (phase 3) `recall::search::run` resolves scope before validating filters, so D-23's two-shape time rule now exists twice (cmd/mod.rs and recall::search::bound)
+- [ ] (phase 3) a JSON-RPC line is materialized whole by read_until with no size cap on one message
+
 
 ## Seeds
 
