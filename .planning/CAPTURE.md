@@ -87,6 +87,12 @@
 - [ ] (phase 3) the MCP tool result shape is pinned in no document; docs/json-shapes.md is the CLI contract only
 - [ ] (phase 3) `recall::search::run` resolves scope before validating filters, so D-23's two-shape time rule now exists twice (cmd/mod.rs and recall::search::bound)
 - [ ] (phase 3) a JSON-RPC line is materialized whole by read_until with no size cap on one message
+- [ ] (phase 3) `cmd/mcp/tools.rs` optional_time inherits shape-only date validation, so `since: 2026-02-30` is accepted and returns reason:null with isError:false
+- [ ] (phase 3) `cmd/mcp/mod.rs` serve has no size cap on one JSON-RPC line and amplifies wire bytes to resident memory ~20x (12.9 MB line -> 278.7 MiB RSS)
+- [ ] (phase 3) `cmd/mcp/rpc.rs` an integer id outside i64/u64 is parsed as f64 so the echoed id differs from the id sent; a fractional id is accepted, which MCP forbids
+- [ ] (phase 3) `cmd/mcp/tools.rs` time_bound's message hardcodes the CLI `--since` spelling in a tool result whose inputSchema forbids that argument
+- [ ] (phase 3) `cmd/mcp/tools.rs` recall_get truncates to MAX_IDS before get::records deduplicates, so duplicate ids consume the budget
+- [ ] (phase 3) `cmd/mcp/rpc.rs` PROTOCOL_VERSIONS offers 2025-03-26, which mandates JSON-RPC batching, but a batch is answered with one -32600 and every request in it goes unanswered
 
 
 ## Seeds

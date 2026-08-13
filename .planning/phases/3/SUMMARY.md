@@ -33,6 +33,7 @@ exposing `recall_search`, `recall_context` and `recall_get`.
 | 2 | gate | 1066d40 | Scope to the row that names the caller's directory directly |
 | 2 | gate | 12c22c9 | Degrade the read on an aged store, and scope the context window |
 | 3 | gate | 4e48c97 | Cut the day off a timestamp on a character boundary |
+| 4 | gate | f3f2076 | Stop naming an excluded project, and bound the path filter |
 | - | - | 5d85f1b | Drop the transient risk diff from the tree |
 
 ## Deviations
@@ -60,8 +61,8 @@ exposing `recall_search`, `recall_context` and `recall_get`.
 
 ## Open items
 
-Five `high` findings were caught by the blocking `risk_surface` gate and fixed
-in-phase (commits above). The medium/low findings are recorded per plan in
+Seven `high` findings were caught by the blocking `risk_surface` gate and fixed
+in-phase (commits above, plus `f3f2076`). The medium/low findings are recorded per plan in
 `REVIEW-risk_surface-plan-{1,2,3}.md` and queued in `CAPTURE.md`. The ones most
 worth naming here:
 
@@ -83,8 +84,14 @@ worth naming here:
   confirm another project holds the id.
 - The MCP tool result shape is not pinned in any document; `docs/json-shapes.md`
   is the CLI contract only.
-- Plan 4's `risk_surface` gate was still in flight when this summary was
-  written. Its findings land in `REVIEW-risk_surface-plan-4.md`.
+- Plan 4's gate found two more `high` findings, both fixed in `f3f2076`: the
+  exclusion arm running before the scope arm in `recall::get::records` and
+  `recall::context::window`, which named an excluded project's absolute path to
+  a client at the default scope, and an unbounded `paths` filter on
+  `recall_search` that returned a 2 MB SQLite error as a non-error empty result.
+  Its medium/low items are in `REVIEW-risk_surface-plan-4.md` and `CAPTURE.md`;
+  the ones worth naming are an uncapped JSON-RPC line (~20x wire-to-resident
+  amplification) and `2025-03-26` being advertised while batches go unanswered.
 
 ## Goal check
 
@@ -106,13 +113,14 @@ directory_the_server_was_started_in`, `the_star_project_reaches_more_than_one_
 project`), SC5 (`an_evicted_body_is_a_flag_and_not_a_failed_call`, `a_malformed_
 call_is_an_empty_result_with_a_reason_and_never_a_throw`) and SC6 (`the_handshake_
 reports_three_read_only_tools_and_ends_at_eof`, plus the socket probe).
-30 test binaries pass and clippy is clean at `d457c06`.
+30 test binaries pass and clippy is clean at `f3f2076`.
 
-What is honestly not settled: the phase shipped five high-severity defects that
-only a blocking adversarial gate caught, three of them cross-project read paths
+What is honestly not settled: the phase shipped seven high-severity defects that
+only a blocking adversarial gate caught, four of them cross-project read paths
 that the plans' own tests passed over - `longest_prefix` resolving to the wrong
 project, `context::window` reading across projects by enumerable id, and
-`recall_get` naming an excluded project in a reason. Scoping is the phase's
+`recall_get` and `recall_context` naming an excluded project in a reason at the
+default scope, reachable by an untrusted MCP client with no opt-out argument. Scoping is the phase's
 authorization boundary and it was the phase's weakest tested surface; phase 4's
 verification should treat it as such rather than trusting these tests. The
 bounds noted in open items (`MAX_BODY_BYTES`, unbounded entity values, unbounded
