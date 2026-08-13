@@ -1289,3 +1289,167 @@ fn an_over_large_argument_is_lowered_to_the_budget_rather_than_refused() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The process itself (RCL-11, AC7)
+// ---------------------------------------------------------------------------
+
+/// The socket-inspection tool, if this machine has one.
+///
+/// Probed rather than assumed, and its absence is announced rather than
+/// swallowed: a suite that skipped this silently would go on reporting green
+/// while the one assertion about the process holding no port had stopped
+/// running.
+fn socket_tool() -> Option<&'static str> {
+    ["/usr/bin/ss", "/usr/sbin/ss", "/sbin/ss", "/bin/ss"]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).exists())
+}
+
+/// RCL-11 at the process level: while it is alive the server holds no listening
+/// socket, and when its stdin closes it exits 0 without any signal being sent.
+///
+/// The second half is what makes Claude Code's shutdown clean rather than a
+/// kill. That client closes stdin, waits two seconds, sends SIGTERM, waits two
+/// more and sends SIGKILL - so a server that only stopped on a signal would look
+/// like it worked while leaving a process alive past every session, which is the
+/// orphaned-process failure class this project exists partly to retire. Nothing
+/// in this test sends a signal on the passing path.
+///
+/// The server is driven through a real call first, on purpose: a process
+/// inspected before it had done any work would hold nothing for the trivial
+/// reason that it had not started.
+#[test]
+fn the_server_holds_no_listening_socket_and_exits_zero_when_stdin_closes() {
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    let bench = bench();
+    bench.ingest_fixtures();
+    let alpha = bench.project("session-recall.jsonl");
+
+    let mut child = bench.spawn(&alpha);
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    {
+        let stdin = child.stdin.as_mut().expect("stdin is piped");
+        writeln!(stdin, "{}", initialize()).unwrap();
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                   "params": {"name": "recall_search",
+                              "arguments": {"query": "src/worker/S.ts"}}})
+        )
+        .unwrap();
+        stdin.flush().unwrap();
+    }
+    for expected in [1, 2] {
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("a response");
+        let response: Value = serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("stdout is not JSON-RPC ({e}): {line}"));
+        assert_eq!(response["id"], expected, "{response}");
+    }
+
+    let pid = child.id();
+    match socket_tool() {
+        None => eprintln!(
+            "SKIP: no `ss` on this machine, so the listening-socket assertion for \
+             pid {pid} did not run"
+        ),
+        Some(tool) => {
+            let listening = Command::new(tool)
+                .args(["-l", "-n", "-p"])
+                .output()
+                .expect("run the socket tool");
+            assert!(
+                listening.status.success(),
+                "the socket tool failed: {}",
+                String::from_utf8_lossy(&listening.stderr)
+            );
+            let table = String::from_utf8_lossy(&listening.stdout);
+            assert!(
+                !table.contains(&format!("pid={pid}")),
+                "the server holds a listening socket:\n{table}"
+            );
+        }
+    }
+
+    // Stdin closes and nothing else happens: no signal, no kill.
+    drop(child.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().expect("wait on the server") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                panic!("the server was still alive 10s after its stdin closed");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the server did not exit 0 at EOF: {status:?}"
+    );
+}
+
+/// AC7's second half: pointed at a data directory holding no store, the server
+/// answers with an empty result and a reason, exits 0, and leaves not one byte
+/// behind.
+///
+/// The last clause is what `Store::open` would fail. It would create the data
+/// directory, initialize a database and set `journal_mode=wal`, so a server
+/// advertising `readOnlyHint` would have created a database as the side effect
+/// of being asked a question - the contradiction D-10 exists to prevent. Both
+/// starting states are covered: a directory that exists and is empty, and a path
+/// that is not there at all.
+#[test]
+fn a_server_with_no_store_answers_with_a_reason_and_creates_no_file() {
+    let bench = bench();
+
+    // A directory that exists and holds nothing. Read back afterwards, because
+    // "the directory is still there" and "the directory is still empty" are
+    // different facts and only the second one is the claim.
+    std::fs::create_dir_all(&bench.data_dir).unwrap();
+    let (document, is_error) =
+        bench.call_flagged(&bench.work, "recall_search", json!({"query": "anything"}));
+    assert!(
+        !is_error,
+        "an archive with nothing in it is an empty result, not a failed call: {document}"
+    );
+    assert!(hits(&document).is_empty(), "{document}");
+    assert!(
+        document["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no verbatim store")),
+        "a missing store gave no reason: {document}"
+    );
+    let left = std::fs::read_dir(&bench.data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert!(left.is_empty(), "a read created {left:?} in the data dir");
+
+    // And a data directory that is not there at all is not brought into being.
+    std::fs::remove_dir(&bench.data_dir).unwrap();
+    for tool in ["recall_search", "recall_context", "recall_get"] {
+        let arguments = match tool {
+            "recall_search" => json!({"query": "anything"}),
+            "recall_context" => json!({"turn_id": 1}),
+            _ => json!({"turn_ids": [1]}),
+        };
+        let document = bench.call(&bench.work, tool, arguments);
+        assert!(
+            document["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no verbatim store")),
+            "`{tool}` gave no reason with no store: {document}"
+        );
+    }
+    assert!(
+        !bench.data_dir.exists(),
+        "a read created the data directory it was asked about"
+    );
+}
