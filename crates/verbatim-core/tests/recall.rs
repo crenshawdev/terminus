@@ -1282,3 +1282,77 @@ fn a_window_into_an_excluded_project_is_empty_with_a_reason() {
     assert!(missing.turns.is_empty());
     assert_eq!(missing.reason, Some(Reason::NoSuchTurn { turn_id: -1 }));
 }
+
+/// One directory is routinely both one row's `project` and another row's
+/// `project_pre_worktree`, and the caller standing in it must be scoped to the
+/// row that names it directly.
+///
+/// This is the ordinary state of a machine that ingested from a worktree before
+/// phase 2 folded the two keys together and again after, not a contrived store.
+/// Both hits cover the directory at the same depth, so before the folded key
+/// outranked the pre-folding one the tie fell to the projection's `ORDER BY`:
+/// `/home/u/main` sorts before `/home/u/proj`, so a user standing in
+/// `/home/u/proj` was scoped to `/home/u/main` - handed another project's turns
+/// while their own stayed invisible.
+#[test]
+fn a_directory_that_is_also_another_rows_pre_worktree_key_scopes_to_itself() {
+    use verbatim_core::recall::scope::{self, Scope};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = verbatim_core::Store::open(dir.path()).unwrap();
+    let conn = store.conn();
+
+    let mut insert = |key: &str, no: i64, project: &str, pre: Option<&str>| {
+        conn.execute(
+            "INSERT INTO sessions (session_key, session_no, blob) VALUES (?1, ?2, x'00')",
+            rusqlite::params![key, no],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_meta
+                 (session_key, transcript_path, checksum, uncompressed_len,
+                  project, project_pre_worktree)
+             VALUES (?1, ?1, x'00', 0, ?2, ?3)",
+            rusqlite::params![key, project, pre],
+        )
+        .unwrap();
+    };
+    // Written by a pre-folding binary run from the worktree itself.
+    insert("a", 0, "/home/u/proj", None);
+    // Written after folding, which maps that same worktree onto the repository.
+    insert("b", 1, "/home/u/main", Some("/home/u/proj"));
+
+    let scoped = scope::resolve(
+        conn,
+        &config(&[]),
+        &Scope::Directory(std::path::PathBuf::from("/home/u/proj")),
+    )
+    .unwrap();
+    assert_eq!(
+        scoped.project(),
+        Some("/home/u/proj"),
+        "scoped to another project's key"
+    );
+
+    // A subdirectory resolves the same way, and so does the trailing-slash
+    // spelling a shell completion produces.
+    for spelling in ["/home/u/proj/src", "/home/u/proj/"] {
+        let scoped = scope::resolve(
+            conn,
+            &config(&[]),
+            &Scope::Directory(std::path::PathBuf::from(spelling)),
+        )
+        .unwrap();
+        assert_eq!(scoped.project(), Some("/home/u/proj"), "{spelling}");
+    }
+
+    // The control: the folded key still resolves to itself, so ranking the
+    // direct hit up did not break the case worktree folding exists for.
+    let scoped = scope::resolve(
+        conn,
+        &config(&[]),
+        &Scope::Directory(std::path::PathBuf::from("/home/u/main")),
+    )
+    .unwrap();
+    assert_eq!(scoped.project(), Some("/home/u/main"));
+}

@@ -217,27 +217,48 @@ pub fn resolve(conn: &Connection, config: &Config, scope: &Scope) -> Result<Scop
 /// own, which is the fragmentation phase 2 D-06 folded the two keys together to
 /// prevent.
 ///
-/// Ties are broken by the projection's own `ORDER BY`, which is over the stored
-/// values, so two runs against an unchanged store resolve to the same project.
+/// **At equal depth the folded key wins.** One directory is routinely both one
+/// row's `project` and another row's `project_pre_worktree`: that is the
+/// ordinary state of a machine that ingested from a worktree before phase 2
+/// folded the two keys together and again after. Both hits then score the same
+/// depth, and breaking that tie by the projection's `ORDER BY` resolves to
+/// whichever project string sorted first - which is not the caller's own, so
+/// the search returns another project's turns and hides theirs. Deterministic,
+/// and deterministically wrong. Ranking a direct `project` hit above a
+/// `project_pre_worktree` hit resolves it to the row that actually names the
+/// directory the caller is standing in.
+///
+/// Ties that remain - the same rank at the same depth - still fall to the
+/// projection's `ORDER BY`, which is over the stored values, so two runs
+/// against an unchanged store resolve to the same project.
 fn longest_prefix(keys: &[visible::ProjectKeys], path: &Path) -> Option<String> {
-    let mut best: Option<(usize, &str)> = None;
+    /// A hit on the row's own `project`, which outranks a pre-folding hit.
+    const FOLDED: u8 = 1;
+    /// A hit on `project_pre_worktree`, which resolves to the row's `project`.
+    const PRE_WORKTREE: u8 = 0;
+
+    let mut best: Option<(usize, u8, &str)> = None;
     for row in keys {
         let Some(project) = row.project.as_deref() else {
             // Nothing to scope to: a session with no `cwd` is reachable only
             // through `*`.
             continue;
         };
-        for key in [row.project.as_deref(), row.project_pre_worktree.as_deref()]
+        let candidates = [
+            (FOLDED, row.project.as_deref()),
+            (PRE_WORKTREE, row.project_pre_worktree.as_deref()),
+        ];
+        for (rank, key) in candidates
             .into_iter()
-            .flatten()
+            .filter_map(|(rank, key)| key.map(|key| (rank, key)))
         {
             let Some(depth) = config::covers(Path::new(key), path) else {
                 continue;
             };
-            if best.is_none_or(|(deepest, _)| depth > deepest) {
-                best = Some((depth, project));
+            if best.is_none_or(|(deepest, best_rank, _)| (depth, rank) > (deepest, best_rank)) {
+                best = Some((depth, rank, project));
             }
         }
     }
-    best.map(|(_, project)| project.to_owned())
+    best.map(|(_, _, project)| project.to_owned())
 }
