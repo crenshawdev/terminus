@@ -11,6 +11,7 @@ use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::error::Result;
+use crate::recall::excerpt;
 use crate::recall::query::EntityMatch;
 use crate::recall::scope::{self, Reason, Scope};
 use crate::recall::Query;
@@ -127,6 +128,9 @@ pub struct Hit {
     /// Higher is a better match: the negated bm25 (see [`HEAD`]) plus
     /// [`Hit::entity_score`].
     pub relevance: f64,
+    /// The matched text, cut from the session blob (D-05). Empty only when the
+    /// archive would not give it up - see [`crate::recall::excerpt`].
+    pub excerpt: String,
 }
 
 /// What a search answered.
@@ -138,6 +142,9 @@ pub struct Hit {
 pub struct Response {
     pub hits: Vec<Hit>,
     pub reason: Option<Reason>,
+    /// How many session blobs the excerpts materialized. An instrument, not an
+    /// answer: see [`crate::recall::excerpt::Reads`].
+    pub reads: excerpt::Reads,
 }
 
 /// The projection and the ordering, with the one place the bm25 sign is fixed.
@@ -202,6 +209,7 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
         return Ok(Response {
             hits: Vec::new(),
             reason: Some(reason.clone()),
+            reads: excerpt::Reads::default(),
         });
     }
 
@@ -248,6 +256,7 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
                 sidechain: row.get::<_, i64>(5)? != 0,
                 entity_score: 0.0,
                 relevance: row.get(6)?,
+                excerpt: String::new(),
             })
         })?
         .collect::<rusqlite::Result<Vec<Hit>>>()?;
@@ -256,8 +265,15 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
     weight_by_entities(conn, &request.query, &mut hits)?;
     hits.sort_by(rank);
     hits.truncate(request.effective_limit());
+    // After the truncation, never before: an excerpt costs a whole decompressed
+    // session and the candidate pool is four times what the caller asked for.
+    let reads = excerpt::attach(conn, &request.query, &mut hits)?;
 
-    Ok(Response { hits, reason: None })
+    Ok(Response {
+        hits,
+        reason: None,
+        reads,
+    })
 }
 
 /// The same total order [`TAIL`] applies, over scores SQL could not compute.

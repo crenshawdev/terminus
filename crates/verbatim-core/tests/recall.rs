@@ -970,3 +970,135 @@ fn a_rare_entity_value_moves_a_hit_more_than_a_common_one() {
     assert_eq!(ranked(&conn, rare, MAX_RESULTS), rare_hits);
     assert_eq!(ranked(&conn, common, MAX_RESULTS), common_hits);
 }
+
+/// D-05: every hit carries an excerpt cut from the archive, showing the text
+/// that matched.
+///
+/// `snippet()` over the contentless FTS table returns an empty string with exit
+/// 0, so an excerpt built from it would validate against the documented shape
+/// and say nothing. The assertion is therefore on the content: the queried word
+/// is in it, and the JSON the record is written in is not.
+#[test]
+fn every_hit_carries_an_excerpt_from_the_blob() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    for raw in [
+        "cargo",
+        "docs/RETRY.md",
+        "the echo agent repeats this line exactly",
+    ] {
+        let hits = ranked(&conn, raw, MAX_RESULTS);
+        assert!(!hits.is_empty(), "`{raw}` matched nothing");
+        for hit in &hits {
+            assert!(
+                !hit.excerpt.is_empty(),
+                "turn {} came back with no excerpt for `{raw}`",
+                hit.turn_id
+            );
+            let folded = hit.excerpt.to_lowercase();
+            assert!(
+                Query::parse(raw)
+                    .tokens()
+                    .iter()
+                    .any(|token| folded.contains(&token.to_lowercase())),
+                "excerpt for turn {} shows none of `{raw}`: {:?}",
+                hit.turn_id,
+                hit.excerpt
+            );
+            for key in ["\"type\"", "\"message\"", "\"content\"", "\"tool_use\""] {
+                assert!(
+                    !hit.excerpt.contains(key),
+                    "excerpt for turn {} is JSON, not prose: {:?}",
+                    hit.turn_id,
+                    hit.excerpt
+                );
+            }
+        }
+    }
+}
+
+/// D-20: several hits from one session read that session's blob once.
+///
+/// Whole-blob materialization is what this bounds, not decompression: the
+/// `blob` feature that would give the reader incremental I/O is deliberately
+/// not enabled, and one archived session reaches 10.1 MB uncompressed.
+#[test]
+fn one_session_is_read_once_however_many_hits_it_answered() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let response = answer(&conn, &[], Scope::Everything, "retry budget");
+    let mut sessions: Vec<&str> = response
+        .hits
+        .iter()
+        .map(|hit| hit.session_key.as_str())
+        .collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+
+    assert!(
+        response.hits.len() > sessions.len(),
+        "this query needs several hits in one session to be about anything: {:?}",
+        response.hits
+    );
+    assert_eq!(response.reads.blobs, sessions.len());
+}
+
+/// A long turn is cut down, with the cut marked and the match inside the
+/// window.
+#[test]
+fn a_long_excerpt_is_a_window_around_the_match() {
+    let bench = bench();
+    let filler = "padding ".repeat(200);
+    bench.flood("long.jsonl", &format!("{filler} needleword"), 1);
+    let conn = bench.conn();
+
+    let hits = ranked(&conn, "needleword", MAX_RESULTS);
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    let excerpt = &hits[0].excerpt;
+
+    assert!(excerpt.contains("needleword"), "{excerpt:?}");
+    assert!(excerpt.starts_with("..."), "the cut is marked: {excerpt:?}");
+    assert!(
+        excerpt.chars().count() <= verbatim_core::recall::EXCERPT_CHARS + 2 * "...".len(),
+        "excerpt is {} chars",
+        excerpt.chars().count()
+    );
+}
+
+/// A blob that will not decompress costs that hit its excerpt and nothing else.
+///
+/// `verbatim verify` is the command that reports archive damage; a search that
+/// failed outright would take every undamaged session's results down with it.
+#[test]
+fn a_damaged_blob_leaves_an_empty_excerpt_and_a_whole_hit() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let before = ranked(&conn, "cargo", MAX_RESULTS);
+    let damaged = before
+        .iter()
+        .find(|hit| hit.session_key.ends_with("session-errors-a.jsonl"))
+        .expect("the errors fixture answers this query")
+        .session_key
+        .clone();
+    conn.execute(
+        "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
+        rusqlite::params![vec![0u8; 64], &damaged],
+    )
+    .unwrap();
+
+    let after = ranked(&conn, "cargo", MAX_RESULTS);
+    assert_eq!(after.len(), before.len(), "the search still answered");
+    for hit in &after {
+        if hit.session_key == damaged {
+            assert!(hit.excerpt.is_empty());
+            // Everything else survived: the damage is one field wide.
+            assert!(!hit.record_type.is_empty());
+            assert!(hit.relevance > 0.0);
+        } else {
+            assert!(!hit.excerpt.is_empty(), "{hit:?}");
+        }
+    }
+}

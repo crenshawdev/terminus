@@ -12,10 +12,12 @@
 //! (D-10) - rather than opening one of its own, so the layer cannot create a
 //! store as a side effect of being asked a question.
 
+pub mod excerpt;
 pub mod query;
 pub mod scope;
 pub mod search;
 
+pub use excerpt::EXCERPT_CHARS;
 pub use query::{EntityMatch, Query, MAX_QUERY_TOKENS};
 pub use scope::{Reason, Scope};
 pub use search::{Filters, Hit, Request, Response, DEFAULT_RESULTS, MAX_RESULTS};
