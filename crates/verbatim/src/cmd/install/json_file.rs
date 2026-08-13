@@ -46,6 +46,28 @@
 //! A file that does not exist is created. A file that exists and is not valid
 //! JSON is an operational failure that writes nothing - never a file to
 //! overwrite, because whatever it is, it is not ours to lose.
+//!
+//! # What the user approves is what lands (INST-03)
+//!
+//! [`Document::apply`] writes the whole document back, re-rendered. For the two
+//! real files that is a byte-for-byte round trip, because both are what
+//! `JSON.stringify(value, null, 2)` produced. For a settings file that is
+//! minified, four-space indented, or CRLF it is not: the write reformats
+//! everything, not only the members install added.
+//!
+//! Of the two ways to close that gap - preserve the original bytes outside the
+//! edited region, or show the rewrite honestly - this module does the second.
+//! The diff is taken against [`Document::source`], the bytes on disk, so a file
+//! whose formatting is not this renderer's shows its whole rewrite at the
+//! confirmation and the user approves exactly what lands.
+//!
+//! What that does not cover: install still cannot make a small edit to a file
+//! it did not format. The user's choice is to accept a re-rendered file or to
+//! decline the install; there is no third answer, and a byte-preserving splice
+//! is the change that would offer one. It also says nothing about a file that
+//! changes between the diff and the write - `apply` re-reads and re-applies at
+//! that instant (D-06), and its own no-op check is rendered against rendered, so
+//! an install with nothing to add writes nothing and reformats nothing.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -257,6 +279,9 @@ pub struct Document {
     /// What is actually written to. May be several links away from `path`.
     resolved: PathBuf,
     existed: bool,
+    /// The bytes read, kept so the diff can be taken against the file itself
+    /// rather than against this module's idea of how it should look.
+    source: String,
     value: Json,
     trailing_newline: bool,
 }
@@ -280,6 +305,7 @@ impl Document {
             path: path.to_owned(),
             resolved,
             existed,
+            source: text,
             value,
             trailing_newline,
         })
@@ -293,16 +319,41 @@ impl Document {
         &self.value
     }
 
+    /// The file's bytes as they are on disk, empty when there is no file.
+    ///
+    /// The left-hand side of every diff install shows. It is the file, not the
+    /// re-rendered copy, because the re-rendered copy is what install is asking
+    /// permission to write.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
     /// This file as this module would write it, unchanged.
     pub fn rendered(&self) -> String {
         render(&self.value, self.trailing_newline)
     }
 
-    /// What `edit` would make of this file, without writing anything.
+    /// Would writing `after` change this file at all?
     ///
-    /// Rendered from the parsed copy on both sides rather than from the original
-    /// bytes, so the diff carries the change and not the reformatting a differently
-    /// indented file would otherwise show.
+    /// The same test [`Document::apply`] makes at the moment it writes, so a
+    /// caller can decide whether to back the file up without applying twice.
+    /// Note what it is *not*: a file whose formatting differs from this
+    /// renderer's is not a reason to write. Install re-renders only a file it
+    /// also has something to add to.
+    pub fn would_write(&self, after: &str) -> bool {
+        !self.existed || after != self.rendered()
+    }
+
+    /// Would writing re-render bytes install was not asked to change?
+    ///
+    /// True for a file this renderer did not produce - minified, four-space
+    /// indented, CRLF. The diff shows that rewrite in full; this is what lets a
+    /// caller say why it is there.
+    pub fn reformats(&self) -> bool {
+        self.existed && self.source != self.rendered()
+    }
+
+    /// What `edit` would make of this file, without writing anything.
     pub fn preview(
         &self,
         edit: &dyn Fn(&mut Json) -> Result<(), Failure>,
@@ -348,6 +399,12 @@ impl Document {
     /// Returns whether anything was written. The read is deliberately not the
     /// one [`Document::read`] did: D-06's whole point is that the file may have
     /// moved under us between the diff and the answer.
+    ///
+    /// What lands is the whole document, re-rendered - not a splice into the
+    /// original bytes. That is why the diff is taken against
+    /// [`Document::source`]: a file this renderer did not format is rewritten in
+    /// full, and the user has to have seen that before answering. See the module
+    /// header for what that choice does not cover.
     pub fn apply(&self, edit: &dyn Fn(&mut Json) -> Result<(), Failure>) -> Result<bool, Failure> {
         let fresh = Document::read(&self.resolved)?;
         let before = fresh.rendered();

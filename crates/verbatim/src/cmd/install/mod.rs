@@ -92,8 +92,11 @@ pub fn run(options: Options) -> Result<(), Failure> {
 
     let add_hooks = |root: &mut Json| targets::add_hooks(root, &stable);
     let add_server = |root: &mut Json| targets::add_mcp_server(root, &stable);
-    let hook_diff = json_file::diff(&settings.rendered(), &settings.preview(&add_hooks)?);
-    let server_diff = json_file::diff(&claude.rendered(), &claude.preview(&add_server)?);
+    // Against the file's own bytes, not against a re-rendered copy of it: what
+    // `apply` writes is the whole document, so a settings file this renderer did
+    // not format is rewritten in full and the diff has to say so (INST-03).
+    let hook_diff = pending(&settings, &settings.preview(&add_hooks)?);
+    let server_diff = pending(&claude, &claude.preview(&add_server)?);
 
     println!("verbatim install");
     println!();
@@ -101,12 +104,12 @@ pub fn run(options: Options) -> Result<(), Failure> {
     println!("  copied to   {}", stable.display());
     println!();
     show(
-        settings.path(),
+        &settings,
         &hook_diff,
         "the four hook entries are already there",
     );
     show(
-        claude.path(),
+        &claude,
         &server_diff,
         "the mcp server is already registered",
     );
@@ -236,11 +239,36 @@ fn advise(settings: &Document, yes: bool) -> Result<(), Failure> {
     Ok(())
 }
 
-fn show(path: &Path, diff: &str, unchanged: &str) {
-    println!("  {}", path.display());
+/// The diff install will write, or nothing at all when it will write nothing.
+///
+/// Taken against the file on disk. The empty string means install has nothing
+/// to add to this file, which is also the answer when the file's formatting is
+/// not this renderer's: install re-renders a file only when it also has
+/// something to put in it, so a formatting difference alone is not a change to
+/// show or a file to back up.
+fn pending(document: &Document, after: &str) -> String {
+    if !document.would_write(after) {
+        return String::new();
+    }
+    json_file::diff(document.source(), after)
+}
+
+fn show(document: &Document, diff: &str, unchanged: &str) {
+    println!("  {}", document.path().display());
     if diff.is_empty() {
         println!("    no change: {unchanged}");
     } else {
+        if document.reformats() {
+            // The diff is large and every line of it is real: this file is not
+            // written the way verbatim writes one, and verbatim writes the whole
+            // document. Saying so is the difference between a confusing diff and
+            // an informed answer.
+            println!(
+                "    note: this file is not formatted the way verbatim writes one, so applying\n    \
+                 this rewrites all of it - two-space indented, keys and values unchanged and in\n    \
+                 the order they are in now. every line below is part of that."
+            );
+        }
         print!("{diff}");
     }
     println!();

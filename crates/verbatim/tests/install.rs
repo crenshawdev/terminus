@@ -230,6 +230,19 @@ fn key_order(path: &Path) -> Vec<String> {
     keys
 }
 
+/// The same JSON, indented four spaces per level instead of two.
+///
+/// What an editor's "format document" leaves behind, and a file verbatim's
+/// renderer did not produce.
+fn four_space(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let depth = line.len() - line.trim_start().len();
+            format!("{}{}\n", " ".repeat(depth * 2), line.trim_start())
+        })
+        .collect()
+}
+
 /// Every entry in `settings.json` whose command is the stable path.
 fn our_entries(settings: &serde_json::Value, stable: &Path) -> Vec<serde_json::Value> {
     let want = serde_json::Value::from(stable.display().to_string());
@@ -592,6 +605,57 @@ fn an_accepted_confirmation_writes_all_three_after_showing_the_diff() {
         4
     );
     assert!(read(&fixture.claude_json())["mcpServers"]["verbatim"].is_object());
+}
+
+/// INST-03: the diff is the file's own bytes against what will land on top of
+/// them, so a settings file verbatim's renderer did not produce shows the whole
+/// rewrite it is about to get. A diff of two re-rendered copies would show a
+/// four-line insertion and then reformat the file.
+#[test]
+fn a_differently_formatted_file_shows_the_rewrite_it_will_get() {
+    let fixture = fixture();
+    fixture.seed();
+    std::fs::write(fixture.settings(), four_space(SETTINGS)).unwrap();
+
+    let output = fixture.run(&["install", "--yes"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let said = text(&output);
+    let shown = said
+        .split("apply these changes?")
+        .next()
+        .expect("the confirmation is asked once");
+
+    // The line as the file spells it, removed; the line as install will write
+    // it, added. Neither appears in a diff taken between two rendered copies,
+    // because nothing in `theme` changed - only its indentation did.
+    assert!(
+        shown.contains("   -     \"theme\": \"dark\""),
+        "the diff hid the reformatting of a line it is about to rewrite:\n{shown}"
+    );
+    assert!(
+        shown.contains("   +   \"theme\": \"dark\""),
+        "the diff did not show the line it will write:\n{shown}"
+    );
+    assert!(
+        shown.contains("rewrites all of it"),
+        "the diff did not say why it is the whole file:\n{shown}"
+    );
+
+    // And what landed is what it showed.
+    let after = std::fs::read_to_string(fixture.settings()).unwrap();
+    assert!(
+        after.contains("\n  \"theme\": \"dark\""),
+        "the file was not rewritten the way the diff said it would be"
+    );
+    assert_eq!(
+        our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
+        4
+    );
+    // The backup is still the bytes that were there before any of this.
+    assert_eq!(
+        std::fs::read_to_string(fixture.claude_dir.join("settings.json.verbatim-backup")).unwrap(),
+        four_space(SETTINGS)
+    );
 }
 
 /// D-24: `install` is human-only. `--json` is misuse, exit 2.
