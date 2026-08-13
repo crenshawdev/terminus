@@ -21,8 +21,10 @@
 //! `cargo test` and still reports green - which would silently retire the
 //! budget assertion this file exists to hold.
 
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use verbatim_core::testkit;
 
@@ -111,6 +113,34 @@ impl Hook {
 
 /// Repeats of the two fixtures, ~10 MB, ~700 ms of debug-build ingest.
 const BIG: usize = 48;
+
+/// Every event Claude Code fires at this binary, against the payload it sends.
+/// A fifth event is a line here and a line in `cmd::hook::EVENTS`.
+const FIXTURES: &[(&str, &str)] = &[
+    ("SessionStart", "hooks/session-start.json"),
+    ("UserPromptSubmit", "hooks/user-prompt-submit.json"),
+    ("SessionEnd", "hooks/session-end.json"),
+    ("PostCompact", "hooks/post-compact.json"),
+];
+
+/// One hook invocation: the payload on stdin, then EOF, the way Claude Code
+/// 2.1.231 writes it (`stdin.write(payload + "\n"); stdin.end()`).
+fn feed(hook: &Hook, event: &str, payload: &[u8]) -> Output {
+    let mut child = hook
+        .command(&["hook", event])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the hook");
+    child
+        .stdin
+        .take()
+        .expect("the hook's stdin")
+        .write_all(payload)
+        .expect("write the payload");
+    child.wait_with_output().expect("wait for the hook")
+}
 
 /// One row of the process table.
 #[cfg(unix)]
@@ -217,19 +247,116 @@ fn the_working_process_leaves_the_group_and_the_parentage_of_the_process_that_sp
         "the ingest is still parented to the process that spawned it"
     );
 
-    reap(worker.pid);
+    drain(&hook.ingest_argv());
 }
 
-/// Let a spawned ingest finish rather than leaving it writing into a directory
-/// the test is about to delete.
+/// Wait for every ingest this test started to finish.
+///
+/// Not tidiness: the temporary directory is removed when the test returns, and
+/// a pass still walking it would be reading a tree that is being deleted under
+/// it.
 #[cfg(unix)]
-fn reap(pid: u32) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while ps().iter().any(|p| p.pid == pid) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the ingest never finished"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
+fn drain(argv: &str) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while ps().iter().any(|p| p.argv == argv) {
+        assert!(Instant::now() < deadline, "an ingest never finished");
+        std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(not(unix))]
+fn drain(_argv: &str) {}
+
+/// AC1: the four events, the exact payloads, the clean stdout and the budget.
+///
+/// The p99 is printed rather than only asserted, so a regression names a number
+/// a reader can compare against the next run instead of a boolean.
+#[test]
+fn every_event_exits_zero_with_an_empty_stdout_inside_the_budget() {
+    const RUNS: usize = 100;
+    const BUDGET: f64 = 10.0;
+
+    let hook = hook();
+    for (event, fixture) in FIXTURES {
+        let payload = testkit::fixture_bytes(fixture);
+        let mut millis = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let started = Instant::now();
+            let output = feed(&hook, event, &payload);
+            millis.push(started.elapsed().as_secs_f64() * 1000.0);
+
+            assert!(
+                output.status.success(),
+                "{event} exited {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // D-15: Claude Code validates any hook stdout that parses as JSON
+            // against the event name, so a stray line is a protocol error and
+            // not noise.
+            assert!(
+                output.stdout.is_empty(),
+                "{event} wrote to stdout: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        millis.sort_by(f64::total_cmp);
+        let p50 = millis[RUNS / 2 - 1];
+        let p99 = millis[(RUNS * 99) / 100 - 1];
+        println!("{event}: p50 {p50:.2} ms, p99 {p99:.2} ms over {RUNS} runs");
+        assert!(p99 < BUDGET, "{event}: p99 {p99:.2} ms is over {BUDGET} ms");
+    }
+    drain(&hook.ingest_argv());
+}
+
+/// The hook hands the ingest nothing the harness gave it.
+///
+/// A caller reading the hook's stdout to EOF must get an empty read as soon as
+/// the hook exits. A child holding the inherited write end of that pipe would
+/// keep the read blocked for the whole pass instead - which on a backfill is
+/// minutes of a harness waiting on a hook that already returned.
+#[cfg(unix)]
+#[test]
+fn reading_the_hooks_stdout_to_eof_returns_at_once_while_the_ingest_still_runs() {
+    let hook = hook();
+    hook.big_transcript("-p", "22222222-2222-4222-8222-222222222222.jsonl", BIG);
+
+    let mut child = hook
+        .command(&["hook", "SessionStart"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the hook");
+    child
+        .stdin
+        .take()
+        .expect("the hook's stdin")
+        .write_all(&testkit::fixture_bytes("hooks/session-start.json"))
+        .expect("write the payload");
+
+    let started = Instant::now();
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("the hook's stdout")
+        .read_to_end(&mut stdout)
+        .expect("read the hook's stdout to EOF");
+    let elapsed = started.elapsed();
+
+    assert!(stdout.is_empty(), "the hook wrote {stdout:?} to stdout");
+    // The pass this hook started runs for roughly 700 ms, so anything near it
+    // means the read was waiting on the ingest and not on the hook.
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "reading the hook's stdout to EOF took {elapsed:?}: the ingest is \
+         holding a handle the hook inherited"
+    );
+    assert!(child.wait().expect("wait for the hook").success());
+
+    // And it returned *while* the pass was running, which is what makes the
+    // reading above an answer rather than a coincidence.
+    await_process(&hook.ingest_argv());
+    drain(&hook.ingest_argv());
 }

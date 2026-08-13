@@ -26,6 +26,31 @@ by hand without re-deriving the others will fail
 | `subagents/workflows/wf_demo/journal.jsonl` | D-12: a `.jsonl` in the tree that is not a transcript at all |
 | `subagents/agent-alpha.meta.json` | D-04: the sidecar metadata file, stored as opaque bytes and never a session |
 
+## `hooks/`: the payloads, not the transcripts
+
+`hooks/session-start.json`, `hooks/user-prompt-submit.json`,
+`hooks/session-end.json` and `hooks/post-compact.json` are a different kind of
+fixture. They are not transcripts and they are not ingested: each is the single
+line of JSON Claude Code writes to a hook's stdin before closing it, and
+`crates/verbatim/tests/hook.rs` feeds them to `verbatim hook <event>` to hold
+AC1's "exit 0, nothing on stdout, p99 under 10 ms".
+
+Their fields are read off the 2.1.231 payload schemas rather than guessed. Every
+payload carries the base object the bundle's builder returns - `session_id`,
+`transcript_path`, `cwd`, `prompt_id`, `permission_mode`, `agent_type` - then
+`hook_event_name`, then that event's own fields: `source`, `model` and
+`session_title` for `SessionStart`, `prompt` and `session_title` for
+`UserPromptSubmit`, `reason` for `SessionEnd`, `trigger` and `compact_summary`
+for `PostCompact`. The enumerated values are the schema's own: `source`
+`"resume"`, `reason` `"prompt_input_exit"`, `trigger` `"auto"`.
+
+Nothing in phase 4 parses a single one of those fields (D-15) - the hook reads
+the line and drops it. They are shaped correctly anyway because phase 5 reads
+them, and a fixture invented then would be a fixture invented against the code
+that consumes it.
+
+Each is one line with a trailing newline, matching `stdin.write(payload + "\n")`.
+
 ## What each one pins
 
 **`session-basic.jsonl`** carries all fifteen `type` values: the four turn types
