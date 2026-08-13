@@ -1453,3 +1453,119 @@ fn a_server_with_no_store_answers_with_a_reason_and_creates_no_file() {
         "a read created the data directory it was asked about"
     );
 }
+
+/// The `paths` filter binds one SQL placeholder each, so an unbounded
+/// client-supplied array was an operational SQLite failure handed back as an
+/// ordinary empty result carrying the whole generated statement.
+///
+/// Two wrong behaviours in the one answer: a model reads `isError:false` with
+/// no hits as "no matches" rather than "your filter was rejected", and the
+/// reason itself pushed megabytes into the context the budget exists to
+/// protect.
+#[test]
+fn a_path_filter_longer_than_the_cap_is_bounded_and_said_so() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let alpha = bench.project("session-recall.jsonl");
+
+    let paths: Vec<String> = (0..40_000).map(|n| format!("/x/{n}")).collect();
+    let (document, is_error) = bench.call_flagged(
+        &alpha,
+        "recall_search",
+        serde_json::json!({ "query": "the", "paths": paths }),
+    );
+
+    let reason = document["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("paths were filtered on"),
+        "the cap was not reported: {reason}"
+    );
+    assert!(
+        !reason.contains("SELECT") && !reason.contains("sqlite:"),
+        "the generated SQL reached the model's context: {reason}"
+    );
+    assert!(
+        reason.len() < 400,
+        "the reason is {} bytes, which is a context budget problem",
+        reason.len()
+    );
+    assert!(!is_error, "a bounded filter is not a failed call");
+}
+
+/// An excluded project's name must not reach a client that never asked for it.
+///
+/// Both `recall_get` and `recall_context` refuse an id they will not serve, but
+/// only one of the two refusals names a path. The exclusion arm ran before the
+/// scope arm, so at the DEFAULT scope - no `project` argument, the only shape a
+/// model normally sends - an id inside an excluded project answered
+/// "<absolute path> is excluded by config", confirming both that the id exists
+/// and what the excluded project is called. Ids are `session_no << 24 |
+/// turn_seq`, so sweeping them mapped every excluded project's name and live id
+/// ranges with no argument a client had to pass.
+#[test]
+fn an_excluded_project_is_never_named_to_a_client_at_the_default_scope() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let alpha = bench.project("session-recall.jsonl");
+    let excluded = bench.project("session-errors-a.jsonl");
+    assert_ne!(alpha, excluded, "the fixtures must span two projects");
+    let excluded_name = excluded.to_string_lossy().into_owned();
+
+    // Ids that really do live in the excluded project, which is what makes the
+    // silence meaningful rather than incidental. Read before the exclusion,
+    // since afterwards nothing will admit they exist.
+    let ids: Vec<i64> = {
+        let conn = bench.conn();
+        let mut statement = conn
+            .prepare(
+                "SELECT t.id FROM turns t JOIN session_meta m USING (session_key)
+                  WHERE m.project = ?1 ORDER BY t.id LIMIT 4",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([&excluded_name], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    };
+    assert!(!ids.is_empty(), "the excluded project must hold turns");
+
+    bench.config(&format!("exclude = [{excluded_name:?}]\n"));
+
+    let got = bench.call(&alpha, "recall_get", serde_json::json!({ "turn_ids": ids }));
+    let rendered = got.to_string();
+    assert!(
+        !rendered.contains(&excluded_name),
+        "recall_get named the excluded project: {rendered}"
+    );
+    assert!(
+        !rendered.contains("excluded by config"),
+        "recall_get confirmed the id belongs to an excluded project: {rendered}"
+    );
+
+    let window = bench.call(
+        &alpha,
+        "recall_context",
+        serde_json::json!({ "turn_id": ids[0] }),
+    );
+    let rendered = window.to_string();
+    assert!(
+        !rendered.contains(&excluded_name),
+        "recall_context named the excluded project: {rendered}"
+    );
+    assert!(
+        !rendered.contains("excluded by config"),
+        "recall_context confirmed the id belongs to an excluded project: {rendered}"
+    );
+
+    // The control: an id that is simply not archived answers the same way, so
+    // "excluded" and "absent" are indistinguishable from outside.
+    let absent = bench.call(&alpha, "recall_context", serde_json::json!({"turn_id": 1}));
+    assert_eq!(
+        absent["reason"].as_str().is_some(),
+        window["reason"].as_str().is_some(),
+        "an excluded id and an unarchived id answer differently"
+    );
+}

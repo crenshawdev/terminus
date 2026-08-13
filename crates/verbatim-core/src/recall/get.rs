@@ -141,6 +141,24 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
             continue;
         };
 
+        // Scope FIRST, then exclusion. Both arms refuse the id; only one of
+        // them names a path. An excluded project is also outside the caller's
+        // scope at every scope but `*`, so checking exclusion first answered
+        // "<absolute path> is excluded by config" for an id the caller was
+        // never entitled to hear about - confirming both that the id exists and
+        // what the excluded project is called. Ids are densely enumerable
+        // (`session_no << 24 | turn_seq`), so that reason mapped every excluded
+        // project's name and live id ranges, one call at a time, with no
+        // argument a client had to pass to reach it.
+        if let Some(wanted_project) = scoped.project() {
+            if row.project.as_deref() != Some(wanted_project) {
+                fetched.absent.push(Absent {
+                    turn_id: id,
+                    reason: Reason::NoSuchTurn { turn_id: id },
+                });
+                continue;
+            }
+        }
         let hidden = |key: &Option<String>, excluded: &[String]| {
             key.as_deref()
                 .is_some_and(|k| excluded.iter().any(|e| e == k))
@@ -159,15 +177,6 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
                 },
             });
             continue;
-        }
-        if let Some(wanted_project) = scoped.project() {
-            if row.project.as_deref() != Some(wanted_project) {
-                fetched.absent.push(Absent {
-                    turn_id: id,
-                    reason: Reason::NoSuchTurn { turn_id: id },
-                });
-                continue;
-            }
         }
 
         let index = fetched.records.len();

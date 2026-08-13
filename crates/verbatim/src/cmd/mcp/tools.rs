@@ -63,6 +63,18 @@ pub const MAX_CONTEXT_SIDE: usize = recall::MAX_CONTEXT_SIDE;
 /// the number in the tens rather than the hundreds.
 pub const MAX_IDS: usize = 25;
 
+/// How many `paths` one `recall_search` call may filter on.
+///
+/// The same hazard [`MAX_IDS`] closes, on the other tool: `Filters::push_onto`
+/// binds one SQL placeholder per path, so a client-supplied array past
+/// SQLITE_MAX_VARIABLE_NUMBER turned into an operational SQLite failure handed
+/// back as an ordinary empty result - which a model reads as "no matches"
+/// rather than "your filter was rejected" - carrying the whole generated
+/// statement as its reason. A 1,000,000-element array produced a 2 MB tool
+/// result, defeating the budget that exists so a client cannot pull the archive
+/// into its context one call at a time.
+pub const MAX_PATHS: usize = 25;
+
 /// How many hits `recall_search` returns when the caller does not say.
 ///
 /// Below [`MAX_HITS`] on purpose: this answer goes into a model's context, and
@@ -111,7 +123,11 @@ pub fn descriptors() -> Vec<Value> {
                     "paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Only turns that structurally touched one of these files."
+                        "maxItems": MAX_PATHS,
+                        "description": format!(
+                            "Only turns that structurally touched one of these files, \
+                             at most {MAX_PATHS} per call."
+                        )
                     },
                     "tool": {
                         "type": "string",
@@ -303,10 +319,20 @@ fn nothing(name: &str, reason: &str) -> Value {
 fn run_search(args: &Map<String, Value>) -> Result<Value, Refused> {
     let raw = required_string(args, "query")?;
     let project = optional_string(args, "project")?;
+    let asked_paths = optional_strings(args, "paths")?;
+    let asked_path_count = asked_paths.len();
+    // `get` and not a slice expression, for the same reason `recall_get` uses
+    // one: the length came from a client and a panic here writes a backtrace
+    // onto the transport.
+    let paths = asked_paths
+        .get(..MAX_PATHS)
+        .map(<[String]>::to_vec)
+        .unwrap_or(asked_paths);
+    let served_paths = paths.len();
     let filters = Filters {
         tool: optional_string(args, "tool")?,
         kind: optional_string(args, "kind")?,
-        paths: optional_strings(args, "paths")?,
+        paths,
         since: optional_time(args, "since")?,
         until: optional_time(args, "until")?,
     };
@@ -352,6 +378,12 @@ fn run_search(args: &Map<String, Value>) -> Result<Value, Refused> {
     if reason.is_none() && truncated {
         reason = Some(format!(
             "only the first {tokens} tokens of the query were used"
+        ));
+    }
+    if reason.is_none() && served_paths < asked_path_count {
+        reason = Some(format!(
+            "only the first {served_paths} of {asked_path_count} paths were \
+             filtered on; this server caps one request at {MAX_PATHS}"
         ));
     }
 

@@ -118,18 +118,12 @@ pub fn window(
         .optional()?;
     let (project, pre_worktree, continues_from) = meta.unwrap_or((None, None, None));
 
-    let hidden = |key: &Option<String>, excluded: &[String]| {
-        key.as_deref()
-            .is_some_and(|k| excluded.iter().any(|e| e == k))
-    };
-    if hidden(&project, scoped.excluded_projects())
-        || hidden(&pre_worktree, scoped.excluded_pre_worktree())
-    {
-        return Ok(Window::nothing(Reason::ProjectExcluded {
-            project: project.or(pre_worktree).unwrap_or_default(),
-        }));
-    }
-
+    // Scope FIRST, then exclusion - the order is the finding, not a style
+    // choice. Both arms refuse the anchor; only one of them names a path, and
+    // an excluded project is outside the caller's scope at every scope but
+    // `*`, so checking exclusion first answered "<absolute path> is excluded by
+    // config" for a turn the caller was never entitled to hear about.
+    //
     // The scoping half of the same door. RCL-10 auto-scopes all three MCP
     // tools to the current project with `project: "*"` opting out, and this is
     // the only place the context tool can enforce it: a caller supplies a turn
@@ -146,6 +140,18 @@ pub fn window(
         if project.as_deref() != Some(wanted) {
             return Ok(Window::nothing(Reason::NoSuchTurn { turn_id: anchor }));
         }
+    }
+
+    let hidden = |key: &Option<String>, excluded: &[String]| {
+        key.as_deref()
+            .is_some_and(|k| excluded.iter().any(|e| e == k))
+    };
+    if hidden(&project, scoped.excluded_projects())
+        || hidden(&pre_worktree, scoped.excluded_pre_worktree())
+    {
+        return Ok(Window::nothing(Reason::ProjectExcluded {
+            project: project.or(pre_worktree).unwrap_or_default(),
+        }));
     }
 
     let low = seq - before.min(MAX_CONTEXT_SIDE) as i64;
