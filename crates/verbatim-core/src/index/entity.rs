@@ -195,11 +195,29 @@ impl Collector {
         }
     }
 
-    /// The top-level `toolUseResult`. `filePath` is the one path key it carries
-    /// (679 of the measured sample); a non-empty `stderr` is the other half of
-    /// D-03's error signal.
+    /// The top-level `toolUseResult`. Two path keys, not one, and a non-empty
+    /// `stderr` as the other half of D-03's error signal.
+    ///
+    /// D-02's measurement counted `filePath` at the top level only (679 of that
+    /// sample) and the code that followed it read only there. `Read` - the tool
+    /// that names a file more often than any other - nests its path one level
+    /// down at `file.filePath` instead, so the result-side turn of every `Read`
+    /// emitted no path at all. Remeasured over a 400-file sample: 8,719
+    /// `toolUseResult` objects carrying `file.filePath` 1,238 times against the
+    /// top-level key's 1,171, so reading one of the two dropped slightly more
+    /// than half of the result-side paths in the archive.
+    ///
+    /// Both are read and neither is preferred. A record carrying the same value
+    /// twice is deduped by `push` on `(kind, value)` like any other repeat.
     fn tool_use_result(&mut self, result: &Value) {
-        if let Some(raw) = result.get("filePath").and_then(Value::as_str) {
+        let nested = result
+            .get("file")
+            .and_then(|file| file.get("filePath"))
+            .and_then(Value::as_str);
+        for raw in [result.get("filePath").and_then(Value::as_str), nested]
+            .into_iter()
+            .flatten()
+        {
             if let Some(path) = normalize_path(raw) {
                 self.push(PATH, path);
             }

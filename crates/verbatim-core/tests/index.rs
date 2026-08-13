@@ -713,3 +713,63 @@ fn a_turn_writes_no_more_entities_than_the_cap_and_the_same_ones_twice() {
     );
     assert_eq!(paths_of(conn, id).len(), MAX_ENTITIES_PER_TURN - 2);
 }
+
+/// `Read` nests its result path where `Write` and `Edit` do not, and reading
+/// one of the two places dropped every `Read` result-side path in the archive.
+#[test]
+fn a_nested_result_path_becomes_an_entity_like_a_top_level_one() {
+    use verbatim_core::index::entities;
+
+    let paths = |record: serde_json::Value| -> Vec<String> {
+        entities(&record)
+            .into_iter()
+            .filter(|e| e.kind == "path")
+            .map(|e| e.value)
+            .collect()
+    };
+
+    // `Read`: the path is at `toolUseResult.file.filePath`.
+    assert_eq!(
+        paths(serde_json::json!({
+            "type": "user",
+            "uuid": "u1",
+            "timestamp": "2026-08-12T09:14:21.000Z",
+            "message": { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "1\tfn main(){}" }
+            ]},
+            "toolUseResult": { "type": "text", "file": {
+                "filePath": "/a/b/main.rs", "content": "fn main(){}", "numLines": 1
+            }}
+        })),
+        ["/a/b/main.rs"],
+        "a Read result path is not extracted"
+    );
+
+    // The control the old code did handle: `Write`/`Edit` at the top level.
+    assert_eq!(
+        paths(serde_json::json!({
+            "type": "user",
+            "uuid": "u2",
+            "timestamp": "2026-08-12T09:14:22.000Z",
+            "message": { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_2", "content": "ok" }
+            ]},
+            "toolUseResult": { "filePath": "/a/b/new.rs" }
+        })),
+        ["/a/b/new.rs"]
+    );
+
+    // One value, however many keys carry it: `push` dedupes on (kind, value).
+    assert_eq!(
+        paths(serde_json::json!({
+            "type": "user",
+            "uuid": "u3",
+            "timestamp": "2026-08-12T09:14:23.000Z",
+            "message": { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_3", "content": "ok" }
+            ]},
+            "toolUseResult": { "filePath": "/a/b/x.rs", "file": { "filePath": "/a/b/x.rs" }}
+        })),
+        ["/a/b/x.rs"]
+    );
+}
