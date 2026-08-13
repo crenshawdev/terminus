@@ -524,6 +524,39 @@ fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
     );
 }
 
+/// The backup's name is taken, never written through.
+///
+/// A dangling symlink at it is the case `Path::exists` answers wrongly: it
+/// follows the link, finds nothing, and reports the name free - and the copy
+/// that follows then creates the link's target, somewhere install was never
+/// asked to write.
+#[test]
+#[cfg(unix)]
+fn a_symlink_at_the_backup_name_is_not_written_through() {
+    let fixture = fixture();
+    fixture.seed();
+    let victim = fixture.root.join("not-a-backup");
+    std::os::unix::fs::symlink(
+        &victim,
+        fixture.claude_dir.join("settings.json.verbatim-backup"),
+    )
+    .unwrap();
+
+    let output = fixture.run(&["install", "--yes"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        !victim.exists(),
+        "install wrote a backup through a symlink, into {}",
+        victim.display()
+    );
+
+    // And it still did the job it was asked to do.
+    assert_eq!(
+        our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
+        4
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Task 3: the four hook entries
 // ---------------------------------------------------------------------------

@@ -369,6 +369,14 @@ impl Document {
     /// install must not back up the file it wrote itself, or the backup stops
     /// being the pre-install bytes uninstall restores (AC7). `None` means there
     /// was no file to copy, which is an ordinary first install.
+    ///
+    /// That rule makes the backup's integrity load-bearing, because there is no
+    /// second chance at it. So the copy is written to a temporary file and only
+    /// then given the backup's name: a crash, a full disk or a kill leaves
+    /// either no backup or a whole one, never the truncated one a direct copy
+    /// would leave permanently in place. The name is taken with [`link_once`],
+    /// which cannot clobber a backup an earlier install made and cannot be
+    /// raced by a second install the way `exists()` then copy could.
     pub fn backup(&self) -> Result<Option<PathBuf>, Failure> {
         if !self.existed {
             return Ok(None);
@@ -385,13 +393,19 @@ impl Document {
         let path = self
             .resolved
             .with_file_name(format!("{name}{BACKUP_SUFFIX}"));
-        if path.exists() {
-            return Ok(Some(path));
-        }
-        std::fs::copy(&self.resolved, &path).map_err(|e| {
-            Failure::Operational(format!("{} could not be written: {e}", path.display()))
-        })?;
-        Ok(Some(path))
+        let dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+
+        let (temporary, mut file) =
+            super::create_temporary(dir, &format!(".{name}{BACKUP_SUFFIX}."))?;
+        let outcome = copy_through(&self.resolved, &mut file, &temporary)
+            .and_then(|()| link_once(&temporary, &path));
+        // Either it has the backup's name now or it never will; either way this
+        // one is not a file to leave beside the user's settings.
+        let _ = std::fs::remove_file(&temporary);
+        outcome.map(|()| Some(path))
     }
 
     /// Re-read, re-apply `edit`, and write only if that changed something.
@@ -556,6 +570,60 @@ fn fill(
         let _ = std::fs::set_permissions(temporary, meta.permissions());
     }
     Ok(())
+}
+
+/// The whole of `source` into an already-open temporary, permissions and all.
+///
+/// The permissions matter: `settings.json` is 0600 on this machine and can hold
+/// an `env` block of credentials, and a fresh temporary file is 0644. A backup
+/// that widened them would be its own small leak.
+fn copy_through(source: &Path, file: &mut std::fs::File, temporary: &Path) -> Result<(), Failure> {
+    let mut reading = std::fs::File::open(source).map_err(|e| {
+        Failure::Operational(format!("{} could not be read: {e}", source.display()))
+    })?;
+    std::io::copy(&mut reading, file).map_err(|e| {
+        Failure::Operational(format!(
+            "{} could not be copied to {}: {e}",
+            source.display(),
+            temporary.display()
+        ))
+    })?;
+    if let Ok(meta) = std::fs::metadata(source) {
+        let _ = file.set_permissions(meta.permissions());
+    }
+    file.sync_all().map_err(|e| {
+        Failure::Operational(format!("{} could not be flushed: {e}", temporary.display()))
+    })?;
+    Ok(())
+}
+
+/// Give a finished copy the backup's name, and only if nothing else has it.
+///
+/// `hard_link` is the one operation here that is both atomic and refuses to
+/// clobber. `rename` would overwrite a backup an earlier install made - the
+/// pre-install bytes AC7 restores - and an `exists()` test before it is a race
+/// two concurrent installs both win.
+///
+/// A filesystem without hard links (FAT, some network mounts) falls back to the
+/// rename behind an `exists()` check: still atomic, with the refusal to clobber
+/// back down to best effort.
+fn link_once(temporary: &Path, path: &Path) -> Result<(), Failure> {
+    let linked = match std::fs::hard_link(temporary, path) {
+        Ok(()) => return Ok(()),
+        // A backup is already there. It is never refreshed: it holds the bytes
+        // from before any install ran, and this copy does not.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(e) => e,
+    };
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::rename(temporary, path).map_err(|e| {
+        Failure::Operational(format!(
+            "{} could not be written: {e} (and it could not be linked: {linked})",
+            path.display()
+        ))
+    })
 }
 
 /// The lines `edit` adds and removes, with a little context and nothing else.
@@ -1086,6 +1154,38 @@ mod tests {
 
         assert_eq!(second, first);
         assert_eq!(std::fs::read_to_string(&first).unwrap(), FIXTURE);
+    }
+
+    /// The backup is the file, with the file's permissions, and the temporary
+    /// it was written through is gone.
+    ///
+    /// 0600 is what `settings.json` is on this machine, and a fresh temporary
+    /// file is 0644: a backup that widened them would be its own small leak.
+    #[test]
+    #[cfg(unix)]
+    fn the_backup_carries_the_bytes_and_the_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, path) = seeded(FIXTURE);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let backup = Document::read(&path).unwrap().backup().unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), FIXTURE);
+        assert_eq!(
+            std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["settings.json", "settings.json.verbatim-backup"],
+            "the temporary the backup was written through is still there"
+        );
     }
 
     /// Nothing to back up when there is no file yet.
