@@ -62,6 +62,30 @@ pub enum Error {
     #[error("{path} exists but is not a verbatim store ({detail})")]
     NotAStore { path: PathBuf, detail: String },
 
+    /// A read command was pointed at a data directory that holds no store.
+    ///
+    /// Its own variant rather than an [`Error::Io`] carrying a message, for the
+    /// same reason [`Error::TranscriptDiverged`] is one: D-10 requires `search`,
+    /// `show`, `sessions` and `mcp` to render this as an empty result with a
+    /// reason instead of a failure, and a caller that had to recognize it by
+    /// matching on message text would break the first time the wording moved.
+    /// A read never creates the store it did not find (D-10), so this is the
+    /// ordinary state of a machine that has installed verbatim and not yet run
+    /// an ingest.
+    #[error("no verbatim store at {path}")]
+    StoreNotFound { path: PathBuf },
+
+    /// The store is there and this build cannot open it for reading.
+    ///
+    /// The case that is not hypothetical: a WAL database whose shared-memory
+    /// index cannot be created - read-only media, a directory the user cannot
+    /// write - which SQLite reports as `unable to open database file` on the
+    /// first statement rather than at connect. Reported like
+    /// [`Error::StoreNotFound`] so a read command can say why it returned
+    /// nothing instead of propagating a SQLite string.
+    #[error("cannot read the verbatim store at {path}: {detail}")]
+    StoreUnreadable { path: PathBuf, detail: String },
+
     /// The bytes in `sessions.blob` are not a blob this build can read.
     #[error("malformed session blob: {detail}")]
     BlobFormat { detail: String },

@@ -58,12 +58,25 @@ pub struct RebuildRequired {
     pub binary_derived_schema: i64,
 }
 
+/// A column this build declares that the open store does not carry.
+///
+/// Only a read-only open can produce one: [`Store::open`] runs
+/// [`bring_forward`] and adds it. Both strings come from
+/// [`crate::store::schema::BRING_FORWARD_COLUMNS`], never from the database, so
+/// a caller may compare them against that list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingColumn {
+    pub table: &'static str,
+    pub column: &'static str,
+}
+
 /// An open verbatim store.
 pub struct Store {
     conn: Connection,
     data_dir: PathBuf,
     path: PathBuf,
     rebuild: Option<RebuildRequired>,
+    missing: Vec<MissingColumn>,
 }
 
 impl std::fmt::Debug for Store {
@@ -106,6 +119,10 @@ impl Store {
             data_dir: data_dir.to_path_buf(),
             path,
             rebuild,
+            // `bring_forward` runs below on every existing store and
+            // `initialize` writes the whole schema on a fresh one, so a writable
+            // open never leaves a declared column absent.
+            missing: Vec::new(),
         };
         if state == StoreState::Fresh {
             store.initialize()?;
@@ -122,6 +139,87 @@ impl Store {
             bring_forward(&store.conn)?;
         }
         Ok(store)
+    }
+
+    /// Open an existing store for reading, and do nothing else to it (D-10).
+    ///
+    /// `SQLITE_OPEN_READ_ONLY`, no `create_dir_all`, no `initialize`, no
+    /// `bring_forward`, no `pragma_update`. A `readOnlyHint` server may not
+    /// perform DDL on connect, `verbatim search` may not create a store as a
+    /// side effect of a read, and a store on read-only media must return an
+    /// empty result rather than fail to open at all - which are three
+    /// statements about the same connection flags.
+    ///
+    /// The version gate still runs, because it is already read-only and because
+    /// [`Store::rebuild_required`] is what lets a read command say the store
+    /// predates this build instead of silently querying an old-shape index
+    /// (D-18).
+    ///
+    /// Dropping `bring_forward` means the columns it adds are not guaranteed to
+    /// be there: `session_meta.project_pre_worktree`, `agent_meta` and
+    /// `transcript_diverged` all arrived after phase 1, and a read query naming
+    /// one of them fails with `no such column` on a connection that cannot
+    /// `ALTER`. So their absence is measured here, once, and reported through
+    /// [`Store::missing_columns`] - the D-18 degraded read - rather than left to
+    /// surface as a SQLite error from the middle of a search.
+    ///
+    /// A missing data directory or database file is
+    /// [`Error::StoreNotFound`] and any other failure to open is
+    /// [`Error::StoreUnreadable`]: both are variants and neither is a panic,
+    /// because RCL-10 renders them as an empty result with a reason and a
+    /// caller must not have to match on message text to tell them apart.
+    pub fn open_read_only(data_dir: &Path) -> Result<Self> {
+        let path = data_dir.join(DB_FILE_NAME);
+
+        // Nothing is created, and that includes the probe: `fs::metadata` on a
+        // path that is not there is the whole of "a read against a machine that
+        // has never ingested".
+        match std::fs::metadata(&path) {
+            // A zero-length file is what an interrupted `initialize` leaves
+            // (see `inspect`), and it holds no store to read.
+            Ok(m) if m.len() == 0 => return Err(Error::StoreNotFound { path }),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::StoreNotFound { path })
+            }
+            Err(e) => {
+                return Err(Error::StoreUnreadable {
+                    path,
+                    detail: e.to_string(),
+                })
+            }
+        }
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn =
+            Connection::open_with_flags(&path, flags).map_err(|source| Error::StoreUnreadable {
+                path: path.clone(),
+                detail: source.to_string(),
+            })?;
+        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS.into()))?;
+
+        // SQLite opens lazily, so this first statement is where a WAL database
+        // whose shared-memory index cannot be created actually fails. Mapping it
+        // here is what keeps that case an empty result with a reason rather than
+        // a bare `unable to open database file` out of the query layer.
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map_err(|source| Error::StoreUnreadable {
+            path: path.clone(),
+            detail: source.to_string(),
+        })?;
+
+        let rebuild = read_versions(&conn, &path)?;
+        let missing = missing_columns(&conn)?;
+
+        Ok(Store {
+            conn,
+            data_dir: data_dir.to_path_buf(),
+            path,
+            rebuild,
+            missing,
+        })
     }
 
     /// Write the tables and the version integers a fresh store carries.
@@ -171,6 +269,26 @@ impl Store {
     /// rebuilding. Nothing has been rebuilt: this is the caller's cue.
     pub fn rebuild_required(&self) -> Option<RebuildRequired> {
         self.rebuild
+    }
+
+    /// Columns this build declares and the open store does not carry.
+    ///
+    /// Always empty for [`Store::open`], which adds them. A read-only open
+    /// cannot, so this is the list of columns its caller must not name in a
+    /// query - and, since only a store older than this build can be missing
+    /// one, the evidence for [`Store::predates_this_build`].
+    pub fn missing_columns(&self) -> &[MissingColumn] {
+        &self.missing
+    }
+
+    /// Is this store older than the build reading it (D-18)?
+    ///
+    /// Either half is enough: version integers that do not match, or a column
+    /// this build's queries name and the store does not carry. A read command
+    /// says so and queries what is there; it never repairs, because opening a
+    /// store is a read.
+    pub fn predates_this_build(&self) -> bool {
+        self.rebuild.is_some() || !self.missing.is_empty()
     }
 
     /// Read an integer out of `meta`.
@@ -247,6 +365,29 @@ fn bring_forward(conn: &Connection) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Which of [`crate::store::schema::BRING_FORWARD_COLUMNS`] the open store does
+/// not carry.
+///
+/// The read-only counterpart of the scheduling half of [`bring_forward`]: same
+/// list, same `PRAGMA table_info` comparison, and no `ALTER`. A table that is
+/// missing outright reports every one of its columns, which is the honest
+/// answer - a query naming one of them would fail either way.
+fn missing_columns(conn: &Connection) -> Result<Vec<MissingColumn>> {
+    let mut missing = Vec::new();
+    for (table, columns) in crate::store::schema::BRING_FORWARD_COLUMNS {
+        let present = column_names(conn, table)?;
+        for (name, _) in *columns {
+            if !present.iter().any(|c| c == name) {
+                missing.push(MissingColumn {
+                    table,
+                    column: name,
+                });
+            }
+        }
+    }
+    Ok(missing)
 }
 
 /// Every table in the open database, virtual tables included.
@@ -342,8 +483,25 @@ fn gate(path: &Path) -> Result<Option<RebuildRequired>> {
     conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS.into()))?;
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let outcome = read_versions(&tx, path)?;
+
+    // Explicit: the read transaction and the read-only connection are both gone
+    // before any writable connection is opened.
+    drop(tx);
+    drop(conn);
+    Ok(outcome)
+}
+
+/// The gate's decision, over a connection the caller already holds.
+///
+/// Split out so [`Store::open_read_only`] runs the same rule on its own
+/// read-only connection instead of opening a second one: the read path is the
+/// cold-start path, and two connects to answer one question is a cost the hook
+/// budget notices. [`gate`] keeps its own connection because a writable one is
+/// opened right after it and must not exist while the versions are read.
+fn read_versions(conn: &Connection, path: &Path) -> Result<Option<RebuildRequired>> {
     let read = |key: &str| -> Result<Option<i64>> {
-        let text: Option<String> = tx
+        let text: Option<String> = conn
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
             .optional()
             .map_err(|source| Error::NotAStore {
@@ -385,10 +543,6 @@ fn gate(path: &Path) -> Result<Option<RebuildRequired>> {
         None
     };
 
-    // Explicit: the read transaction and the read-only connection are both gone
-    // before any writable connection is opened.
-    drop(tx);
-    drop(conn);
     Ok(outcome)
 }
 

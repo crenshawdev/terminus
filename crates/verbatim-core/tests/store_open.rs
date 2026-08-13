@@ -212,6 +212,189 @@ fn a_file_that_is_not_a_store_is_named_as_such() {
     assert!(matches!(err, Error::NotAStore { .. }), "{err:?}");
 }
 
+/// D-10's first half: a read never creates the store it did not find.
+///
+/// Asserted on the filesystem rather than on the error, because the failure
+/// this prevents - `verbatim search` on a machine that has never ingested
+/// leaving a data directory behind - is a file that exists, not a message.
+#[test]
+fn a_read_only_open_of_a_missing_store_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("never-ingested");
+
+    let err = Store::open_read_only(&absent).expect_err("there is no store to open");
+    assert!(matches!(err, Error::StoreNotFound { .. }), "{err:?}");
+    assert!(!absent.exists(), "the read created the data directory");
+
+    // The other half: the directory is there and the database is not.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let err = Store::open_read_only(&empty).expect_err("an empty data directory holds no store");
+    assert!(matches!(err, Error::StoreNotFound { .. }), "{err:?}");
+    assert_eq!(
+        std::fs::read_dir(&empty).unwrap().count(),
+        0,
+        "the read wrote something into an empty data directory"
+    );
+}
+
+/// D-10's second half: the connection cannot write, whatever the caller asks of
+/// it. `readOnlyHint` is a claim about this flag and nothing else.
+#[test]
+fn a_read_only_connection_refuses_every_write() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Store::open(dir.path()).unwrap());
+
+    let store = Store::open_read_only(dir.path()).expect("an existing store opens for reading");
+    assert!(store.rebuild_required().is_none());
+    assert!(store.missing_columns().is_empty());
+    assert!(!store.predates_this_build());
+
+    for statement in [
+        "INSERT INTO runs (started_at) VALUES ('2026-08-13T00:00:00Z')",
+        "CREATE TABLE scratch (x INTEGER)",
+        "ALTER TABLE session_meta ADD COLUMN invented TEXT",
+        "DELETE FROM meta",
+    ] {
+        let err = store
+            .conn()
+            .execute_batch(statement)
+            .expect_err("a read-only connection accepted a write");
+        assert!(
+            err.to_string().contains("readonly"),
+            "unexpected refusal for `{statement}`: {err}"
+        );
+    }
+}
+
+/// D-18: a store written before this build opens, reports itself, and is left
+/// exactly as it was - no bring-forward, no pragma, no byte of the store.
+///
+/// **What "untouched" can mean for a WAL database.** Measured here: a read-only
+/// connection to a WAL database materializes `verbatim.db-shm` (32 KB) and an
+/// empty `verbatim.db-wal` whenever the directory allows it, because the
+/// shared-memory index is how WAL readers find the snapshot at all. That is
+/// SQLite's, not ours - the same mechanism this constructor's
+/// [`Error::StoreUnreadable`] exists to report when the medium will *not* allow
+/// it. So the assertion is the one that carries the meaning: `verbatim.db` is
+/// byte-identical, every file that already existed is byte-identical, and the
+/// only additions are those two, with the WAL empty because nothing was
+/// committed through it.
+#[cfg(feature = "testkit")]
+#[test]
+fn a_read_only_open_of_an_older_store_reports_it_and_writes_nothing() {
+    use verbatim_core::store::schema::BRING_FORWARD_COLUMNS;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let path = verbatim_core::testkit::copy_fixture_into("session-basic.jsonl", &work);
+    match verbatim_core::ingest::run(&data_dir, &path).unwrap() {
+        verbatim_core::ingest::Outcome::Committed(_) => {}
+        other => panic!("the fixture must archive: {other:?}"),
+    }
+
+    // Age it the way `tests/schema.rs` does: phase 2's columns back off, the
+    // derived-schema integer back where a phase 1 binary left it.
+    {
+        let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+        for (table, added) in BRING_FORWARD_COLUMNS {
+            for (name, _) in *added {
+                conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {name}"))
+                    .unwrap_or_else(|e| panic!("drop {table}.{name}: {e}"));
+            }
+        }
+        conn.execute(
+            "UPDATE meta SET value = '1' WHERE key = ?1",
+            [META_DERIVED_SCHEMA],
+        )
+        .unwrap();
+    }
+
+    let before = directory_bytes(&data_dir);
+    assert!(
+        before.iter().any(|(name, _)| name == DB_FILE_NAME),
+        "the aged store must exist to be compared"
+    );
+
+    let store = Store::open_read_only(&data_dir).expect("an aged store still opens for reading");
+    let rebuild = store
+        .rebuild_required()
+        .expect("an older derived_schema must be reported");
+    assert_eq!(rebuild.store_derived_schema, 1);
+    assert_eq!(rebuild.binary_derived_schema, DERIVED_SCHEMA);
+
+    // The columns a read query would have named. Reported, not added.
+    let missing: Vec<(&str, &str)> = store
+        .missing_columns()
+        .iter()
+        .map(|c| (c.table, c.column))
+        .collect();
+    for (table, added) in BRING_FORWARD_COLUMNS {
+        for (name, _) in *added {
+            assert!(
+                missing.contains(&(*table, *name)),
+                "{table}.{name} is gone and was not reported"
+            );
+        }
+    }
+    assert!(store.predates_this_build());
+
+    // A query naming one of them still fails - the point is that the caller was
+    // told, not that SQLite was made tolerant.
+    assert!(store
+        .conn()
+        .query_row("SELECT project_pre_worktree FROM session_meta", [], |_| Ok(
+            ()
+        ))
+        .is_err());
+
+    drop(store);
+    let after = directory_bytes(&data_dir);
+
+    for (name, bytes) in &before {
+        let found = after
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("the read-only open removed {name}"));
+        assert!(found.1 == *bytes, "the read-only open rewrote {name}");
+    }
+    for (name, bytes) in &after {
+        if before.iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        assert!(
+            name == "verbatim.db-shm" || name == "verbatim.db-wal",
+            "the read-only open created {name}"
+        );
+        assert!(
+            name != "verbatim.db-wal" || bytes.is_empty(),
+            "the read-only open committed {} bytes through the WAL",
+            bytes.len()
+        );
+    }
+}
+
+/// Every file in `dir`, by name, with its bytes. Sorted, so two snapshots
+/// compare directly.
+#[cfg(feature = "testkit")]
+fn directory_bytes(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 fn runs_count(conn: &Connection) -> i64 {
     conn.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
         .unwrap()
