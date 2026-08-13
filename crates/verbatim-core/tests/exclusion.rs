@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use verbatim_core::config::{self, visible, Config};
 use verbatim_core::ingest::pass::{self, PassOutcome};
+use verbatim_core::recall::{search, Query, Request, Response, Scope, MAX_RESULTS};
 use verbatim_core::store::DB_FILE_NAME;
 
 struct Tree {
@@ -77,6 +78,21 @@ impl Tree {
 
     fn counts(&self, exclusions: &[&str]) -> visible::Counts {
         visible::counts(&self.conn(), &self.config(exclusions)).unwrap()
+    }
+
+    /// One search over this tree, run the way a read command runs it.
+    ///
+    /// The read path this file is about now has two halves - listing sessions
+    /// and searching turns - and D-21 routes both through `config::visible`.
+    /// A search that honored exclusion by a rule of its own is the drift the
+    /// module note forbids, so the search is asserted here beside the listing.
+    fn found(&self, exclusions: &[&str], scope: Scope, raw: &str) -> Response {
+        search::run(
+            &self.conn(),
+            &self.config(exclusions),
+            &Request::new(Query::parse(raw), scope).limit(MAX_RESULTS),
+        )
+        .unwrap()
     }
 
     /// The row is still in `session_meta` - exclusion hides, it does not delete.
@@ -244,4 +260,105 @@ fn with_no_exclusions_every_session_is_visible() {
     assert_eq!(counts.sessions, 3);
     assert_eq!(counts.watermarks, 3);
     assert!(counts.watermark_bytes > 0);
+}
+
+/// The distinct projects a search answered from, in sorted order.
+fn projects_of(response: &Response) -> Vec<String> {
+    let mut out: Vec<String> = response
+        .hits
+        .iter()
+        .map(|hit| hit.project.clone().unwrap_or_default())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The search half of the same retroactive rule: a project excluded after its
+/// sessions were archived stops answering, under the default scope and under
+/// `*` alike.
+#[test]
+fn an_excluded_project_disappears_from_search_too() {
+    let tree = tree();
+    tree.transcript(1, "/data/projects/alpha");
+    tree.transcript(2, "/data/projects/beta");
+    tree.transcript(3, "/data/projects/alpha-research");
+    assert_eq!(tree.ingest_everything().files_committed, 3);
+
+    // Scoped to one project, nothing excluded: only that project answers,
+    // though every session in the tree carries the queried word.
+    let scoped = tree.found(&[], Scope::parse("/data/projects/alpha"), "hi");
+    assert_eq!(
+        projects_of(&scoped),
+        vec!["/data/projects/alpha".to_owned()]
+    );
+    assert!(
+        !projects_of(&scoped).contains(&"/data/projects/alpha-research".to_owned()),
+        "a project that merely shares leading segments is a different project"
+    );
+
+    // `*` is every project, and this is the control for what exclusion removes.
+    let everything = tree.found(&[], Scope::Everything, "hi");
+    assert_eq!(
+        projects_of(&everything),
+        vec![
+            "/data/projects/alpha".to_owned(),
+            "/data/projects/alpha-research".to_owned(),
+            "/data/projects/beta".to_owned(),
+        ]
+    );
+
+    // Excluded afterwards: gone from `*` as well as from its own scope.
+    let excluded = ["/data/projects/alpha"];
+    let after = tree.found(&excluded, Scope::Everything, "hi");
+    assert_eq!(
+        projects_of(&after),
+        vec![
+            "/data/projects/alpha-research".to_owned(),
+            "/data/projects/beta".to_owned(),
+        ]
+    );
+
+    let scoped_after = tree.found(&excluded, Scope::parse("/data/projects/alpha"), "hi");
+    assert!(scoped_after.hits.is_empty());
+    assert!(
+        scoped_after.reason.is_some(),
+        "an excluded scope is an empty result with a reason, not a silent one"
+    );
+}
+
+/// D-23 from the worktree side, on the search path: a session folded into its
+/// parent repo is still hidden by excluding the worktree path alone.
+///
+/// `project` alone could not answer this - it holds the repo for both sessions -
+/// so a search filtering on one column would return the worktree session's
+/// turns after the user excluded exactly that directory.
+#[test]
+fn a_worktree_session_is_hidden_from_search_under_either_key() {
+    let tree = tree();
+    let repo_cwd = "/data/projects/beta";
+    let worktree_cwd = "/data/projects/beta/.claude/worktrees/wt-a";
+    let plain = tree.transcript(1, repo_cwd);
+    let forked = tree.transcript(2, worktree_cwd);
+    assert_eq!(tree.ingest_everything().files_committed, 2);
+
+    // Both sessions carry the same `project`, which is the point.
+    let both = tree.found(&[], Scope::Everything, "hi");
+    let keys: Vec<String> = both.hits.iter().map(|h| h.session_key.clone()).collect();
+    assert!(
+        keys.contains(&key(&plain)) && keys.contains(&key(&forked)),
+        "{keys:?}"
+    );
+    assert_eq!(projects_of(&both), vec![repo_cwd.to_owned()]);
+
+    // Excluding the worktree path hides only the worktree session's turns.
+    let after = tree.found(&[worktree_cwd], Scope::Everything, "hi");
+    let keys: Vec<String> = after.hits.iter().map(|h| h.session_key.clone()).collect();
+    assert_eq!(keys, vec![key(&plain)]);
+
+    // Excluding the repository hides both, under the other key.
+    assert!(tree
+        .found(&[repo_cwd], Scope::Everything, "hi")
+        .hits
+        .is_empty());
 }

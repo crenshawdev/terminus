@@ -354,3 +354,38 @@ fn matching(conn: &Connection, query: &str) -> Vec<i64> {
         .map(Result::unwrap)
         .collect()
 }
+
+/// How many indexes of that name the store carries: 0 or 1.
+fn index_count(conn: &Connection, name: &str) -> i64 {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [name],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// D-19: an index added in a later phase reaches an existing store because
+/// `reindex` runs the whole `CREATE_SQL` batch, and not because `Store::open`
+/// creates it.
+///
+/// `Store::open` runs `CREATE_SQL` only when a whole table is missing and
+/// `BRING_FORWARD_COLUMNS` covers columns rather than indexes, so an index that
+/// arrived with project-scoped search would otherwise exist on fresh stores and
+/// silently not on upgraded ones - two machines running one binary at different
+/// speeds, with nothing saying why.
+#[test]
+fn the_project_index_reaches_a_store_that_predates_it() {
+    let (_dir, mut store) = fresh();
+    assert_eq!(index_count(store.conn(), "idx_session_meta_project"), 1);
+
+    // A store written before the index existed.
+    store
+        .conn()
+        .execute_batch("DROP INDEX idx_session_meta_project")
+        .unwrap();
+    assert_eq!(index_count(store.conn(), "idx_session_meta_project"), 0);
+
+    verbatim_core::reindex::reindex(&mut store).unwrap();
+    assert_eq!(index_count(store.conn(), "idx_session_meta_project"), 1);
+}

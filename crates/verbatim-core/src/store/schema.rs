@@ -104,6 +104,15 @@ CREATE INDEX IF NOT EXISTS idx_session_meta_continues_from
     ON session_meta(continues_from);
 CREATE INDEX IF NOT EXISTS idx_session_meta_path
     ON session_meta(transcript_path);
+-- Project-scoped search filters on this column, and phase 5's injection will
+-- read it on every prompt. D-19: it reaches a store that already exists only
+-- because `reindex` runs this whole batch and phase 3's `DERIVED_SCHEMA` bump
+-- forces that reindex - `Store::open` runs `CREATE_SQL` only when a whole table
+-- is missing, and `BRING_FORWARD_COLUMNS` covers columns, not indexes. An index
+-- that existed on fresh stores and silently not on upgraded ones is two
+-- machines running one binary at different speeds with nothing reporting why.
+CREATE INDEX IF NOT EXISTS idx_session_meta_project
+    ON session_meta(project);
 
 -- DERIVED. Rebuildable from the blobs alone; dropped and recreated by reindex.
 

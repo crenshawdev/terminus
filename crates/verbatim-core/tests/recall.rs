@@ -9,7 +9,10 @@
 use std::path::PathBuf;
 
 use rusqlite::Connection;
-use verbatim_core::recall::{search, Hit, Query, Request, MAX_QUERY_TOKENS, MAX_RESULTS};
+use verbatim_core::config::Config;
+use verbatim_core::recall::{
+    search, Hit, Query, Reason, Request, Response, Scope, MAX_QUERY_TOKENS, MAX_RESULTS,
+};
 use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::{ingest, testkit};
 
@@ -17,6 +20,9 @@ struct Bench {
     _dir: tempfile::TempDir,
     data_dir: PathBuf,
     work: PathBuf,
+    /// The root the rooted fixtures' `cwd` values were substituted with, and so
+    /// the parent of every project directory a scoped search can stand in.
+    root: PathBuf,
 }
 
 /// A store with every transcript fixture ingested.
@@ -44,6 +50,7 @@ fn bench() -> Bench {
         _dir: dir,
         data_dir,
         work,
+        root,
     }
 }
 
@@ -305,9 +312,35 @@ fn the_token_count_is_bounded() {
     assert!(!short.truncated());
 }
 
-/// The ranked search, run the way a read command will run it.
+/// A config with no roots and the given exclusions: the read path never opens a
+/// transcript, so the roots are not what it is about.
+fn config(exclusions: &[&str]) -> Config {
+    Config::from_parts(
+        Vec::new(),
+        exclusions.iter().map(|e| (*e).to_owned()).collect(),
+    )
+}
+
+/// One search, as a read command runs it.
+fn answer(conn: &Connection, exclusions: &[&str], scope: Scope, raw: &str) -> Response {
+    search::run(
+        conn,
+        &config(exclusions),
+        &Request::new(Query::parse(raw), scope).limit(MAX_RESULTS),
+    )
+    .unwrap()
+}
+
+/// The ranked search over every project, which is what the ranking tests are
+/// about.
 fn ranked(conn: &Connection, raw: &str, limit: usize) -> Vec<Hit> {
-    search::run(conn, &Request::new(Query::parse(raw)).limit(limit)).unwrap()
+    search::run(
+        conn,
+        &config(&[]),
+        &Request::new(Query::parse(raw), Scope::Everything).limit(limit),
+    )
+    .unwrap()
+    .hits
 }
 
 /// The last component of a session key, which is the fixture's own file name.
@@ -389,7 +422,7 @@ fn the_result_limit_cannot_be_raised() {
     let conn = bench.conn();
 
     assert_eq!(
-        Request::new(Query::parse("floodtoken"))
+        Request::new(Query::parse("floodtoken"), Scope::Everything)
             .limit(usize::MAX)
             .effective_limit(),
         MAX_RESULTS
@@ -397,4 +430,119 @@ fn the_result_limit_cannot_be_raised() {
 
     assert_eq!(ranked(&conn, "floodtoken", usize::MAX).len(), MAX_RESULTS);
     assert_eq!(ranked(&conn, "floodtoken", 3).len(), 3);
+}
+
+/// The distinct projects a set of hits came from.
+fn projects_of(response: &Response) -> Vec<String> {
+    let mut out: Vec<String> = response
+        .hits
+        .iter()
+        .map(|hit| hit.project.clone().unwrap_or_default())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// D-12: the default scope is the project the caller is standing in, found by
+/// matching the directory against the keys ingest already wrote.
+#[test]
+fn a_search_is_scoped_to_the_project_the_caller_stands_in() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let alpha = testkit::fixture_project("session-recall.jsonl", &bench.root);
+    let alpha_key = alpha.to_string_lossy().into_owned();
+
+    // The control: this word is in more than one project, so a single-project
+    // result is the scope working and not the corpus being thin.
+    let everywhere = answer(&conn, &[], Scope::Everything, "the");
+    assert!(
+        projects_of(&everywhere).len() > 2,
+        "`the` should reach several projects: {:?}",
+        projects_of(&everywhere)
+    );
+
+    let here = answer(&conn, &[], Scope::Directory(alpha.clone()), "the");
+    assert!(!here.hits.is_empty());
+    assert_eq!(here.reason, None);
+    assert_eq!(projects_of(&here), vec![alpha_key.clone()]);
+
+    // A subdirectory of the project resolves to the same key: the match is on
+    // path components, so anywhere inside the project is inside the project.
+    let deeper = answer(
+        &conn,
+        &[],
+        Scope::Directory(alpha.join("crates").join("core")),
+        "the",
+    );
+    assert_eq!(projects_of(&deeper), vec![alpha_key.clone()]);
+
+    // And naming it explicitly is the same rule over a caller-supplied string.
+    let named = answer(&conn, &[], Scope::parse(&alpha_key), "the");
+    assert_eq!(projects_of(&named), vec![alpha_key]);
+    assert_eq!(Scope::parse("*"), Scope::Everything);
+}
+
+/// A directory no archived project covers matches nothing, and says so.
+///
+/// The alternative is silently widening to every project, which reads as a
+/// scoping bug to anyone who notices and as an answer to everyone who does not.
+#[test]
+fn an_unknown_directory_matches_nothing_and_says_why() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let elsewhere = bench.root.join("no-project-here");
+    let response = answer(&conn, &[], Scope::Directory(elsewhere.clone()), "the");
+
+    assert!(response.hits.is_empty());
+    assert_eq!(
+        response.reason,
+        Some(Reason::UnknownProject {
+            named: elsewhere.to_string_lossy().into_owned()
+        })
+    );
+    // The reason renders: RCL-10 hands this to a caller to print.
+    assert!(response
+        .reason
+        .unwrap()
+        .to_string()
+        .contains("no-project-here"));
+}
+
+/// An exclusion covering the filesystem root short-circuits before any query.
+#[test]
+fn excluding_everything_short_circuits() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let response = answer(&conn, &["/"], Scope::Everything, "the");
+    assert!(response.hits.is_empty());
+    assert_eq!(response.reason, Some(Reason::EverythingExcluded));
+}
+
+/// The scope a caller stands in, when the config excludes it.
+#[test]
+fn standing_in_an_excluded_project_says_so() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let alpha = testkit::fixture_project("session-recall.jsonl", &bench.root);
+    let alpha_key = alpha.to_string_lossy().into_owned();
+
+    let response = answer(&conn, &[&alpha_key], Scope::Directory(alpha), "the");
+    assert!(response.hits.is_empty());
+    assert_eq!(
+        response.reason,
+        Some(Reason::ProjectExcluded {
+            project: alpha_key.clone()
+        })
+    );
+
+    // And `*` still hides it, where there is no scope to report a reason for.
+    let everywhere = answer(&conn, &[&alpha_key], Scope::Everything, "the");
+    assert_eq!(everywhere.reason, None);
+    assert!(!everywhere.hits.is_empty());
+    assert!(!projects_of(&everywhere).contains(&alpha_key));
 }

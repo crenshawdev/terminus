@@ -241,13 +241,9 @@ impl Config {
     /// prefixes, because that is what makes the separator boundary exact and
     /// what makes a trailing slash in the config irrelevant.
     pub fn excludes_path(&self, path: &Path) -> bool {
-        let candidate = components(path);
-        self.exclusions.iter().any(|excluded| {
-            let prefix = components(Path::new(excluded));
-            !prefix.is_empty()
-                && candidate.len() >= prefix.len()
-                && candidate[..prefix.len()] == prefix[..]
-        })
+        self.exclusions
+            .iter()
+            .any(|excluded| covers(Path::new(excluded), path).is_some())
     }
 }
 
@@ -418,6 +414,29 @@ fn components(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Does `ancestor` cover `path`, and by how many components?
+///
+/// `Some(n)` when `ancestor` is `path` itself or a directory above it, where
+/// `n` is how many components deep `ancestor` is - which is what makes "the
+/// longest stored key that covers this directory" a comparison of numbers.
+/// `None` when it covers nothing, including for an empty `ancestor`, which
+/// would otherwise be a prefix of every path there is.
+///
+/// One rule, used twice on purpose. [`Config::excludes_path`] asks it whether a
+/// project is hidden (D-23) and `recall::scope` asks it which project a working
+/// directory sits in (D-12); two spellings of "is this path inside that one"
+/// would eventually disagree about a trailing separator or about case folding,
+/// and a project in scope under one rule and excluded under the other is a
+/// search that returns an excluded project's turns.
+pub fn covers(ancestor: &Path, path: &Path) -> Option<usize> {
+    let prefix = components(ancestor);
+    let candidate = components(path);
+    (!prefix.is_empty()
+        && candidate.len() >= prefix.len()
+        && candidate[..prefix.len()] == prefix[..])
+        .then_some(prefix.len())
+}
+
 /// Verbatim's config directory, resolved the way `store::data_dir` resolves the
 /// data directory: an environment override first, then the platform location.
 pub fn config_dir() -> Result<PathBuf> {
@@ -554,6 +573,81 @@ pub mod visible {
             if !is_excluded(config, &session) {
                 out.push(session);
             }
+        }
+        Ok(out)
+    }
+
+    /// One distinct pair of project keys the archive carries, and what the
+    /// config says about each of them.
+    ///
+    /// Both keys travel together rather than as two independent sets, because
+    /// they are only meaningful as a pair: a longest-prefix hit on
+    /// `project_pre_worktree` has to resolve back to that row's `project`
+    /// before it can scope anything (phase 2 D-06 folded a repo and its
+    /// worktree into ONE key on purpose), and exclusion has to be able to hide
+    /// a session under its worktree path while leaving a sibling session with
+    /// the same `project` visible.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ProjectKeys {
+        /// The key ingest resolved, after worktree folding. `None` for a
+        /// session whose records carry no `cwd` at all.
+        pub project: Option<String>,
+        /// The key the session had before that folding (ING-05).
+        pub project_pre_worktree: Option<String>,
+        /// The config excludes [`ProjectKeys::project`] itself.
+        pub project_excluded: bool,
+        /// The config excludes [`ProjectKeys::project_pre_worktree`].
+        pub pre_worktree_excluded: bool,
+    }
+
+    impl ProjectKeys {
+        /// Is a session carrying these keys hidden from every read path?
+        pub fn excluded(&self) -> bool {
+            self.project_excluded || self.pre_worktree_excluded
+        }
+    }
+
+    /// Every distinct project key the archive carries, and which of them the
+    /// config excludes.
+    ///
+    /// D-21: this is the projection a read path scopes and filters on, and
+    /// [`sessions`] is not. Measured on a synthetic store shaped like the real
+    /// one - 2,000 sessions, 250,000 turns, warm - `sessions()` costs 6.2-6.8
+    /// ms because of its per-session `count(*)` on `turns` plus the watermark
+    /// lookup, against 0.56-0.58 ms for the same join projecting only
+    /// `project`. The whole phase 5 budget is single-digit milliseconds, so a
+    /// search that paid for a turn count it never reads would spend the budget
+    /// before the FTS query started and the cost would look like search.
+    ///
+    /// Read off `session_meta` alone. A session with no meta row carries no
+    /// project key to scope on, so it contributes no row here - and it stays
+    /// visible for exactly that reason, since nothing can say it is excluded.
+    pub fn projects(conn: &Connection, config: &Config) -> Result<Vec<ProjectKeys>> {
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT project, project_pre_worktree FROM session_meta
+             ORDER BY project, project_pre_worktree",
+        )?;
+        let rows = statement.query_map([], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        })?;
+
+        let excludes = |key: &Option<String>| {
+            key.as_deref()
+                .is_some_and(|k| config.excludes_path(std::path::Path::new(k)))
+        };
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (project, project_pre_worktree) = row?;
+            out.push(ProjectKeys {
+                project_excluded: excludes(&project),
+                pre_worktree_excluded: excludes(&project_pre_worktree),
+                project,
+                project_pre_worktree,
+            });
         }
         Ok(out)
     }

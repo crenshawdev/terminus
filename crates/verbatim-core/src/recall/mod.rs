@@ -13,7 +13,9 @@
 //! store as a side effect of being asked a question.
 
 pub mod query;
+pub mod scope;
 pub mod search;
 
 pub use query::{Query, MAX_QUERY_TOKENS};
-pub use search::{Hit, Request, DEFAULT_RESULTS, MAX_RESULTS};
+pub use scope::{Reason, Scope};
+pub use search::{Hit, Request, Response, DEFAULT_RESULTS, MAX_RESULTS};
