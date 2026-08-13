@@ -518,6 +518,40 @@ pub mod visible {
     use super::Config;
     use crate::error::Result;
 
+    /// `project_pre_worktree`, or the literal `NULL` when the store predates it.
+    ///
+    /// The column arrived in phase 2 and `bring_forward` adds it - but only
+    /// `Store::open` runs `bring_forward`, and the read commands deliberately
+    /// open read-only (D-10). So there is an ordinary window where every read
+    /// names a column the file does not have: upgrade the binary, run
+    /// `verbatim search` before the next ingest. Naming it unconditionally made
+    /// that window return a raw `no such column` from the first statement of
+    /// both `search::run` and `context::window`, which is exactly the failure
+    /// `Store::missing_columns` exists to prevent and the degraded read D-18
+    /// asks for. There is no caller behaviour that could avoid it, since
+    /// `scope::resolve` runs before anything else on both paths.
+    ///
+    /// Selecting `NULL` instead degrades the way the store itself has already
+    /// degraded: a file with no pre-folding key has no pre-folding key to
+    /// scope or exclude on, so every such session carries `None` and scoping
+    /// falls back to `project` alone. Checked per call rather than cached
+    /// because these are free functions over a borrowed connection;
+    /// `pragma_table_info` is an in-memory lookup against the schema SQLite
+    /// already parsed.
+    pub(crate) fn pre_worktree_column(conn: &Connection) -> Result<&'static str> {
+        let present: i64 = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('session_meta')
+              WHERE name = 'project_pre_worktree'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(if present > 0 {
+            "project_pre_worktree"
+        } else {
+            "NULL"
+        })
+    }
+
     /// One session a read path may see.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Session {
@@ -548,14 +582,18 @@ pub mod visible {
     /// still listed rather than silently dropped: `verbatim verify` is what
     /// reports that damage, and a read path that hid it would hide the evidence.
     pub fn sessions(conn: &Connection, config: &Config) -> Result<Vec<Session>> {
-        let mut statement = conn.prepare(
-            "SELECT s.session_key, s.session_no, m.project, m.project_pre_worktree,
+        let pre_worktree = match pre_worktree_column(conn)? {
+            "project_pre_worktree" => "m.project_pre_worktree",
+            absent => absent,
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT s.session_key, s.session_no, m.project, {pre_worktree},
                     (SELECT count(*) FROM turns t WHERE t.session_key = s.session_key),
                     (SELECT w.byte_offset FROM watermarks w
                       WHERE w.transcript_path = s.session_key)
              FROM sessions s LEFT JOIN session_meta m USING (session_key)
-             ORDER BY s.session_no",
-        )?;
+             ORDER BY s.session_no"
+        ))?;
         let rows = statement.query_map([], |r| {
             Ok(Session {
                 session_key: r.get(0)?,
@@ -623,10 +661,11 @@ pub mod visible {
     /// project key to scope on, so it contributes no row here - and it stays
     /// visible for exactly that reason, since nothing can say it is excluded.
     pub fn projects(conn: &Connection, config: &Config) -> Result<Vec<ProjectKeys>> {
-        let mut statement = conn.prepare(
-            "SELECT DISTINCT project, project_pre_worktree FROM session_meta
-             ORDER BY project, project_pre_worktree",
-        )?;
+        let pre_worktree = pre_worktree_column(conn)?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT DISTINCT project, {pre_worktree} FROM session_meta
+             ORDER BY project, 2"
+        ))?;
         let rows = statement.query_map([], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?,

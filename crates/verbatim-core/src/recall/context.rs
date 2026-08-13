@@ -81,11 +81,12 @@ impl Window {
 pub fn window(
     conn: &Connection,
     config: &Config,
+    scope: &Scope,
     anchor: i64,
     before: usize,
     after: usize,
 ) -> Result<Window> {
-    let scoped = scope::resolve(conn, config, &Scope::Everything)?;
+    let scoped = scope::resolve(conn, config, scope)?;
     if let Some(reason) = scoped.reason() {
         return Ok(Window::nothing(reason.clone()));
     }
@@ -101,10 +102,16 @@ pub fn window(
         return Ok(Window::nothing(Reason::NoSuchTurn { turn_id: anchor }));
     };
 
+    // Named through the same degraded-read helper the scoping projection uses:
+    // a read-only open of a store that predates `project_pre_worktree` must not
+    // meet a raw `no such column` here either.
+    let pre_worktree = crate::config::visible::pre_worktree_column(conn)?;
     let meta: Option<(Option<String>, Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT project, project_pre_worktree, continues_from FROM session_meta
-             WHERE session_key = ?1",
+            &format!(
+                "SELECT project, {pre_worktree}, continues_from FROM session_meta
+                 WHERE session_key = ?1"
+            ),
             [&session_key],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -121,6 +128,24 @@ pub fn window(
         return Ok(Window::nothing(Reason::ProjectExcluded {
             project: project.or(pre_worktree).unwrap_or_default(),
         }));
+    }
+
+    // The scoping half of the same door. RCL-10 auto-scopes all three MCP
+    // tools to the current project with `project: "*"` opting out, and this is
+    // the only place the context tool can enforce it: a caller supplies a turn
+    // id, not a search, and ids are densely enumerable (`session_no << 24 |
+    // turn_seq`), so a window that scoped nothing would walk out of the
+    // caller's project one id at a time. `search::run` refuses those rows with
+    // `AND m.project = ?`; leaving this open was the second door the module doc
+    // above closes for exclusion and had not closed for scoping.
+    //
+    // Answered as `NoSuchTurn` rather than a reason of its own, deliberately:
+    // out of the caller's scope, the turn does not exist, and a distinct reason
+    // would confirm that some other project holds that id.
+    if let Some(wanted) = scoped.project() {
+        if project.as_deref() != Some(wanted) {
+            return Ok(Window::nothing(Reason::NoSuchTurn { turn_id: anchor }));
+        }
     }
 
     let low = seq - before.min(MAX_CONTEXT_SIDE) as i64;

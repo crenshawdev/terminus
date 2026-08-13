@@ -1147,7 +1147,19 @@ fn around(
     before: usize,
     after: usize,
 ) -> Window {
-    context::window(conn, &config(exclusions), anchor, before, after).unwrap()
+    scoped_around(conn, exclusions, &Scope::Everything, anchor, before, after)
+}
+
+/// The same window, scoped, which is what an MCP client's default reaches.
+fn scoped_around(
+    conn: &Connection,
+    exclusions: &[&str],
+    scope: &Scope,
+    anchor: i64,
+    before: usize,
+    after: usize,
+) -> Window {
+    context::window(conn, &config(exclusions), scope, anchor, before, after).unwrap()
 }
 
 /// RCL-08: the turns on either side of a hit, in `turn_seq` order.
@@ -1302,7 +1314,7 @@ fn a_directory_that_is_also_another_rows_pre_worktree_key_scopes_to_itself() {
     let store = verbatim_core::Store::open(dir.path()).unwrap();
     let conn = store.conn();
 
-    let mut insert = |key: &str, no: i64, project: &str, pre: Option<&str>| {
+    let insert = |key: &str, no: i64, project: &str, pre: Option<&str>| {
         conn.execute(
             "INSERT INTO sessions (session_key, session_no, blob) VALUES (?1, ?2, x'00')",
             rusqlite::params![key, no],
@@ -1355,4 +1367,135 @@ fn a_directory_that_is_also_another_rows_pre_worktree_key_scopes_to_itself() {
     )
     .unwrap();
     assert_eq!(scoped.project(), Some("/home/u/main"));
+}
+
+/// D-18's degraded read: a store that predates `project_pre_worktree` answers
+/// with what it has, rather than meeting a raw `no such column`.
+///
+/// The window is ordinary rather than exotic. The column arrived in phase 2 and
+/// only `Store::open` runs `bring_forward`, while every read command opens
+/// read-only (D-10) - so upgrading the binary and searching before the next
+/// ingest is enough to reach it. `scope::resolve` is the first statement of
+/// both `search::run` and `context::window`, so there was no caller behaviour
+/// that could route around it: every read errored, which is exactly what
+/// `Store::missing_columns` exists to prevent.
+#[test]
+fn a_store_predating_the_pre_worktree_column_still_answers_reads() {
+    use verbatim_core::recall::{context, scope::Scope};
+    use verbatim_core::store::schema::BRING_FORWARD_COLUMNS;
+    use verbatim_core::Store;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let path = verbatim_core::testkit::copy_fixture_into("session-basic.jsonl", &work);
+    match verbatim_core::ingest::run(&data_dir, &path).unwrap() {
+        verbatim_core::ingest::Outcome::Committed(_) => {}
+        other => panic!("the fixture must archive: {other:?}"),
+    }
+
+    let anchor: i64 = {
+        let conn = Connection::open(data_dir.join(verbatim_core::store::DB_FILE_NAME)).unwrap();
+        let anchor = conn
+            .query_row("SELECT min(id) FROM turns", [], |r| r.get(0))
+            .unwrap();
+        // Age it: phase 2's columns back off, exactly as `store_open.rs` does.
+        for (table, added) in BRING_FORWARD_COLUMNS {
+            for (name, _) in *added {
+                conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {name}"))
+                    .unwrap_or_else(|e| panic!("drop {table}.{name}: {e}"));
+            }
+        }
+        anchor
+    };
+
+    let store = Store::open_read_only(&data_dir).expect("an aged store still opens for reading");
+    assert!(
+        store.predates_this_build(),
+        "the premise: the column has to be gone for this to be a test"
+    );
+    assert!(store
+        .missing_columns()
+        .iter()
+        .any(|c| c.column == "project_pre_worktree"));
+    let conn = store.conn();
+
+    // Both read paths, because `scope::resolve` is the first statement of each
+    // and each names the column again afterwards.
+    let response = search::run(
+        conn,
+        &config(&[]),
+        &Request::new(Query::parse("the"), Scope::Everything).limit(MAX_RESULTS),
+    )
+    .expect("a search against an aged store must answer, not error");
+    assert!(!response.hits.is_empty(), "{response:?}");
+
+    let window = context::window(conn, &config(&[]), &Scope::Everything, anchor, 2, 2)
+        .expect("a context window against an aged store must answer, not error");
+    assert!(!window.turns.is_empty(), "{window:?}");
+
+    // Scoping still works on what the store does hold: `project` alone. A file
+    // with no pre-folding key has none to scope or exclude on, which is a
+    // degraded answer and not a wrong one.
+    let project: String = conn
+        .query_row("SELECT project FROM session_meta LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let scoped = search::run(
+        conn,
+        &config(&[]),
+        &Request::new(Query::parse("the"), Scope::parse(&project)).limit(MAX_RESULTS),
+    )
+    .expect("scoping an aged store must answer");
+    assert!(!scoped.hits.is_empty(), "{scoped:?}");
+}
+
+/// RCL-10 auto-scopes all three MCP tools, and the context window is the one
+/// that takes an id instead of a query.
+///
+/// Turn ids are densely enumerable - `session_no << 24 | turn_seq` - so a
+/// window that scoped nothing walks out of the caller's project one id at a
+/// time, no search required. The search half of the same layer refuses those
+/// rows with `AND m.project = ?`; this is the second door.
+#[test]
+fn a_context_window_is_scoped_like_a_search_is() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let anchor = turn_at(&conn, "session-recall.jsonl", 2);
+    let mine: String = conn
+        .query_row(
+            "SELECT m.project FROM turns t
+               JOIN session_meta m USING (session_key) WHERE t.id = ?1",
+            [anchor],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    // A project the archive holds that is not the anchor's.
+    let other: String = conn
+        .query_row(
+            "SELECT DISTINCT project FROM session_meta
+              WHERE project IS NOT NULL AND project <> ?1 ORDER BY project LIMIT 1",
+            [&mine],
+            |r| r.get(0),
+        )
+        .expect("the corpus must span more than one project for this to mean anything");
+
+    // The control: unscoped, and scoped to its own project, the window answers.
+    assert!(!around(&conn, &[], anchor, 2, 2).turns.is_empty());
+    let own = scoped_around(&conn, &[], &Scope::parse(&mine), anchor, 2, 2);
+    assert!(!own.turns.is_empty(), "{own:?}");
+    assert_eq!(own.reason, None);
+
+    // Standing in another project, that id is not the caller's to read.
+    let across = scoped_around(&conn, &[], &Scope::parse(&other), anchor, 2, 2);
+    assert!(
+        across.turns.is_empty(),
+        "a context window read across a project boundary: {across:?}"
+    );
+    // Reported as absent rather than as somebody else's, so the answer does not
+    // confirm that another project holds the id.
+    assert_eq!(across.reason, Some(Reason::NoSuchTurn { turn_id: anchor }));
 }

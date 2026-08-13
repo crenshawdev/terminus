@@ -501,7 +501,10 @@ fn the_entity_rules_are_functions_with_answers() {
     );
     assert_eq!(path_words("cd /a/b; make"), ["/a/b"]);
     assert_eq!(path_words("cargo test 2>/dev/null"), ["/dev/null"]);
-    assert_eq!(path_words("grep -rn foo src/x >>/tmp/out.log"), ["src/x", "/tmp/out.log"]);
+    assert_eq!(
+        path_words("grep -rn foo src/x >>/tmp/out.log"),
+        ["src/x", "/tmp/out.log"]
+    );
     assert_eq!(path_words("(cd /a/b && ls) | wc -l"), ["/a/b"]);
     assert_eq!(path_words("git commit -m \"fix /a/b\""), ["/a/b"]);
 
@@ -517,7 +520,10 @@ fn the_entity_rules_are_functions_with_answers() {
     assert_eq!(path_words("rm src/*.rs"), Vec::<String>::new());
     // The brace list goes; the plain destination beside it stays.
     assert_eq!(path_words("cp src/{a,b}.rs /tmp"), ["/tmp"]);
-    assert_eq!(path_words("curl https://example.com/x"), Vec::<String>::new());
+    assert_eq!(
+        path_words("curl https://example.com/x"),
+        Vec::<String>::new()
+    );
     // `2>&1` leaves two words, neither carrying a separator.
     assert_eq!(path_words("cargo build 2>&1"), Vec::<String>::new());
 
