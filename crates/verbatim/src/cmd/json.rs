@@ -63,6 +63,18 @@ impl Document {
         self
     }
 
+    /// The same, for a reason the caller may or may not have.
+    ///
+    /// The library-side reasons are `Option<Reason>` by construction - a search
+    /// that matched nothing for no particular reason is an ordinary answer - so
+    /// this is the shape every command actually holds.
+    pub fn maybe_because(self, reason: Option<impl std::fmt::Display>) -> Document {
+        match reason {
+            Some(reason) => self.because(reason),
+            None => self,
+        }
+    }
+
     /// One field of this command's own data.
     pub fn field(mut self, name: &str, value: impl Into<Value>) -> Document {
         self.data.insert(name.to_owned(), value.into());

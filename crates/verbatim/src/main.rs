@@ -14,6 +14,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                      commands:\n  \
                        ingest                archive every transcript under the configured roots\n  \
                        ingest <path.jsonl>   archive one transcript file\n  \
+                       search <words>        find a past turn by text, path, error or identifier\n  \
                        verify                check every blob against its checksum\n  \
                        reindex               rebuild the derived tables from the blobs\n  \
                        status                sizes, counts, watermarks and the last ingest run\n\
@@ -67,6 +68,7 @@ fn run() -> Result<(), Failure> {
 fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
     match name {
         "ingest" => cmd::ingest::run(cmd::ingest::parse(parser)?),
+        "search" => cmd::search::run(cmd::search::parse(parser)?),
         // D-24: the three commands phase 1 and 2 shipped take `--json` and
         // nothing else. `cmd::json_flag` is what replaced `no_more_arguments`
         // here - the rule that a subcommand rejects every argument it was not

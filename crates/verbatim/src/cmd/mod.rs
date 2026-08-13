@@ -7,7 +7,9 @@
 
 pub mod ingest;
 pub mod json;
+pub mod read;
 pub mod reindex;
+pub mod search;
 pub mod status;
 pub mod verify;
 
