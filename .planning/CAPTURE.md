@@ -93,6 +93,12 @@
 - [ ] (phase 3) `cmd/mcp/tools.rs` time_bound's message hardcodes the CLI `--since` spelling in a tool result whose inputSchema forbids that argument
 - [ ] (phase 3) `cmd/mcp/tools.rs` recall_get truncates to MAX_IDS before get::records deduplicates, so duplicate ids consume the budget
 - [ ] (phase 3) `cmd/mcp/rpc.rs` PROTOCOL_VERSIONS offers 2025-03-26, which mandates JSON-RPC batching, but a batch is answered with one -32600 and every request in it goes unanswered
+- [ ] (phase 3) `crates/verbatim/tests/mcp.rs` and `tests/recall_cli.rs` are
+      `#![cfg(feature = "testkit")]` on the `verbatim` package, whose `testkit`
+      feature is not default and is enabled by nothing in the workspace. A bare
+      `cargo test --workspace` runs 0 of their 41 tests and still reports 304
+      passed / 0 failed, so the two binaries carrying AC5/AC6/AC7's
+      process-level assertions are silently absent from the default command.
 
 
 ## Seeds

@@ -156,17 +156,17 @@ Explicit exclusions. The reason prevents scope creep later.
 | ING-09 | Phase 2 | Complete |
 | ING-05 | Phase 2 | Complete |
 | ING-06 | Phase 2 | Complete |
-| RCL-01 | Phase 3 | Pending |
-| RCL-02 | Phase 3 | Pending |
-| RCL-03 | Phase 3 | Pending |
-| RCL-04 | Phase 3 | Pending |
-| RCL-05 | Phase 3 | Pending |
-| RCL-07 | Phase 3 | Pending |
-| RCL-08 | Phase 3 | Pending |
-| RCL-06 | Phase 3 | Pending |
-| RCL-09 | Phase 3 | Pending |
-| RCL-10 | Phase 3 | Pending |
-| RCL-11 | Phase 3 | Pending |
+| RCL-01 | Phase 3 | Complete |
+| RCL-02 | Phase 3 | Complete |
+| RCL-03 | Phase 3 | Complete |
+| RCL-04 | Phase 3 | Complete |
+| RCL-05 | Phase 3 | Complete |
+| RCL-07 | Phase 3 | Complete |
+| RCL-08 | Phase 3 | Complete |
+| RCL-06 | Phase 3 | Complete |
+| RCL-09 | Phase 3 | Complete |
+| RCL-10 | Phase 3 | Complete |
+| RCL-11 | Phase 3 | Complete |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 

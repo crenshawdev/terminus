@@ -1,0 +1,161 @@
+{
+  "status": "delivered",
+  "score": "19/19",
+  "method": "Built a real store from a subset of the live corpus (185 sessions / 19,077 turns / 3 project keys, plus a second 1,175-session store carrying real project_pre_worktree keys) under VERBATIM_DATA_DIR in scratch, and drove the built binary and a hand-written JSON-RPC client against it. Nothing outside the scratch directory was written.",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "A fresh data directory boots clean: ingest populates the store and a primary query returns real hits, and a DERIVED_SCHEMA that predates the binary drives a full rebuild on the next ingest.",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "Fresh dir: `verbatim ingest` exit 0 over 185 files, `verbatim status` reports 185 sessions / 19077 turns / 185 watermarks, `verbatim search --json BlobReader` returns 10 hits. Aged store: `sqlite3 'delete from turns_fts; delete from entities; update meta set value=1 where key=derived_schema'` then `verbatim ingest` restored turns_fts=19077, entities=23367, derived_schema=3."
+    },
+    {
+      "n": 2,
+      "truth": "Case and separator expansion reaches the same turn from the whole identifier, from a case variant, and from one component; a path-bearing turn is reached by a path component.",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "Single-turn check on rowid 50331681 (a turn containing `BlobReader`): `select count(*) from turns_fts where turns_fts match '<q>' and rowid=50331681` returns 1 for each of blobreader, reader, blob, Reader. Turn 16777221 carries paths row `.../recall/scope.rs` and matches both `scope` and `recall`. Named tests `a_component_query_finds_the_whole_token` and `the_expansion_rules_are_functions_with_answers` pass."
+    },
+    {
+      "n": 3,
+      "truth": "JSON scaffolding is not indexed: keys present on real records produce no FTS hit.",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "In the airlock project 14 raw records carry `\"toolUseResult\"` and 95 carry `\"parentUuid\"`; `verbatim search --json --project /data/code/airlock toolUseResult|parentUuid|isSidechain` returns 0 hits for each. (The verbatim project itself returns 10 hits for `toolUseResult` because its own source and planning docs discuss the key in prose - inspected, all 10 excerpts are content, not scaffolding.) Named test `no_json_key_and_no_record_type_literal_is_indexed` passes."
+    },
+    {
+      "n": 4,
+      "truth": "Error normalization collapses line numbers, addresses, timestamps and UUIDs so one failure seen in two sessions is one entity value.",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "Live store: 12 distinct `error` value_norm values are each carried by more than one session_key. `crates/verbatim-core/src/index/entity.rs:325-336` places timestamp, uuid, address and line:col placeholders. Named test `one_failure_seen_twice_is_one_value_and_a_different_integer_is_two` passes."
+    },
+    {
+      "n": 5,
+      "truth": "Normalization stops at bare integers, so two errors differing only in a non-line-number integer stay two values.",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "`placeholder_at` (entity.rs:325) matches only timestamp/uuid/address/line-col; live `error` values retain bare digits (e.g. `... | INS-01 | Phase 1 | ...` survives verbatim). Named test `one_failure_seen_twice_is_one_value_and_a_different_integer_is_two` passes - the same test carries the negative arm."
+    },
+    {
+      "n": 6,
+      "truth": "All five entity kinds are emitted over a real corpus, and a path named only in prose emits no path entity.",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "`select kind,count(*) from entities group by 1` -> command 3375, error 179, path 11156, symbol 3203, tool 5454. For the hottest path value (`/dev/null`): 423 turns carry a paths row, while 33 turns whose FTS text contains the literal carry none (all record_type=user, tool_name null). Path-entity turns cluster on structured tools: Bash 2756, Read 919, Edit 499, Write 191, Grep 103. Named test `a_structured_path_becomes_an_entity_and_the_same_path_in_prose_does_not` passes."
+    },
+    {
+      "n": 7,
+      "truth": "The per-turn entity cap binds and no turn exceeds it.",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "`MAX_ENTITIES_PER_TURN: usize = 48` (crates/verbatim-core/src/index/entity.rs:62). Live max over 19,077 turns is exactly 48 (2 turns at 48, then 47, 46, 45...), so the cap binds rather than merely being unreached. Named test `a_turn_writes_no_more_entities_than_the_cap_and_the_same_ones_twice` passes."
+    },
+    {
+      "n": 8,
+      "truth": "Dropping the derived tables and running `verbatim reindex` reproduces the same rows.",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "On a store copy: before `entities 23367 / sum(len(value_norm)) 486367 | paths 11156 | turns_fts 19077`; after `delete from entities; delete from paths; delete from turns_fts` -> 0|0|0; `verbatim reindex` printed `rebuilt 19077 turn(s) across 185 session(s)` exit 0; after: identical 23367:486367|11156|19077."
+    },
+    {
+      "n": 9,
+      "truth": "Search exit codes: hits 0, empty result 0, misuse 2.",
+      "status": "VERIFIED",
+      "uat_item": 9,
+      "evidence": "`verbatim search crates/verbatim-core/src/recall/scope.rs` exit 0 with 10 hits; `verbatim search zzzzqqqqnothingmatchesthis` prints `0 hit(s)` exit 0 (`ok:true`, `hits:[]`); `verbatim search --nope foo` exit 2, `verbatim sessions --nope` exit 2, `verbatim frobnicate` exit 2, `verbatim search --since notadate cargo` exit 2 with the message on stderr. Named test `success_and_an_empty_result_both_exit_zero` passes."
+    },
+    {
+      "n": 10,
+      "truth": "Every data command takes --json, writes one document on stdout matching docs/json-shapes.md, and keeps diagnostics on stderr.",
+      "status": "VERIFIED",
+      "uat_item": 10,
+      "evidence": "search/show/sessions/status/verify/reindex each exit 0 with a stdout document whose keys are exactly command,data,ok,reason and 0 bytes on stderr; field sets match docs/json-shapes.md:71-160 (search: query/truncated/hits with turn_id,session_key,project,record_type,ts,sidechain,relevance,entity_score,excerpt). An out-of-scope `verbatim show 0` puts `verbatim: no turn 0 is archived` on stderr and the same string in the document's `reason`. Named test `every_data_command_emits_the_documented_shape` passes."
+    },
+    {
+      "n": 11,
+      "truth": "Both read paths default to the project the process stands in and widen only for project:\"*\".",
+      "status": "VERIFIED",
+      "uat_item": 11,
+      "evidence": "CLI: from /data/code/weathervane, `search --json weather` -> 5 hits, projects {weathervane}; with `--project '*'` -> 8 hits across {airlock, verbatim, weathervane}. From /data/code/airlock, `airlock` -> 4 hits {airlock}; with `*` -> 10 hits {airlock, verbatim}. From /data/code/verbatim/crates the scope resolves to /data/code/verbatim (subdirectory). From /tmp: 0 hits with reason `no archived project contains /tmp` and exit 0, never a silent widening. MCP: the identical five cases through a spawned `verbatim mcp` with matching cwd give the identical hit counts and project sets. Prefix confusion probed and absent: `--project /data/code/verbatimX` and `/data/code/verbatim-extra` both answer `no archived project contains ...` rather than scoping to /data/code/verbatim (`config::covers` compares path components, config.rs:431-438). Worktree fold probed on a second store holding 7 real `project_pre_worktree` keys: `--project /data/code/cadence/.claude/worktrees/agent-a33a2fe2e250017c7` resolves to project /data/code/cadence and returns the repository's own sessions, and the equal-depth tie test `a_directory_that_is_also_another_rows_pre_worktree_key_scopes_to_itself` passes."
+    },
+    {
+      "n": 12,
+      "truth": "An excluded project is invisible on both read paths and is not named in a reason to a caller that did not name it.",
+      "status": "VERIFIED",
+      "uat_item": 12,
+      "evidence": "With `exclude = [\"/data/code/weathervane\"]` and 49 weathervane turns in the store: `verbatim search --json --project '*' weather` -> 3 hits, projects {airlock, verbatim}, zero weathervane; `recall_search` at default scope -> 1 hit {verbatim}, at `*` -> 3 hits {airlock, verbatim}; neither response's `reason` is set. The excluded path appears only where the caller supplied it (standing inside it, or `--project /data/code/weathervane`), which is the ProjectExcluded arm answering a question the caller asked. Named tests `an_excluded_projects_turns_are_absent_from_recall_search` and `an_excluded_project_is_never_named_to_a_client_at_the_default_scope` pass. RESIDUAL, already an open item and outside this item's wording: at `project:\"*\"` only, `recall_get` and `recall_context` still answer `\"/data/code/weathervane is excluded by config\"` for an id of that project (default scope correctly answers `no turn N is archived`)."
+    },
+    {
+      "n": 13,
+      "truth": "A sidechain turn sorts below a top-level turn of equal score.",
+      "status": "VERIFIED",
+      "uat_item": 13,
+      "evidence": "Named test `a_sidechain_turn_sorts_below_an_identical_top_level_turn` passes (it asserts the two fixture turns score identically first, so it tests the tie-break rather than bm25). Live: over six 50-hit searches at `*` scope on a store holding 69 sidechain sessions (sidechain hit counts 42/39/30/7/5/38), zero equal-relevance pairs order a sidechain hit above a top-level one. The rule is written twice on purpose - SQL `ORDER BY relevance DESC, sidechain ASC, ...` (search.rs TAIL) and the same comparison in `fn rank` after entity weighting."
+    },
+    {
+      "n": 14,
+      "truth": "recall_context returns turns in turn_seq order around the anchor, stops at the session boundary and reports which end it stopped at.",
+      "status": "VERIFIED",
+      "uat_item": 14,
+      "evidence": "Live against a 95-turn session (seq 0..94) through a spawned `verbatim mcp`: anchor 40 before/after 3 -> 7 turns, seq 37..43 ascending, anchor flagged, at_session_start false, at_session_end false; anchor 0 before 5 -> 3 turns seq 0..2 with at_session_start true; anchor 94 after 5 -> 3 turns seq 92..94 with at_session_end true, nothing past the boundary; before/after 100 -> 51 turns (seq 15..65) with reason `before and after were lowered to this server's budget of 25 turns on each side`. `continues_from` is returned unfollowed (context.rs, D-06). Named tests `recall_context_returns_the_turns_around_a_hit_in_turn_seq_order`, `a_window_stops_at_the_session_start_and_names_what_it_continues_from` and `a_window_larger_than_the_budget_returns_the_budgets_worth` pass."
+    },
+    {
+      "n": 15,
+      "truth": "An evicted body comes back as a flag on a real record, and a malformed call comes back as an empty result carrying a reason rather than a throw.",
+      "status": "VERIFIED",
+      "uat_item": 15,
+      "evidence": "Set `is_evicted=1` on one session in a store copy: `recall_get {turn_ids:[5,6]}` returns records with `body_evicted: true`, `body: null`, full metadata, `reason: null`, no isError, process exit 0 - no blob read attempted. Seven malformed calls (missing `query`; `query` as a number; `since: \"not-a-date\"`; empty `turn_ids`; missing `turn_id`; `turn_id` as a string; unknown id) all return a JSON-RPC *result* whose document carries the tool's own empty shape plus a prose reason (`query is required`, `query must be a string, not a number`, `turn_id must be an integer turn id, not a string`, ...) - zero JSON-RPC `error` objects, zero panics, exit 0 in every case. Named tests `an_evicted_body_is_a_flag_and_not_a_failed_call`, `a_malformed_call_is_an_empty_result_with_a_reason_and_never_a_throw`, `an_unknown_tool_is_a_protocol_error_and_a_bad_argument_is_not` pass."
+    },
+    {
+      "n": 16,
+      "truth": "A spawned `verbatim mcp` reports exactly three read-only tools, holds no listening socket, and exits 0 when stdin closes.",
+      "status": "VERIFIED",
+      "uat_item": 16,
+      "evidence": "Live spawn: `initialize` -> protocolVersion 2025-03-26, serverInfo verbatim/0.1.0; `tools/list` -> exactly 3 tools (recall_search, recall_context, recall_get), each with `annotations: {readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false}`. While alive (pid 437355), `ss -ltnp` shows no listening socket owned by the pid or named verbatim, and /proc/<pid>/fd holds only the two stdio pipes and the inherited output handle. Closing stdin: `wait()` returns exit code 0. Named tests `the_handshake_reports_three_read_only_tools_and_ends_at_eof` and `the_server_holds_no_listening_socket_and_exits_zero_when_stdin_closes` pass."
+    },
+    {
+      "n": 17,
+      "truth": "The same binary against a nonexistent store returns an empty result with a reason and creates no file.",
+      "status": "VERIFIED",
+      "uat_item": 17,
+      "evidence": "`VERBATIM_DATA_DIR=<absent dir> verbatim mcp` + `recall_search {query:'x'}` -> `{\"hits\": [], \"reason\": \"no verbatim store at <dir>/verbatim.db; nothing has been archived yet\"}`, exit 0, stderr empty, and `os.path.exists(<dir>)` is still False afterwards. Named test `a_server_with_no_store_answers_with_a_reason_and_creates_no_file` passes."
+    },
+    {
+      "n": 18,
+      "truth": "The tree builds clean and the whole test suite passes.",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "`cargo clippy --workspace --all-targets -- -D warnings` exits 0. `cargo test --workspace` -> 30 binaries, 304 passed, 0 failed. NOTE: `tests/mcp.rs` and `tests/recall_cli.rs` are `#![cfg(feature = \"testkit\")]` on the `verbatim` package, whose `testkit` feature is not default and is not enabled by any workspace dependency, so a bare `cargo test --workspace` runs 0 of their 41 tests and still reports green. Run separately here: `cargo test -p verbatim --features testkit --test mcp --test recall_cli` -> 23 + 18 passed, 0 failed. Every plan's Verify line names `--features testkit`, so this is convention rather than an oversight, but the default command is quietly green over the two binaries that carry AC5/AC6/AC7's process-level assertions."
+    },
+    {
+      "n": 19,
+      "truth": "The phase's files carry no unreferenced debt markers or stub implementations on the goal path.",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "`grep -rn 'TODO|FIXME|todo!()|unimplemented!()' --include='*.rs' crates/` -> 0 matches. The only `placeholder` hits are `placeholder_at`/`placeholder`, real identifiers in the error-normalization rule (entity.rs:290-293)."
+    }
+  ],
+  "passes": [
+    { "k": 1, "name": "Cold start from scratch", "evidence": "Fresh VERBATIM_DATA_DIR: `verbatim ingest` exit 0 over 185 real transcripts, `verbatim status` 185 sessions / 19077 turns, `verbatim search --json BlobReader` 10 hits. Aged store with derived_schema forced to 1 and turns_fts/entities emptied: the next `verbatim ingest` rebuilt to 19077 / 23367 and reset derived_schema to 3." },
+    { "k": 2, "name": "Case and separator expansion reaches a turn", "evidence": "One turn (rowid 50331681) matches turns_fts for blobreader, reader, blob and Reader alike; turn 16777221, whose paths row is `.../recall/scope.rs`, matches `scope` and `recall`. `a_component_query_finds_the_whole_token` passes." },
+    { "k": 3, "name": "JSON scaffolding is not indexed", "evidence": "airlock holds 14 raw records with `\"toolUseResult\"` and 95 with `\"parentUuid\"`; a project-scoped search for each returns 0 hits. The verbatim project's 10 `toolUseResult` hits were read and are all prose/code that genuinely names the key." },
+    { "k": 4, "name": "Error normalization collapses variable parts", "evidence": "12 distinct normalized `error` values are shared across more than one session in the live store; `one_failure_seen_twice_is_one_value_and_a_different_integer_is_two` passes." },
+    { "k": 5, "name": "Error normalization stops at bare integers", "evidence": "`placeholder_at` (entity.rs:325-336) recognizes only timestamp, uuid, address and :line:col; live normalized values retain bare integers. Same named test carries the negative arm and passes." },
+    { "k": 6, "name": "All five entity kinds are emitted over the real corpus", "evidence": "command 3375, error 179, path 11156, symbol 3203, tool 5454 over 19,077 real turns; 423 turns carry a `/dev/null` paths row while 33 turns that name it in text carry none." },
+    { "k": 7, "name": "The per-turn entity cap holds", "evidence": "MAX_ENTITIES_PER_TURN = 48 (entity.rs:62); the live per-turn maximum is exactly 48, so the cap binds and nothing exceeds it." },
+    { "k": 8, "name": "Reindex reproduces the derived rows", "evidence": "entities 23367 (486,367 value bytes) / paths 11156 / turns_fts 19077 -> deleted to 0/0/0 -> `verbatim reindex` -> byte-identical counts and value-length sum." },
+    { "k": 9, "name": "Search exit codes", "evidence": "path query exit 0 with hits; unmatched query exit 0 with an empty set and ok:true; `--nope`, an unknown subcommand and a malformed `--since` all exit 2." },
+    { "k": 10, "name": "--json on every data command", "evidence": "search/show/sessions/status/verify/reindex each emit one stdout document keyed command,data,ok,reason with 0 bytes of stderr on success; fields match docs/json-shapes.md:71-160; diagnostics (out-of-scope show, bad --since) go to stderr. `every_data_command_emits_the_documented_shape` passes." },
+    { "k": 11, "name": "Default project scoping, and the star escape", "evidence": "Five cwd/scope cases run identically through `verbatim search` and through a spawned `verbatim mcp` recall_search: default returns only the standing project, `*` returns 3 projects, an unindexed cwd returns 0 hits with `no archived project contains /tmp` rather than widening. Sibling-prefix probe (`/data/code/verbatim-extra`, `/data/code/verbatimX`) does not resolve to /data/code/verbatim; a real worktree key on a second store folds to the repository's project." },
+    { "k": 12, "name": "An excluded project is invisible on both read paths", "evidence": "49 weathervane turns present, 0 returned by `verbatim search --project '*'` or by `recall_search` at either scope, and neither response sets a reason. The path is named only when the caller itself supplied it. Residual, already an open item: `recall_get`/`recall_context` at `project:\"*\"` still name the excluded absolute path in a reason; at the default scope they correctly answer `no turn N is archived`." },
+    { "k": 13, "name": "Sidechain turns rank below top-level", "evidence": "`a_sidechain_turn_sorts_below_an_identical_top_level_turn` passes on an equal-bm25 pair; live, six 50-hit cross-project searches over a store with 69 sidechain sessions produce zero equal-relevance inversions." },
+    { "k": 14, "name": "recall_context ordering and session boundary", "evidence": "Live MCP windows over a 95-turn session: ascending turn_seq in every case, at_session_start true at seq 0, at_session_end true at seq 94, nothing past either end, and an over-large request lowered to the 25-per-side budget with that reason stated." },
+    { "k": 15, "name": "Evicted body is a flag, malformed call is a reason", "evidence": "is_evicted=1 -> records returned with body_evicted true and body null, no error, exit 0. Seven malformed calls all return results with prose reasons; zero JSON-RPC errors, zero panics." },
+    { "k": 16, "name": "MCP handshake: three read-only tools, no socket, ends at EOF", "evidence": "tools/list returns exactly 3 tools each with annotations.readOnlyHint true; `ss -ltnp` shows no listening socket for the live pid and /proc/<pid>/fd holds only stdio; exit code 0 after stdin close." },
+    { "k": 17, "name": "MCP against a nonexistent store", "evidence": "Empty hits with `no verbatim store at <path>/verbatim.db; nothing has been archived yet`, exit 0, and the directory still does not exist afterwards." }
+  ],
+  "gaps": [],
+  "human_checks": []
+}
