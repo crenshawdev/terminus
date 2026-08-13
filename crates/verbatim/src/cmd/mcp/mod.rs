@@ -25,6 +25,23 @@
 //! answer with an archive that is already out of date. `cmd::read::open` is the
 //! same entry point `search`, `show` and `sessions` use, so the read-only rule
 //! (D-10) and the missing-store answer are one implementation rather than two.
+//!
+//! **Nothing here may panic on what a client sent.** A panic writes a Rust
+//! backtrace onto the transport stream and takes the session's tool with it, and
+//! what the user sees is a tool that silently stopped working. The four ways to
+//! do it are denied below rather than reviewed for, across this module and both
+//! of its children; test code is exempt, where an assertion is a panic on
+//! purpose.
+
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 pub mod rpc;
 pub mod tools;

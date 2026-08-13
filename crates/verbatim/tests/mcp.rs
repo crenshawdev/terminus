@@ -1036,3 +1036,256 @@ fn a_list_longer_than_the_cap_is_truncated_and_said_so() {
         "the truncation was not reported: {document}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bounds and malformed requests (RCL-10, AC6)
+// ---------------------------------------------------------------------------
+
+/// This tool's empty document, whatever went wrong: the same keys a successful
+/// answer carries, so a client parses one shape either way.
+fn assert_empty_shape(tool: &str, document: &Value) {
+    match tool {
+        "recall_search" => assert_eq!(document["hits"], json!([]), "{document}"),
+        "recall_context" => {
+            assert_eq!(document["turns"], json!([]), "{document}");
+            assert_eq!(document["at_session_start"], false, "{document}");
+            assert_eq!(document["continues_from"], Value::Null, "{document}");
+        }
+        _ => {
+            assert_eq!(document["records"], json!([]), "{document}");
+            assert_eq!(document["absent"], json!([]), "{document}");
+        }
+    }
+}
+
+/// Every way a caller can malform a `tools/call` for a tool that exists: a
+/// successful JSON-RPC response whose content is an empty result carrying a
+/// reason, marked `isError`, and never a panic.
+///
+/// RCL-10 wants the empty-result-with-reason contract because a throw is what
+/// the client surfaces to the user as a broken server: the model can read a
+/// reason and call again, and it cannot read a JSON-RPC error the same way. The
+/// `isError` flag is what still tells the two apart from an ordinary empty
+/// answer.
+#[test]
+fn a_malformed_call_is_an_empty_result_with_a_reason_and_never_a_throw() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let alpha = bench.project("session-recall.jsonl");
+
+    let cases: &[(&str, Value)] = &[
+        // A required argument, absent.
+        ("recall_search", json!({})),
+        ("recall_context", json!({})),
+        ("recall_get", json!({})),
+        // `arguments` itself of the wrong JSON type.
+        ("recall_search", json!("not an object")),
+        ("recall_get", json!([1, 2, 3])),
+        // An argument of the wrong JSON type.
+        ("recall_search", json!({"query": 12})),
+        ("recall_search", json!({"query": "cargo", "tool": true})),
+        (
+            "recall_search",
+            json!({"query": "cargo", "paths": "src/a.rs"}),
+        ),
+        ("recall_search", json!({"query": "cargo", "paths": [7]})),
+        ("recall_context", json!({"turn_id": "12"})),
+        ("recall_get", json!({"turn_ids": 12})),
+        ("recall_get", json!({"turn_ids": ["12"]})),
+        ("recall_get", json!({"turn_ids": []})),
+        // A limit that is not a number, is negative, or is not whole.
+        ("recall_search", json!({"query": "cargo", "limit": "ten"})),
+        ("recall_search", json!({"query": "cargo", "limit": -1})),
+        ("recall_search", json!({"query": "cargo", "limit": 2.5})),
+        ("recall_search", json!({"query": "cargo", "limit": 0})),
+        ("recall_context", json!({"turn_id": 1, "before": -1})),
+        // A date nothing can parse. `2026-13-99` is deliberately NOT in this
+        // list: D-23 pins a bound to a shape rather than to a calendar - every
+        // stored timestamp is `NNNN-NN-NNTNN:NN:NN.NNNZ` and the comparison is
+        // lexicographic with no date parsing on the stored side - so a shaped
+        // impossibility is a bound that compares cleanly, and only an unshaped
+        // string is a caller error.
+        (
+            "recall_search",
+            json!({"query": "cargo", "since": "last tuesday"}),
+        ),
+    ];
+
+    for (tool, arguments) in cases {
+        let (document, is_error) = bench.call_flagged(&alpha, tool, arguments.clone());
+        assert!(
+            is_error,
+            "`{tool}` with {arguments} was not marked as a caller error: {document}"
+        );
+        assert!(
+            document["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "`{tool}` with {arguments} gave no reason: {document}"
+        );
+        assert!(
+            !document.to_string().contains("panicked"),
+            "`{tool}` with {arguments} returned a panic message: {document}"
+        );
+        assert_empty_shape(tool, &document);
+    }
+}
+
+/// The line between the two failure kinds: a tool this server does not have is a
+/// JSON-RPC error, a bad argument to a tool it does have is not.
+///
+/// A request the server understood and could not satisfy is a result; a message
+/// it could not understand as a request is an error. Collapsing the two either
+/// way is what makes a client report a broken server for a typo, or swallow a
+/// call it never routed.
+#[test]
+fn an_unknown_tool_is_a_protocol_error_and_a_bad_argument_is_not() {
+    let bench = bench();
+
+    let conversation = bench.talk(
+        &bench.work,
+        &[
+            initialize(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                   "params": {"name": "recall_everything", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                   "params": {"name": "recall_search", "arguments": {}}}),
+        ],
+    );
+    conversation.expect_ok();
+    assert_eq!(conversation.responses.len(), 4);
+
+    for index in [1, 2] {
+        assert_eq!(
+            conversation.responses[index]["error"]["code"], -32602,
+            "params that name no call must be a protocol error: {:?}",
+            conversation.responses[index]
+        );
+    }
+    assert!(
+        conversation.responses[3].get("error").is_none(),
+        "a missing argument must not be a protocol error: {:?}",
+        conversation.responses[3]
+    );
+}
+
+/// A malformed call does not end the session: the server answers the next
+/// request over the same pipes.
+///
+/// This is the property a per-call `unwrap` would break invisibly. The bad call
+/// would still "fail", and the tool would be gone for the rest of the session
+/// with nothing in the transcript saying why.
+#[test]
+fn the_server_answers_the_next_request_after_a_malformed_one() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let alpha = bench.project("session-recall.jsonl");
+
+    let conversation = bench.talk(
+        &alpha,
+        &[
+            initialize(),
+            initialized(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                   "params": {"name": "recall_get", "arguments": {"turn_ids": "nope"}}}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                   "params": {"name": "recall_search",
+                              "arguments": {"query": "src/worker/S.ts"}}}),
+            json!({"jsonrpc": "2.0", "id": 4, "method": "ping"}),
+        ],
+    );
+    conversation.expect_ok();
+    // The handshake plus the three requests. The notification is not in the
+    // count, because it is never answered.
+    assert_eq!(
+        conversation.responses.len(),
+        4,
+        "{:?}",
+        conversation.responses
+    );
+
+    assert_eq!(conversation.responses[1]["result"]["isError"], true);
+    assert!(
+        !hits(&content(&conversation.responses[2])).is_empty(),
+        "the search after the malformed call answered nothing: {:?}",
+        conversation.responses[2]
+    );
+    assert_eq!(conversation.responses[3]["result"], json!({}));
+}
+
+/// An argument above a budget is lowered to it, not refused: the answer comes
+/// back bounded and says the budget was applied.
+///
+/// Deliberately not an empty result. An over-large `limit` is a client being
+/// optimistic rather than a client being wrong, and RCL-10 wants an answer -
+/// what the budget exists to stop is the archive arriving in the model's context
+/// one call at a time, and a bounded answer stops that.
+#[test]
+fn an_over_large_argument_is_lowered_to_the_budget_rather_than_refused() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let project = bench.long_session("project-window", 60);
+
+    let anchor: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT id FROM turns WHERE session_key LIKE '%project-window.jsonl'
+              ORDER BY turn_seq LIMIT 1 OFFSET 30",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let ids: Vec<i64> = bench
+        .conn()
+        .prepare(
+            "SELECT id FROM turns WHERE session_key LIKE '%project-window.jsonl'
+              ORDER BY turn_seq LIMIT 60",
+        )
+        .unwrap()
+        .query_map([], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    let cases: &[(&str, Value, &str, usize)] = &[
+        (
+            "recall_search",
+            json!({"query": "longwindowmarker", "limit": 100_000}),
+            "hits",
+            50,
+        ),
+        (
+            "recall_context",
+            json!({"turn_id": anchor, "before": 100_000, "after": 100_000}),
+            "turns",
+            51,
+        ),
+        (
+            "recall_get",
+            json!({"turn_ids": ids, "project": "*"}),
+            "records",
+            25,
+        ),
+    ];
+
+    for (tool, arguments, key, most) in cases {
+        let (document, is_error) = bench.call_flagged(&project, tool, arguments.clone());
+        assert!(
+            !is_error,
+            "`{tool}` refused an over-large argument: {document}"
+        );
+
+        let returned = document[key].as_array().map(Vec::len).unwrap_or_default();
+        assert!(
+            returned > 0 && returned <= *most,
+            "`{tool}` returned {returned}, outside 1..={most}: {document}"
+        );
+        assert!(
+            document["reason"].as_str().is_some_and(|reason| {
+                reason.contains("budget") || reason.contains("caps one request")
+            }),
+            "`{tool}` did not say the budget was applied: {document}"
+        );
+    }
+}

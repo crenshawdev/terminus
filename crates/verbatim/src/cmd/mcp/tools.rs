@@ -480,14 +480,19 @@ fn run_context(args: &Map<String, Value>) -> Result<Value, Refused> {
 fn run_get(args: &Map<String, Value>) -> Result<Value, Refused> {
     let asked = required_ids(args, "turn_ids")?;
     let project = optional_string(args, "project")?;
-    let served = asked.len().min(MAX_IDS);
+    // `get` and not a slice expression: the bound is provably inside the list
+    // and is written totally anyway, because this is the one path where the
+    // length came from a client and a panic here writes a backtrace onto the
+    // transport.
+    let ids = asked.get(..MAX_IDS).unwrap_or(&asked);
+    let served = ids.len();
 
     let reader = reader()?;
     let fetched = get::records(
         reader.store().conn(),
         reader.config(),
         &scope(project.as_deref())?,
-        &asked[..served],
+        ids,
     )
     .map_err(|error| Refused::archive(error.to_string()))?;
 
