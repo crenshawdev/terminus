@@ -1,0 +1,3527 @@
+diff --git a/crates/verbatim-core/src/config.rs b/crates/verbatim-core/src/config.rs
+index 1f82535..6ddbb8f 100644
+--- a/crates/verbatim-core/src/config.rs
++++ b/crates/verbatim-core/src/config.rs
+@@ -241,13 +241,9 @@ impl Config {
+     /// prefixes, because that is what makes the separator boundary exact and
+     /// what makes a trailing slash in the config irrelevant.
+     pub fn excludes_path(&self, path: &Path) -> bool {
+-        let candidate = components(path);
+-        self.exclusions.iter().any(|excluded| {
+-            let prefix = components(Path::new(excluded));
+-            !prefix.is_empty()
+-                && candidate.len() >= prefix.len()
+-                && candidate[..prefix.len()] == prefix[..]
+-        })
++        self.exclusions
++            .iter()
++            .any(|excluded| covers(Path::new(excluded), path).is_some())
+     }
+ }
+ 
+@@ -418,6 +414,29 @@ fn components(path: &Path) -> Vec<String> {
+         .collect()
+ }
+ 
++/// Does `ancestor` cover `path`, and by how many components?
++///
++/// `Some(n)` when `ancestor` is `path` itself or a directory above it, where
++/// `n` is how many components deep `ancestor` is - which is what makes "the
++/// longest stored key that covers this directory" a comparison of numbers.
++/// `None` when it covers nothing, including for an empty `ancestor`, which
++/// would otherwise be a prefix of every path there is.
++///
++/// One rule, used twice on purpose. [`Config::excludes_path`] asks it whether a
++/// project is hidden (D-23) and `recall::scope` asks it which project a working
++/// directory sits in (D-12); two spellings of "is this path inside that one"
++/// would eventually disagree about a trailing separator or about case folding,
++/// and a project in scope under one rule and excluded under the other is a
++/// search that returns an excluded project's turns.
++pub fn covers(ancestor: &Path, path: &Path) -> Option<usize> {
++    let prefix = components(ancestor);
++    let candidate = components(path);
++    (!prefix.is_empty()
++        && candidate.len() >= prefix.len()
++        && candidate[..prefix.len()] == prefix[..])
++        .then_some(prefix.len())
++}
++
+ /// Verbatim's config directory, resolved the way `store::data_dir` resolves the
+ /// data directory: an environment override first, then the platform location.
+ pub fn config_dir() -> Result<PathBuf> {
+@@ -558,6 +577,81 @@ pub mod visible {
+         Ok(out)
+     }
+ 
++    /// One distinct pair of project keys the archive carries, and what the
++    /// config says about each of them.
++    ///
++    /// Both keys travel together rather than as two independent sets, because
++    /// they are only meaningful as a pair: a longest-prefix hit on
++    /// `project_pre_worktree` has to resolve back to that row's `project`
++    /// before it can scope anything (phase 2 D-06 folded a repo and its
++    /// worktree into ONE key on purpose), and exclusion has to be able to hide
++    /// a session under its worktree path while leaving a sibling session with
++    /// the same `project` visible.
++    #[derive(Debug, Clone, PartialEq, Eq)]
++    pub struct ProjectKeys {
++        /// The key ingest resolved, after worktree folding. `None` for a
++        /// session whose records carry no `cwd` at all.
++        pub project: Option<String>,
++        /// The key the session had before that folding (ING-05).
++        pub project_pre_worktree: Option<String>,
++        /// The config excludes [`ProjectKeys::project`] itself.
++        pub project_excluded: bool,
++        /// The config excludes [`ProjectKeys::project_pre_worktree`].
++        pub pre_worktree_excluded: bool,
++    }
++
++    impl ProjectKeys {
++        /// Is a session carrying these keys hidden from every read path?
++        pub fn excluded(&self) -> bool {
++            self.project_excluded || self.pre_worktree_excluded
++        }
++    }
++
++    /// Every distinct project key the archive carries, and which of them the
++    /// config excludes.
++    ///
++    /// D-21: this is the projection a read path scopes and filters on, and
++    /// [`sessions`] is not. Measured on a synthetic store shaped like the real
++    /// one - 2,000 sessions, 250,000 turns, warm - `sessions()` costs 6.2-6.8
++    /// ms because of its per-session `count(*)` on `turns` plus the watermark
++    /// lookup, against 0.56-0.58 ms for the same join projecting only
++    /// `project`. The whole phase 5 budget is single-digit milliseconds, so a
++    /// search that paid for a turn count it never reads would spend the budget
++    /// before the FTS query started and the cost would look like search.
++    ///
++    /// Read off `session_meta` alone. A session with no meta row carries no
++    /// project key to scope on, so it contributes no row here - and it stays
++    /// visible for exactly that reason, since nothing can say it is excluded.
++    pub fn projects(conn: &Connection, config: &Config) -> Result<Vec<ProjectKeys>> {
++        let mut statement = conn.prepare(
++            "SELECT DISTINCT project, project_pre_worktree FROM session_meta
++             ORDER BY project, project_pre_worktree",
++        )?;
++        let rows = statement.query_map([], |r| {
++            Ok((
++                r.get::<_, Option<String>>(0)?,
++                r.get::<_, Option<String>>(1)?,
++            ))
++        })?;
++
++        let excludes = |key: &Option<String>| {
++            key.as_deref()
++                .is_some_and(|k| config.excludes_path(std::path::Path::new(k)))
++        };
++
++        let mut out = Vec::new();
++        for row in rows {
++            let (project, project_pre_worktree) = row?;
++            out.push(ProjectKeys {
++                project_excluded: excludes(&project),
++                pre_worktree_excluded: excludes(&project_pre_worktree),
++                project,
++                project_pre_worktree,
++            });
++        }
++        Ok(out)
++    }
++
+     /// The counts `verbatim status` prints, over exactly the visible sessions.
+     pub fn counts(conn: &Connection, config: &Config) -> Result<Counts> {
+         let mut counts = Counts::default();
+diff --git a/crates/verbatim-core/src/error.rs b/crates/verbatim-core/src/error.rs
+index e4ac4c8..ca78eae 100644
+--- a/crates/verbatim-core/src/error.rs
++++ b/crates/verbatim-core/src/error.rs
+@@ -62,6 +62,44 @@ pub enum Error {
+     #[error("{path} exists but is not a verbatim store ({detail})")]
+     NotAStore { path: PathBuf, detail: String },
+ 
++    /// A read command was pointed at a data directory that holds no store.
++    ///
++    /// Its own variant rather than an [`Error::Io`] carrying a message, for the
++    /// same reason [`Error::TranscriptDiverged`] is one: D-10 requires `search`,
++    /// `show`, `sessions` and `mcp` to render this as an empty result with a
++    /// reason instead of a failure, and a caller that had to recognize it by
++    /// matching on message text would break the first time the wording moved.
++    /// A read never creates the store it did not find (D-10), so this is the
++    /// ordinary state of a machine that has installed verbatim and not yet run
++    /// an ingest.
++    #[error("no verbatim store at {path}")]
++    StoreNotFound { path: PathBuf },
++
++    /// The store is there and this build cannot open it for reading.
++    ///
++    /// The case that is not hypothetical: a WAL database whose shared-memory
++    /// index cannot be created - read-only media, a directory the user cannot
++    /// write - which SQLite reports as `unable to open database file` on the
++    /// first statement rather than at connect. Reported like
++    /// [`Error::StoreNotFound`] so a read command can say why it returned
++    /// nothing instead of propagating a SQLite string.
++    #[error("cannot read the verbatim store at {path}: {detail}")]
++    StoreUnreadable { path: PathBuf, detail: String },
++
++    /// A `since` or `until` filter that is neither a whole transcript timestamp
++    /// nor a bare date (D-23).
++    ///
++    /// A caller error rather than an empty result, and that is the point: all
++    /// 22,412 sampled turns carry exactly one timestamp shape and the
++    /// comparison is lexicographic with no date parsing on the stored side, so
++    /// a value of any other shape would compare cleanly against every row and
++    /// return a plausible wrong answer instead of failing.
++    #[error(
++        "{field} value {value:?} is not a time; \
++         expected YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS.mmmZ"
++    )]
++    InvalidTimeFilter { field: &'static str, value: String },
++
+     /// The bytes in `sessions.blob` are not a blob this build can read.
+     #[error("malformed session blob: {detail}")]
+     BlobFormat { detail: String },
+diff --git a/crates/verbatim-core/src/lib.rs b/crates/verbatim-core/src/lib.rs
+index fdb7152..5fde6f3 100644
+--- a/crates/verbatim-core/src/lib.rs
++++ b/crates/verbatim-core/src/lib.rs
+@@ -16,6 +16,7 @@ pub mod ingest;
+ pub mod lineage;
+ pub mod parse;
+ pub mod project;
++pub mod recall;
+ pub mod recover;
+ pub mod reindex;
+ pub mod store;
+diff --git a/crates/verbatim-core/src/recall/context.rs b/crates/verbatim-core/src/recall/context.rs
+new file mode 100644
+index 0000000..76bc0fe
+--- /dev/null
++++ b/crates/verbatim-core/src/recall/context.rs
+@@ -0,0 +1,213 @@
++//! RCL-08: the turns around a hit, in the order they happened.
++//!
++//! **`turn_seq` order, never timestamp (D-22).** 31 of 62 sampled real
++//! transcripts carry a record whose timestamp goes backwards, so a timestamp
++//! sort would show a reply before the prompt it answers in half of all
++//! sessions. `turns` carries `UNIQUE (session_key, turn_seq)`, which is the
++//! covering index this window reads through.
++//!
++//! **The window stops at the session (D-06).** It does not follow
++//! `continues_from` and it does not follow `parent_session_key`: continuation
++//! is a fan-out with zero, one or many successors, 2 of 173 real files name a
++//! predecessor that was never ingested, and `parent_session_key` is a different
++//! namespace again. A lineage walk here could cross into a sibling fork and
++//! return turns from a conversation that never happened. What the window does
++//! instead is say which end it stopped at, and hand back the `continues_from`
++//! link unfollowed, so a caller can decide to make a second call.
++
++use rusqlite::{Connection, OptionalExtension};
++
++use crate::blob::BlobReader;
++use crate::config::Config;
++use crate::error::Result;
++use crate::recall::scope::{self, Reason, Scope};
++use crate::recall::{excerpt, Query};
++
++/// The most turns one call may ask for on either side of the anchor.
++///
++/// A window is read out of one decompressed session and every turn in it is
++/// projected, so an unbounded `before` returns the whole session as prose - the
++/// thing `recall_get` exists for, arrived at by accident.
++pub const MAX_CONTEXT_SIDE: usize = 25;
++
++/// One turn of a context window.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ContextTurn {
++    pub turn_id: i64,
++    pub turn_seq: i64,
++    pub record_type: String,
++    pub tool_name: Option<String>,
++    pub ts: Option<String>,
++    /// The turn's own text, projected the way the index projected it. Empty
++    /// when the archive would not give the bytes up.
++    pub text: String,
++    /// The turn the window was asked about.
++    pub is_anchor: bool,
++}
++
++/// A chronological window around one turn.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Window {
++    /// The turns, in `turn_seq` order, the anchor among them.
++    pub turns: Vec<ContextTurn>,
++    /// The window reaches the first turn of the session: there is nothing
++    /// earlier to ask for, in this file.
++    pub at_session_start: bool,
++    /// The window reaches the last turn of the session.
++    pub at_session_end: bool,
++    /// The session this one continues from, when it names one - returned and
++    /// NOT followed (D-06). A caller that wants the turns before the start of
++    /// this file resolves this itself and issues a second call.
++    pub continues_from: Option<String>,
++    /// Set when the window is empty for a reason rather than by accident.
++    pub reason: Option<Reason>,
++}
++
++impl Window {
++    fn nothing(reason: Reason) -> Window {
++        Window {
++            reason: Some(reason),
++            ..Window::default()
++        }
++    }
++}
++
++/// The turns around `anchor`, `before` of them earlier and `after` later.
++///
++/// Exclusion is applied on the same projection the search scopes through
++/// (D-21): a turn of an excluded project returns an empty window with a reason,
++/// because a context call that answered would be the read-path half of
++/// exclusion leaking through a second door.
++pub fn window(
++    conn: &Connection,
++    config: &Config,
++    anchor: i64,
++    before: usize,
++    after: usize,
++) -> Result<Window> {
++    let scoped = scope::resolve(conn, config, &Scope::Everything)?;
++    if let Some(reason) = scoped.reason() {
++        return Ok(Window::nothing(reason.clone()));
++    }
++
++    let Some((session_key, seq)) = conn
++        .query_row(
++            "SELECT session_key, turn_seq FROM turns WHERE id = ?1",
++            [anchor],
++            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
++        )
++        .optional()?
++    else {
++        return Ok(Window::nothing(Reason::NoSuchTurn { turn_id: anchor }));
++    };
++
++    let meta: Option<(Option<String>, Option<String>, Option<String>)> = conn
++        .query_row(
++            "SELECT project, project_pre_worktree, continues_from FROM session_meta
++             WHERE session_key = ?1",
++            [&session_key],
++            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
++        )
++        .optional()?;
++    let (project, pre_worktree, continues_from) = meta.unwrap_or((None, None, None));
++
++    let hidden = |key: &Option<String>, excluded: &[String]| {
++        key.as_deref()
++            .is_some_and(|k| excluded.iter().any(|e| e == k))
++    };
++    if hidden(&project, scoped.excluded_projects())
++        || hidden(&pre_worktree, scoped.excluded_pre_worktree())
++    {
++        return Ok(Window::nothing(Reason::ProjectExcluded {
++            project: project.or(pre_worktree).unwrap_or_default(),
++        }));
++    }
++
++    let low = seq - before.min(MAX_CONTEXT_SIDE) as i64;
++    let high = seq + after.min(MAX_CONTEXT_SIDE) as i64;
++
++    let mut statement = conn.prepare(
++        "SELECT id, turn_seq, record_type, tool_name, ts, stream_offset, byte_len
++         FROM turns
++         WHERE session_key = ?1 AND turn_seq BETWEEN ?2 AND ?3
++         ORDER BY turn_seq",
++    )?;
++    let rows = statement
++        .query_map(rusqlite::params![&session_key, low, high], |row| {
++            Ok((
++                ContextTurn {
++                    turn_id: row.get(0)?,
++                    turn_seq: row.get(1)?,
++                    record_type: row.get(2)?,
++                    tool_name: row.get(3)?,
++                    ts: row.get(4)?,
++                    text: String::new(),
++                    is_anchor: row.get::<_, i64>(0)? == anchor,
++                },
++                (row.get::<_, i64>(5)?, row.get::<_, i64>(6)?),
++            ))
++        })?
++        .collect::<rusqlite::Result<Vec<_>>>()?;
++    drop(statement);
++
++    // The session's own ends, which is what "cut short" is measured against.
++    let (first, last): (i64, i64) = conn.query_row(
++        "SELECT min(turn_seq), max(turn_seq) FROM turns WHERE session_key = ?1",
++        [&session_key],
++        |r| Ok((r.get(0)?, r.get(1)?)),
++    )?;
++
++    let mut turns: Vec<ContextTurn> = rows.iter().map(|(turn, _)| turn.clone()).collect();
++    fill_text(conn, &session_key, &rows, &mut turns)?;
++
++    let at_session_start = turns.first().is_some_and(|turn| turn.turn_seq == first);
++    let at_session_end = turns.last().is_some_and(|turn| turn.turn_seq == last);
++
++    Ok(Window {
++        turns,
++        at_session_start,
++        at_session_end,
++        // Returned whether or not the window reached the start, because that is
++        // a fact about the session rather than about this call.
++        continues_from,
++        reason: None,
++    })
++}
++
++/// Project every turn of the window out of the one session blob.
++///
++/// One `SELECT blob` for the whole window, which is free here in a way it is
++/// not for a search: a context window is one session by definition (D-06).
++fn fill_text(
++    conn: &Connection,
++    session_key: &str,
++    rows: &[(ContextTurn, (i64, i64))],
++    turns: &mut [ContextTurn],
++) -> Result<()> {
++    if rows.is_empty() {
++        return Ok(());
++    }
++    let blob: Option<Vec<u8>> = conn
++        .query_row(
++            "SELECT blob FROM sessions WHERE session_key = ?1",
++            [session_key],
++            |r| r.get(0),
++        )
++        .optional()?;
++    let Some(blob) = blob else { return Ok(()) };
++    let Ok(reader) = BlobReader::open(&blob) else {
++        return Ok(());
++    };
++
++    // An empty query, so the projection is taken from its head rather than
++    // windowed around a match: a context turn is being read for what it says,
++    // not for why it matched.
++    let query = Query::default();
++    for (index, (_, (offset, len))) in rows.iter().enumerate() {
++        let Ok(bytes) = reader.read_range(*offset as u64, *len as u64) else {
++            continue;
++        };
++        turns[index].text = excerpt::of_record(&query, &bytes);
++    }
++    Ok(())
++}
+diff --git a/crates/verbatim-core/src/recall/excerpt.rs b/crates/verbatim-core/src/recall/excerpt.rs
+new file mode 100644
+index 0000000..435c1fb
+--- /dev/null
++++ b/crates/verbatim-core/src/recall/excerpt.rs
+@@ -0,0 +1,225 @@
++//! The text under each hit, cut from the archive.
++//!
++//! **Never from FTS5 (D-05).** Measured on sqlite 3.53.4 against the
++//! contentless table `crates/verbatim-core/src/store/schema.rs` declares,
++//! `snippet(f,0,'[',']','...',8)` returns an empty string with exit 0 while
++//! `bm25(f)` still ranks - because `content=''` means the table holds no text
++//! to snippet. An excerpt built from `snippet()` would validate against the
++//! documented shape, pass every schema test, and tell the reader nothing.
++//!
++//! So the bytes come out of the session blob at the `stream_offset` and
++//! `byte_len` already on the turn row, and are projected through the same
++//! [`crate::index::text::project`] ingest indexed them with. That is what makes
++//! the excerpt prose rather than a JSON line: the projection is the rule that
++//! knows a `tool_use` block's text from its scaffolding, and writing a second
++//! one here would be a second definition of what a turn said.
++//!
++//! **One blob per session per search (D-20).** rusqlite's incremental blob I/O
++//! is behind a `blob` feature this workspace does not enable, so reading one
++//! turn materializes the whole compressed session - up to 10.1 MB uncompressed
++//! (phase 1 D-05). Hits are therefore grouped by session and each session's
++//! blob is selected once, which bounds the cost per request without eliminating
++//! it.
++
++use std::collections::BTreeMap;
++
++use rusqlite::{Connection, OptionalExtension};
++
++use crate::blob::BlobReader;
++use crate::error::Result;
++use crate::index::text;
++use crate::recall::search::Hit;
++use crate::recall::Query;
++
++/// How many characters of context an excerpt carries.
++///
++/// A terminal line and an MCP result are the two consumers and both want a
++/// sentence, not a paragraph: `recall_get` is the tool for the whole record,
++/// and an excerpt long enough to replace it would put the archive back in every
++/// search result.
++pub const EXCERPT_CHARS: usize = 240;
++
++/// What stands where text was cut away.
++///
++/// ASCII, because this is printed to a terminal whose code page is not ours to
++/// choose - the Windows console is first-class (`.planning/PROJECT.md`) and a
++/// horizontal ellipsis is exactly the character that arrives there as mojibake.
++pub const ELISION: &str = "...";
++
++/// How many session blobs an excerpt pass materialized.
++///
++/// An instrument, not an answer, and in the normal build for the same reason
++/// [`BlobReader::blocks_decompressed`] is: "each session's blob is read at most
++/// once per search" is a claim about a number, so the number is measured rather
++/// than argued from the shape of the code.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++pub struct Reads {
++    pub blobs: usize,
++}
++
++/// Give every hit an excerpt, reading each session's blob once.
++///
++/// A blob that will not open, a range that will not read, a record that is not
++/// JSON: each leaves that one hit with an empty excerpt and every other field
++/// intact. A search is not the command that reports archive damage - `verbatim
++/// verify` is - and failing the whole search because one session of many is
++/// corrupt would hide the results that are fine.
++pub fn attach(conn: &Connection, query: &Query, hits: &mut [Hit]) -> Result<Reads> {
++    let mut reads = Reads::default();
++    if hits.is_empty() {
++        return Ok(reads);
++    }
++
++    let coordinates = coordinates(conn, hits)?;
++
++    // Grouped by session, which is the whole of D-20: the blob is selected once
++    // and every turn of that session is cut out of the one copy.
++    let mut by_session: BTreeMap<String, Vec<usize>> = BTreeMap::new();
++    for (index, hit) in hits.iter().enumerate() {
++        by_session
++            .entry(hit.session_key.clone())
++            .or_default()
++            .push(index);
++    }
++
++    for (session_key, indexes) in by_session {
++        let blob: Option<Vec<u8>> = conn
++            .query_row(
++                "SELECT blob FROM sessions WHERE session_key = ?1",
++                [&session_key],
++                |r| r.get(0),
++            )
++            .optional()?;
++        reads.blobs += 1;
++        let Some(blob) = blob else { continue };
++        let Ok(reader) = BlobReader::open(&blob) else {
++            continue;
++        };
++
++        for index in indexes {
++            let Some((offset, len)) = coordinates.get(&hits[index].turn_id) else {
++                continue;
++            };
++            let Ok(bytes) = reader.read_range(*offset as u64, *len as u64) else {
++                continue;
++            };
++            hits[index].excerpt = of_record(query, &bytes);
++        }
++    }
++
++    Ok(reads)
++}
++
++/// `(stream_offset, byte_len)` for every hit, in one statement.
++///
++/// D-04: both address the UNCOMPRESSED session stream, never the blob.
++fn coordinates(conn: &Connection, hits: &[Hit]) -> Result<BTreeMap<i64, (i64, i64)>> {
++    let ids: Vec<i64> = hits.iter().map(|hit| hit.turn_id).collect();
++    let placeholders = std::iter::repeat_n("?", ids.len())
++        .collect::<Vec<_>>()
++        .join(",");
++    let mut statement = conn.prepare(&format!(
++        "SELECT id, stream_offset, byte_len FROM turns WHERE id IN ({placeholders})"
++    ))?;
++    let rows = statement.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
++        Ok((
++            row.get::<_, i64>(0)?,
++            (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
++        ))
++    })?;
++
++    let mut out = BTreeMap::new();
++    for row in rows {
++        let (id, coordinates) = row?;
++        out.insert(id, coordinates);
++    }
++    Ok(out)
++}
++
++/// One record's bytes, as the sentence a reader should see.
++///
++/// Public because a context window projects its turns the same way (RCL-08):
++/// one rule for what a turn said, whatever asked for it.
++pub fn of_record(query: &Query, record: &[u8]) -> String {
++    let Ok(value) = serde_json::from_slice::<serde_json::Value>(record) else {
++        // A line that is not JSON is archived verbatim all the same (D-13), and
++        // it has no projection. Nothing to excerpt is an empty excerpt.
++        return String::new();
++    };
++    window(query, &flatten(&text::project(&value)))
++}
++
++/// The projection as one line: runs of whitespace become single spaces.
++///
++/// The projected text is newline-joined by construction - one line per text
++/// block, per tool input leaf, per stderr line - and an excerpt is read on one
++/// terminal row or inside one JSON string.
++fn flatten(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++    let mut pending = false;
++    for c in text.chars() {
++        if c.is_whitespace() {
++            pending = !out.is_empty();
++            continue;
++        }
++        if pending {
++            out.push(' ');
++            pending = false;
++        }
++        out.push(c);
++    }
++    out
++}
++
++/// A bounded window around the first query token in `text`.
++///
++/// The fallback when no token occurs is the head of the projection rather than
++/// an empty string. That case is real and is not damage: an entity-only hit
++/// matched on a normalized `error` value or on a tool name that the projected
++/// text spells differently, and the opening of the turn is still what the turn
++/// was about.
++fn window(query: &Query, text: &str) -> String {
++    let chars: Vec<char> = text.chars().collect();
++    if chars.len() <= EXCERPT_CHARS {
++        return text.to_owned();
++    }
++
++    let at = first_token(query, text).unwrap_or(0);
++    // A third of the window ahead of the match, so the reader sees what led to
++    // it as well as what followed.
++    let lead = EXCERPT_CHARS / 3;
++    let end = (at.saturating_sub(lead) + EXCERPT_CHARS).min(chars.len());
++    let start = end - EXCERPT_CHARS;
++
++    let mut out = String::new();
++    if start > 0 {
++        out.push_str(ELISION);
++    }
++    out.extend(&chars[start..end]);
++    if end < chars.len() {
++        out.push_str(ELISION);
++    }
++    out
++}
++
++/// The character index of the first query token in `text`, case-insensitively.
++fn first_token(query: &Query, text: &str) -> Option<usize> {
++    let folded: Vec<char> = text.to_lowercase().chars().collect();
++    // Folded on both sides, and the index counted in characters, because the
++    // window is cut in characters: a byte index from `str::find` would be the
++    // wrong number here for any turn carrying one non-ASCII character.
++    let mut best: Option<usize> = None;
++    for token in query.tokens() {
++        let needle: Vec<char> = token.to_lowercase().chars().collect();
++        if needle.is_empty() || needle.len() > folded.len() {
++            continue;
++        }
++        if let Some(at) = folded
++            .windows(needle.len())
++            .position(|window| window == needle.as_slice())
++        {
++            best = Some(best.map_or(at, |current: usize| current.min(at)));
++        }
++    }
++    best
++}
+diff --git a/crates/verbatim-core/src/recall/mod.rs b/crates/verbatim-core/src/recall/mod.rs
+new file mode 100644
+index 0000000..8b3ccc4
+--- /dev/null
++++ b/crates/verbatim-core/src/recall/mod.rs
+@@ -0,0 +1,25 @@
++//! The query layer both terminal recall and the MCP server sit on.
++//!
++//! One raw string becomes ranked turns scoped to the project the process is
++//! standing in, with excluded projects invisible, subagent turns present but
++//! ranked below the turns the user watched, an excerpt cut from the archive, and
++//! a chronological window around any hit. `verbatim search` (PLAN-3) and
++//! `recall_search` (PLAN-4) are two front ends over exactly this, which is what
++//! keeps them from drifting into two definitions of relevance.
++//!
++//! Nothing here writes. Every function takes a `&rusqlite::Connection` that the
++//! caller opened - through [`crate::Store::open_read_only`] on a read command
++//! (D-10) - rather than opening one of its own, so the layer cannot create a
++//! store as a side effect of being asked a question.
++
++pub mod context;
++pub mod excerpt;
++pub mod query;
++pub mod scope;
++pub mod search;
++
++pub use context::{ContextTurn, Window, MAX_CONTEXT_SIDE};
++pub use excerpt::EXCERPT_CHARS;
++pub use query::{EntityMatch, Query, MAX_QUERY_TOKENS};
++pub use scope::{Reason, Scope};
++pub use search::{Filters, Hit, Request, Response, DEFAULT_RESULTS, MAX_RESULTS};
+diff --git a/crates/verbatim-core/src/recall/query.rs b/crates/verbatim-core/src/recall/query.rs
+new file mode 100644
+index 0000000..a939995
+--- /dev/null
++++ b/crates/verbatim-core/src/recall/query.rs
+@@ -0,0 +1,179 @@
++//! D-09: the user's string is tokenized and rebuilt in Rust, and a raw query
++//! never reaches `MATCH`.
++//!
++//! Measured on sqlite 3.53.4 against the table
++//! `crates/verbatim-core/src/store/schema.rs` declares: `MATCH 'src/worker/S.ts'`
++//! fails with `fts5: syntax error near "/"` and exit 1, and `MATCH 'foo AND
++//! (bar'` and `MATCH '"unbalanced'` fail the same way. None of the three returns
++//! an empty result - they return an error - and RCL-06 forbids a non-zero exit
++//! for a query that simply found nothing. Searching for a path is this phase's
++//! own headline case, so the most natural command in the product is exactly the
++//! one that would fail.
++//!
++//! The rule is therefore: split the user's string on the separators the index
++//! tokenizes on, quote each surviving token, and require all of them. Every FTS5
++//! metacharacter is a separator under that split, so there is no operator left
++//! to be unbalanced and no syntax for a user to get wrong.
++//!
++//! **Query tokens are not expanded.** [`crate::index::expand`] already ran over
++//! the indexed text, so the stored body of a turn containing `SearchManager`
++//! carries `Search` and `Manager` as tokens of their own and a query for
++//! `manager` matches it directly. Expanding here as well would turn a specific
++//! query into its own components - a search for `SearchManager` would start
++//! matching every turn that says `manager` - which is the opposite of what the
++//! expansion was for.
++
++use std::collections::BTreeSet;
++
++use crate::index::expand::separator_components;
++
++/// How many tokens one query may carry into `MATCH`.
++///
++/// A pasted stack trace or a whole error log is a plausible query - it is what a
++/// user has in the clipboard when they go looking - and each token is a term the
++/// FTS5 expression evaluates. The bound is on the expression, not on what the
++/// user may type: tokens past it are dropped, the query still runs, and because
++/// the tokens are combined conjunctively a truncated query is *broader* than the
++/// one asked for rather than wrong in an unpredictable direction.
++pub const MAX_QUERY_TOKENS: usize = 32;
++
++/// How a query matched one stored `entities.value_norm` (RCL-04).
++///
++/// The comparison is between the query and a WHOLE stored value, never between
++/// one query token and a whole value: `path` and `error` values are multi-token
++/// by construction - `src/worker/S.ts`, and a whole normalized stderr line - so
++/// a token-equality rule could never fire for the two kinds this phase
++/// headlines.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum EntityMatch {
++    /// The value tokenizes to exactly this query, in order: the user asked for
++    /// this stored value and nothing else.
++    Exact,
++    /// Every token of the value is in the query, which asks for more besides.
++    Covered,
++}
++
++/// A user's raw string, reduced to the tokens the index can be asked about.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Query {
++    tokens: Vec<String>,
++    /// The same tokens, case-folded, in the same order. Kept rather than
++    /// recomputed because [`Query::matches_entity`] runs once per distinct
++    /// entity value on every candidate turn of every search.
++    folded: Vec<String>,
++    truncated: bool,
++}
++
++impl Query {
++    /// Tokenize a raw query string. Never fails: every input is either some
++    /// tokens or none.
++    pub fn parse(raw: &str) -> Query {
++        let mut tokens: Vec<String> = Vec::new();
++        let mut folded: Vec<String> = Vec::new();
++        let mut seen: BTreeSet<String> = BTreeSet::new();
++        let mut truncated = false;
++
++        for piece in separator_components(raw) {
++            // Case-insensitively, because `unicode61` folds case and asking for
++            // `Cargo` and `cargo` as two terms is one term twice.
++            let lowered = piece.to_lowercase();
++            if !seen.insert(lowered.clone()) {
++                continue;
++            }
++            if tokens.len() == MAX_QUERY_TOKENS {
++                truncated = true;
++                break;
++            }
++            tokens.push(piece.to_owned());
++            folded.push(lowered);
++        }
++
++        Query {
++            tokens,
++            folded,
++            truncated,
++        }
++    }
++
++    /// Does this query ask for one whole stored entity value?
++    ///
++    /// The value is tokenized by the same rule the query was, and it matches
++    /// when every one of its tokens is in the query - so a query for
++    /// `src/worker/S.ts` matches the stored path and a query for `worker` alone
++    /// does not. `None` for a value that tokenizes to nothing, which cannot be
++    /// asked for at all.
++    ///
++    /// Equality is compared over the token sequences rather than the raw
++    /// strings. Two spellings of one path differing only in a separator or in
++    /// case are the same value to the index, and a rule that called them
++    /// different would make the strongest match depend on punctuation the
++    /// tokenizer already threw away.
++    pub fn matches_entity(&self, value: &str) -> Option<EntityMatch> {
++        let value_tokens: Vec<String> =
++            separator_components(value).map(str::to_lowercase).collect();
++        if value_tokens.is_empty() {
++            return None;
++        }
++        if !value_tokens.iter().all(|token| self.folded.contains(token)) {
++            return None;
++        }
++        Some(if value_tokens == self.folded {
++            EntityMatch::Exact
++        } else {
++            EntityMatch::Covered
++        })
++    }
++
++    /// The tokens, in the order the raw string produced them and in the
++    /// spelling the user wrote.
++    ///
++    /// The spelling is kept because the excerpt reader looks for these in the
++    /// turn's own text, where the user's casing is a better first guess than a
++    /// folded one, and because a `--json` shape that echoed a lowercased query
++    /// back would be reporting something the user did not type.
++    pub fn tokens(&self) -> &[String] {
++        &self.tokens
++    }
++
++    /// Did the raw string carry more than [`MAX_QUERY_TOKENS`] distinct tokens?
++    pub fn truncated(&self) -> bool {
++        self.truncated
++    }
++
++    /// Does this query ask for nothing at all?
++    ///
++    /// True for an empty string and for a string of pure punctuation. The
++    /// distinction matters because `MATCH ''` is itself an fts5 error, so the
++    /// caller must skip the query rather than run it and catch the failure.
++    pub fn is_empty(&self) -> bool {
++        self.tokens.is_empty()
++    }
++
++    /// The FTS5 expression, or `None` when there is nothing to ask.
++    ///
++    /// Every token is a quoted FTS5 string, which is the form that carries no
++    /// operator meaning: inside double quotes fts5 reads a string and tokenizes
++    /// it with the table's own tokenizer, so a token can neither open a group
++    /// nor be a bare `AND`. `AND` between them is explicit rather than left to
++    /// fts5's implicit conjunction, because the default is a compile-time option
++    /// of the amalgamation and a query that silently became a disjunction would
++    /// return the whole archive for one common word.
++    pub fn match_expression(&self) -> Option<String> {
++        if self.tokens.is_empty() {
++            return None;
++        }
++        let mut out = String::new();
++        for token in &self.tokens {
++            if !out.is_empty() {
++                out.push_str(" AND ");
++            }
++            out.push('"');
++            // Cannot fire: a token is a run of alphanumerics by construction.
++            // Written anyway, because the cost is one pass over a short string
++            // and the alternative is an injection into a query language.
++            out.push_str(&token.replace('"', "\"\""));
++            out.push('"');
++        }
++        Some(out)
++    }
++}
+diff --git a/crates/verbatim-core/src/recall/scope.rs b/crates/verbatim-core/src/recall/scope.rs
+new file mode 100644
+index 0000000..2a42573
+--- /dev/null
++++ b/crates/verbatim-core/src/recall/scope.rs
+@@ -0,0 +1,243 @@
++//! Two rules over one projection: which project a search is in, and which
++//! projects it may never see.
++//!
++//! **Scoping (D-12).** The project a read command means by default is the one
++//! the process is standing in, and it is found by a longest-prefix match of the
++//! working directory against the project keys `session_meta` already holds -
++//! never by resolving the directory afresh through [`crate::project::Resolver`].
++//! Two reasons, and both are decisive. The resolver shells out to `git` with a
++//! 2 s budget, and process spawn is the 10-30 ms the cold-start budget is made
++//! of; and a rule that resolves independently can disagree with what ingest
++//! wrote, at which point a scoped search inside a worktree returns zero hits -
++//! the identity fragmentation `.planning/PROJECT.md` names the incumbent for.
++//! Matching against stored keys cannot disagree with them.
++//!
++//! **Exclusion (D-21, D-23).** Applied to `project` and to
++//! `project_pre_worktree` both, because either alone leaks a worktree session,
++//! and a session whose `project` is null stays visible because nothing can say
++//! it is excluded. It stays in force under every scope, including `*`.
++
++use std::path::{Path, PathBuf};
++
++use rusqlite::Connection;
++
++use crate::config::{self, visible, Config};
++use crate::error::Result;
++
++/// The literal a caller passes to mean "every project".
++pub const EVERY_PROJECT: &str = "*";
++
++/// Which project's turns a search may return.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Scope {
++    /// The project this directory sits inside - the default, and the process's
++    /// own working directory at the top of a read command.
++    ///
++    /// The directory is a value rather than something this module reads for
++    /// itself: an MCP server's `cwd` and a terminal command's are the same
++    /// question asked by two front ends, and a caller that has already resolved
++    /// it should not have it resolved again.
++    Directory(PathBuf),
++    /// One project, named by any path inside it - the project key itself, a
++    /// worktree path, or a subdirectory of either.
++    Named(String),
++    /// Every project. Exclusion is still in force.
++    Everything,
++}
++
++impl Scope {
++    /// The default scope: whatever project the process is standing in.
++    pub fn current_directory() -> Result<Scope> {
++        let dir =
++            std::env::current_dir().map_err(|e| crate::error::Error::io(Path::new("."), e))?;
++        Ok(Scope::Directory(dir))
++    }
++
++    /// The `project` argument a caller passed, as a scope.
++    pub fn parse(value: &str) -> Scope {
++        if value == EVERY_PROJECT {
++            Scope::Everything
++        } else {
++            Scope::Named(value.to_owned())
++        }
++    }
++}
++
++/// Why a scoped search can return nothing at all.
++///
++/// A value rather than a formatted string, for the same reason
++/// [`crate::Error::StoreNotFound`] is a variant: RCL-10 renders an empty result
++/// with a reason, and a caller must not have to match on message text to tell
++/// one empty result from another.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Reason {
++    /// Nothing is archived, so there is no project to be standing in.
++    NothingArchived,
++    /// No archived project covers this directory. Said out loud rather than
++    /// silently widening to every project: a user in an unindexed directory
++    /// who gets the whole archive back reads it as a scoping bug, and a user
++    /// who gets nothing back with no reason reads it as an empty archive.
++    UnknownProject { named: String },
++    /// The project in scope is one the config excludes.
++    ProjectExcluded { project: String },
++    /// The config excludes the filesystem root, so no read path may see
++    /// anything at all.
++    EverythingExcluded,
++    /// A context window was asked about a turn the archive does not hold.
++    NoSuchTurn { turn_id: i64 },
++}
++
++impl std::fmt::Display for Reason {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Reason::NothingArchived => write!(f, "no sessions are archived yet"),
++            Reason::UnknownProject { named } => {
++                write!(f, "no archived project contains {named}")
++            }
++            Reason::ProjectExcluded { project } => {
++                write!(f, "{project} is excluded by config")
++            }
++            Reason::EverythingExcluded => {
++                write!(f, "the configured exclusions cover the filesystem root")
++            }
++            Reason::NoSuchTurn { turn_id } => write!(f, "no turn {turn_id} is archived"),
++        }
++    }
++}
++
++/// A scope resolved against what the archive actually holds.
++#[derive(Debug, Clone, PartialEq, Eq, Default)]
++pub struct Scoped {
++    project: Option<String>,
++    excluded_projects: Vec<String>,
++    excluded_pre_worktree: Vec<String>,
++    reason: Option<Reason>,
++}
++
++impl Scoped {
++    /// The `session_meta.project` value a search is restricted to, or `None`
++    /// when every project is in scope.
++    pub fn project(&self) -> Option<&str> {
++        self.project.as_deref()
++    }
++
++    /// Distinct `session_meta.project` values the config excludes.
++    pub fn excluded_projects(&self) -> &[String] {
++        &self.excluded_projects
++    }
++
++    /// Distinct `session_meta.project_pre_worktree` values the config excludes.
++    pub fn excluded_pre_worktree(&self) -> &[String] {
++        &self.excluded_pre_worktree
++    }
++
++    /// Set when this scope can match nothing at all, whatever the query is.
++    pub fn reason(&self) -> Option<&Reason> {
++        self.reason.as_ref()
++    }
++
++    /// Can this scope return a hit? False whenever [`Scoped::reason`] is set.
++    pub fn is_empty(&self) -> bool {
++        self.reason.is_some()
++    }
++
++    fn nothing(reason: Reason) -> Scoped {
++        Scoped {
++            reason: Some(reason),
++            ..Scoped::default()
++        }
++    }
++}
++
++/// Resolve a scope against the project keys the archive holds.
++pub fn resolve(conn: &Connection, config: &Config, scope: &Scope) -> Result<Scoped> {
++    // The short circuit D-21 asks for. An exclusion of the filesystem root is
++    // "read nothing", and answering it with a query would be asking the store
++    // for rows it may not return.
++    if config.excludes_everything() {
++        return Ok(Scoped::nothing(Reason::EverythingExcluded));
++    }
++
++    let keys = visible::projects(conn, config)?;
++
++    let mut excluded_projects: Vec<String> = keys
++        .iter()
++        .filter(|k| k.project_excluded)
++        .filter_map(|k| k.project.clone())
++        .collect();
++    excluded_projects.sort_unstable();
++    excluded_projects.dedup();
++
++    let mut excluded_pre_worktree: Vec<String> = keys
++        .iter()
++        .filter(|k| k.pre_worktree_excluded)
++        .filter_map(|k| k.project_pre_worktree.clone())
++        .collect();
++    excluded_pre_worktree.sort_unstable();
++    excluded_pre_worktree.dedup();
++
++    let named = match scope {
++        Scope::Everything => {
++            return Ok(Scoped {
++                project: None,
++                excluded_projects,
++                excluded_pre_worktree,
++                reason: None,
++            })
++        }
++        Scope::Directory(dir) => dir.to_string_lossy().into_owned(),
++        Scope::Named(name) => name.clone(),
++    };
++
++    if keys.is_empty() {
++        return Ok(Scoped::nothing(Reason::NothingArchived));
++    }
++
++    let Some(project) = longest_prefix(&keys, Path::new(&named)) else {
++        return Ok(Scoped::nothing(Reason::UnknownProject { named }));
++    };
++
++    if config.excludes_path(Path::new(&project)) {
++        return Ok(Scoped::nothing(Reason::ProjectExcluded { project }));
++    }
++
++    Ok(Scoped {
++        project: Some(project),
++        excluded_projects,
++        excluded_pre_worktree,
++        reason: None,
++    })
++}
++
++/// The `project` of the stored key that covers `path` most specifically.
++///
++/// Both stored keys are candidates and both resolve to the row's `project`. A
++/// hit on `project_pre_worktree` resolving to the worktree path instead would
++/// show only the sessions run from inside the worktree and hide the repository's
++/// own, which is the fragmentation phase 2 D-06 folded the two keys together to
++/// prevent.
++///
++/// Ties are broken by the projection's own `ORDER BY`, which is over the stored
++/// values, so two runs against an unchanged store resolve to the same project.
++fn longest_prefix(keys: &[visible::ProjectKeys], path: &Path) -> Option<String> {
++    let mut best: Option<(usize, &str)> = None;
++    for row in keys {
++        let Some(project) = row.project.as_deref() else {
++            // Nothing to scope to: a session with no `cwd` is reachable only
++            // through `*`.
++            continue;
++        };
++        for key in [row.project.as_deref(), row.project_pre_worktree.as_deref()]
++            .into_iter()
++            .flatten()
++        {
++            let Some(depth) = config::covers(Path::new(key), path) else {
++                continue;
++            };
++            if best.is_none_or(|(deepest, _)| depth > deepest) {
++                best = Some((depth, project));
++            }
++        }
++    }
++    best.map(|(_, project)| project.to_owned())
++}
+diff --git a/crates/verbatim-core/src/recall/search.rs b/crates/verbatim-core/src/recall/search.rs
+new file mode 100644
+index 0000000..f8e485d
+--- /dev/null
++++ b/crates/verbatim-core/src/recall/search.rs
+@@ -0,0 +1,502 @@
++//! Ranked search: the `turns_fts` match joined back to the rows that say which
++//! turn, in which session, of which project it was.
++//!
++//! This is the search the phase exists for, and both front ends sit on it -
++//! `verbatim search` (PLAN-3) and `recall_search` (PLAN-4) - so there is one
++//! definition of relevance rather than two that drift.
++
++use std::collections::BTreeMap;
++
++use rusqlite::Connection;
++
++use crate::config::Config;
++use crate::error::Result;
++use crate::recall::excerpt;
++use crate::recall::query::EntityMatch;
++use crate::recall::scope::{self, Reason, Scope};
++use crate::recall::Query;
++
++/// The most hits one search may return, whatever the caller asks for.
++///
++/// A caller may lower it and may not raise it. The MCP server needs a
++/// server-side budget it does not have to trust a client to respect (RCL-10),
++/// and every hit costs an excerpt read out of a session blob, which is a whole
++/// decompressed session per session touched while rusqlite's incremental blob
++/// I/O stays out of scope (D-20).
++pub const MAX_RESULTS: usize = 50;
++
++/// What a caller gets when it does not say.
++///
++/// Injection is precision-first and a terminal page is short; a caller that
++/// wants more asks for more, up to [`MAX_RESULTS`].
++pub const DEFAULT_RESULTS: usize = 20;
++
++/// RCL-07's filters: everything that narrows a search without changing what it
++/// is asking for.
++///
++/// Each one is independently optional and they combine conjunctively, so a
++/// default [`Filters`] narrows nothing.
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct Filters {
++    /// `turns.tool_name`. D-16 measured exactly one `tool_use` block on every
++    /// tool-bearing record of a 19,809-turn sample, so the column is the whole
++    /// tool filter and not a first guess at one.
++    pub tool: Option<String>,
++    /// `turns.record_type`: `user`, `assistant`, `system`, `attachment`.
++    pub kind: Option<String>,
++    /// Turns carrying any of these in the `paths` table. Structural, not
++    /// textual: a turn that merely names a path in prose has no `paths` row and
++    /// is not a match here.
++    pub paths: Vec<String>,
++    /// Inclusive lower bound on `turns.ts`.
++    pub since: Option<String>,
++    /// Inclusive upper bound on `turns.ts`.
++    pub until: Option<String>,
++}
++
++/// One search, as asked for.
++#[derive(Debug, Clone)]
++pub struct Request {
++    pub query: Query,
++    /// Which project's turns may come back. Defaults to the project the caller
++    /// is standing in, which is the only default that makes `verbatim search`
++    /// answer about the work in front of the user.
++    pub scope: Scope,
++    pub filters: Filters,
++    /// How many hits the caller wants. Silently clamped to [`MAX_RESULTS`] -
++    /// see [`Request::effective_limit`].
++    pub limit: usize,
++}
++
++impl Request {
++    /// A request scoped to the process's own working directory.
++    ///
++    /// Fallible only because reading the working directory is: a process whose
++    /// `cwd` was deleted out from under it has no project to be standing in.
++    pub fn here(query: Query) -> Result<Self> {
++        Ok(Request::new(query, Scope::current_directory()?))
++    }
++
++    pub fn new(query: Query, scope: Scope) -> Self {
++        Request {
++            query,
++            scope,
++            filters: Filters::default(),
++            limit: DEFAULT_RESULTS,
++        }
++    }
++
++    pub fn limit(mut self, limit: usize) -> Self {
++        self.limit = limit;
++        self
++    }
++
++    pub fn filters(mut self, filters: Filters) -> Self {
++        self.filters = filters;
++        self
++    }
++
++    /// The limit actually applied.
++    ///
++    /// Clamping rather than rejecting: an over-large `limit` is a client being
++    /// optimistic, not a caller error, and RCL-10 wants an answer rather than a
++    /// refusal.
++    pub fn effective_limit(&self) -> usize {
++        self.limit.min(MAX_RESULTS)
++    }
++}
++
++/// One matching turn.
++#[derive(Debug, Clone, PartialEq)]
++pub struct Hit {
++    pub turn_id: i64,
++    pub session_key: String,
++    pub record_type: String,
++    pub ts: Option<String>,
++    /// The project key ingest resolved for this turn's session, or `None` when
++    /// the session has no meta row at all.
++    pub project: Option<String>,
++    /// A subagent turn (D-07): its session carries a `parent_session_key`.
++    pub sidechain: bool,
++    /// What RCL-04's exact-match half added to [`Hit::relevance`]. Zero when the
++    /// query matched this turn only as free text.
++    ///
++    /// Reported rather than folded away: it is the difference between "this
++    /// turn ran that command" and "this turn mentions that word", and a caller
++    /// that cannot see it cannot show it or test it.
++    pub entity_score: f64,
++    /// Higher is a better match: the negated bm25 (see [`HEAD`]) plus
++    /// [`Hit::entity_score`].
++    pub relevance: f64,
++    /// The matched text, cut from the session blob (D-05). Empty only when the
++    /// archive would not give it up - see [`crate::recall::excerpt`].
++    pub excerpt: String,
++}
++
++/// What a search answered.
++///
++/// An empty `hits` with a `reason` is the shape RCL-10 asks for: a search that
++/// could not match anything says so, rather than throwing or looking like an
++/// archive with nothing in it.
++#[derive(Debug, Clone, PartialEq, Default)]
++pub struct Response {
++    pub hits: Vec<Hit>,
++    pub reason: Option<Reason>,
++    /// How many session blobs the excerpts materialized. An instrument, not an
++    /// answer: see [`crate::recall::excerpt::Reads`].
++    pub reads: excerpt::Reads,
++}
++
++/// The projection and the ordering, with the one place the bm25 sign is fixed.
++///
++/// `bm25()` returns a NEGATIVE number and more negative is a better match. The
++/// negation happens here, once, in the projection, and every ordering below is
++/// written against the negated value - because a sign error here ranks the
++/// worst match first and every test that only checks "hits came back" still
++/// passes.
++///
++/// The join to `session_meta` is a LEFT join on purpose. An inner join would
++/// drop every turn of a session that has no meta row, which is the damage
++/// `config::visible::sessions` deliberately keeps visible: a session archived
++/// without meta is a bug to see, not a bug to hide.
++const HEAD: &str = "
++    SELECT t.id,
++           t.session_key,
++           t.record_type,
++           t.ts,
++           m.project,
++           m.parent_session_key IS NOT NULL AS sidechain,
++           -bm25(turns_fts) AS relevance
++    FROM turns_fts
++    JOIN turns t ON t.id = turns_fts.rowid
++    LEFT JOIN session_meta m ON m.session_key = t.session_key
++    WHERE turns_fts MATCH ?
++";
++
++/// The order is total, so two runs over an unchanged store agree - phase 5
++/// reads rank 1..3 and a nondeterministic tie would make its threshold fire on
++/// a different turn each time. Relevance first, then D-07's rule that a
++/// sidechain turn sorts last at equal score, then the newer turn, then the
++/// lower id.
++///
++/// This orders the CANDIDATES. The entity weighting below then moves rows
++/// within that set and the same comparison is applied again in Rust, which is
++/// why it is written twice: SQL cannot see a score that is computed from a
++/// second table's document frequencies.
++const TAIL: &str = "
++    ORDER BY relevance DESC, sidechain ASC, t.ts DESC, t.id ASC
++    LIMIT ?
++";
++
++/// How many turns are ranked before the caller's limit is applied.
++///
++/// The entity weighting can only re-order rows it was given, so a pool no
++/// larger than the limit would mean a turn that carries the exact command the
++/// user asked for could never climb past a turn that merely says the word.
++/// Four times the maximum is a bounded read - the rows are seven small columns
++/// and no blob is touched until after the truncation - and it is the whole of
++/// what a re-rank can reach.
++const CANDIDATE_POOL: usize = MAX_RESULTS * 4;
++
++/// Run one search.
++///
++/// A query that reduced to no tokens returns no hits without asking SQLite
++/// anything: `MATCH ''` is itself an fts5 error (D-09), so the empty result is
++/// produced rather than caught.
++pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Response> {
++    let scoped = scope::resolve(conn, config, &request.scope)?;
++    if let Some(reason) = scoped.reason() {
++        return Ok(Response {
++            hits: Vec::new(),
++            reason: Some(reason.clone()),
++            reads: excerpt::Reads::default(),
++        });
++    }
++
++    let Some(expression) = request.query.match_expression() else {
++        return Ok(Response::default());
++    };
++
++    let mut sql = String::from(HEAD);
++    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(expression)];
++
++    if let Some(project) = scoped.project() {
++        sql.push_str(" AND m.project = ?\n");
++        params.push(Box::new(project.to_owned()));
++    }
++    // `NOT IN` is written with the null guard rather than without it: SQL's
++    // `NULL NOT IN (...)` is NULL, which is not true, so an unguarded clause
++    // would drop every session whose project is null - the one session nothing
++    // can say is excluded.
++    push_exclusion(
++        &mut sql,
++        &mut params,
++        "m.project",
++        scoped.excluded_projects(),
++    );
++    push_exclusion(
++        &mut sql,
++        &mut params,
++        "m.project_pre_worktree",
++        scoped.excluded_pre_worktree(),
++    );
++    request.filters.push_onto(&mut sql, &mut params)?;
++    sql.push_str(TAIL);
++    params.push(Box::new(CANDIDATE_POOL as i64));
++
++    let mut statement = conn.prepare(&sql)?;
++    let mut hits = statement
++        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
++            Ok(Hit {
++                turn_id: row.get(0)?,
++                session_key: row.get(1)?,
++                record_type: row.get(2)?,
++                ts: row.get(3)?,
++                project: row.get(4)?,
++                sidechain: row.get::<_, i64>(5)? != 0,
++                entity_score: 0.0,
++                relevance: row.get(6)?,
++                excerpt: String::new(),
++            })
++        })?
++        .collect::<rusqlite::Result<Vec<Hit>>>()?;
++    drop(statement);
++
++    weight_by_entities(conn, &request.query, &mut hits)?;
++    hits.sort_by(rank);
++    hits.truncate(request.effective_limit());
++    // After the truncation, never before: an excerpt costs a whole decompressed
++    // session and the candidate pool is four times what the caller asked for.
++    let reads = excerpt::attach(conn, &request.query, &mut hits)?;
++
++    Ok(Response {
++        hits,
++        reason: None,
++        reads,
++    })
++}
++
++/// The same total order [`TAIL`] applies, over scores SQL could not compute.
++fn rank(a: &Hit, b: &Hit) -> std::cmp::Ordering {
++    b.relevance
++        .partial_cmp(&a.relevance)
++        .unwrap_or(std::cmp::Ordering::Equal)
++        .then_with(|| a.sidechain.cmp(&b.sidechain))
++        // Descending, and `None` last, which is where SQL puts it too.
++        .then_with(|| b.ts.cmp(&a.ts))
++        .then_with(|| a.turn_id.cmp(&b.turn_id))
++}
++
++/// An exact match on a whole stored value counts double one that merely
++/// covers it.
++///
++/// The user who typed the command asked for the command; the user who typed it
++/// inside a longer question asked for something the command is part of.
++const EXACT_WEIGHT: f64 = 2.0;
++const COVERED_WEIGHT: f64 = 1.0;
++
++/// RCL-04's query-time half: weight each matched entity by how rare its value
++/// is, and add it to the relevance of every candidate carrying it.
++///
++/// Nothing is rejected and there is no stop-list. "Too common" changes as the
++/// corpus grows and an index-time rejection is irreversible, which is why the
++/// requirement puts this here: a value carried by half the archive still
++/// matches, it just moves a hit almost not at all.
++///
++/// Deterministic, and dependent only on stored rows: the document frequency is
++/// a count over `entities` and the total is a count over `turns`, so two runs
++/// against an unchanged store produce the same order. Phase 5's structural
++/// threshold reads rank 1..3, and a nondeterministic tie would make it fire on
++/// a different turn each time.
++fn weight_by_entities(conn: &Connection, query: &Query, hits: &mut [Hit]) -> Result<()> {
++    if hits.is_empty() || query.is_empty() {
++        return Ok(());
++    }
++
++    let ids: Vec<i64> = hits.iter().map(|hit| hit.turn_id).collect();
++    let placeholders = std::iter::repeat_n("?", ids.len())
++        .collect::<Vec<_>>()
++        .join(",");
++    let mut statement = conn.prepare(&format!(
++        "SELECT turn_id, kind, value_norm FROM entities WHERE turn_id IN ({placeholders})"
++    ))?;
++    let rows = statement
++        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
++            Ok((
++                row.get::<_, i64>(0)?,
++                row.get::<_, String>(1)?,
++                row.get::<_, String>(2)?,
++            ))
++        })?
++        .collect::<rusqlite::Result<Vec<(i64, String, String)>>>()?;
++    drop(statement);
++    if rows.is_empty() {
++        return Ok(());
++    }
++
++    // The N of the IDF. Every turn is a document whether or not it carries an
++    // entity, so a value on one turn in the archive is rare in the archive and
++    // not merely rare among the turns that happen to have entities.
++    let total: f64 =
++        conn.query_row("SELECT count(*) FROM turns", [], |r| r.get::<_, i64>(0))? as f64;
++
++    let mut weights: BTreeMap<(String, String), f64> = BTreeMap::new();
++    let mut by_turn: BTreeMap<i64, f64> = BTreeMap::new();
++    let mut frequency = conn.prepare(
++        "SELECT count(DISTINCT turn_id) FROM entities WHERE kind = ?1 AND value_norm = ?2",
++    )?;
++
++    for (turn_id, kind, value) in rows {
++        let key = (kind, value);
++        let weight = match weights.get(&key) {
++            Some(weight) => *weight,
++            None => {
++                let weight = match query.matches_entity(&key.1) {
++                    None => 0.0,
++                    Some(matched) => {
++                        // `idx_entities_lookup` is on exactly (kind, value_norm).
++                        let df: i64 =
++                            frequency.query_row(rusqlite::params![&key.0, &key.1], |r| r.get(0))?;
++                        let idf = (1.0 + total / df.max(1) as f64).ln();
++                        idf * match matched {
++                            EntityMatch::Exact => EXACT_WEIGHT,
++                            EntityMatch::Covered => COVERED_WEIGHT,
++                        }
++                    }
++                };
++                weights.insert(key.clone(), weight);
++                weight
++            }
++        };
++        if weight > 0.0 {
++            *by_turn.entry(turn_id).or_insert(0.0) += weight;
++        }
++    }
++
++    for hit in hits.iter_mut() {
++        if let Some(bonus) = by_turn.get(&hit.turn_id) {
++            hit.entity_score = *bonus;
++            hit.relevance += *bonus;
++        }
++    }
++    Ok(())
++}
++
++impl Filters {
++    /// Append every filter that is set, conjunctively.
++    fn push_onto(
++        &self,
++        sql: &mut String,
++        params: &mut Vec<Box<dyn rusqlite::ToSql>>,
++    ) -> Result<()> {
++        if let Some(tool) = &self.tool {
++            sql.push_str(" AND t.tool_name = ?\n");
++            params.push(Box::new(tool.clone()));
++        }
++        if let Some(kind) = &self.kind {
++            sql.push_str(" AND t.record_type = ?\n");
++            params.push(Box::new(kind.clone()));
++        }
++        if !self.paths.is_empty() {
++            // EXISTS rather than a join: a turn carrying three of the named
++            // paths is still one hit, and a join would return it three times
++            // and spend three excerpt reads saying so.
++            sql.push_str(
++                " AND EXISTS (SELECT 1 FROM paths p WHERE p.turn_id = t.id AND p.path IN (",
++            );
++            for (index, path) in self.paths.iter().enumerate() {
++                if index > 0 {
++                    sql.push(',');
++                }
++                sql.push('?');
++                params.push(Box::new(path.clone()));
++            }
++            sql.push_str("))\n");
++        }
++        // A turn with no timestamp is outside every window, because SQL's
++        // `NULL >= x` is NULL. That is the wanted answer: a turn that cannot say
++        // when it happened cannot be shown as evidence of when something did.
++        if let Some(since) = &self.since {
++            sql.push_str(" AND t.ts >= ?\n");
++            params.push(Box::new(bound(FIELD_SINCE, since)?));
++        }
++        if let Some(until) = &self.until {
++            sql.push_str(" AND t.ts <= ?\n");
++            params.push(Box::new(bound(FIELD_UNTIL, until)?));
++        }
++        Ok(())
++    }
++}
++
++const FIELD_SINCE: &str = "since";
++const FIELD_UNTIL: &str = "until";
++
++/// One end of a time window, as a string that can be compared against
++/// `turns.ts` directly.
++///
++/// D-23: the comparison is lexicographic and there is no date parsing on the
++/// stored side. All 22,412 turns of a 180-file sample carry exactly the shape
++/// `NNNN-NN-NNTNN:NN:NN.NNNZ` - one format, UTC only - and `turns(ts)` is
++/// already indexed, so a text comparison is both correct and the fast plan.
++///
++/// A bare `YYYY-MM-DD` is extended to the first instant of that day for `since`
++/// and the last for `until`, which is what makes a one-day window include its
++/// own day. Extending both ends to midnight would make `--since 2026-08-12
++/// --until 2026-08-12` return the single turn that happened at exactly
++/// 00:00:00.000 and look like an empty day.
++///
++/// Anything else is a caller error. Comparing it would succeed - every string
++/// orders against every other - and return an answer that looks right.
++fn bound(field: &'static str, raw: &str) -> Result<String> {
++    if is_shaped(raw, "NNNN-NN-NNTNN:NN:NN.NNNZ") {
++        return Ok(raw.to_owned());
++    }
++    if is_shaped(raw, "NNNN-NN-NN") {
++        let tail = if field == FIELD_SINCE {
++            "T00:00:00.000Z"
++        } else {
++            "T23:59:59.999Z"
++        };
++        return Ok(format!("{raw}{tail}"));
++    }
++    Err(crate::error::Error::InvalidTimeFilter {
++        field,
++        value: raw.to_owned(),
++    })
++}
++
++/// Does `value` match `shape`, where `N` stands for one ASCII digit and every
++/// other character stands for itself?
++fn is_shaped(value: &str, shape: &str) -> bool {
++    value.len() == shape.len()
++        && value
++            .bytes()
++            .zip(shape.bytes())
++            .all(|(byte, expected)| match expected {
++                b'N' => byte.is_ascii_digit(),
++                other => byte == other,
++            })
++}
++
++/// Hide every session whose `column` names an excluded project.
++///
++/// Nothing is appended for an empty list, because `NOT IN ()` is not SQL.
++fn push_exclusion(
++    sql: &mut String,
++    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
++    column: &str,
++    excluded: &[String],
++) {
++    if excluded.is_empty() {
++        return;
++    }
++    sql.push_str(&format!(" AND ({column} IS NULL OR {column} NOT IN ("));
++    for (index, value) in excluded.iter().enumerate() {
++        if index > 0 {
++            sql.push(',');
++        }
++        sql.push('?');
++        params.push(Box::new(value.clone()));
++    }
++    sql.push_str("))\n");
++}
+diff --git a/crates/verbatim-core/src/store/open.rs b/crates/verbatim-core/src/store/open.rs
+index d55259e..ad38638 100644
+--- a/crates/verbatim-core/src/store/open.rs
++++ b/crates/verbatim-core/src/store/open.rs
+@@ -58,12 +58,25 @@ pub struct RebuildRequired {
+     pub binary_derived_schema: i64,
+ }
+ 
++/// A column this build declares that the open store does not carry.
++///
++/// Only a read-only open can produce one: [`Store::open`] runs
++/// [`bring_forward`] and adds it. Both strings come from
++/// [`crate::store::schema::BRING_FORWARD_COLUMNS`], never from the database, so
++/// a caller may compare them against that list.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct MissingColumn {
++    pub table: &'static str,
++    pub column: &'static str,
++}
++
+ /// An open verbatim store.
+ pub struct Store {
+     conn: Connection,
+     data_dir: PathBuf,
+     path: PathBuf,
+     rebuild: Option<RebuildRequired>,
++    missing: Vec<MissingColumn>,
+ }
+ 
+ impl std::fmt::Debug for Store {
+@@ -106,6 +119,10 @@ impl Store {
+             data_dir: data_dir.to_path_buf(),
+             path,
+             rebuild,
++            // `bring_forward` runs below on every existing store and
++            // `initialize` writes the whole schema on a fresh one, so a writable
++            // open never leaves a declared column absent.
++            missing: Vec::new(),
+         };
+         if state == StoreState::Fresh {
+             store.initialize()?;
+@@ -124,6 +141,87 @@ impl Store {
+         Ok(store)
+     }
+ 
++    /// Open an existing store for reading, and do nothing else to it (D-10).
++    ///
++    /// `SQLITE_OPEN_READ_ONLY`, no `create_dir_all`, no `initialize`, no
++    /// `bring_forward`, no `pragma_update`. A `readOnlyHint` server may not
++    /// perform DDL on connect, `verbatim search` may not create a store as a
++    /// side effect of a read, and a store on read-only media must return an
++    /// empty result rather than fail to open at all - which are three
++    /// statements about the same connection flags.
++    ///
++    /// The version gate still runs, because it is already read-only and because
++    /// [`Store::rebuild_required`] is what lets a read command say the store
++    /// predates this build instead of silently querying an old-shape index
++    /// (D-18).
++    ///
++    /// Dropping `bring_forward` means the columns it adds are not guaranteed to
++    /// be there: `session_meta.project_pre_worktree`, `agent_meta` and
++    /// `transcript_diverged` all arrived after phase 1, and a read query naming
++    /// one of them fails with `no such column` on a connection that cannot
++    /// `ALTER`. So their absence is measured here, once, and reported through
++    /// [`Store::missing_columns`] - the D-18 degraded read - rather than left to
++    /// surface as a SQLite error from the middle of a search.
++    ///
++    /// A missing data directory or database file is
++    /// [`Error::StoreNotFound`] and any other failure to open is
++    /// [`Error::StoreUnreadable`]: both are variants and neither is a panic,
++    /// because RCL-10 renders them as an empty result with a reason and a
++    /// caller must not have to match on message text to tell them apart.
++    pub fn open_read_only(data_dir: &Path) -> Result<Self> {
++        let path = data_dir.join(DB_FILE_NAME);
++
++        // Nothing is created, and that includes the probe: `fs::metadata` on a
++        // path that is not there is the whole of "a read against a machine that
++        // has never ingested".
++        match std::fs::metadata(&path) {
++            // A zero-length file is what an interrupted `initialize` leaves
++            // (see `inspect`), and it holds no store to read.
++            Ok(m) if m.len() == 0 => return Err(Error::StoreNotFound { path }),
++            Ok(_) => {}
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
++                return Err(Error::StoreNotFound { path })
++            }
++            Err(e) => {
++                return Err(Error::StoreUnreadable {
++                    path,
++                    detail: e.to_string(),
++                })
++            }
++        }
++
++        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
++        let conn =
++            Connection::open_with_flags(&path, flags).map_err(|source| Error::StoreUnreadable {
++                path: path.clone(),
++                detail: source.to_string(),
++            })?;
++        conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS.into()))?;
++
++        // SQLite opens lazily, so this first statement is where a WAL database
++        // whose shared-memory index cannot be created actually fails. Mapping it
++        // here is what keeps that case an empty result with a reason rather than
++        // a bare `unable to open database file` out of the query layer.
++        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
++            r.get::<_, i64>(0)
++        })
++        .map_err(|source| Error::StoreUnreadable {
++            path: path.clone(),
++            detail: source.to_string(),
++        })?;
++
++        let rebuild = read_versions(&conn, &path)?;
++        let missing = missing_columns(&conn)?;
++
++        Ok(Store {
++            conn,
++            data_dir: data_dir.to_path_buf(),
++            path,
++            rebuild,
++            missing,
++        })
++    }
++
+     /// Write the tables and the version integers a fresh store carries.
+     ///
+     /// One transaction, and that is load-bearing rather than tidy. The tables
+@@ -173,6 +271,26 @@ impl Store {
+         self.rebuild
+     }
+ 
++    /// Columns this build declares and the open store does not carry.
++    ///
++    /// Always empty for [`Store::open`], which adds them. A read-only open
++    /// cannot, so this is the list of columns its caller must not name in a
++    /// query - and, since only a store older than this build can be missing
++    /// one, the evidence for [`Store::predates_this_build`].
++    pub fn missing_columns(&self) -> &[MissingColumn] {
++        &self.missing
++    }
++
++    /// Is this store older than the build reading it (D-18)?
++    ///
++    /// Either half is enough: version integers that do not match, or a column
++    /// this build's queries name and the store does not carry. A read command
++    /// says so and queries what is there; it never repairs, because opening a
++    /// store is a read.
++    pub fn predates_this_build(&self) -> bool {
++        self.rebuild.is_some() || !self.missing.is_empty()
++    }
++
+     /// Read an integer out of `meta`.
+     pub fn meta_int(&self, key: &str) -> Result<Option<i64>> {
+         let text: Option<String> = self
+@@ -249,6 +367,29 @@ fn bring_forward(conn: &Connection) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Which of [`crate::store::schema::BRING_FORWARD_COLUMNS`] the open store does
++/// not carry.
++///
++/// The read-only counterpart of the scheduling half of [`bring_forward`]: same
++/// list, same `PRAGMA table_info` comparison, and no `ALTER`. A table that is
++/// missing outright reports every one of its columns, which is the honest
++/// answer - a query naming one of them would fail either way.
++fn missing_columns(conn: &Connection) -> Result<Vec<MissingColumn>> {
++    let mut missing = Vec::new();
++    for (table, columns) in crate::store::schema::BRING_FORWARD_COLUMNS {
++        let present = column_names(conn, table)?;
++        for (name, _) in *columns {
++            if !present.iter().any(|c| c == name) {
++                missing.push(MissingColumn {
++                    table,
++                    column: name,
++                });
++            }
++        }
++    }
++    Ok(missing)
++}
++
+ /// Every table in the open database, virtual tables included.
+ fn table_names(conn: &Connection) -> Result<Vec<String>> {
+     let mut statement = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+@@ -342,8 +483,25 @@ fn gate(path: &Path) -> Result<Option<RebuildRequired>> {
+     conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS.into()))?;
+ 
+     let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
++    let outcome = read_versions(&tx, path)?;
++
++    // Explicit: the read transaction and the read-only connection are both gone
++    // before any writable connection is opened.
++    drop(tx);
++    drop(conn);
++    Ok(outcome)
++}
++
++/// The gate's decision, over a connection the caller already holds.
++///
++/// Split out so [`Store::open_read_only`] runs the same rule on its own
++/// read-only connection instead of opening a second one: the read path is the
++/// cold-start path, and two connects to answer one question is a cost the hook
++/// budget notices. [`gate`] keeps its own connection because a writable one is
++/// opened right after it and must not exist while the versions are read.
++fn read_versions(conn: &Connection, path: &Path) -> Result<Option<RebuildRequired>> {
+     let read = |key: &str| -> Result<Option<i64>> {
+-        let text: Option<String> = tx
++        let text: Option<String> = conn
+             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+             .optional()
+             .map_err(|source| Error::NotAStore {
+@@ -385,10 +543,6 @@ fn gate(path: &Path) -> Result<Option<RebuildRequired>> {
+         None
+     };
+ 
+-    // Explicit: the read transaction and the read-only connection are both gone
+-    // before any writable connection is opened.
+-    drop(tx);
+-    drop(conn);
+     Ok(outcome)
+ }
+ 
+diff --git a/crates/verbatim-core/src/store/schema.rs b/crates/verbatim-core/src/store/schema.rs
+index 16f7693..895da27 100644
+--- a/crates/verbatim-core/src/store/schema.rs
++++ b/crates/verbatim-core/src/store/schema.rs
+@@ -104,6 +104,15 @@ CREATE INDEX IF NOT EXISTS idx_session_meta_continues_from
+     ON session_meta(continues_from);
+ CREATE INDEX IF NOT EXISTS idx_session_meta_path
+     ON session_meta(transcript_path);
++-- Project-scoped search filters on this column, and phase 5's injection will
++-- read it on every prompt. D-19: it reaches a store that already exists only
++-- because `reindex` runs this whole batch and phase 3's `DERIVED_SCHEMA` bump
++-- forces that reindex - `Store::open` runs `CREATE_SQL` only when a whole table
++-- is missing, and `BRING_FORWARD_COLUMNS` covers columns, not indexes. An index
++-- that existed on fresh stores and silently not on upgraded ones is two
++-- machines running one binary at different speeds with nothing reporting why.
++CREATE INDEX IF NOT EXISTS idx_session_meta_project
++    ON session_meta(project);
+ 
+ -- DERIVED. Rebuildable from the blobs alone; dropped and recreated by reindex.
+ 
+diff --git a/crates/verbatim-core/tests/exclusion.rs b/crates/verbatim-core/tests/exclusion.rs
+index f868343..907a338 100644
+--- a/crates/verbatim-core/tests/exclusion.rs
++++ b/crates/verbatim-core/tests/exclusion.rs
+@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
+ use rusqlite::Connection;
+ use verbatim_core::config::{self, visible, Config};
+ use verbatim_core::ingest::pass::{self, PassOutcome};
++use verbatim_core::recall::{search, Query, Request, Response, Scope, MAX_RESULTS};
+ use verbatim_core::store::DB_FILE_NAME;
+ 
+ struct Tree {
+@@ -79,6 +80,21 @@ impl Tree {
+         visible::counts(&self.conn(), &self.config(exclusions)).unwrap()
+     }
+ 
++    /// One search over this tree, run the way a read command runs it.
++    ///
++    /// The read path this file is about now has two halves - listing sessions
++    /// and searching turns - and D-21 routes both through `config::visible`.
++    /// A search that honored exclusion by a rule of its own is the drift the
++    /// module note forbids, so the search is asserted here beside the listing.
++    fn found(&self, exclusions: &[&str], scope: Scope, raw: &str) -> Response {
++        search::run(
++            &self.conn(),
++            &self.config(exclusions),
++            &Request::new(Query::parse(raw), scope).limit(MAX_RESULTS),
++        )
++        .unwrap()
++    }
++
+     /// The row is still in `session_meta` - exclusion hides, it does not delete.
+     fn archived(&self, path: &Path) -> bool {
+         let rows: i64 = self
+@@ -245,3 +261,104 @@ fn with_no_exclusions_every_session_is_visible() {
+     assert_eq!(counts.watermarks, 3);
+     assert!(counts.watermark_bytes > 0);
+ }
++
++/// The distinct projects a search answered from, in sorted order.
++fn projects_of(response: &Response) -> Vec<String> {
++    let mut out: Vec<String> = response
++        .hits
++        .iter()
++        .map(|hit| hit.project.clone().unwrap_or_default())
++        .collect();
++    out.sort();
++    out.dedup();
++    out
++}
++
++/// The search half of the same retroactive rule: a project excluded after its
++/// sessions were archived stops answering, under the default scope and under
++/// `*` alike.
++#[test]
++fn an_excluded_project_disappears_from_search_too() {
++    let tree = tree();
++    tree.transcript(1, "/data/projects/alpha");
++    tree.transcript(2, "/data/projects/beta");
++    tree.transcript(3, "/data/projects/alpha-research");
++    assert_eq!(tree.ingest_everything().files_committed, 3);
++
++    // Scoped to one project, nothing excluded: only that project answers,
++    // though every session in the tree carries the queried word.
++    let scoped = tree.found(&[], Scope::parse("/data/projects/alpha"), "hi");
++    assert_eq!(
++        projects_of(&scoped),
++        vec!["/data/projects/alpha".to_owned()]
++    );
++    assert!(
++        !projects_of(&scoped).contains(&"/data/projects/alpha-research".to_owned()),
++        "a project that merely shares leading segments is a different project"
++    );
++
++    // `*` is every project, and this is the control for what exclusion removes.
++    let everything = tree.found(&[], Scope::Everything, "hi");
++    assert_eq!(
++        projects_of(&everything),
++        vec![
++            "/data/projects/alpha".to_owned(),
++            "/data/projects/alpha-research".to_owned(),
++            "/data/projects/beta".to_owned(),
++        ]
++    );
++
++    // Excluded afterwards: gone from `*` as well as from its own scope.
++    let excluded = ["/data/projects/alpha"];
++    let after = tree.found(&excluded, Scope::Everything, "hi");
++    assert_eq!(
++        projects_of(&after),
++        vec![
++            "/data/projects/alpha-research".to_owned(),
++            "/data/projects/beta".to_owned(),
++        ]
++    );
++
++    let scoped_after = tree.found(&excluded, Scope::parse("/data/projects/alpha"), "hi");
++    assert!(scoped_after.hits.is_empty());
++    assert!(
++        scoped_after.reason.is_some(),
++        "an excluded scope is an empty result with a reason, not a silent one"
++    );
++}
++
++/// D-23 from the worktree side, on the search path: a session folded into its
++/// parent repo is still hidden by excluding the worktree path alone.
++///
++/// `project` alone could not answer this - it holds the repo for both sessions -
++/// so a search filtering on one column would return the worktree session's
++/// turns after the user excluded exactly that directory.
++#[test]
++fn a_worktree_session_is_hidden_from_search_under_either_key() {
++    let tree = tree();
++    let repo_cwd = "/data/projects/beta";
++    let worktree_cwd = "/data/projects/beta/.claude/worktrees/wt-a";
++    let plain = tree.transcript(1, repo_cwd);
++    let forked = tree.transcript(2, worktree_cwd);
++    assert_eq!(tree.ingest_everything().files_committed, 2);
++
++    // Both sessions carry the same `project`, which is the point.
++    let both = tree.found(&[], Scope::Everything, "hi");
++    let keys: Vec<String> = both.hits.iter().map(|h| h.session_key.clone()).collect();
++    assert!(
++        keys.contains(&key(&plain)) && keys.contains(&key(&forked)),
++        "{keys:?}"
++    );
++    assert_eq!(projects_of(&both), vec![repo_cwd.to_owned()]);
++
++    // Excluding the worktree path hides only the worktree session's turns.
++    let after = tree.found(&[worktree_cwd], Scope::Everything, "hi");
++    let keys: Vec<String> = after.hits.iter().map(|h| h.session_key.clone()).collect();
++    assert_eq!(keys, vec![key(&plain)]);
++
++    // Excluding the repository hides both, under the other key.
++    assert!(tree
++        .found(&[repo_cwd], Scope::Everything, "hi")
++        .hits
++        .is_empty());
++}
+diff --git a/crates/verbatim-core/tests/recall.rs b/crates/verbatim-core/tests/recall.rs
+new file mode 100644
+index 0000000..a53aeea
+--- /dev/null
++++ b/crates/verbatim-core/tests/recall.rs
+@@ -0,0 +1,1284 @@
++//! The query layer both terminal recall and the MCP server sit on.
++//!
++//! Every test runs against a store holding the whole fixture corpus, built by
++//! the ordinary ingest path, so what is asserted is what a real pass wrote and
++//! not what a helper decided to insert.
++
++#![cfg(feature = "testkit")]
++
++use std::path::PathBuf;
++
++use rusqlite::Connection;
++use verbatim_core::config::Config;
++use verbatim_core::recall::{
++    context, search, EntityMatch, Filters, Hit, Query, Reason, Request, Response, Scope, Window,
++    MAX_CONTEXT_SIDE, MAX_QUERY_TOKENS, MAX_RESULTS,
++};
++use verbatim_core::store::DB_FILE_NAME;
++use verbatim_core::{ingest, testkit};
++
++struct Bench {
++    _dir: tempfile::TempDir,
++    data_dir: PathBuf,
++    work: PathBuf,
++    /// The root the rooted fixtures' `cwd` values were substituted with, and so
++    /// the parent of every project directory a scoped search can stand in.
++    root: PathBuf,
++}
++
++/// A store with every transcript fixture ingested.
++fn bench() -> Bench {
++    let dir = tempfile::tempdir().unwrap();
++    let data_dir = dir.path().join("data");
++    let work = dir.path().join("work");
++    let root = dir.path().join("root");
++    std::fs::create_dir_all(&work).unwrap();
++
++    for fixture in testkit::TRANSCRIPT_FIXTURES {
++        let rooted = testkit::ROOTED_FIXTURES.iter().any(|(f, _)| f == fixture);
++        let path = if rooted {
++            testkit::copy_rooted_fixture_into(fixture, &work, &root)
++        } else {
++            testkit::copy_fixture_into(fixture, &work)
++        };
++        match ingest::run(&data_dir, &path).unwrap() {
++            ingest::Outcome::Committed(_) => {}
++            other => panic!("{fixture}: {other:?}"),
++        }
++    }
++
++    Bench {
++        _dir: dir,
++        data_dir,
++        work,
++        root,
++    }
++}
++
++impl Bench {
++    fn conn(&self) -> Connection {
++        Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
++    }
++
++    /// Archive one more session, written by the test and ingested through the
++    /// ordinary path.
++    ///
++    /// The fixture corpus is 47 turns and no single term reaches 17 of them, so
++    /// a claim about a result limit in the tens has nothing to be true about
++    /// until a session exists that exceeds it. The records are as thin as the
++    /// parser accepts: what is being measured is how many rows come back, not
++    /// what is in them.
++    fn flood(&self, name: &str, token: &str, records: usize) -> PathBuf {
++        let session = "77777777-7777-4777-8777-777777777777";
++        let mut body = String::new();
++        for n in 0..records {
++            let line = serde_json::json!({
++                "parentUuid": null,
++                "isSidechain": false,
++                // A directory nothing created, so project identity degrades to
++                // the path itself rather than spawning git for an answer.
++                "cwd": self.work.join("flooded").to_string_lossy(),
++                "sessionId": session,
++                "type": "user",
++                "uuid": format!("dddddddd-0000-4000-8000-{n:012}"),
++                "timestamp": format!("2026-08-12T21:{:02}:{:02}.000Z", n / 60, n % 60),
++                "message": {
++                    "role": "user",
++                    "content": [{"type": "text", "text": format!("{token} line {n}")}],
++                },
++            });
++            body.push_str(&line.to_string());
++            body.push('\n');
++        }
++
++        self.archive(name, &body)
++    }
++
++    /// A session of `Read` tool calls, one per named path.
++    ///
++    /// A path reaches the `entities` table only from a tool call's own input
++    /// (RCL-02), so a document frequency to weight by is something only a real
++    /// tool record can produce.
++    fn reads(&self, name: &str, paths: &[&str]) -> PathBuf {
++        let mut body = String::new();
++        for (n, file) in paths.iter().enumerate() {
++            let line = serde_json::json!({
++                "parentUuid": null,
++                "isSidechain": false,
++                "cwd": self.work.join("entities").to_string_lossy(),
++                "sessionId": "88888888-8888-4888-8888-888888888888",
++                "type": "assistant",
++                "uuid": format!("eeeeeeee-0000-4000-8000-{n:012}"),
++                "timestamp": format!("2026-08-12T22:{:02}:{:02}.000Z", n / 60, n % 60),
++                "message": {
++                    "role": "assistant",
++                    "model": "claude-opus-5",
++                    "content": [{
++                        "type": "tool_use",
++                        "id": format!("toolu_e{n}"),
++                        "name": "Read",
++                        "input": {"file_path": file},
++                    }],
++                },
++            });
++            body.push_str(&line.to_string());
++            body.push('\n');
++        }
++        self.archive(name, &body)
++    }
++
++    /// A session whose records carry the given timestamps, in the given order.
++    ///
++    /// Written so a test can hand it a clock that goes backwards: 31 of 62 real
++    /// transcripts carry a record whose timestamp does, which is the whole of
++    /// why D-22 orders a context window by `turn_seq`.
++    fn timeline(&self, name: &str, stamps: &[&str]) -> PathBuf {
++        let mut body = String::new();
++        for (n, stamp) in stamps.iter().enumerate() {
++            let line = serde_json::json!({
++                "parentUuid": null,
++                "isSidechain": false,
++                "cwd": self.work.join("timeline").to_string_lossy(),
++                "sessionId": "99999999-9999-4999-8999-999999999999",
++                "type": "user",
++                "uuid": format!("ffffffff-0000-4000-8000-{n:012}"),
++                "timestamp": stamp,
++                "message": {
++                    "role": "user",
++                    "content": [{"type": "text", "text": format!("timeline step {n}")}],
++                },
++            });
++            body.push_str(&line.to_string());
++            body.push('\n');
++        }
++        self.archive(name, &body)
++    }
++
++    fn archive(&self, name: &str, body: &str) -> PathBuf {
++        let path = self.work.join(name);
++        std::fs::write(&path, body).unwrap();
++        match ingest::run(&self.data_dir, &path).unwrap() {
++            ingest::Outcome::Committed(_) => {}
++            other => panic!("{name}: {other:?}"),
++        }
++        path
++    }
++}
++
++/// The turn ids one FTS5 expression returns, or the error it raised.
++///
++/// Deliberately fallible where the rest of the suite unwraps: the whole point of
++/// D-09 is which strings raise and which do not, so the error has to be a value
++/// the test can assert on rather than a panic.
++fn matching(conn: &Connection, expression: &str) -> rusqlite::Result<Vec<i64>> {
++    conn.prepare("SELECT rowid FROM turns_fts WHERE turns_fts MATCH ?1 ORDER BY rowid")?
++        .query_map([expression], |r| r.get::<_, i64>(0))?
++        .collect()
++}
++
++/// A user's raw string, run the way a read command will run it.
++fn search_ids(conn: &Connection, raw: &str) -> rusqlite::Result<Vec<i64>> {
++    match Query::parse(raw).match_expression() {
++        Some(expression) => matching(conn, &expression),
++        // `MATCH ''` is itself an fts5 error, so a query that reduces to no
++        // tokens is answered without asking SQLite anything.
++        None => Ok(Vec::new()),
++    }
++}
++
++/// One turn's record bytes, read back out of its session blob.
++fn record(conn: &Connection, turn_id: i64) -> String {
++    let (bytes, _) = testkit::read_turn(conn, turn_id);
++    String::from_utf8(bytes).unwrap()
++}
++
++/// How many archived turns carry `needle` anywhere in their raw record.
++fn turns_whose_record_contains(conn: &Connection, needle: &str) -> Vec<i64> {
++    conn.prepare("SELECT id FROM turns ORDER BY id")
++        .unwrap()
++        .query_map([], |r| r.get::<_, i64>(0))
++        .unwrap()
++        .map(Result::unwrap)
++        .filter(|id| record(conn, *id).contains(needle))
++        .collect()
++}
++
++/// The strings D-09 measured, plus the two shapes RCL-06 has to survive: a query
++/// that is nothing at all and a query that is nothing but punctuation.
++const HOSTILE: &[&str] = &[
++    "src/worker/S.ts",
++    "foo AND (bar",
++    "\"unbalanced",
++    "*",
++    "",
++    "!@#$%^&*()",
++];
++
++/// D-09: no raw query reaches `MATCH`, so none of these is an error.
++///
++/// The control is the first half of the loop. "The query layer returned Ok" says
++/// nothing unless the raw string really would have failed, and every one of
++/// these six does - `fts5: syntax error near "/"`, `near ""`, `unterminated
++/// string`, `unknown special query`. RCL-06 forbids a non-zero exit for a query
++/// that simply found nothing, and searching for a path is the phase's headline
++/// case, so the most natural command in the product is exactly the one that
++/// would have failed.
++#[test]
++fn no_raw_query_reaches_fts5() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    for raw in HOSTILE {
++        assert!(
++            matching(&conn, raw).is_err(),
++            "`{raw}` is not an fts5 syntax error, so routing it through the \
++             query layer proves nothing"
++        );
++
++        let result = search_ids(&conn, raw);
++        assert!(
++            result.is_ok(),
++            "`{raw}` reached fts5 as written: {:?}",
++            result.unwrap_err()
++        );
++    }
++}
++
++/// The headline case: `verbatim search src/worker/S.ts` finds the turn that
++/// names that path.
++#[test]
++fn a_path_query_returns_the_turn_that_contains_it() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let carriers = turns_whose_record_contains(&conn, "src/worker/S.ts");
++    assert_eq!(
++        carriers.len(),
++        1,
++        "the fixture corpus should name that path in exactly one turn"
++    );
++
++    let hits = search_ids(&conn, "src/worker/S.ts").unwrap();
++    assert!(
++        hits.contains(&carriers[0]),
++        "turn {} carries `src/worker/S.ts` and the search missed it: {hits:?}",
++        carriers[0]
++    );
++}
++
++/// A query that found nothing is an empty result, never an error and never a
++/// wrong one.
++#[test]
++fn a_query_matching_nothing_is_an_empty_result() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    assert_eq!(
++        search_ids(&conn, "zzzzunfindable").unwrap(),
++        Vec::<i64>::new()
++    );
++    // A real token beside one nothing carries: the conjunction is what makes
++    // this empty, not the absence of any indexable word at all.
++    assert!(!search_ids(&conn, testkit::UNIQUE_TOKEN).unwrap().is_empty());
++    assert_eq!(
++        search_ids(&conn, &format!("{} zzzzunfindable", testkit::UNIQUE_TOKEN)).unwrap(),
++        Vec::<i64>::new()
++    );
++}
++
++/// A query that reduces to no tokens asks SQLite nothing.
++#[test]
++fn a_query_of_no_tokens_makes_no_match_call() {
++    for raw in ["", "   ", "!@#$%^&*()", "-- ... --"] {
++        let query = Query::parse(raw);
++        assert!(query.is_empty(), "`{raw}` produced {:?}", query.tokens());
++        assert_eq!(query.match_expression(), None, "`{raw}`");
++    }
++}
++
++/// Every token is a quoted fts5 string and the tokens are conjoined, so nothing
++/// the user typed can be read as an operator.
++#[test]
++fn tokens_are_quoted_and_conjoined() {
++    assert_eq!(
++        Query::parse("src/worker/S.ts")
++            .match_expression()
++            .as_deref(),
++        Some(r#""src" AND "worker" AND "S" AND "ts""#)
++    );
++    // `AND` survives as a term rather than as the operator it looks like: it is
++    // inside quotes, where fts5 reads a string and hands it to the tokenizer.
++    assert_eq!(
++        Query::parse("foo AND (bar").match_expression().as_deref(),
++        Some(r#""foo" AND "AND" AND "bar""#)
++    );
++}
++
++/// Query tokens are not expanded, because the expansion already happened at
++/// index time.
++///
++/// Both halves matter. `SearchManager` stays one term - expanding it into
++/// `Search` and `Manager` would widen a specific query into every turn that
++/// says `manager` - and a query for `manager` still finds the turn, because
++/// `index::expand` put that component in the stored body (D-13).
++#[test]
++fn query_tokens_are_not_expanded() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    assert_eq!(Query::parse("SearchManager").tokens(), ["SearchManager"]);
++
++    let carriers = turns_whose_record_contains(&conn, "SearchManager");
++    assert_eq!(carriers.len(), 1, "one fixture turn names SearchManager");
++
++    for raw in ["SearchManager", "manager"] {
++        assert!(
++            search_ids(&conn, raw).unwrap().contains(&carriers[0]),
++            "`{raw}` missed turn {}",
++            carriers[0]
++        );
++    }
++}
++
++/// The same token twice is one term, whatever case it was typed in.
++#[test]
++fn repeated_tokens_collapse() {
++    let query = Query::parse("cargo Cargo cargo/cargo");
++    assert_eq!(query.tokens(), ["cargo"]);
++    assert!(!query.truncated());
++}
++
++/// A pasted stack trace cannot build a thousand-term expression.
++///
++/// Truncation is safe in one direction only, and this is the direction: the
++/// tokens are conjoined, so dropping some makes the query broader than the one
++/// asked for rather than wrong in a way the user cannot see.
++#[test]
++fn the_token_count_is_bounded() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let pasted: String = (0..MAX_QUERY_TOKENS * 4)
++        .map(|n| format!("frame{n} "))
++        .collect();
++
++    let query = Query::parse(&pasted);
++    assert_eq!(query.tokens().len(), MAX_QUERY_TOKENS);
++    assert!(query.truncated());
++    assert_eq!(
++        query.match_expression().unwrap().matches(" AND ").count(),
++        MAX_QUERY_TOKENS - 1
++    );
++
++    // And it still runs: a bounded expression is one fts5 accepts.
++    assert_eq!(search_ids(&conn, &pasted).unwrap(), Vec::<i64>::new());
++
++    let short = Query::parse("one two");
++    assert!(!short.truncated());
++}
++
++/// A config with no roots and the given exclusions: the read path never opens a
++/// transcript, so the roots are not what it is about.
++fn config(exclusions: &[&str]) -> Config {
++    Config::from_parts(
++        Vec::new(),
++        exclusions.iter().map(|e| (*e).to_owned()).collect(),
++    )
++}
++
++/// One search, as a read command runs it.
++fn answer(conn: &Connection, exclusions: &[&str], scope: Scope, raw: &str) -> Response {
++    search::run(
++        conn,
++        &config(exclusions),
++        &Request::new(Query::parse(raw), scope).limit(MAX_RESULTS),
++    )
++    .unwrap()
++}
++
++/// The ranked search over every project, which is what the ranking tests are
++/// about.
++fn ranked(conn: &Connection, raw: &str, limit: usize) -> Vec<Hit> {
++    search::run(
++        conn,
++        &config(&[]),
++        &Request::new(Query::parse(raw), Scope::Everything).limit(limit),
++    )
++    .unwrap()
++    .hits
++}
++
++/// The last component of a session key, which is the fixture's own file name.
++fn fixture_of(hit: &Hit) -> &str {
++    hit.session_key
++        .rsplit(['/', '\\'])
++        .next()
++        .expect("a session key is a path")
++}
++
++/// Hits come back best-first, across every session that matched.
++#[test]
++fn hits_come_back_in_descending_relevance() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let found = ranked(&conn, "cargo", MAX_RESULTS);
++    assert!(found.len() > 2, "{found:?}");
++
++    let mut sessions: Vec<&str> = found.iter().map(fixture_of).collect();
++    sessions.sort_unstable();
++    sessions.dedup();
++    assert!(
++        sessions.len() > 1,
++        "one query should reach several fixtures: {sessions:?}"
++    );
++
++    for pair in found.windows(2) {
++        assert!(
++            pair[0].relevance >= pair[1].relevance,
++            "out of order: {:?} then {:?}",
++            pair[0],
++            pair[1]
++        );
++    }
++
++    // The sign, which is the thing a "hits came back" assertion cannot see.
++    // bm25 is negative and more negative is better, so a relevance that came
++    // back unnegated would be ordered exactly backwards and still be sorted.
++    assert!(
++        found.iter().all(|hit| hit.relevance > 0.0),
++        "relevance is not the negated bm25: {found:?}"
++    );
++}
++
++/// D-07: a subagent turn is searchable, and at equal score it sorts below the
++/// turn the user actually watched.
++///
++/// The two fixture turns carry the same sentence and nothing else, so their
++/// projected bodies are byte-identical and bm25 scores them identically - which
++/// is what makes this a test of the tie-break rather than of bm25.
++#[test]
++fn a_sidechain_turn_sorts_below_an_identical_top_level_turn() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let found = ranked(
++        &conn,
++        "the echo agent repeats this line exactly",
++        MAX_RESULTS,
++    );
++    assert_eq!(found.len(), 2, "{found:?}");
++    assert_eq!(
++        found[0].relevance, found[1].relevance,
++        "the two turns should score identically, so the order is the tie-break"
++    );
++
++    assert_eq!(fixture_of(&found[0]), "session-recall.jsonl");
++    assert!(!found[0].sidechain);
++    assert_eq!(fixture_of(&found[1]), "agent-echo.jsonl");
++    assert!(found[1].sidechain);
++}
++
++/// The result limit is a budget the caller may lower and may not raise.
++#[test]
++fn the_result_limit_cannot_be_raised() {
++    let bench = bench();
++    bench.flood("flooded.jsonl", "floodtoken", MAX_RESULTS + 10);
++    let conn = bench.conn();
++
++    assert_eq!(
++        Request::new(Query::parse("floodtoken"), Scope::Everything)
++            .limit(usize::MAX)
++            .effective_limit(),
++        MAX_RESULTS
++    );
++
++    assert_eq!(ranked(&conn, "floodtoken", usize::MAX).len(), MAX_RESULTS);
++    assert_eq!(ranked(&conn, "floodtoken", 3).len(), 3);
++}
++
++/// The distinct projects a set of hits came from.
++fn projects_of(response: &Response) -> Vec<String> {
++    let mut out: Vec<String> = response
++        .hits
++        .iter()
++        .map(|hit| hit.project.clone().unwrap_or_default())
++        .collect();
++    out.sort();
++    out.dedup();
++    out
++}
++
++/// D-12: the default scope is the project the caller is standing in, found by
++/// matching the directory against the keys ingest already wrote.
++#[test]
++fn a_search_is_scoped_to_the_project_the_caller_stands_in() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let alpha = testkit::fixture_project("session-recall.jsonl", &bench.root);
++    let alpha_key = alpha.to_string_lossy().into_owned();
++
++    // The control: this word is in more than one project, so a single-project
++    // result is the scope working and not the corpus being thin.
++    let everywhere = answer(&conn, &[], Scope::Everything, "the");
++    assert!(
++        projects_of(&everywhere).len() > 2,
++        "`the` should reach several projects: {:?}",
++        projects_of(&everywhere)
++    );
++
++    let here = answer(&conn, &[], Scope::Directory(alpha.clone()), "the");
++    assert!(!here.hits.is_empty());
++    assert_eq!(here.reason, None);
++    assert_eq!(projects_of(&here), vec![alpha_key.clone()]);
++
++    // A subdirectory of the project resolves to the same key: the match is on
++    // path components, so anywhere inside the project is inside the project.
++    let deeper = answer(
++        &conn,
++        &[],
++        Scope::Directory(alpha.join("crates").join("core")),
++        "the",
++    );
++    assert_eq!(projects_of(&deeper), vec![alpha_key.clone()]);
++
++    // And naming it explicitly is the same rule over a caller-supplied string.
++    let named = answer(&conn, &[], Scope::parse(&alpha_key), "the");
++    assert_eq!(projects_of(&named), vec![alpha_key]);
++    assert_eq!(Scope::parse("*"), Scope::Everything);
++}
++
++/// A directory no archived project covers matches nothing, and says so.
++///
++/// The alternative is silently widening to every project, which reads as a
++/// scoping bug to anyone who notices and as an answer to everyone who does not.
++#[test]
++fn an_unknown_directory_matches_nothing_and_says_why() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let elsewhere = bench.root.join("no-project-here");
++    let response = answer(&conn, &[], Scope::Directory(elsewhere.clone()), "the");
++
++    assert!(response.hits.is_empty());
++    assert_eq!(
++        response.reason,
++        Some(Reason::UnknownProject {
++            named: elsewhere.to_string_lossy().into_owned()
++        })
++    );
++    // The reason renders: RCL-10 hands this to a caller to print.
++    assert!(response
++        .reason
++        .unwrap()
++        .to_string()
++        .contains("no-project-here"));
++}
++
++/// An exclusion covering the filesystem root short-circuits before any query.
++#[test]
++fn excluding_everything_short_circuits() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let response = answer(&conn, &["/"], Scope::Everything, "the");
++    assert!(response.hits.is_empty());
++    assert_eq!(response.reason, Some(Reason::EverythingExcluded));
++}
++
++/// The scope a caller stands in, when the config excludes it.
++#[test]
++fn standing_in_an_excluded_project_says_so() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let alpha = testkit::fixture_project("session-recall.jsonl", &bench.root);
++    let alpha_key = alpha.to_string_lossy().into_owned();
++
++    let response = answer(&conn, &[&alpha_key], Scope::Directory(alpha), "the");
++    assert!(response.hits.is_empty());
++    assert_eq!(
++        response.reason,
++        Some(Reason::ProjectExcluded {
++            project: alpha_key.clone()
++        })
++    );
++
++    // And `*` still hides it, where there is no scope to report a reason for.
++    let everywhere = answer(&conn, &[&alpha_key], Scope::Everything, "the");
++    assert_eq!(everywhere.reason, None);
++    assert!(!everywhere.hits.is_empty());
++    assert!(!projects_of(&everywhere).contains(&alpha_key));
++}
++
++/// One filtered search over every project.
++fn narrowed(conn: &Connection, raw: &str, filters: Filters) -> verbatim_core::Result<Response> {
++    search::run(
++        conn,
++        &config(&[]),
++        &Request::new(Query::parse(raw), Scope::Everything)
++            .filters(filters)
++            .limit(MAX_RESULTS),
++    )
++}
++
++/// The timestamps a response answered with, in the order it answered.
++fn stamps(response: &Response) -> Vec<String> {
++    response
++        .hits
++        .iter()
++        .map(|hit| hit.ts.clone().expect("every fixture turn carries a ts"))
++        .collect()
++}
++
++/// One turn's `tool_name`, straight off the row.
++fn tool_of(conn: &Connection, turn_id: i64) -> Option<String> {
++    conn.query_row(
++        "SELECT tool_name FROM turns WHERE id = ?1",
++        [turn_id],
++        |r| r.get(0),
++    )
++    .unwrap()
++}
++
++/// D-16: `turns.tool_name` is the whole tool filter.
++#[test]
++fn a_tool_filter_returns_only_that_tools_turns() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    // The control: this query reaches turns that are not tool calls at all, so
++    // a filtered result being all-Bash is the filter and not the corpus.
++    let unfiltered = ranked(&conn, "cargo", MAX_RESULTS);
++    assert!(unfiltered
++        .iter()
++        .any(|hit| tool_of(&conn, hit.turn_id).is_none()));
++
++    let bash = narrowed(
++        &conn,
++        "cargo",
++        Filters {
++            tool: Some("Bash".into()),
++            ..Filters::default()
++        },
++    )
++    .unwrap();
++    assert!(!bash.hits.is_empty());
++    assert!(bash.hits.len() < unfiltered.len());
++    for hit in &bash.hits {
++        assert_eq!(tool_of(&conn, hit.turn_id).as_deref(), Some("Bash"));
++    }
++
++    // A tool nothing in the corpus ran is an empty result, not an error.
++    let none = narrowed(
++        &conn,
++        "cargo",
++        Filters {
++            tool: Some("WebFetch".into()),
++            ..Filters::default()
++        },
++    )
++    .unwrap();
++    assert!(none.hits.is_empty());
++    assert_eq!(none.reason, None);
++}
++
++#[test]
++fn a_kind_filter_returns_only_that_record_type() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let unfiltered = ranked(&conn, "the", MAX_RESULTS);
++    assert!(unfiltered.iter().any(|hit| hit.record_type != "user"));
++
++    let users = narrowed(
++        &conn,
++        "the",
++        Filters {
++            kind: Some("user".into()),
++            ..Filters::default()
++        },
++    )
++    .unwrap();
++    assert!(!users.hits.is_empty());
++    assert!(users.hits.iter().all(|hit| hit.record_type == "user"));
++}
++
++/// The path filter is structural: it reads the `paths` table, so a turn that
++/// merely names the path in prose is not a hit.
++///
++/// Both turns match the query as text - one is the `Read` that opened the file,
++/// the other is the sentence about what was in it - which is what makes this a
++/// test of where the filter reads rather than of what the query matched.
++#[test]
++fn a_path_filter_is_structural_and_not_textual() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let textual = ranked(&conn, "docs/RETRY.md", MAX_RESULTS);
++    assert_eq!(textual.len(), 2, "{textual:?}");
++
++    let structural = narrowed(
++        &conn,
++        "docs/RETRY.md",
++        Filters {
++            paths: vec!["docs/RETRY.md".into()],
++            ..Filters::default()
++        },
++    )
++    .unwrap();
++    assert_eq!(structural.hits.len(), 1);
++    assert_eq!(
++        tool_of(&conn, structural.hits[0].turn_id).as_deref(),
++        Some("Read"),
++        "the surviving hit should be the tool call that opened the file"
++    );
++
++    // Several paths are a union, and a turn carrying two of them is still one
++    // hit rather than one per row.
++    let union = narrowed(
++        &conn,
++        "the",
++        Filters {
++            paths: vec!["docs/RETRY.md".into(), "src".into()],
++            ..Filters::default()
++        },
++    )
++    .unwrap();
++    let mut ids: Vec<i64> = union.hits.iter().map(|hit| hit.turn_id).collect();
++    let unique = {
++        ids.sort_unstable();
++        ids.dedup();
++        ids.len()
++    };
++    assert_eq!(unique, union.hits.len(), "a turn came back twice");
++}
++
++/// D-23: the window is a lexicographic comparison against `turns.ts`, and a
++/// bare date covers its own whole day.
++#[test]
++fn a_time_window_includes_and_excludes_by_timestamp() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let everything = stamps(&narrowed(&conn, "cargo", Filters::default()).unwrap());
++    assert!(everything.iter().any(|ts| ts.starts_with("2026-08-12")));
++    assert!(
++        everything.iter().any(|ts| ts.starts_with("2026-08-19")),
++        "the corpus needs turns on two days for a window to exclude anything"
++    );
++
++    // The bare-date case that discriminates: `until` on a day whose turns
++    // happen in the afternoon. Compared as written, `2026-08-12` sorts BEFORE
++    // every timestamp on 2026-08-12, so an unextended bound would return
++    // nothing at all from that day.
++    let until_day = stamps(
++        &narrowed(
++            &conn,
++            "cargo",
++            Filters {
++                until: Some("2026-08-12".into()),
++                ..Filters::default()
++            },
++        )
++        .unwrap(),
++    );
++    assert!(!until_day.is_empty());
++    assert!(until_day.iter().all(|ts| ts.starts_with("2026-08-12")));
++    assert!(until_day.iter().any(|ts| ts.as_str() > "2026-08-12T12:00"));
++
++    let since_day = stamps(
++        &narrowed(
++            &conn,
++            "cargo",
++            Filters {
++                since: Some("2026-08-19".into()),
++                ..Filters::default()
++            },
++        )
++        .unwrap(),
++    );
++    assert!(!since_day.is_empty());
++    assert!(since_day.iter().all(|ts| ts.starts_with("2026-08-19")));
++
++    // A full timestamp is used as written.
++    let afternoon = stamps(
++        &narrowed(
++            &conn,
++            "cargo",
++            Filters {
++                since: Some("2026-08-12T14:00:00.000Z".into()),
++                until: Some("2026-08-12T23:59:59.999Z".into()),
++                ..Filters::default()
++            },
++        )
++        .unwrap(),
++    );
++    assert!(!afternoon.is_empty());
++    assert!(afternoon
++        .iter()
++        .all(|ts| ts.as_str() >= "2026-08-12T14:00:00.000Z" && ts.starts_with("2026-08-12")));
++    assert!(
++        afternoon.len() < until_day.len(),
++        "the morning turns should have dropped out: {afternoon:?}"
++    );
++
++    // Both ends, one day.
++    let one_day = stamps(
++        &narrowed(
++            &conn,
++            "cargo",
++            Filters {
++                since: Some("2026-08-12".into()),
++                until: Some("2026-08-12".into()),
++                ..Filters::default()
++            },
++        )
++        .unwrap(),
++    );
++    assert_eq!(one_day, until_day);
++}
++
++/// A time of any other shape is a caller error, not an empty result.
++///
++/// Every string compares cleanly against every other, so a malformed bound
++/// would return a plausible wrong answer and nothing would say so.
++#[test]
++fn a_malformed_time_is_a_caller_error() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    for raw in [
++        "2026-8-1",
++        "12/08/2026",
++        "yesterday",
++        "2026-08-12T14:00:00Z",
++        "2026-08-12 14:00:00.000Z",
++        "",
++    ] {
++        for (field, filters) in [
++            (
++                "since",
++                Filters {
++                    since: Some(raw.into()),
++                    ..Filters::default()
++                },
++            ),
++            (
++                "until",
++                Filters {
++                    until: Some(raw.into()),
++                    ..Filters::default()
++                },
++            ),
++        ] {
++            match narrowed(&conn, "cargo", filters) {
++                Err(verbatim_core::Error::InvalidTimeFilter { field: got, value }) => {
++                    assert_eq!(got, field);
++                    assert_eq!(value, raw);
++                }
++                other => panic!("`{raw}` as {field} was not a caller error: {other:?}"),
++            }
++        }
++    }
++}
++
++/// RCL-04 matches a whole stored value, never one query token against one.
++///
++/// `path` and `error` values are multi-token by construction, so a
++/// token-equality rule could never fire for the two kinds this phase headlines.
++#[test]
++fn an_entity_match_is_against_the_whole_stored_value() {
++    let path = "src/worker/S.ts";
++
++    assert_eq!(
++        Query::parse(path).matches_entity(path),
++        Some(EntityMatch::Exact)
++    );
++    // Spelling that survives the tokenizer is the same value.
++    assert_eq!(
++        Query::parse("SRC worker s TS").matches_entity(path),
++        Some(EntityMatch::Exact)
++    );
++    // The query asks for more than the value, so the value is covered.
++    assert_eq!(
++        Query::parse("who edited src/worker/S.ts today").matches_entity(path),
++        Some(EntityMatch::Covered)
++    );
++    // One token of a multi-token value is not that value.
++    assert_eq!(Query::parse("worker").matches_entity(path), None);
++    assert_eq!(Query::parse("").matches_entity(path), None);
++    // A value that tokenizes to nothing cannot be asked for.
++    assert_eq!(Query::parse("anything").matches_entity("///"), None);
++}
++
++/// RCL-04's point: an exact structural match outranks a free-text one.
++///
++/// The assertion is the reordering itself. `cargo` reaches turns that ran it as
++/// a command and turns that merely say the word, and among them is a pair the
++/// text score ranks the wrong way round - which is what makes this a test of
++/// the entity weight rather than of bm25 agreeing with it.
++#[test]
++fn an_exact_entity_match_outranks_a_free_text_match() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let hits = ranked(&conn, "cargo", MAX_RESULTS);
++    let structural: Vec<&Hit> = hits.iter().filter(|h| h.entity_score > 0.0).collect();
++    let textual: Vec<&Hit> = hits.iter().filter(|h| h.entity_score == 0.0).collect();
++    assert!(!structural.is_empty() && !textual.is_empty(), "{hits:?}");
++
++    // The text score alone, which is what the relevance was before weighting.
++    let text_only = |hit: &Hit| hit.relevance - hit.entity_score;
++
++    let flipped = structural.iter().any(|entity_hit| {
++        textual.iter().any(|text_hit| {
++            text_only(text_hit) > text_only(entity_hit) && entity_hit.relevance > text_hit.relevance
++        })
++    });
++    assert!(
++        flipped,
++        "no turn carrying the exact command climbed past a turn that only says it: {hits:?}"
++    );
++}
++
++/// The same rule for a path: the tool call that opened the file outranks the
++/// sentence about what was in it.
++#[test]
++fn a_path_in_a_tool_call_outranks_the_same_path_in_prose() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let hits = ranked(&conn, "docs/RETRY.md", MAX_RESULTS);
++    assert_eq!(hits.len(), 2, "{hits:?}");
++
++    assert_eq!(
++        tool_of(&conn, hits[0].turn_id).as_deref(),
++        Some("Read"),
++        "the tool call should rank first: {hits:?}"
++    );
++    assert!(hits[0].entity_score > 0.0);
++    assert_eq!(
++        hits[1].entity_score, 0.0,
++        "a path named in prose emits no entity, so it earns no structural weight"
++    );
++}
++
++/// A value half the corpus carries moves a hit far less than a rare one.
++///
++/// Nothing is rejected and there is no stop-list: the common value still
++/// matches, and RCL-04 puts the judgement at query time precisely because "too
++/// common" changes as the archive grows.
++#[test]
++fn a_rare_entity_value_moves_a_hit_more_than_a_common_one() {
++    let bench = bench();
++    let common = "src/common/everywhere.rs";
++    let rare = "src/rare/once.rs";
++    let mut paths: Vec<&str> = vec![common; 30];
++    paths.push(rare);
++    bench.reads("entities.jsonl", &paths);
++    let conn = bench.conn();
++
++    let common_hits = ranked(&conn, common, MAX_RESULTS);
++    let rare_hits = ranked(&conn, rare, MAX_RESULTS);
++    assert_eq!(rare_hits.len(), 1, "{rare_hits:?}");
++    assert!(common_hits.len() > 10, "{}", common_hits.len());
++
++    let common_score = common_hits[0].entity_score;
++    let rare_score = rare_hits[0].entity_score;
++    assert!(common_score > 0.0, "the common value still matches");
++    assert!(
++        rare_score > common_score,
++        "rare {rare_score} should outweigh common {common_score}"
++    );
++
++    // Deterministic: the same store answers the same way twice.
++    assert_eq!(ranked(&conn, rare, MAX_RESULTS), rare_hits);
++    assert_eq!(ranked(&conn, common, MAX_RESULTS), common_hits);
++}
++
++/// D-05: every hit carries an excerpt cut from the archive, showing the text
++/// that matched.
++///
++/// `snippet()` over the contentless FTS table returns an empty string with exit
++/// 0, so an excerpt built from it would validate against the documented shape
++/// and say nothing. The assertion is therefore on the content: the queried word
++/// is in it, and the JSON the record is written in is not.
++#[test]
++fn every_hit_carries_an_excerpt_from_the_blob() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    for raw in [
++        "cargo",
++        "docs/RETRY.md",
++        "the echo agent repeats this line exactly",
++    ] {
++        let hits = ranked(&conn, raw, MAX_RESULTS);
++        assert!(!hits.is_empty(), "`{raw}` matched nothing");
++        for hit in &hits {
++            assert!(
++                !hit.excerpt.is_empty(),
++                "turn {} came back with no excerpt for `{raw}`",
++                hit.turn_id
++            );
++            let folded = hit.excerpt.to_lowercase();
++            assert!(
++                Query::parse(raw)
++                    .tokens()
++                    .iter()
++                    .any(|token| folded.contains(&token.to_lowercase())),
++                "excerpt for turn {} shows none of `{raw}`: {:?}",
++                hit.turn_id,
++                hit.excerpt
++            );
++            for key in ["\"type\"", "\"message\"", "\"content\"", "\"tool_use\""] {
++                assert!(
++                    !hit.excerpt.contains(key),
++                    "excerpt for turn {} is JSON, not prose: {:?}",
++                    hit.turn_id,
++                    hit.excerpt
++                );
++            }
++        }
++    }
++}
++
++/// D-20: several hits from one session read that session's blob once.
++///
++/// Whole-blob materialization is what this bounds, not decompression: the
++/// `blob` feature that would give the reader incremental I/O is deliberately
++/// not enabled, and one archived session reaches 10.1 MB uncompressed.
++#[test]
++fn one_session_is_read_once_however_many_hits_it_answered() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let response = answer(&conn, &[], Scope::Everything, "retry budget");
++    let mut sessions: Vec<&str> = response
++        .hits
++        .iter()
++        .map(|hit| hit.session_key.as_str())
++        .collect();
++    sessions.sort_unstable();
++    sessions.dedup();
++
++    assert!(
++        response.hits.len() > sessions.len(),
++        "this query needs several hits in one session to be about anything: {:?}",
++        response.hits
++    );
++    assert_eq!(response.reads.blobs, sessions.len());
++}
++
++/// A long turn is cut down, with the cut marked and the match inside the
++/// window.
++#[test]
++fn a_long_excerpt_is_a_window_around_the_match() {
++    let bench = bench();
++    let filler = "padding ".repeat(200);
++    bench.flood("long.jsonl", &format!("{filler} needleword"), 1);
++    let conn = bench.conn();
++
++    let hits = ranked(&conn, "needleword", MAX_RESULTS);
++    assert_eq!(hits.len(), 1, "{hits:?}");
++    let excerpt = &hits[0].excerpt;
++
++    assert!(excerpt.contains("needleword"), "{excerpt:?}");
++    assert!(excerpt.starts_with("..."), "the cut is marked: {excerpt:?}");
++    assert!(
++        excerpt.chars().count() <= verbatim_core::recall::EXCERPT_CHARS + 2 * "...".len(),
++        "excerpt is {} chars",
++        excerpt.chars().count()
++    );
++}
++
++/// A blob that will not decompress costs that hit its excerpt and nothing else.
++///
++/// `verbatim verify` is the command that reports archive damage; a search that
++/// failed outright would take every undamaged session's results down with it.
++#[test]
++fn a_damaged_blob_leaves_an_empty_excerpt_and_a_whole_hit() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let before = ranked(&conn, "cargo", MAX_RESULTS);
++    let damaged = before
++        .iter()
++        .find(|hit| hit.session_key.ends_with("session-errors-a.jsonl"))
++        .expect("the errors fixture answers this query")
++        .session_key
++        .clone();
++    conn.execute(
++        "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
++        rusqlite::params![vec![0u8; 64], &damaged],
++    )
++    .unwrap();
++
++    let after = ranked(&conn, "cargo", MAX_RESULTS);
++    assert_eq!(after.len(), before.len(), "the search still answered");
++    for hit in &after {
++        if hit.session_key == damaged {
++            assert!(hit.excerpt.is_empty());
++            // Everything else survived: the damage is one field wide.
++            assert!(!hit.record_type.is_empty());
++            assert!(hit.relevance > 0.0);
++        } else {
++            assert!(!hit.excerpt.is_empty(), "{hit:?}");
++        }
++    }
++}
++
++/// The turn at `seq` of the fixture whose file name ends with `fixture`.
++fn turn_at(conn: &Connection, fixture: &str, seq: i64) -> i64 {
++    conn.query_row(
++        "SELECT id FROM turns WHERE session_key LIKE '%' || ?1 AND turn_seq = ?2",
++        rusqlite::params![fixture, seq],
++        |r| r.get(0),
++    )
++    .unwrap_or_else(|e| panic!("{fixture} turn {seq}: {e}"))
++}
++
++fn around(
++    conn: &Connection,
++    exclusions: &[&str],
++    anchor: i64,
++    before: usize,
++    after: usize,
++) -> Window {
++    context::window(conn, &config(exclusions), anchor, before, after).unwrap()
++}
++
++/// RCL-08: the turns on either side of a hit, in `turn_seq` order.
++#[test]
++fn a_window_returns_the_requested_turns_in_turn_seq_order() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let anchor = turn_at(&conn, "session-recall.jsonl", 2);
++    let window = around(&conn, &[], anchor, 2, 2);
++
++    assert_eq!(window.reason, None);
++    let seqs: Vec<i64> = window.turns.iter().map(|turn| turn.turn_seq).collect();
++    assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
++    assert_eq!(window.turns.iter().filter(|turn| turn.is_anchor).count(), 1);
++    assert_eq!(window.turns[2].turn_id, anchor);
++    assert!(window.at_session_start, "seq 0 is the session's first turn");
++    assert!(!window.at_session_end, "seq 5 is still ahead");
++
++    // The text comes with them, projected the way the index projected it.
++    assert!(window
++        .turns
++        .iter()
++        .all(|turn| !turn.text.is_empty() && !turn.text.contains("\"type\"")));
++
++    // Asking for more than the session holds is a short window, not an error.
++    let whole = around(&conn, &[], anchor, MAX_CONTEXT_SIDE, MAX_CONTEXT_SIDE);
++    assert!(whole.at_session_start && whole.at_session_end);
++    assert_eq!(whole.turns.len(), 6);
++}
++
++/// D-22: `turn_seq` order, never timestamp order.
++///
++/// Half of all real sessions carry a record whose timestamp goes backwards, so
++/// a timestamp sort would show a reply before the prompt it answers in half the
++/// archive. This session's clock runs backwards on purpose.
++#[test]
++fn a_window_is_ordered_by_turn_seq_and_not_by_timestamp() {
++    let bench = bench();
++    bench.timeline(
++        "backwards.jsonl",
++        &[
++            "2026-08-12T23:00:04.000Z",
++            "2026-08-12T23:00:03.000Z",
++            "2026-08-12T23:00:02.000Z",
++            "2026-08-12T23:00:01.000Z",
++            "2026-08-12T23:00:00.000Z",
++        ],
++    );
++    let conn = bench.conn();
++
++    let anchor = turn_at(&conn, "backwards.jsonl", 2);
++    let window = around(&conn, &[], anchor, 2, 2);
++
++    let seqs: Vec<i64> = window.turns.iter().map(|turn| turn.turn_seq).collect();
++    assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
++
++    let stamps: Vec<&str> = window
++        .turns
++        .iter()
++        .map(|turn| turn.ts.as_deref().unwrap())
++        .collect();
++    let mut sorted = stamps.clone();
++    sorted.sort_unstable();
++    assert_ne!(
++        stamps, sorted,
++        "the fixture's clock must go backwards or this asserts nothing"
++    );
++}
++
++/// D-06: the window stops at the session and hands back the link it did not
++/// follow.
++#[test]
++fn a_window_stops_at_the_session_boundary() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let first = turn_at(&conn, "session-continuation.jsonl", 0);
++    let window = around(&conn, &[], first, 5, 1);
++
++    assert!(window.at_session_start);
++    assert_eq!(window.turns[0].turn_id, first);
++    assert!(
++        window.turns[0].is_anchor,
++        "nothing before the first turn of the file, however much was asked for"
++    );
++    assert!(
++        window.turns.iter().all(|turn| turn.turn_seq >= 0),
++        "{:?}",
++        window.turns
++    );
++    assert!(
++        window.continues_from.is_some(),
++        "this fixture continues another session, and the window returns the link \
++         rather than walking it"
++    );
++    // Every returned turn belongs to the one session.
++    let ids: Vec<i64> = window.turns.iter().map(|turn| turn.turn_id).collect();
++    for id in ids {
++        let key: String = conn
++            .query_row("SELECT session_key FROM turns WHERE id = ?1", [id], |r| {
++                r.get(0)
++            })
++            .unwrap();
++        assert!(key.ends_with("session-continuation.jsonl"), "{key}");
++    }
++}
++
++/// A turn of an excluded project has no window, and says why.
++#[test]
++fn a_window_into_an_excluded_project_is_empty_with_a_reason() {
++    let bench = bench();
++    let conn = bench.conn();
++
++    let alpha = testkit::fixture_project("session-recall.jsonl", &bench.root);
++    let alpha_key = alpha.to_string_lossy().into_owned();
++    let anchor = turn_at(&conn, "session-recall.jsonl", 2);
++
++    assert!(!around(&conn, &[], anchor, 1, 1).turns.is_empty());
++
++    let hidden = around(&conn, &[&alpha_key], anchor, 1, 1);
++    assert!(hidden.turns.is_empty());
++    assert_eq!(
++        hidden.reason,
++        Some(Reason::ProjectExcluded {
++            project: alpha_key.clone()
++        })
++    );
++
++    // And a turn that is not archived at all is a reason too, not a panic.
++    let missing = around(&conn, &[], -1, 1, 1);
++    assert!(missing.turns.is_empty());
++    assert_eq!(missing.reason, Some(Reason::NoSuchTurn { turn_id: -1 }));
++}
+diff --git a/crates/verbatim-core/tests/schema.rs b/crates/verbatim-core/tests/schema.rs
+index de1aca0..9934883 100644
+--- a/crates/verbatim-core/tests/schema.rs
++++ b/crates/verbatim-core/tests/schema.rs
+@@ -354,3 +354,38 @@ fn matching(conn: &Connection, query: &str) -> Vec<i64> {
+         .map(Result::unwrap)
+         .collect()
+ }
++
++/// How many indexes of that name the store carries: 0 or 1.
++fn index_count(conn: &Connection, name: &str) -> i64 {
++    conn.query_row(
++        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
++        [name],
++        |r| r.get(0),
++    )
++    .unwrap()
++}
++
++/// D-19: an index added in a later phase reaches an existing store because
++/// `reindex` runs the whole `CREATE_SQL` batch, and not because `Store::open`
++/// creates it.
++///
++/// `Store::open` runs `CREATE_SQL` only when a whole table is missing and
++/// `BRING_FORWARD_COLUMNS` covers columns rather than indexes, so an index that
++/// arrived with project-scoped search would otherwise exist on fresh stores and
++/// silently not on upgraded ones - two machines running one binary at different
++/// speeds, with nothing saying why.
++#[test]
++fn the_project_index_reaches_a_store_that_predates_it() {
++    let (_dir, mut store) = fresh();
++    assert_eq!(index_count(store.conn(), "idx_session_meta_project"), 1);
++
++    // A store written before the index existed.
++    store
++        .conn()
++        .execute_batch("DROP INDEX idx_session_meta_project")
++        .unwrap();
++    assert_eq!(index_count(store.conn(), "idx_session_meta_project"), 0);
++
++    verbatim_core::reindex::reindex(&mut store).unwrap();
++    assert_eq!(index_count(store.conn(), "idx_session_meta_project"), 1);
++}
+diff --git a/crates/verbatim-core/tests/store_open.rs b/crates/verbatim-core/tests/store_open.rs
+index 65b24be..3d3f135 100644
+--- a/crates/verbatim-core/tests/store_open.rs
++++ b/crates/verbatim-core/tests/store_open.rs
+@@ -212,6 +212,189 @@ fn a_file_that_is_not_a_store_is_named_as_such() {
+     assert!(matches!(err, Error::NotAStore { .. }), "{err:?}");
+ }
+ 
++/// D-10's first half: a read never creates the store it did not find.
++///
++/// Asserted on the filesystem rather than on the error, because the failure
++/// this prevents - `verbatim search` on a machine that has never ingested
++/// leaving a data directory behind - is a file that exists, not a message.
++#[test]
++fn a_read_only_open_of_a_missing_store_creates_nothing() {
++    let dir = tempfile::tempdir().unwrap();
++    let absent = dir.path().join("never-ingested");
++
++    let err = Store::open_read_only(&absent).expect_err("there is no store to open");
++    assert!(matches!(err, Error::StoreNotFound { .. }), "{err:?}");
++    assert!(!absent.exists(), "the read created the data directory");
++
++    // The other half: the directory is there and the database is not.
++    let empty = dir.path().join("empty");
++    std::fs::create_dir_all(&empty).unwrap();
++    let err = Store::open_read_only(&empty).expect_err("an empty data directory holds no store");
++    assert!(matches!(err, Error::StoreNotFound { .. }), "{err:?}");
++    assert_eq!(
++        std::fs::read_dir(&empty).unwrap().count(),
++        0,
++        "the read wrote something into an empty data directory"
++    );
++}
++
++/// D-10's second half: the connection cannot write, whatever the caller asks of
++/// it. `readOnlyHint` is a claim about this flag and nothing else.
++#[test]
++fn a_read_only_connection_refuses_every_write() {
++    let dir = tempfile::tempdir().unwrap();
++    drop(Store::open(dir.path()).unwrap());
++
++    let store = Store::open_read_only(dir.path()).expect("an existing store opens for reading");
++    assert!(store.rebuild_required().is_none());
++    assert!(store.missing_columns().is_empty());
++    assert!(!store.predates_this_build());
++
++    for statement in [
++        "INSERT INTO runs (started_at) VALUES ('2026-08-13T00:00:00Z')",
++        "CREATE TABLE scratch (x INTEGER)",
++        "ALTER TABLE session_meta ADD COLUMN invented TEXT",
++        "DELETE FROM meta",
++    ] {
++        let err = store
++            .conn()
++            .execute_batch(statement)
++            .expect_err("a read-only connection accepted a write");
++        assert!(
++            err.to_string().contains("readonly"),
++            "unexpected refusal for `{statement}`: {err}"
++        );
++    }
++}
++
++/// D-18: a store written before this build opens, reports itself, and is left
++/// exactly as it was - no bring-forward, no pragma, no byte of the store.
++///
++/// **What "untouched" can mean for a WAL database.** Measured here: a read-only
++/// connection to a WAL database materializes `verbatim.db-shm` (32 KB) and an
++/// empty `verbatim.db-wal` whenever the directory allows it, because the
++/// shared-memory index is how WAL readers find the snapshot at all. That is
++/// SQLite's, not ours - the same mechanism this constructor's
++/// [`Error::StoreUnreadable`] exists to report when the medium will *not* allow
++/// it. So the assertion is the one that carries the meaning: `verbatim.db` is
++/// byte-identical, every file that already existed is byte-identical, and the
++/// only additions are those two, with the WAL empty because nothing was
++/// committed through it.
++#[cfg(feature = "testkit")]
++#[test]
++fn a_read_only_open_of_an_older_store_reports_it_and_writes_nothing() {
++    use verbatim_core::store::schema::BRING_FORWARD_COLUMNS;
++
++    let dir = tempfile::tempdir().unwrap();
++    let data_dir = dir.path().join("data");
++    let work = dir.path().join("work");
++    std::fs::create_dir_all(&work).unwrap();
++
++    let path = verbatim_core::testkit::copy_fixture_into("session-basic.jsonl", &work);
++    match verbatim_core::ingest::run(&data_dir, &path).unwrap() {
++        verbatim_core::ingest::Outcome::Committed(_) => {}
++        other => panic!("the fixture must archive: {other:?}"),
++    }
++
++    // Age it the way `tests/schema.rs` does: phase 2's columns back off, the
++    // derived-schema integer back where a phase 1 binary left it.
++    {
++        let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
++        for (table, added) in BRING_FORWARD_COLUMNS {
++            for (name, _) in *added {
++                conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {name}"))
++                    .unwrap_or_else(|e| panic!("drop {table}.{name}: {e}"));
++            }
++        }
++        conn.execute(
++            "UPDATE meta SET value = '1' WHERE key = ?1",
++            [META_DERIVED_SCHEMA],
++        )
++        .unwrap();
++    }
++
++    let before = directory_bytes(&data_dir);
++    assert!(
++        before.iter().any(|(name, _)| name == DB_FILE_NAME),
++        "the aged store must exist to be compared"
++    );
++
++    let store = Store::open_read_only(&data_dir).expect("an aged store still opens for reading");
++    let rebuild = store
++        .rebuild_required()
++        .expect("an older derived_schema must be reported");
++    assert_eq!(rebuild.store_derived_schema, 1);
++    assert_eq!(rebuild.binary_derived_schema, DERIVED_SCHEMA);
++
++    // The columns a read query would have named. Reported, not added.
++    let missing: Vec<(&str, &str)> = store
++        .missing_columns()
++        .iter()
++        .map(|c| (c.table, c.column))
++        .collect();
++    for (table, added) in BRING_FORWARD_COLUMNS {
++        for (name, _) in *added {
++            assert!(
++                missing.contains(&(*table, *name)),
++                "{table}.{name} is gone and was not reported"
++            );
++        }
++    }
++    assert!(store.predates_this_build());
++
++    // A query naming one of them still fails - the point is that the caller was
++    // told, not that SQLite was made tolerant.
++    assert!(store
++        .conn()
++        .query_row("SELECT project_pre_worktree FROM session_meta", [], |_| Ok(
++            ()
++        ))
++        .is_err());
++
++    drop(store);
++    let after = directory_bytes(&data_dir);
++
++    for (name, bytes) in &before {
++        let found = after
++            .iter()
++            .find(|(n, _)| n == name)
++            .unwrap_or_else(|| panic!("the read-only open removed {name}"));
++        assert!(found.1 == *bytes, "the read-only open rewrote {name}");
++    }
++    for (name, bytes) in &after {
++        if before.iter().any(|(n, _)| n == name) {
++            continue;
++        }
++        assert!(
++            name == "verbatim.db-shm" || name == "verbatim.db-wal",
++            "the read-only open created {name}"
++        );
++        assert!(
++            name != "verbatim.db-wal" || bytes.is_empty(),
++            "the read-only open committed {} bytes through the WAL",
++            bytes.len()
++        );
++    }
++}
++
++/// Every file in `dir`, by name, with its bytes. Sorted, so two snapshots
++/// compare directly.
++#[cfg(feature = "testkit")]
++fn directory_bytes(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
++    let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
++        .unwrap()
++        .map(|entry| {
++            let entry = entry.unwrap();
++            (
++                entry.file_name().to_string_lossy().into_owned(),
++                std::fs::read(entry.path()).unwrap_or_default(),
++            )
++        })
++        .collect();
++    out.sort_by(|a, b| a.0.cmp(&b.0));
++    out
++}
++
+ fn runs_count(conn: &Connection) -> i64 {
+     conn.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
+         .unwrap()
