@@ -136,8 +136,14 @@ fn document(query: &str, hits: &[serde_json::Value], truncated: bool) -> Documen
 /// blank column that reads as an alignment bug.
 fn day(ts: Option<&str>) -> &str {
     match ts {
-        Some(ts) if ts.len() >= 10 => &ts[..10],
-        Some(ts) => ts,
+        // `get` and not `&ts[..10]`: `len` counts bytes, the slice needs a char
+        // boundary, and a stored `ts` is any JSON string the transcript carried
+        // (`parse::record` validates neither shape nor encoding). A timestamp
+        // with a multi-byte character across byte 10 panicked the whole command
+        // - exit 101, outside the documented 0/1/2 vocabulary - and took the
+        // project's every hit with it. Falling back to the raw string is what
+        // the short-timestamp arm already does.
+        Some(ts) => ts.get(..10).unwrap_or(ts),
         None => "(no time)",
     }
 }
@@ -224,4 +230,33 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
         limit,
         json,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::day;
+
+    /// A stored timestamp is any JSON string the transcript carried, so the
+    /// day cut has to be total over arbitrary bytes rather than over the one
+    /// shape D-23 measured.
+    #[test]
+    fn the_day_cut_survives_a_timestamp_that_is_not_the_measured_shape() {
+        // The shape 22,412 of 22,412 sampled turns actually carry.
+        assert_eq!(day(Some("2026-08-12T09:14:21.000Z")), "2026-08-12");
+
+        // A multi-byte character across byte 10. `len()` is 10 or more, so the
+        // old length guard admitted it and the slice panicked.
+        let ragged = "2026-08-1\u{e9}9:00:00.000Z";
+        assert!(ragged.len() > 10, "the premise: the length guard passes");
+        assert!(
+            !ragged.is_char_boundary(10),
+            "the premise: byte 10 is inside a character"
+        );
+        assert_eq!(day(Some(ragged)), ragged, "the whole string, not a panic");
+
+        // Shorter than the cut, and empty, both already fell through.
+        assert_eq!(day(Some("2026")), "2026");
+        assert_eq!(day(Some("")), "");
+        assert_eq!(day(None), "(no time)");
+    }
 }
