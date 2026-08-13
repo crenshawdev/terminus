@@ -35,6 +35,7 @@
 
 pub mod hook;
 pub mod ingest;
+pub mod install;
 pub mod json;
 pub mod mcp;
 pub mod read;

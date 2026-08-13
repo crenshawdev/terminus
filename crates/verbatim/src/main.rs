@@ -21,7 +21,8 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        verify                check every blob against its checksum\n  \
                        reindex               rebuild the derived tables from the blobs\n  \
                        status                sizes, counts, watermarks and the last ingest run\n  \
-                       mcp                   serve the three recall tools over stdio (for Claude Code)\n\
+                       mcp                   serve the three recall tools over stdio (for Claude Code)\n  \
+                       install               wire verbatim into Claude Code's hooks and mcp servers\n\
                      \n\
                      every data command accepts --json: one JSON document on stdout,\n\
                      every diagnostic on stderr, exit 0 on success including an empty result.";
@@ -104,6 +105,10 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         // it, nobody types it - and it writes JSON-RPC on stdout rather than
         // anything the `--json` contract above describes.
         "mcp" => cmd::mcp::run(cmd::mcp::parse(parser)?),
+        // Human-only and deliberately not a `--json` data command (D-24): it
+        // shows a diff and asks once, and a single JSON document on stdout
+        // cannot be both of those things.
+        "install" => cmd::install::run(cmd::install::parse(parser)?),
         other => Err(Failure::Misuse(format!("unknown command '{other}'"))),
     }
 }
