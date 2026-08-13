@@ -44,7 +44,6 @@ pub fn run(json: bool) -> Result<(), Failure> {
                     .field("turns", 0)
                     .field("skipped", Vec::<serde_json::Value>::new())
                     .emit();
-                eprintln!("verbatim: {held}");
                 return Err(Failure::Silent);
             }
             return Err(Failure::Operational(held));
@@ -77,25 +76,29 @@ pub fn run(json: bool) -> Result<(), Failure> {
             ));
         }
         document.emit();
+    } else {
+        // Nothing on stdout without `--json`: this command produces no data, and
+        // a caller must not have to filter a progress line out of the document.
+        // In JSON mode the same counts are in the document, so printing them
+        // here as well would be two accounts of one rebuild.
+        eprintln!(
+            "rebuilt {} turn(s) across {} session(s)",
+            rebuilt.turns, rebuilt.sessions
+        );
+        for (session_key, reason) in &rebuilt.failed {
+            eprintln!("{session_key}: {reason}");
+        }
+        if !rebuilt.failed.is_empty() {
+            eprintln!(
+                "{} session(s) could not be rebuilt and were skipped",
+                rebuilt.failed.len()
+            );
+        }
     }
-
-    // Nothing on stdout without `--json`: this command produces no data, and a
-    // caller must not have to filter a progress line out of the document.
-    eprintln!(
-        "rebuilt {} turn(s) across {} session(s)",
-        rebuilt.turns, rebuilt.sessions
-    );
 
     if rebuilt.failed.is_empty() {
         return Ok(());
     }
-    for (session_key, reason) in &rebuilt.failed {
-        eprintln!("{session_key}: {reason}");
-    }
-    eprintln!(
-        "{} session(s) could not be rebuilt and were skipped",
-        rebuilt.failed.len()
-    );
     // Every undamaged session was still rebuilt; the exit code is what tells a
     // script the store is not whole.
     Err(Failure::Silent)

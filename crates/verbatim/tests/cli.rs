@@ -504,13 +504,18 @@ fn the_three_shipped_commands_take_json_without_changing_their_plain_output() {
         assert!(document["data"].is_object(), "{command}: {document}");
     }
 
-    // The commentary is still on stderr, which is what "JSON and only JSON on
-    // stdout" is worth anything for. `status` is deliberately not in this list:
-    // its whole output IS the data, so it has no commentary to keep anywhere.
+    // Plain mode keeps its commentary on stderr; JSON mode MOVES it into the
+    // document rather than printing it twice. Two accounts of one walk that can
+    // disagree is what one shape exists to prevent.
     for command in ["verify", "reindex"] {
         assert!(
-            !stderr(&bench.run(&[command, "--json"])).is_empty(),
-            "{command} --json dropped the commentary instead of moving it"
+            !stderr(&bench.run(&[command])).is_empty(),
+            "{command} lost its plain-mode commentary"
+        );
+        assert_eq!(
+            stderr(&bench.run(&[command, "--json"])),
+            "",
+            "{command} --json printed commentary the document already carries"
         );
     }
 
@@ -607,4 +612,298 @@ fn reindex_json_reports_a_held_lock_as_a_document() {
     );
 
     drop(guard);
+}
+
+// ---------------------------------------------------------------------------
+// RCL-06: the shapes and the exit codes, swept across every data command
+//
+// One test per property rather than one test per command. A seventh data
+// command added in a later phase joins `DATA_COMMANDS` on one line and is held
+// to the whole contract by that alone.
+// ---------------------------------------------------------------------------
+
+/// Every data command, the arguments that make it answer, and the `data` fields
+/// `docs/json-shapes.md` says it emits.
+///
+/// The field lists are the documented shape, transcribed. That transcription is
+/// the point: a shape that drifts from the doc fails here, and a doc updated
+/// without the code fails here too.
+const DATA_COMMANDS: &[(&str, &[&str], &[&str])] = &[
+    (
+        "search",
+        &["--project", "*", "cargo"],
+        &["query", "truncated", "hits"],
+    ),
+    ("show", &["--project", "*"], &["records", "absent"]),
+    ("sessions", &["--project", "*"], &["sessions"]),
+    (
+        "status",
+        &[],
+        &[
+            "store",
+            "size_bytes",
+            "sessions",
+            "turns",
+            "watermarks",
+            "watermark_bytes",
+            "excluded",
+            "last_run",
+        ],
+    ),
+    ("verify", &[], &["checked", "failures"]),
+    ("reindex", &[], &["sessions", "turns", "skipped"]),
+];
+
+/// A bench with the whole fixture corpus in it and one known turn id, which is
+/// the argument `show` needs to answer at all.
+fn swept() -> (Bench, String) {
+    let bench = bench();
+    for fixture in testkit::TRANSCRIPT_FIXTURES {
+        bench.ingest(fixture);
+    }
+    let id: i64 = bench
+        .conn()
+        .query_row("SELECT min(id) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    (bench, id.to_string())
+}
+
+/// The command line for one swept command, with `show`'s id appended.
+fn sweep_args<'a>(command: &'a str, args: &'a [&'a str], id: &'a str) -> Vec<&'a str> {
+    let mut out = vec![command];
+    out.extend_from_slice(args);
+    if command == "show" {
+        out.push(id);
+    }
+    out
+}
+
+/// Property 1: `--json` output parses and matches the documented shape field for
+/// field, on every data command.
+#[test]
+fn every_data_command_emits_the_documented_shape() {
+    let (bench, id) = swept();
+
+    for (command, args, fields) in DATA_COMMANDS {
+        let mut argv = sweep_args(command, args, &id);
+        argv.push("--json");
+        let out = bench.run(&argv);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`{}`: {}",
+            argv.join(" "),
+            stderr(&out)
+        );
+
+        let value = document(&out);
+        let envelope = value.as_object().expect("a document is an object");
+        let mut keys: Vec<&str> = envelope.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["command", "data", "ok", "reason"],
+            "`{}` emitted a different envelope",
+            argv.join(" ")
+        );
+        assert_eq!(value["command"], *command);
+
+        let data = value["data"].as_object().expect("data is an object");
+        let mut present: Vec<&str> = data.keys().map(String::as_str).collect();
+        present.sort_unstable();
+        let mut documented: Vec<&str> = fields.to_vec();
+        documented.sort_unstable();
+        assert_eq!(
+            present,
+            documented,
+            "`{}` does not match docs/json-shapes.md",
+            argv.join(" ")
+        );
+    }
+}
+
+/// Property 2: with `--json`, stdout is the document and nothing else, and a
+/// warning still lands on stderr.
+///
+/// The rule `--json` keeps is that the document IS the answer: routine
+/// commentary moves into it, so a clean run writes nothing to stderr at all, and
+/// stderr is left for warnings. The second half of this test is what keeps the
+/// first from being vacuous - a store older than this build is a real warning,
+/// and it has to reach stderr without putting one byte on stdout.
+#[test]
+fn json_mode_keeps_stdout_pure_and_warnings_on_stderr() {
+    let (bench, id) = swept();
+
+    for (command, args, _) in DATA_COMMANDS {
+        let mut argv = sweep_args(command, args, &id);
+        argv.push("--json");
+        let out = bench.run(&argv);
+
+        let text = stdout(&out);
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "`{}` wrote more than the document to stdout: {text:?}",
+            argv.join(" ")
+        );
+        serde_json::from_str::<serde_json::Value>(text.trim())
+            .unwrap_or_else(|e| panic!("`{}` stdout is not JSON ({e}): {text:?}", argv.join(" ")));
+        assert_eq!(
+            stderr(&out),
+            "",
+            "`{}` printed commentary the document already carries",
+            argv.join(" ")
+        );
+    }
+
+    // Now give the commands something to warn about. `reindex` would repair it
+    // and `verify` and `status` do not read through the shared entry point, so
+    // the three read commands are the ones with a warning to place.
+    bench
+        .conn()
+        .execute(
+            "UPDATE meta SET value = ?1 WHERE key = ?2",
+            rusqlite::params![(DERIVED_SCHEMA - 1).to_string(), META_DERIVED_SCHEMA],
+        )
+        .unwrap();
+
+    for (command, args, _) in DATA_COMMANDS.iter().take(3) {
+        let mut argv = sweep_args(command, args, &id);
+        argv.push("--json");
+        let out = bench.run(&argv);
+
+        assert!(
+            stderr(&out).contains("predate this build"),
+            "`{}` swallowed the warning: {:?}",
+            argv.join(" "),
+            stderr(&out)
+        );
+        // And it is still exactly one document on stdout.
+        let text = stdout(&out);
+        assert_eq!(text.lines().count(), 1, "{text:?}");
+        serde_json::from_str::<serde_json::Value>(text.trim())
+            .unwrap_or_else(|e| panic!("`{}` stdout is not JSON ({e})", argv.join(" ")));
+    }
+}
+
+/// Property 3a: exit 0 on success, including an empty result set.
+///
+/// The empty case is the one RCL-06 exists for. Searching for a path is the
+/// headline command in the product and a raw `MATCH` would exit 1 on it, so
+/// "found nothing" and "could not ask" must never share a code.
+#[test]
+fn success_and_an_empty_result_both_exit_zero() {
+    let (bench, id) = swept();
+
+    for (command, args, _) in DATA_COMMANDS {
+        let argv = sweep_args(command, args, &id);
+        let out = bench.run(&argv);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`{}`: {}",
+            argv.join(" "),
+            stderr(&out)
+        );
+    }
+
+    // The empty results, one per read command, each of which could plausibly
+    // have been an error instead.
+    let unknown: String = bench
+        .conn()
+        .query_row("SELECT max(id) + 1000 FROM turns", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+        .to_string();
+    for argv in [
+        vec!["search", "--project", "*", "zzzznotinanyfixture"],
+        vec!["search", "--project", "*", "src/worker/does-not-exist.ts"],
+        vec!["show", "--project", "*", unknown.as_str()],
+        vec!["sessions", "--project", "*", "--until", "2000-01-01"],
+    ] {
+        let out = bench.run(&argv);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`{}` should be an empty result, not a failure: {}",
+            argv.join(" "),
+            stderr(&out)
+        );
+        assert_eq!(
+            stdout(&out),
+            "",
+            "`{}` printed data for an empty result",
+            argv.join(" ")
+        );
+    }
+}
+
+/// Property 3b: exit 2 for misuse, on every command, for an unknown flag - and
+/// for an unknown subcommand.
+#[test]
+fn an_unknown_flag_and_an_unknown_subcommand_both_exit_two() {
+    let (bench, id) = swept();
+
+    for (command, args, _) in DATA_COMMANDS {
+        let mut argv = sweep_args(command, args, &id);
+        argv.push("--definitely-not-a-flag");
+        let out = bench.run(&argv);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{}` should be misuse: {}",
+            argv.join(" "),
+            stderr(&out)
+        );
+        assert_eq!(
+            stdout(&out),
+            "",
+            "`{}` printed to stdout on misuse",
+            argv.join(" ")
+        );
+    }
+
+    for argv in [vec!["no-such-command"], vec!["no-such-command", "--json"]] {
+        let out = bench.run(&argv);
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+    }
+}
+
+/// Property 3c: exit 1 for an operational failure, with the `--json` document
+/// still written and `ok` false.
+///
+/// A caller that parses the document and a caller that checks the code must not
+/// disagree about whether the store is whole, which is why this asserts both on
+/// the same run rather than one on each.
+#[test]
+fn an_operational_failure_exits_one_with_ok_false() {
+    let bench = bench();
+    bench.ingest("session-basic.jsonl");
+    let sidecar = bench.ingest("subagents/agent-alpha.jsonl");
+
+    {
+        let conn = bench.conn();
+        let mut bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT blob FROM sessions WHERE session_key = ?1",
+                [&sidecar],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] ^= 0xff;
+        conn.execute(
+            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
+            rusqlite::params![bytes, &sidecar],
+        )
+        .unwrap();
+    }
+
+    let out = bench.run(&["verify", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let value = document(&out);
+    assert_eq!(value["ok"], false, "{value}");
+    assert!(value["reason"].is_string(), "{value}");
 }

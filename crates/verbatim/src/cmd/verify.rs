@@ -40,15 +40,16 @@ pub fn run(json: bool) -> Result<(), Failure> {
         // commentary and goes to stderr, which also keeps stdout free of anything
         // AC3's "and no other session" clause would have to exempt.
         print!("{}", report.render());
+        // Not printed in JSON mode, and that is the rule rather than an
+        // omission: `--json` means the document IS the answer, so routine
+        // commentary moves into it and stderr is left for warnings. Printing
+        // both would give a caller two accounts of one walk that can disagree.
+        eprintln!(
+            "{} session(s) checked, {} failed",
+            report.checked,
+            report.failures.len()
+        );
     }
-
-    // On stderr either way: in JSON mode stdout carries the document and nothing
-    // else, and the commentary a human wants is still printed.
-    eprintln!(
-        "{} session(s) checked, {} failed",
-        report.checked,
-        report.failures.len()
-    );
 
     if report.is_ok() {
         Ok(())

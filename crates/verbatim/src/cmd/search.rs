@@ -31,15 +31,20 @@ const COMMAND: &str = "search";
 const DEFAULT_LIMIT: usize = 10;
 
 pub fn run(args: Args) -> Result<(), Failure> {
+    // Parsed before the store is opened, so both exits carry the same shape: a
+    // document whose fields depend on whether a store was there would be a
+    // second shape for a caller to handle.
+    let query = Query::parse(&args.query);
+    let truncated = query.truncated();
+
     let reader = match read::open()? {
         Opened::Ready(reader) => reader,
         Opened::Nothing(reason) => {
-            return read::empty(document(&args.query, &[]), &reason, args.json)
+            return read::empty(document(&args.query, &[], truncated), &reason, args.json)
         }
     };
 
-    let query = Query::parse(&args.query);
-    if query.truncated() {
+    if truncated {
         // On stderr, and the search still runs. The tokens are conjoined, so a
         // truncated query is BROADER than the one asked for rather than wrong in
         // a direction the user cannot see - but they are owed the fact.
@@ -85,8 +90,7 @@ pub fn run(args: Args) -> Result<(), Failure> {
                 })
             })
             .collect();
-        document(&args.query, &hits)
-            .field("truncated", request.query.truncated())
+        document(&args.query, &hits, truncated)
             .maybe_because(response.reason.as_ref())
             .emit();
         return Ok(());
@@ -117,9 +121,10 @@ pub fn run(args: Args) -> Result<(), Failure> {
 }
 
 /// The envelope for this command, with its hits already in it.
-fn document(query: &str, hits: &[serde_json::Value]) -> Document {
+fn document(query: &str, hits: &[serde_json::Value], truncated: bool) -> Document {
     Document::new(COMMAND)
         .field("query", query)
+        .field("truncated", truncated)
         .field("hits", hits.to_vec())
 }
 

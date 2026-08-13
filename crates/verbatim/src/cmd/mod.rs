@@ -1,9 +1,29 @@
-//! The subcommands: `ingest`, `verify`, `reindex`, `status`.
+//! The subcommands: `ingest`, `search`, `show`, `sessions`, `verify`, `reindex`,
+//! `status`.
 //!
-//! `--json` on data commands, stable output shapes and the full exit-code
-//! contract are RCL-06 in phase 3. What is here is only what the phase-1
-//! acceptance criteria assert on: exit 0 on success, 1 on operational failure,
-//! 2 on misuse, data on stdout, errors on stderr.
+//! # The contract every data command keeps (RCL-06)
+//!
+//! **Exit codes.** 0 on success **including an empty result set** - a query that
+//! matched nothing is a successful answer to a question with no matches - 1 on
+//! operational failure, 2 on misuse. [`Failure`] is the one place that split
+//! lives, so a script can tell "this store is corrupt" from "you typed it
+//! wrong".
+//!
+//! **Streams.** Data on stdout, every diagnostic on stderr, on every path. That
+//! is what lets `verbatim search --json | jq` work while a warning is still
+//! printed.
+//!
+//! **`--json`.** Every data command accepts it and writes exactly one document
+//! on stdout and nothing else: `{command, ok, reason, data}`, built and
+//! serialized by `serde_json` and never assembled with `format!` (D-25). `ok` is
+//! the exit code's answer, and a caller that parses the document and a caller
+//! that checks the code never disagree - `verify --json` on a damaged store
+//! writes its failures AND exits 1.
+//!
+//! The shapes are documented field for field in `docs/json-shapes.md` and
+//! `crates/verbatim/tests/cli.rs` holds every command to them: one test per
+//! property across all commands, rather than one test per command, so a seventh
+//! command is one line rather than a new file.
 
 pub mod ingest;
 pub mod json;
