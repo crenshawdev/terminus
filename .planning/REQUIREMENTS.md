@@ -51,7 +51,7 @@ Committed scope. Each maps to exactly one roadmap phase.
 
 - **INST-01**: `npx verbatim install` runs from a thin npm package with per-platform optional dependencies and no postinstall script.
 - **INST-02**: Install copies the platform binary to the canonical stable path and points both hook entries and MCP registration at that copy, without modifying PATH.
-- **INST-03**: Install shows the exact `settings.json` diff, backs the file up, confirms once, merges into the existing hooks object atomically, and produces no second entry when rerun.
+- **INST-03**: Install shows the exact diff for each file it changes (`~/.claude/settings.json` and `~/.claude.json`), backs each one up, confirms once, merges into the existing objects atomically, and produces no second entry when rerun.
 - **INST-04**: Install offers to raise `cleanupPeriodDays` when it is low and prints the auto-compact recommendation, without changing either setting itself.
 - **INST-05**: An upgrade replaces the binary and re-copies it to the stable path without rewriting a single hook entry.
 - **INST-06**: `verbatim doctor` is read-only, never repairs, and prints the exact command that fixes each problem it reports.
