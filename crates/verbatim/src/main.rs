@@ -14,6 +14,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                      commands:\n  \
                        ingest                archive every transcript under the configured roots\n  \
                        ingest <path.jsonl>   archive one transcript file\n  \
+                       hook <event>          start an ingest for a Claude Code hook event\n  \
                        search <words>        find a past turn by text, path, error or identifier\n  \
                        show <id>...          print the archived record behind a turn id\n  \
                        sessions              list every archived session a read path may see\n  \
@@ -78,6 +79,10 @@ fn run() -> Result<(), Failure> {
 fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
     match name {
         "ingest" => cmd::ingest::run(cmd::ingest::parse(parser)?),
+        // Written into settings.json by `verbatim install` and never typed by
+        // hand. It writes nothing to stdout and exits 0 once its event name is
+        // known, because a hook that fails is a hook that can block a prompt.
+        "hook" => cmd::hook::run(cmd::hook::parse(parser)?),
         "search" => cmd::search::run(cmd::search::parse(parser)?),
         "show" => cmd::show::run(cmd::show::parse(parser)?),
         "sessions" => cmd::sessions::run(cmd::sessions::parse(parser)?),

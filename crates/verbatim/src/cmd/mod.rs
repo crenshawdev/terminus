@@ -33,6 +33,7 @@
 //! property across all commands, rather than one test per command, so a seventh
 //! command is one line rather than a new file.
 
+pub mod hook;
 pub mod ingest;
 pub mod json;
 pub mod mcp;

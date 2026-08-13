@@ -54,8 +54,6 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 ///
 /// The environment is inherited unchanged, which is how `VERBATIM_DATA_DIR`,
 /// `VERBATIM_CONFIG_DIR` and `CLAUDE_CONFIG_DIR` reach the work.
-// The only caller is the `hook` subcommand, which lands in the next commit.
-#[allow(dead_code)]
 pub fn detached<S: AsRef<OsStr>>(args: &[S]) -> io::Result<()> {
     spawn(args, true)
 }
