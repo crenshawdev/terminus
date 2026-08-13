@@ -557,6 +557,38 @@ fn a_symlink_at_the_backup_name_is_not_written_through() {
     );
 }
 
+/// D-07 again, at the other end of the confirmation: a program that appears at
+/// the stable path while install is waiting for an answer is refused, not
+/// renamed over.
+///
+/// The check `run` makes is from before the question. The rename clobbers.
+#[test]
+fn a_binary_that_appears_during_the_confirmation_is_still_refused() {
+    let fixture = fixture();
+    fixture.seed();
+    let paused = fixture.at_the_prompt(&["install"]);
+
+    let foreign = b"#!/bin/sh\nexit 0\n";
+    std::fs::write(fixture.stable(), foreign).unwrap();
+
+    let (status, said) = paused.answer("y\n");
+    assert!(!status.success(), "install overwrote a stranger: {said}");
+    assert!(
+        said.contains("is not a verbatim build"),
+        "the refusal did not say what it found: {said}"
+    );
+    assert_eq!(std::fs::read(fixture.stable()).unwrap(), foreign);
+    assert_eq!(
+        std::fs::read_to_string(fixture.settings()).unwrap(),
+        SETTINGS
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        CLAUDE_JSON
+    );
+    assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
+}
+
 // ---------------------------------------------------------------------------
 // Task 3: the four hook entries
 // ---------------------------------------------------------------------------

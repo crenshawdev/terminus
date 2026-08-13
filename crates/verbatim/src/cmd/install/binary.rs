@@ -174,6 +174,13 @@ fn carries_marker(mut file: impl Read) -> std::io::Result<bool> {
 /// platform. That is atomic everywhere, and on Windows it is also the only way
 /// to replace an executable that may be running - the running image holds the
 /// old inode and the name points at the new one.
+///
+/// [`occupant`] is asked again immediately before the rename, and a foreign
+/// occupant refuses here too. The check `run` made is from before the
+/// confirmation, which is as old as the user took to answer, and the rename
+/// clobbers whatever it lands on. What is left is the microseconds between this
+/// answer and the rename itself: closing that needs a rename that refuses to
+/// replace, which no platform offers through `std`.
 pub fn place(dest: &Path) -> Result<(), Failure> {
     let source = std::env::current_exe().map_err(|e| {
         Failure::Operational(format!("this build's own path could not be resolved: {e}"))
@@ -189,11 +196,19 @@ pub fn place(dest: &Path) -> Result<(), Failure> {
     // symlink would otherwise be followed, truncating whatever it points at and
     // then renaming the link itself over the stable path.
     let (temporary, file) = super::create_temporary(dir, ".verbatim-install-")?;
-    let outcome = copy_into(&source, file, &temporary).and_then(|()| {
-        std::fs::rename(&temporary, dest).map_err(|e| {
-            Failure::Operational(format!("{} could not be replaced: {e}", dest.display()))
+    let outcome = copy_into(&source, file, &temporary)
+        .and_then(|()| match occupant(dest)? {
+            // Not the check `run` made: that one is from before the question was
+            // asked. This is the last look anything gets at the path the rename
+            // is about to take.
+            Occupant::Foreign => Err(super::occupied(dest)),
+            Occupant::Vacant | Occupant::Ours => Ok(()),
         })
-    });
+        .and_then(|()| {
+            std::fs::rename(&temporary, dest).map_err(|e| {
+                Failure::Operational(format!("{} could not be replaced: {e}", dest.display()))
+            })
+        });
     if outcome.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }

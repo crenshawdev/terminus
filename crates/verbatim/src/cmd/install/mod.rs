@@ -400,7 +400,7 @@ fn unanswerable(why: &str) -> Failure {
 /// 12 MB different program whose `--version` prints `verbatim 0.1.0`, byte for
 /// byte this build's output. So the refusal is the only safe answer, and the
 /// command that overrides it has to be the user's to type.
-fn occupied(stable: &Path) -> Failure {
+pub(super) fn occupied(stable: &Path) -> Failure {
     let removal = if cfg!(windows) {
         format!("del \"{}\"", stable.display())
     } else {
