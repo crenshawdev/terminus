@@ -243,19 +243,99 @@ fn status_prints_the_damaged_files_path_and_error_from_the_last_run() {
     assert_eq!(sessions, 2);
 }
 
-/// No `--json` flag: RCL-06's stable shapes are phase 3, and an unadvertised
-/// flag accepted now becomes a shape to keep.
+/// D-24: `status --json` emits the same numbers the human output prints, as one
+/// document, and any OTHER argument is still misuse.
+///
+/// The numbers are read out of the store independently and compared against the
+/// document rather than against the prose, because two accounts of one store
+/// that can disagree is the whole reason the retrofit landed in the phase that
+/// owns the contract rather than beside install in phase 4.
 #[test]
-fn status_json_is_misuse_and_prints_nothing_to_stdout() {
+fn status_json_carries_the_same_numbers_as_the_human_output() {
     let bench = bench();
-    let out = bench.run(&["status", "--json"]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    assert_eq!(stdout(&out), "");
+    bench.place(&format!("{}.jsonl", uuid(1)), "session-basic.jsonl");
+    bench.place(&format!("{}.jsonl", uuid(2)), "session-large-record.jsonl");
+    bench.config("exclude = [\"/data/projects/nowhere\"]\n");
+    let ingest = bench.run(&["ingest"]);
+    assert_eq!(ingest.status.code(), Some(0), "{}", stderr(&ingest));
 
-    // Any argument, not just that one.
+    let conn = bench.conn();
+    let sessions: i64 = conn
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    let turns: i64 = conn
+        .query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    let started: String = conn
+        .query_row(
+            "SELECT started_at FROM runs ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let out = bench.run(&["status", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let text = stdout(&out);
+    let mut lines = text.lines();
+    let document: serde_json::Value = serde_json::from_str(lines.next().expect("a document"))
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {text:?}"));
+    assert_eq!(lines.next(), None, "stdout carried prose too: {text:?}");
+
+    assert_eq!(document["command"], "status");
+    assert_eq!(document["ok"], true);
+    let data = &document["data"];
+    assert_eq!(data["sessions"], sessions);
+    assert_eq!(data["turns"], turns);
+    assert_eq!(data["watermarks"], sessions);
+    assert!(data["watermark_bytes"].as_i64().unwrap() > 0, "{document}");
+    assert!(data["size_bytes"].as_u64().unwrap() > 0, "{document}");
+    assert!(
+        data["store"].as_str().unwrap().ends_with(DB_FILE_NAME),
+        "{document}"
+    );
+    assert_eq!(
+        data["excluded"],
+        serde_json::json!(["/data/projects/nowhere"])
+    );
+    assert_eq!(data["last_run"]["started_at"], started);
+    assert_eq!(data["last_run"]["error"], serde_json::Value::Null);
+
+    // The human run is unchanged, and says the same things.
+    let human = stdout(&bench.run(&["status"]));
+    assert!(
+        human.contains(&format!("sessions       {sessions}")),
+        "{human}"
+    );
+    assert!(
+        human.contains(&format!("turns          {turns}")),
+        "{human}"
+    );
+    assert!(
+        !human.starts_with('{'),
+        "the plain run emitted JSON: {human}"
+    );
+
+    // Any other argument is still misuse.
     let out = bench.run(&["status", "extra"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert_eq!(stdout(&out), "");
+}
+
+/// An empty store's document is zeroes and a null last run, not an error.
+#[test]
+fn status_json_on_an_empty_data_directory_is_zeroes_and_a_null_run() {
+    let bench = bench();
+    let out = bench.run(&["status", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let document: serde_json::Value = serde_json::from_str(stdout(&out).trim()).unwrap();
+    assert_eq!(document["ok"], true);
+    assert_eq!(document["data"]["sessions"], 0);
+    assert_eq!(document["data"]["turns"], 0);
+    assert_eq!(document["data"]["last_run"], serde_json::Value::Null);
+    assert_eq!(document["data"]["excluded"], serde_json::json!([]));
 }
 
 /// `status` takes no ingest lock: reading while a pass runs must work, which is

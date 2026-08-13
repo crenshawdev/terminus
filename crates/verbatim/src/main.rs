@@ -16,7 +16,10 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        ingest <path.jsonl>   archive one transcript file\n  \
                        verify                check every blob against its checksum\n  \
                        reindex               rebuild the derived tables from the blobs\n  \
-                       status                sizes, counts, watermarks and the last ingest run";
+                       status                sizes, counts, watermarks and the last ingest run\n\
+                     \n\
+                     every data command accepts --json: one JSON document on stdout,\n\
+                     every diagnostic on stderr, exit 0 on success including an empty result.";
 
 fn main() -> ExitCode {
     match run() {
@@ -64,28 +67,14 @@ fn run() -> Result<(), Failure> {
 fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
     match name {
         "ingest" => cmd::ingest::run(cmd::ingest::parse(parser)?),
-        "verify" => {
-            no_more_arguments(parser)?;
-            cmd::verify::run()
-        }
-        "reindex" => {
-            no_more_arguments(parser)?;
-            cmd::reindex::run()
-        }
-        "status" => {
-            no_more_arguments(parser)?;
-            cmd::status::run()
-        }
+        // D-24: the three commands phase 1 and 2 shipped take `--json` and
+        // nothing else. `cmd::json_flag` is what replaced `no_more_arguments`
+        // here - the rule that a subcommand rejects every argument it was not
+        // written for still holds, and `--json` is now one it was.
+        "verify" => cmd::verify::run(cmd::json_flag(parser)?),
+        "reindex" => cmd::reindex::run(cmd::json_flag(parser)?),
+        "status" => cmd::status::run(cmd::json_flag(parser)?),
         other => Err(Failure::Misuse(format!("unknown command '{other}'"))),
-    }
-}
-
-/// A subcommand that takes no arguments still has to reject the ones it was
-/// given: silently ignoring them is how `verify --json` comes to look supported.
-fn no_more_arguments(parser: &mut lexopt::Parser) -> Result<(), Failure> {
-    match parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
-        None => Ok(()),
-        Some(arg) => Err(Failure::Misuse(unexpected(arg))),
     }
 }
 

@@ -496,6 +496,7 @@ version = "0.1.0"
 dependencies = [
  "lexopt",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "verbatim-core",
 ]

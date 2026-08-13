@@ -96,6 +96,25 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// The one JSON document a `--json` run wrote to stdout.
+///
+/// Parsed rather than substring-matched, and it asserts stdout holds that
+/// document and nothing else: "JSON and only JSON on stdout" is the half of the
+/// contract a `contains` check cannot fail on, because a progress line printed
+/// beside a valid document still contains it.
+fn document(output: &Output) -> serde_json::Value {
+    let text = stdout(output);
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_else(|| panic!("stdout was empty"));
+    assert_eq!(
+        lines.next(),
+        None,
+        "stdout carried more than the document: {text:?}"
+    );
+    serde_json::from_str(first)
+        .unwrap_or_else(|e| panic!("stdout is not one JSON document ({e}): {text:?}"))
+}
+
 /// AC3, at the process boundary: exit 0 and an empty stdout on a clean store.
 #[test]
 fn verify_exits_zero_and_says_nothing_on_a_clean_store() {
@@ -312,10 +331,19 @@ fn reindex_rebuilds_the_derived_tables_to_byte_identical_query_output() {
 /// phase 1 and is the tree pass now, which is an intended change to a shipped
 /// contract; `bare_ingest_walks_only_the_configured_temporary_root` is the
 /// assertion that replaced it.
+///
+/// `verify --json` left it in phase 3 the same way and for the same reason:
+/// D-24 makes it supported, so the case that stands for "a subcommand rejects
+/// what it was not written for" is now a flag no command accepts.
 #[test]
 fn misuse_exits_two_with_an_empty_stdout() {
     let bench = bench();
-    for args in [vec!["verify", "--json"], vec!["no-such-command"]] {
+    for args in [
+        vec!["verify", "--nope"],
+        vec!["reindex", "extra"],
+        vec!["status", "-x"],
+        vec!["no-such-command"],
+    ] {
         let out = bench.run(&args);
         assert_eq!(
             out.status.code(),
@@ -447,4 +475,136 @@ fn bare_ingest_walks_only_the_configured_temporary_root() {
         .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
         .unwrap();
     assert_eq!(after, 2);
+}
+
+/// D-24, on the three commands phase 1 and 2 shipped: `--json` writes one
+/// document to stdout, and the run without it writes exactly what it wrote
+/// before the flag existed.
+///
+/// The second half is the half that can regress silently. Adding a mode to a
+/// command is how its default output picks up a stray line, and `reindex`
+/// producing nothing on stdout is a contract phase 1 already shipped.
+#[test]
+fn the_three_shipped_commands_take_json_without_changing_their_plain_output() {
+    let bench = bench();
+    bench.ingest("session-basic.jsonl");
+    bench.ingest("subagents/agent-alpha.jsonl");
+
+    // Plain: byte-for-byte what phase 1 and 2 print.
+    assert_eq!(stdout(&bench.run(&["verify"])), "");
+    assert_eq!(stdout(&bench.run(&["reindex"])), "");
+
+    for command in ["verify", "reindex", "status"] {
+        let out = bench.run(&[command, "--json"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let document = document(&out);
+        assert_eq!(document["command"], command);
+        assert_eq!(document["ok"], true);
+        assert_eq!(document["reason"], serde_json::Value::Null);
+        assert!(document["data"].is_object(), "{command}: {document}");
+    }
+
+    // The commentary is still on stderr, which is what "JSON and only JSON on
+    // stdout" is worth anything for. `status` is deliberately not in this list:
+    // its whole output IS the data, so it has no commentary to keep anywhere.
+    for command in ["verify", "reindex"] {
+        assert!(
+            !stderr(&bench.run(&[command, "--json"])).is_empty(),
+            "{command} --json dropped the commentary instead of moving it"
+        );
+    }
+
+    // The numbers are the work, not a placeholder.
+    let verify = document(&bench.run(&["verify", "--json"]));
+    assert_eq!(verify["data"]["checked"], 2);
+    assert_eq!(verify["data"]["failures"].as_array().unwrap().len(), 0);
+
+    let reindex = document(&bench.run(&["reindex", "--json"]));
+    assert_eq!(reindex["data"]["sessions"], 2);
+    assert!(reindex["data"]["turns"].as_i64().unwrap() > 0, "{reindex}");
+    assert_eq!(reindex["data"]["skipped"].as_array().unwrap().len(), 0);
+}
+
+/// A store with a flipped byte: `verify --json` exits 1 AND names the session,
+/// in the one document.
+///
+/// Both halves together are the point. A caller that parses the document and a
+/// caller that checks the exit code must not disagree about whether the store
+/// is whole, so the failing id being present is not an alternative to the
+/// non-zero exit.
+#[test]
+fn verify_json_names_the_corrupt_session_and_still_exits_one() {
+    let bench = bench();
+    let parent = bench.ingest("session-basic.jsonl");
+    let sidecar = bench.ingest("subagents/agent-alpha.jsonl");
+
+    {
+        let conn = bench.conn();
+        let mut bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT blob FROM sessions WHERE session_key = ?1",
+                [&sidecar],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] ^= 0xff;
+        conn.execute(
+            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
+            rusqlite::params![bytes, &sidecar],
+        )
+        .unwrap();
+    }
+
+    let out = bench.run(&["verify", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+
+    let document = document(&out);
+    assert_eq!(document["ok"], false);
+    assert!(
+        document["reason"].as_str().is_some_and(|r| r.contains('1')),
+        "the reason must say how many failed: {document}"
+    );
+    let failures = document["data"]["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1, "{document}");
+    assert_eq!(failures[0]["session_key"], sidecar);
+    assert!(
+        failures[0]["detail"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "a failure says why: {document}"
+    );
+    assert!(
+        !document.to_string().contains(&parent),
+        "the document named a session that verified: {document}"
+    );
+}
+
+/// `reindex --json` on a store whose lock another process holds: the refusal is
+/// a document with `ok: false` and a reason, not an empty stdout.
+///
+/// A `--json` caller that got nothing on stdout could not tell a refusal from a
+/// crash, which is the case this covers and the plain-mode path does not.
+#[test]
+fn reindex_json_reports_a_held_lock_as_a_document() {
+    let bench = bench();
+    bench.ingest("session-basic.jsonl");
+
+    let guard = match verbatim_core::ingest::lock::try_acquire(&bench.data_dir).unwrap() {
+        verbatim_core::ingest::Attempt::Acquired(guard) => guard,
+        other => panic!("the lock should have been free: {other:?}"),
+    };
+
+    let out = bench.run(&["reindex", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let document = document(&out);
+    assert_eq!(document["ok"], false);
+    assert!(
+        document["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("LOCK")),
+        "the refusal must name the lock: {document}"
+    );
+
+    drop(guard);
 }

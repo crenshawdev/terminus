@@ -21,10 +21,12 @@
 use std::fmt::Display;
 use std::path::Path;
 
+use serde_json::json;
 use verbatim_core::config::visible;
 use verbatim_core::store::{Store, DB_FILE_NAME};
 use verbatim_core::Config;
 
+use super::json::Document;
 use super::Failure;
 
 /// A store or filesystem error is operational (exit 1), never misuse.
@@ -32,13 +34,70 @@ fn read<T, E: Display>(result: std::result::Result<T, E>) -> Result<T, Failure> 
     result.map_err(|e| Failure::Operational(e.to_string()))
 }
 
-pub fn run() -> Result<(), Failure> {
+pub fn run(json: bool) -> Result<(), Failure> {
     let data_dir = super::data_dir()?;
     let config = Config::load()?;
     let store = Store::open(&data_dir)?;
     let conn = store.conn();
 
     let counts = read(visible::counts(conn, &config))?;
+    // Counted first rather than reached for with an optional row, so that "no
+    // run yet" and "the query failed" stay two different answers.
+    let runs: i64 = read(conn.query_row("SELECT count(*) FROM runs", [], |r| r.get(0)))?;
+    let last: Option<Run> = if runs == 0 {
+        None
+    } else {
+        Some(read(conn.query_row(
+            "SELECT started_at, coalesce(duration_ms, 0), files_seen, files_committed,
+                    files_failed, bytes_read, turns_added, error
+             FROM runs ORDER BY id DESC LIMIT 1",
+            [],
+            |r| {
+                Ok(Run {
+                    started_at: r.get(0)?,
+                    duration_ms: r.get(1)?,
+                    files_seen: r.get(2)?,
+                    files_committed: r.get(3)?,
+                    files_failed: r.get(4)?,
+                    bytes_read: r.get(5)?,
+                    turns_added: r.get(6)?,
+                    error: r.get(7)?,
+                })
+            },
+        ))?)
+    };
+
+    if json {
+        // The same numbers the human output prints, and no others: two accounts
+        // of one store that could disagree is the failure a shared shape exists
+        // to prevent.
+        Document::new("status")
+            .field("store", store.path().display().to_string())
+            .field("size_bytes", size_bytes(&data_dir))
+            .field("sessions", counts.sessions)
+            .field("turns", counts.turns)
+            .field("watermarks", counts.watermarks)
+            .field("watermark_bytes", counts.watermark_bytes)
+            .field("excluded", config.exclusions())
+            .field(
+                "last_run",
+                match &last {
+                    None => serde_json::Value::Null,
+                    Some(run) => json!({
+                        "started_at": run.started_at,
+                        "duration_ms": run.duration_ms,
+                        "files_seen": run.files_seen,
+                        "files_committed": run.files_committed,
+                        "files_failed": run.files_failed,
+                        "bytes_read": run.bytes_read,
+                        "turns_added": run.turns_added,
+                        "error": run.error,
+                    }),
+                },
+            )
+            .emit();
+        return Ok(());
+    }
 
     println!("store          {}", store.path().display());
     println!("size           {}", size(&data_dir));
@@ -58,34 +117,12 @@ pub fn run() -> Result<(), Failure> {
         );
     }
 
-    // Counted first rather than reached for with an optional row, so that "no
-    // run yet" and "the query failed" stay two different answers.
-    let runs: i64 = read(conn.query_row("SELECT count(*) FROM runs", [], |r| r.get(0)))?;
-    if runs == 0 {
+    let Some(run) = last else {
         // An empty store is not a failure: it is what a machine looks like
         // before the first hook has ever fired.
         println!("last run       none");
         return Ok(());
-    }
-
-    let run: Run = read(conn.query_row(
-        "SELECT started_at, coalesce(duration_ms, 0), files_seen, files_committed,
-                files_failed, bytes_read, turns_added, error
-         FROM runs ORDER BY id DESC LIMIT 1",
-        [],
-        |r| {
-            Ok(Run {
-                started_at: r.get(0)?,
-                duration_ms: r.get(1)?,
-                files_seen: r.get(2)?,
-                files_committed: r.get(3)?,
-                files_failed: r.get(4)?,
-                bytes_read: r.get(5)?,
-                turns_added: r.get(6)?,
-                error: r.get(7)?,
-            })
-        },
-    ))?;
+    };
 
     println!("last run       {}", run.started_at);
     println!("  duration     {} ms", run.duration_ms);
@@ -121,6 +158,14 @@ struct Run {
 /// The store's footprint: the database and its WAL sidecars together, because
 /// a hot WAL can hold a large share of what has been written.
 fn size(data_dir: &Path) -> String {
+    let total = size_bytes(data_dir);
+    format!("{total} byte(s) ({})", human(total))
+}
+
+/// The same footprint as a number, which is what `--json` carries: a consumer
+/// that wants "3.2 MiB" can render it, and one that wants to compare two runs
+/// cannot parse it back out of prose.
+fn size_bytes(data_dir: &Path) -> u64 {
     let mut total = 0u64;
     for name in [
         DB_FILE_NAME.to_owned(),
@@ -131,7 +176,7 @@ fn size(data_dir: &Path) -> String {
             total += meta.len();
         }
     }
-    format!("{total} byte(s) ({})", human(total))
+    total
 }
 
 fn human(bytes: u64) -> String {

@@ -6,6 +6,7 @@
 //! 2 on misuse, data on stdout, errors on stderr.
 
 pub mod ingest;
+pub mod json;
 pub mod reindex;
 pub mod status;
 pub mod verify;
@@ -41,4 +42,31 @@ impl From<verbatim_core::Error> for Failure {
 /// re-derived at each use (`DESIGN-BRIEF.md:404`).
 pub fn data_dir() -> Result<PathBuf, Failure> {
     Ok(verbatim_core::data_dir()?)
+}
+
+/// The `--json` flag as spelled on every command line.
+pub const JSON_FLAG: &str = "json";
+
+/// Parse the rest of the command line for a subcommand whose only argument is
+/// `--json`.
+///
+/// The flag is parsed by the subcommand rather than by `run()`, because
+/// `main.rs` hands the `lexopt::Parser` on and a flag consumed before dispatch
+/// could not be spelled differently by two commands that need to. This is the
+/// shape for `verify`, `reindex` and `status`, which take nothing else;
+/// `search`, `show` and `sessions` match `--json` as one arm of their own loop.
+///
+/// Everything else is still rejected. A subcommand that silently ignored an
+/// argument is how `verify --json` came to look supported before it was.
+pub fn json_flag(parser: &mut lexopt::Parser) -> Result<bool, Failure> {
+    use lexopt::prelude::*;
+
+    let mut json = false;
+    while let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
+        match arg {
+            Long(JSON_FLAG) => json = true,
+            other => return Err(Failure::Misuse(crate::unexpected(other))),
+        }
+    }
+    Ok(json)
 }
