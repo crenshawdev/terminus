@@ -26,6 +26,8 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use rusqlite::{Connection, OpenFlags};
+use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::testkit;
 
 /// Marks the reparenting hand-off. This is `cmd::spawn::REPARENT` spelled
@@ -359,4 +361,158 @@ fn reading_the_hooks_stdout_to_eof_returns_at_once_while_the_ingest_still_runs()
     // reading above an answer rather than a coincidence.
     await_process(&hook.ingest_argv());
     drain(&hook.ingest_argv());
+}
+
+/// The tree the kill test walks: four transcripts, one project, ~1.4 s of
+/// debug-build pass. Big enough that a kill aimed at the moment the first file
+/// commits still has three files of pass left to prove it survived.
+#[cfg(unix)]
+const TREE: usize = 4;
+
+/// Sessions committed so far, read through a second connection while the pass
+/// is running - which is what WAL is on for.
+///
+/// Read-only and never `Connection::open`: an ordinary open would *create* the
+/// database file, and this poll runs before the ingest has made one.
+#[cfg(unix)]
+fn committed(hook: &Hook) -> usize {
+    let db = hook.data_dir.join(DB_FILE_NAME);
+    if !db.is_file() {
+        return 0;
+    }
+    let Ok(conn) = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return 0;
+    };
+    conn.query_row("SELECT count(*) FROM sessions", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|n| n as usize)
+    .unwrap_or(0)
+}
+
+/// Every pid below `root`, breadth first, the way Claude Code 2.1.231 builds
+/// the list it kills: `pid ppid` pairs out of `ps`, walked from the hook.
+#[cfg(unix)]
+fn descendants(root: u32, table: &[Proc]) -> Vec<u32> {
+    let mut found: Vec<u32> = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(pid) = frontier.pop() {
+        for child in table.iter().filter(|p| p.ppid == pid) {
+            if !found.contains(&child.pid) {
+                found.push(child.pid);
+                frontier.push(child.pid);
+            }
+        }
+    }
+    found
+}
+
+#[cfg(unix)]
+fn sigkill(target: &str) {
+    Command::new("kill")
+        .args(["-KILL", target])
+        .output()
+        .expect("run kill");
+}
+
+/// AC2 / D-03: the kill Claude Code actually performs, and an ingest that
+/// finishes anyway.
+///
+/// The hook is left blocked on a stdin nobody closes, which is the only state a
+/// hook is ever killed in - Claude Code kills the ones that time out. It is
+/// spawned into a process group of its own for the same reason: `kill(-pid)`
+/// against a hook sharing the harness's group would take the harness with it,
+/// so a harness that kills that way spawns that way.
+///
+/// The descendant set is taken from a snapshot while the hook is still alive
+/// AND again after the group kill, and every pid in either is killed. That is a
+/// superset of what Claude Code kills, which is the point: the ingest has to be
+/// outside the union, not merely outside whichever snapshot happened to be
+/// taken first.
+#[cfg(unix)]
+#[test]
+fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    let hook = hook();
+    for i in 0..TREE {
+        hook.big_transcript(
+            "-p",
+            &format!("3333333{i}-3333-4333-8333-333333333333.jsonl"),
+            24,
+        );
+    }
+
+    let mut child = hook
+        .command(&["hook", "SessionEnd"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // Its own group, so the group kill below names the hook and nothing
+        // else. Claude Code spawns hooks this way for the same reason.
+        .process_group(0)
+        .spawn()
+        .expect("spawn the hook");
+    // Held open and never written: the hook is now blocked in its one-line
+    // read, exactly where a timed-out hook is when the harness gives up on it.
+    let _stdin = child.stdin.take().expect("the hook's stdin");
+    let hook_pid = child.id();
+
+    // Wait until the pass is provably mid-tree: one transcript committed, three
+    // still to walk. A kill that lands after the pass has committed everything
+    // proves nothing at all.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while committed(&hook) == 0 {
+        assert!(Instant::now() < deadline, "the pass committed nothing");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mid_pass = committed(&hook);
+    assert!(mid_pass < TREE, "the pass finished before the kill: {mid_pass}");
+
+    let ingest = await_process(&hook.ingest_argv());
+    let mut doomed = descendants(hook_pid, &ps());
+    // The group, by its leader's negated pid - `process.kill(-pid)`.
+    sigkill(&format!("-{hook_pid}"));
+    for pid in descendants(hook_pid, &ps()) {
+        if !doomed.contains(&pid) {
+            doomed.push(pid);
+        }
+    }
+    for pid in &doomed {
+        sigkill(&pid.to_string());
+    }
+
+    let status = child.wait().expect("wait for the killed hook");
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "the hook did not die of the group kill: {status:?}"
+    );
+    assert!(
+        !doomed.contains(&ingest.pid),
+        "the descendant sweep named the ingest: {ingest:?} in {doomed:?}"
+    );
+    assert!(
+        ps().iter().any(|p| p.pid == ingest.pid),
+        "the ingest did not survive: {ingest:?}"
+    );
+
+    // And it does not merely survive: it finishes the tree and records the pass.
+    drain(&hook.ingest_argv());
+    let db = hook.data_dir.join(DB_FILE_NAME);
+    let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open the store read-only");
+    assert_eq!(
+        committed(&hook),
+        TREE,
+        "the store is missing sessions the pass should have committed"
+    );
+    let (files, error): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT files_committed, error FROM runs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the pass wrote no runs row");
+    assert_eq!(files as usize, TREE, "the runs row is short of the tree");
+    assert_eq!(error, None, "the pass recorded an error: {error:?}");
 }
