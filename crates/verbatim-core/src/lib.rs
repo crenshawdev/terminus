@@ -16,6 +16,7 @@ pub mod ingest;
 pub mod lineage;
 pub mod parse;
 pub mod project;
+pub mod recall;
 pub mod recover;
 pub mod reindex;
 pub mod store;

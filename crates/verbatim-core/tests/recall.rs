@@ -1,0 +1,261 @@
+//! The query layer both terminal recall and the MCP server sit on.
+//!
+//! Every test runs against a store holding the whole fixture corpus, built by
+//! the ordinary ingest path, so what is asserted is what a real pass wrote and
+//! not what a helper decided to insert.
+
+#![cfg(feature = "testkit")]
+
+use std::path::PathBuf;
+
+use rusqlite::Connection;
+use verbatim_core::recall::{Query, MAX_QUERY_TOKENS};
+use verbatim_core::store::DB_FILE_NAME;
+use verbatim_core::{ingest, testkit};
+
+struct Bench {
+    _dir: tempfile::TempDir,
+    data_dir: PathBuf,
+}
+
+/// A store with every transcript fixture ingested.
+fn bench() -> Bench {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&work).unwrap();
+
+    for fixture in testkit::TRANSCRIPT_FIXTURES {
+        let rooted = testkit::ROOTED_FIXTURES.iter().any(|(f, _)| f == fixture);
+        let path = if rooted {
+            testkit::copy_rooted_fixture_into(fixture, &work, &root)
+        } else {
+            testkit::copy_fixture_into(fixture, &work)
+        };
+        match ingest::run(&data_dir, &path).unwrap() {
+            ingest::Outcome::Committed(_) => {}
+            other => panic!("{fixture}: {other:?}"),
+        }
+    }
+
+    Bench {
+        _dir: dir,
+        data_dir,
+    }
+}
+
+impl Bench {
+    fn conn(&self) -> Connection {
+        Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
+    }
+}
+
+/// The turn ids one FTS5 expression returns, or the error it raised.
+///
+/// Deliberately fallible where the rest of the suite unwraps: the whole point of
+/// D-09 is which strings raise and which do not, so the error has to be a value
+/// the test can assert on rather than a panic.
+fn matching(conn: &Connection, expression: &str) -> rusqlite::Result<Vec<i64>> {
+    conn.prepare("SELECT rowid FROM turns_fts WHERE turns_fts MATCH ?1 ORDER BY rowid")?
+        .query_map([expression], |r| r.get::<_, i64>(0))?
+        .collect()
+}
+
+/// A user's raw string, run the way a read command will run it.
+fn search(conn: &Connection, raw: &str) -> rusqlite::Result<Vec<i64>> {
+    match Query::parse(raw).match_expression() {
+        Some(expression) => matching(conn, &expression),
+        // `MATCH ''` is itself an fts5 error, so a query that reduces to no
+        // tokens is answered without asking SQLite anything.
+        None => Ok(Vec::new()),
+    }
+}
+
+/// One turn's record bytes, read back out of its session blob.
+fn record(conn: &Connection, turn_id: i64) -> String {
+    let (bytes, _) = testkit::read_turn(conn, turn_id);
+    String::from_utf8(bytes).unwrap()
+}
+
+/// How many archived turns carry `needle` anywhere in their raw record.
+fn turns_whose_record_contains(conn: &Connection, needle: &str) -> Vec<i64> {
+    conn.prepare("SELECT id FROM turns ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|id| record(conn, *id).contains(needle))
+        .collect()
+}
+
+/// The strings D-09 measured, plus the two shapes RCL-06 has to survive: a query
+/// that is nothing at all and a query that is nothing but punctuation.
+const HOSTILE: &[&str] = &[
+    "src/worker/S.ts",
+    "foo AND (bar",
+    "\"unbalanced",
+    "*",
+    "",
+    "!@#$%^&*()",
+];
+
+/// D-09: no raw query reaches `MATCH`, so none of these is an error.
+///
+/// The control is the first half of the loop. "The query layer returned Ok" says
+/// nothing unless the raw string really would have failed, and every one of
+/// these six does - `fts5: syntax error near "/"`, `near ""`, `unterminated
+/// string`, `unknown special query`. RCL-06 forbids a non-zero exit for a query
+/// that simply found nothing, and searching for a path is the phase's headline
+/// case, so the most natural command in the product is exactly the one that
+/// would have failed.
+#[test]
+fn no_raw_query_reaches_fts5() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    for raw in HOSTILE {
+        assert!(
+            matching(&conn, raw).is_err(),
+            "`{raw}` is not an fts5 syntax error, so routing it through the \
+             query layer proves nothing"
+        );
+
+        let result = search(&conn, raw);
+        assert!(
+            result.is_ok(),
+            "`{raw}` reached fts5 as written: {:?}",
+            result.unwrap_err()
+        );
+    }
+}
+
+/// The headline case: `verbatim search src/worker/S.ts` finds the turn that
+/// names that path.
+#[test]
+fn a_path_query_returns_the_turn_that_contains_it() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let carriers = turns_whose_record_contains(&conn, "src/worker/S.ts");
+    assert_eq!(
+        carriers.len(),
+        1,
+        "the fixture corpus should name that path in exactly one turn"
+    );
+
+    let hits = search(&conn, "src/worker/S.ts").unwrap();
+    assert!(
+        hits.contains(&carriers[0]),
+        "turn {} carries `src/worker/S.ts` and the search missed it: {hits:?}",
+        carriers[0]
+    );
+}
+
+/// A query that found nothing is an empty result, never an error and never a
+/// wrong one.
+#[test]
+fn a_query_matching_nothing_is_an_empty_result() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    assert_eq!(search(&conn, "zzzzunfindable").unwrap(), Vec::<i64>::new());
+    // A real token beside one nothing carries: the conjunction is what makes
+    // this empty, not the absence of any indexable word at all.
+    assert!(!search(&conn, testkit::UNIQUE_TOKEN).unwrap().is_empty());
+    assert_eq!(
+        search(&conn, &format!("{} zzzzunfindable", testkit::UNIQUE_TOKEN)).unwrap(),
+        Vec::<i64>::new()
+    );
+}
+
+/// A query that reduces to no tokens asks SQLite nothing.
+#[test]
+fn a_query_of_no_tokens_makes_no_match_call() {
+    for raw in ["", "   ", "!@#$%^&*()", "-- ... --"] {
+        let query = Query::parse(raw);
+        assert!(query.is_empty(), "`{raw}` produced {:?}", query.tokens());
+        assert_eq!(query.match_expression(), None, "`{raw}`");
+    }
+}
+
+/// Every token is a quoted fts5 string and the tokens are conjoined, so nothing
+/// the user typed can be read as an operator.
+#[test]
+fn tokens_are_quoted_and_conjoined() {
+    assert_eq!(
+        Query::parse("src/worker/S.ts")
+            .match_expression()
+            .as_deref(),
+        Some(r#""src" AND "worker" AND "S" AND "ts""#)
+    );
+    // `AND` survives as a term rather than as the operator it looks like: it is
+    // inside quotes, where fts5 reads a string and hands it to the tokenizer.
+    assert_eq!(
+        Query::parse("foo AND (bar").match_expression().as_deref(),
+        Some(r#""foo" AND "AND" AND "bar""#)
+    );
+}
+
+/// Query tokens are not expanded, because the expansion already happened at
+/// index time.
+///
+/// Both halves matter. `SearchManager` stays one term - expanding it into
+/// `Search` and `Manager` would widen a specific query into every turn that
+/// says `manager` - and a query for `manager` still finds the turn, because
+/// `index::expand` put that component in the stored body (D-13).
+#[test]
+fn query_tokens_are_not_expanded() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    assert_eq!(Query::parse("SearchManager").tokens(), ["SearchManager"]);
+
+    let carriers = turns_whose_record_contains(&conn, "SearchManager");
+    assert_eq!(carriers.len(), 1, "one fixture turn names SearchManager");
+
+    for raw in ["SearchManager", "manager"] {
+        assert!(
+            search(&conn, raw).unwrap().contains(&carriers[0]),
+            "`{raw}` missed turn {}",
+            carriers[0]
+        );
+    }
+}
+
+/// The same token twice is one term, whatever case it was typed in.
+#[test]
+fn repeated_tokens_collapse() {
+    let query = Query::parse("cargo Cargo cargo/cargo");
+    assert_eq!(query.tokens(), ["cargo"]);
+    assert!(!query.truncated());
+}
+
+/// A pasted stack trace cannot build a thousand-term expression.
+///
+/// Truncation is safe in one direction only, and this is the direction: the
+/// tokens are conjoined, so dropping some makes the query broader than the one
+/// asked for rather than wrong in a way the user cannot see.
+#[test]
+fn the_token_count_is_bounded() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let pasted: String = (0..MAX_QUERY_TOKENS * 4)
+        .map(|n| format!("frame{n} "))
+        .collect();
+
+    let query = Query::parse(&pasted);
+    assert_eq!(query.tokens().len(), MAX_QUERY_TOKENS);
+    assert!(query.truncated());
+    assert_eq!(
+        query.match_expression().unwrap().matches(" AND ").count(),
+        MAX_QUERY_TOKENS - 1
+    );
+
+    // And it still runs: a bounded expression is one fts5 accepts.
+    assert_eq!(search(&conn, &pasted).unwrap(), Vec::<i64>::new());
+
+    let short = Query::parse("one two");
+    assert!(!short.truncated());
+}
