@@ -364,6 +364,45 @@ fn a_foreign_binary_at_the_stable_path_stops_everything() {
     assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
 }
 
+/// A settings file with a repeated key is refused, loudly, and nothing is
+/// written.
+///
+/// `JSON.parse` - Claude Code's reader - takes the last of a repeated key.
+/// Install's reader takes the first. Editing the wrong one would put four hook
+/// entries in the copy Claude Code ignores and report success, so the file is
+/// refused rather than guessed at.
+#[test]
+fn a_settings_file_with_a_repeated_key_is_refused() {
+    let fixture = fixture();
+    fixture.seed();
+    let duplicated = SETTINGS.replace("  \"hooks\": {", "  \"hooks\": {},\n  \"hooks\": {");
+    assert_eq!(
+        duplicated.matches("\"hooks\": {").count(),
+        2,
+        "the fixture does not carry the duplicate under test"
+    );
+    std::fs::write(fixture.settings(), &duplicated).unwrap();
+
+    let output = fixture.run(&["install", "--yes"]);
+    assert!(!output.status.success(), "install edited an ambiguous file");
+    let said = text(&output);
+    assert!(
+        said.contains("more than one '.hooks' key"),
+        "the refusal did not say which key: {said}"
+    );
+
+    assert!(!fixture.stable().exists(), "a refusal placed the binary");
+    assert_eq!(
+        std::fs::read_to_string(fixture.settings()).unwrap(),
+        duplicated
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        CLAUDE_JSON
+    );
+    assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
+}
+
 // ---------------------------------------------------------------------------
 // Task 3: the four hook entries
 // ---------------------------------------------------------------------------

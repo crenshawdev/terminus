@@ -437,7 +437,48 @@ fn interpret(text: &str, path: &Path) -> Result<(Json, bool), Failure> {
             path.display()
         )));
     }
+    if let Some(at) = duplicate_key(&value, "") {
+        return Err(Failure::Operational(format!(
+            "{} has more than one '{at}' key, and a repeated key has no one answer: \
+             `JSON.parse` - which is how Claude Code reads this file - takes the last one, \
+             and this reader takes the first. an entry written into the wrong copy would be \
+             the copy Claude Code ignores, and install would report success with no hook \
+             ever firing.\n  \
+             verbatim will not rewrite a file whose keys are ambiguous. remove the duplicate \
+             and run install again.",
+            path.display()
+        )));
+    }
     Ok((value, text.ends_with('\n')))
+}
+
+/// Where the first repeated key is, if there is one, as a path like
+/// `.hooks.SessionStart` or `.mcpServers`.
+///
+/// JSON permits duplicate keys and every consumer resolves them differently.
+/// This module's own lookups take the first; Claude Code's `JSON.parse` takes
+/// the last. Rather than pick a rule, install refuses the file - it is about to
+/// rewrite the whole of it, and there is no reading of a duplicate under which
+/// that is safe.
+fn duplicate_key(value: &Json, at: &str) -> Option<String> {
+    match value {
+        Json::Object(members) => {
+            let mut seen = std::collections::HashSet::with_capacity(members.len());
+            for member in members {
+                if !seen.insert(member.key.as_str()) {
+                    return Some(format!("{at}.{}", member.key));
+                }
+            }
+            members
+                .iter()
+                .find_map(|member| duplicate_key(&member.value, &format!("{at}.{}", member.key)))
+        }
+        Json::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(index, item)| duplicate_key(item, &format!("{at}[{index}]"))),
+        Json::Scalar(_) => None,
+    }
 }
 
 fn render(value: &Json, trailing_newline: bool) -> String {
@@ -1100,6 +1141,37 @@ mod tests {
         let document = Document::read(&path).unwrap();
         assert!(!document.apply(&|_: &mut Json| Ok(())).unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), FIXTURE);
+    }
+
+    /// A repeated key is refused, wherever it is, and the refusal says where.
+    ///
+    /// `entry` takes the first member with a key; `JSON.parse` takes the last.
+    /// A file that makes those two disagree is one install must not rewrite.
+    #[test]
+    fn a_repeated_key_is_refused_and_located() {
+        for (text, expected) in [
+            (r#"{"hooks": {}, "hooks": {"SessionStart": []}}"#, ".hooks"),
+            (
+                r#"{"hooks": {"SessionStart": [], "SessionStart": []}}"#,
+                ".hooks.SessionStart",
+            ),
+            (
+                r#"{"hooks": {"SessionStart": [{"matcher": "", "matcher": ""}]}}"#,
+                ".hooks.SessionStart[0].matcher",
+            ),
+        ] {
+            let (_dir, path) = seeded(text);
+            match Document::read(&path) {
+                Err(Failure::Operational(message)) => assert!(
+                    message.contains(&format!("more than one '{expected}' key")),
+                    "{message}"
+                ),
+                other => panic!("expected an operational failure, got {other:?}"),
+            }
+        }
+        // And a file that repeats nothing is still read.
+        let (_dir, path) = seeded(FIXTURE);
+        assert!(Document::read(&path).is_ok());
     }
 
     /// The reader rejects what is not JSON rather than round-tripping it as
