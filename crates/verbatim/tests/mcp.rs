@@ -18,7 +18,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use rusqlite::Connection;
 use serde_json::{json, Value};
+use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::testkit;
 
 /// Every directory a spawned `verbatim` may touch, all of them temporary.
@@ -100,6 +102,51 @@ impl Bench {
 
     fn config(&self, text: &str) {
         std::fs::write(self.config_dir.join("verbatim.toml"), text).unwrap();
+    }
+
+    fn conn(&self) -> Connection {
+        Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
+    }
+
+    /// Archive one synthetic session of `turns` turns, and answer with the
+    /// project directory it belongs to.
+    ///
+    /// Built here rather than checked in: the repo fixtures are 2 to 19 records
+    /// each, and a context budget of 25 turns a side cannot be shown to bind by
+    /// a session smaller than the budget. A window that returned the whole
+    /// session would satisfy every assertion an existing fixture could make.
+    fn long_session(&self, name: &str, turns: usize) -> PathBuf {
+        let project = self.root.join(name);
+        std::fs::create_dir_all(&project).unwrap();
+
+        let escaped = project.to_string_lossy().replace('\\', "\\\\");
+        let mut text = String::new();
+        for seq in 0..turns {
+            let minute = seq / 60;
+            let second = seq % 60;
+            text.push_str(&format!(
+                "{{\"parentUuid\":null,\"isSidechain\":false,\"userType\":\"external\",\
+                  \"cwd\":\"{escaped}\",\"sessionId\":\"99999999-9999-4999-8999-999999999999\",\
+                  \"gitBranch\":\"main\",\"version\":\"2.0.31\",\"type\":\"assistant\",\
+                  \"uuid\":\"cccccccc-0000-4000-8000-{seq:012}\",\
+                  \"timestamp\":\"2026-08-12T21:{minute:02}:{second:02}.000Z\",\
+                  \"message\":{{\"role\":\"assistant\",\"content\":\
+                  [{{\"type\":\"text\",\"text\":\"longwindowmarker turn {seq}\"}}]}}}}\n"
+            ));
+        }
+
+        let file = self.work.join(format!("{name}.jsonl"));
+        std::fs::write(&file, text).unwrap();
+        let out = self
+            .command(&self.work, &["ingest", file.to_str().unwrap()])
+            .output()
+            .expect("spawn verbatim");
+        assert!(
+            out.status.success(),
+            "ingest {name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        project
     }
 
     /// Spawn a live server standing in `dir`, with all three streams piped.
@@ -568,4 +615,173 @@ fn the_search_filters_and_the_result_budget_reach_the_query_layer() {
             .is_some_and(|reason| reason.contains("budget")),
         "the lowered limit was not reported: {document}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// recall_context (RCL-08, AC6)
+// ---------------------------------------------------------------------------
+
+/// The turns of a window, as `(turn_seq, is_anchor)` pairs.
+fn window_seqs(document: &Value) -> Vec<(i64, bool)> {
+    document["turns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a context result carries a turns array: {document}"))
+        .iter()
+        .map(|turn| {
+            (
+                turn["turn_seq"].as_i64().unwrap_or_default(),
+                turn["is_anchor"] == true,
+            )
+        })
+        .collect()
+}
+
+/// A window around a middle turn returns the turns asked for, in `turn_seq`
+/// order, with exactly one of them marked as the anchor.
+///
+/// The order is the assertion that could pass by accident on a small fixture and
+/// be wrong on a real transcript, which is why it is checked against a sort
+/// rather than against a literal list: 31 of 62 sampled real transcripts carry a
+/// timestamp that goes backwards, so a timestamp sort would look right here and
+/// scramble half of the corpus.
+#[test]
+fn recall_context_returns_the_turns_around_a_hit_in_turn_seq_order() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let project = bench.long_session("project-window", 60);
+
+    // A turn in the middle of the session, so both sides have something in them.
+    let anchor: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT id FROM turns WHERE session_key LIKE '%project-window.jsonl'
+              ORDER BY turn_seq LIMIT 1 OFFSET 30",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let document = bench.call(
+        &project,
+        "recall_context",
+        json!({"turn_id": anchor, "before": 3, "after": 2}),
+    );
+    let turns = window_seqs(&document);
+    assert_eq!(
+        turns.len(),
+        6,
+        "three before, the anchor, two after: {document}"
+    );
+
+    let seqs: Vec<i64> = turns.iter().map(|(seq, _)| *seq).collect();
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        seqs, sorted,
+        "the window is not in turn_seq order: {seqs:?}"
+    );
+    assert_eq!(
+        turns.iter().filter(|(_, anchor)| *anchor).count(),
+        1,
+        "exactly one turn is the anchor: {document}"
+    );
+
+    // Neither end of a 60-turn session is 30 turns away, so no boundary is
+    // claimed and the text really is the turn's own.
+    assert_eq!(document["at_session_start"], false, "{document}");
+    assert_eq!(document["at_session_end"], false, "{document}");
+    assert!(
+        document["turns"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("longwindowmarker")),
+        "{document}"
+    );
+}
+
+/// The first turn of a session that continues from another: nothing before it,
+/// the start boundary reported, and the link handed back unfollowed (D-06).
+///
+/// All three together are the decision. A window that silently returned the
+/// previous file's turns would be a lineage walk, and continuation is a fan-out
+/// with zero, one or many successors, so the safe shape is to say where the
+/// session began and let the caller ask a second question.
+#[test]
+fn a_window_stops_at_the_session_start_and_names_what_it_continues_from() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let (first, seq): (i64, i64) = bench
+        .conn()
+        .query_row(
+            "SELECT id, turn_seq FROM turns WHERE session_key LIKE '%session-continuation.jsonl'
+              ORDER BY turn_seq LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    // `*`: this fixture hardcodes its `cwd`, so its project key is whatever this
+    // machine resolves for that directory and no spawn can reliably stand in it.
+    let document = bench.call(
+        &bench.work,
+        "recall_context",
+        json!({"turn_id": first, "before": 5, "after": 1, "project": "*"}),
+    );
+
+    assert_eq!(
+        document["at_session_start"], true,
+        "the first turn of a session is a boundary: {document}"
+    );
+    assert!(
+        window_seqs(&document).iter().all(|(s, _)| *s >= seq),
+        "the window returned a turn from before the session began: {document}"
+    );
+    assert!(
+        document["continues_from"].is_string(),
+        "the session this one continues from must be named, unfollowed: {document}"
+    );
+}
+
+/// A request for more turns than the budget returns the budget's worth, and says
+/// it was lowered.
+///
+/// The session is 60 turns and the budget is 25 a side, so a window that ignored
+/// the budget would return all 60 and this is the only assertion in the file
+/// that can tell the two apart.
+#[test]
+fn a_window_larger_than_the_budget_returns_the_budgets_worth() {
+    let bench = bench();
+    let project = bench.long_session("project-window", 60);
+
+    let anchor: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT id FROM turns WHERE session_key LIKE '%project-window.jsonl'
+              ORDER BY turn_seq LIMIT 1 OFFSET 30",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let document = bench.call(
+        &project,
+        "recall_context",
+        json!({"turn_id": anchor, "before": 1000, "after": 1000}),
+    );
+    assert_eq!(
+        window_seqs(&document).len(),
+        51,
+        "twenty-five a side plus the anchor: {document}"
+    );
+    assert!(
+        document["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("budget")),
+        "the lowered window was not reported: {document}"
+    );
+    // The session is longer than the window on both sides, so neither end is a
+    // boundary - which is what distinguishes "the budget bound this" from "the
+    // session ran out".
+    assert_eq!(document["at_session_start"], false, "{document}");
+    assert_eq!(document["at_session_end"], false, "{document}");
 }

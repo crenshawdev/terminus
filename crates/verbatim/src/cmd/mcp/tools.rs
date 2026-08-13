@@ -31,7 +31,7 @@
 
 use serde_json::{json, Map, Value};
 
-use verbatim_core::recall::{self, search, Filters, Query, Request, Scope};
+use verbatim_core::recall::{self, context, search, Filters, Query, Request, Scope};
 use verbatim_core::Error;
 
 use crate::cmd::read::{self, Opened, Reader};
@@ -68,6 +68,10 @@ pub const MAX_IDS: usize = 25;
 /// Below [`MAX_HITS`] on purpose: this answer goes into a model's context, and
 /// the caller that wants the rest asks for it.
 pub const DEFAULT_HITS: usize = 10;
+
+/// How many turns `recall_context` returns on each side when the caller does not
+/// say.
+pub const DEFAULT_CONTEXT_SIDE: usize = 5;
 
 /// The `annotations` object every tool here carries.
 ///
@@ -240,8 +244,9 @@ pub fn call(params: &Value) -> Result<Value, (i64, String)> {
 
     let outcome = match name {
         RECALL_SEARCH => arguments(params).and_then(|args| run_search(&args)),
-        // Tasks 3 and 4 of this plan.
-        RECALL_CONTEXT | RECALL_GET => Err(Refused::archive(format!(
+        RECALL_CONTEXT => arguments(params).and_then(|args| run_context(&args)),
+        // Task 4 of this plan.
+        RECALL_GET => Err(Refused::archive(format!(
             "{name} is listed by this build and not yet served"
         ))),
         other => {
@@ -378,6 +383,81 @@ fn run_search(args: &Map<String, Value>) -> Result<Value, Refused> {
 }
 
 // ---------------------------------------------------------------------------
+// recall_context (RCL-08)
+// ---------------------------------------------------------------------------
+
+/// The conversation around one turn, in the order it happened.
+///
+/// **`turn_seq` order, never timestamp (D-22).** 31 of 62 sampled real
+/// transcripts carry a record whose timestamp goes backwards, so a timestamp
+/// sort would show a reply before the prompt it answers in half of all sessions.
+///
+/// **The window stops at the session (D-06)** and says which end it stopped at.
+/// It does not follow `continues_from` and it does not follow
+/// `parent_session_key`: continuation is a fan-out with zero, one or many
+/// successors, so a lineage walk here could return turns from a conversation
+/// that never happened. The link is handed back unfollowed and the caller
+/// decides whether to make a second call - which is the only safe shape, and is
+/// also why the boundary is reported rather than left to be inferred from a
+/// short list.
+fn run_context(args: &Map<String, Value>) -> Result<Value, Refused> {
+    let anchor = required_id(args, "turn_id")?;
+    let project = optional_string(args, "project")?;
+    let asked_before = optional_count(args, "before")?.unwrap_or(DEFAULT_CONTEXT_SIDE);
+    let asked_after = optional_count(args, "after")?.unwrap_or(DEFAULT_CONTEXT_SIDE);
+    // The same budget rule as everywhere else: a caller may lower it and may not
+    // raise it. Unbounded, one call returns a whole session as prose, which is
+    // `recall_get` arrived at by accident.
+    let before = asked_before.min(MAX_CONTEXT_SIDE);
+    let after = asked_after.min(MAX_CONTEXT_SIDE);
+
+    let reader = reader()?;
+    let window = context::window(
+        reader.store().conn(),
+        reader.config(),
+        &scope(project.as_deref())?,
+        anchor,
+        before,
+        after,
+    )
+    .map_err(|error| Refused::archive(error.to_string()))?;
+
+    let mut reason = window.reason.as_ref().map(ToString::to_string);
+    if reason.is_none() && (asked_before > before || asked_after > after) {
+        reason = Some(format!(
+            "before and after were lowered to this server's budget of \
+             {MAX_CONTEXT_SIDE} turns on each side"
+        ));
+    }
+
+    let turns: Vec<Value> = window
+        .turns
+        .iter()
+        .map(|turn| {
+            json!({
+                "turn_id": turn.turn_id,
+                "turn_seq": turn.turn_seq,
+                "record_type": turn.record_type,
+                "tool_name": turn.tool_name,
+                "ts": turn.ts,
+                "text": turn.text,
+                "is_anchor": turn.is_anchor,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "turns": turns,
+        // Said out loud rather than left to be inferred: "there is nothing
+        // earlier" and "you asked for five and got two" are different answers.
+        "at_session_start": window.at_session_start,
+        "at_session_end": window.at_session_end,
+        "continues_from": window.continues_from,
+        "reason": reason,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // The store, the scope, and the arguments
 // ---------------------------------------------------------------------------
 
@@ -461,6 +541,23 @@ fn required_string(args: &Map<String, Value>, name: &str) -> Result<String, Refu
             "{name} must be a string, not {}",
             kind(other)
         ))),
+    }
+}
+
+/// A turn id: a whole integer, and nothing that merely looks like one.
+///
+/// A string `"1234"` is refused rather than parsed. A client that sends ids as
+/// strings is sending something else than what it read out of a hit, and
+/// accepting it here would hide that until the day one of them is not a number.
+fn required_id(args: &Map<String, Value>, name: &str) -> Result<i64, Refused> {
+    match args.get(name) {
+        None | Some(Value::Null) => Err(Refused::caller(format!("{name} is required"))),
+        Some(value) => value.as_i64().ok_or_else(|| {
+            Refused::caller(format!(
+                "{name} must be an integer turn id, not {}",
+                kind(value)
+            ))
+        }),
     }
 }
 
