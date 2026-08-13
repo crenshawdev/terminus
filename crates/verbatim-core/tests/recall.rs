@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use verbatim_core::config::Config;
 use verbatim_core::recall::{
-    context, search, EntityMatch, Filters, Hit, Query, Reason, Request, Response, Scope, Window,
-    MAX_CONTEXT_SIDE, MAX_QUERY_TOKENS, MAX_RESULTS,
+    context, get, search, EntityMatch, Filters, Hit, Query, Reason, Request, Response, Scope,
+    Window, MAX_CONTEXT_SIDE, MAX_QUERY_TOKENS, MAX_RESULTS,
 };
 use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::{ingest, testkit};
@@ -1498,4 +1498,253 @@ fn a_context_window_is_scoped_like_a_search_is() {
     // Reported as absent rather than as somebody else's, so the answer does not
     // confirm that another project holds the id.
     assert_eq!(across.reason, Some(Reason::NoSuchTurn { turn_id: anchor }));
+}
+
+// ---------------------------------------------------------------------------
+// RCL-09: the verbatim record behind a turn id
+// ---------------------------------------------------------------------------
+
+/// The records for a list of ids, over every project.
+fn fetch(conn: &Connection, exclusions: &[&str], ids: &[i64]) -> get::Fetched {
+    scoped_fetch(conn, exclusions, &Scope::Everything, ids)
+}
+
+fn scoped_fetch(
+    conn: &Connection,
+    exclusions: &[&str],
+    scope: &Scope,
+    ids: &[i64],
+) -> get::Fetched {
+    get::records(conn, &config(exclusions), scope, ids).unwrap()
+}
+
+/// D-20: ids spanning three sessions cost three blob reads, not one per id.
+///
+/// The counter is the assertion, and it has to be: `BlobReader`'s block counter
+/// reports one block decompressed for a single-turn read whether the blob was
+/// materialized once or six times, so phase 1's AC1 stays green either way. Two
+/// ids are taken from one session precisely so "one read per session" and "one
+/// read per id" give different numbers.
+#[test]
+fn ids_across_three_sessions_read_three_blobs() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let ids = [
+        turn_at(&conn, "session-recall.jsonl", 0),
+        turn_at(&conn, "session-recall.jsonl", 3),
+        turn_at(&conn, "session-basic.jsonl", 0),
+        turn_at(&conn, "session-errors-a.jsonl", 0),
+    ];
+    let fetched = fetch(&conn, &[], &ids);
+
+    assert_eq!(fetched.records.len(), 4, "{fetched:?}");
+    assert!(fetched.absent.is_empty(), "{fetched:?}");
+    assert_eq!(
+        fetched.reads.blobs, 3,
+        "four ids across three sessions must cost three blob reads: {fetched:?}"
+    );
+
+    // Answered in the order they were asked for, which is what makes the output
+    // of `verbatim show a b c` readable.
+    let returned: Vec<i64> = fetched.records.iter().map(|r| r.turn_id).collect();
+    assert_eq!(returned, ids.to_vec());
+}
+
+/// The bytes handed back are the record's own line, not a projection of it.
+///
+/// This is the read that answers "what exactly was said", so the comparison is
+/// against the fixture file's own bytes and not against anything the store
+/// derived. A projection would still be prose about the right turn and would
+/// pass any test that only checked the turn was found.
+#[test]
+fn the_returned_bytes_are_the_records_own_line() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let id = turn_at(&conn, "session-recall.jsonl", 1);
+    let fetched = fetch(&conn, &[], &[id]);
+    let body = fetched.records[0]
+        .body
+        .as_ref()
+        .expect("an archived turn has a body");
+
+    // The fixture's own second line, rooted the way the bench ingested it.
+    let text = String::from_utf8(testkit::fixture_bytes("session-recall.jsonl")).unwrap();
+    let expected = text
+        .replace(
+            testkit::FIXTURE_ROOT_TOKEN,
+            &bench.root.to_string_lossy().replace('\\', "\\\\"),
+        )
+        .lines()
+        .nth(1)
+        .expect("the fixture has a second line")
+        .to_owned();
+
+    assert_eq!(
+        String::from_utf8(body.clone()).unwrap(),
+        expected,
+        "the body is not the transcript's own line"
+    );
+    // And it really is the raw record rather than the projection: the JSON
+    // scaffolding is in it, which is exactly what an excerpt strips.
+    assert!(body.starts_with(b"{\""), "{:?}", &body[..8.min(body.len())]);
+    assert!(!fetched.records[0].body_evicted);
+}
+
+/// D-08: `body_evicted` comes off `session_meta.is_evicted` and nowhere else,
+/// and the record still comes back.
+///
+/// The column is written by this test directly, because retention is phase 8 and
+/// nothing writes it before then. The half that matters is the blob read that
+/// does NOT happen: a corrupt blob is what `verbatim verify` reports, and a
+/// failed read allowed to look like an eviction would report silent data loss as
+/// retention working correctly.
+#[test]
+fn an_evicted_session_returns_the_record_flagged_and_reads_no_blob() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let evicted = turn_at(&conn, "session-basic.jsonl", 0);
+    let intact = turn_at(&conn, "session-recall.jsonl", 0);
+    conn.execute(
+        "UPDATE session_meta SET is_evicted = 1
+          WHERE session_key = (SELECT session_key FROM turns WHERE id = ?1)",
+        [evicted],
+    )
+    .unwrap();
+
+    let fetched = fetch(&conn, &[], &[evicted, intact]);
+    assert_eq!(fetched.records.len(), 2, "{fetched:?}");
+
+    let gone = &fetched.records[0];
+    assert_eq!(gone.turn_id, evicted);
+    assert!(gone.body_evicted, "{gone:?}");
+    assert_eq!(gone.body, None, "an evicted record carries no body");
+    // Every other field is still there: the turn is known, only its bytes are
+    // not, which is what makes this a retention answer rather than an error.
+    assert!(!gone.session_key.is_empty());
+    assert_eq!(gone.record_type, "user");
+
+    let kept = &fetched.records[1];
+    assert!(!kept.body_evicted, "{kept:?}");
+    assert!(kept.body.is_some());
+
+    // One blob read, for the one session that still has a body to read.
+    assert_eq!(
+        fetched.reads.blobs, 1,
+        "the evicted session's blob was read anyway: {fetched:?}"
+    );
+}
+
+/// An id the archive does not hold is a reason, never an error.
+///
+/// Asking for four ids of which one is unknown returns the three records and
+/// says what happened to the fourth; failing the call would lose the three.
+#[test]
+fn an_unknown_id_is_a_reason_and_not_an_error() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let known = turn_at(&conn, "session-recall.jsonl", 0);
+    let unknown: i64 = conn
+        .query_row("SELECT max(id) + 1000 FROM turns", [], |r| r.get(0))
+        .unwrap();
+
+    let fetched = fetch(&conn, &[], &[known, unknown]);
+    assert_eq!(fetched.records.len(), 1, "{fetched:?}");
+    assert_eq!(fetched.records[0].turn_id, known);
+    assert_eq!(
+        fetched.absent,
+        vec![get::Absent {
+            turn_id: unknown,
+            reason: Reason::NoSuchTurn { turn_id: unknown },
+        }],
+        "{fetched:?}"
+    );
+    // No blob was read for it either.
+    assert_eq!(fetched.reads.blobs, 1);
+}
+
+/// The same id twice is answered once.
+#[test]
+fn a_repeated_id_is_answered_once() {
+    let bench = bench();
+    let conn = bench.conn();
+    let id = turn_at(&conn, "session-recall.jsonl", 0);
+
+    let fetched = fetch(&conn, &[], &[id, id, id]);
+    assert_eq!(fetched.records.len(), 1, "{fetched:?}");
+    assert_eq!(fetched.reads.blobs, 1);
+}
+
+/// RCL-10 auto-scopes all three tools, and ids are densely enumerable, so a get
+/// standing in another project may not read this one's turns.
+///
+/// Reported as absent rather than as somebody else's, for the reason
+/// `a_context_window_is_scoped_like_a_search_is` gives: a distinct reason would
+/// confirm that another project holds that id.
+#[test]
+fn a_get_is_scoped_like_a_search_is() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let id = turn_at(&conn, "session-recall.jsonl", 0);
+    let mine: String = conn
+        .query_row(
+            "SELECT m.project FROM turns t
+               JOIN session_meta m USING (session_key) WHERE t.id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let other: String = conn
+        .query_row(
+            "SELECT DISTINCT project FROM session_meta
+              WHERE project IS NOT NULL AND project <> ?1 ORDER BY project LIMIT 1",
+            [&mine],
+            |r| r.get(0),
+        )
+        .expect("the corpus must span more than one project");
+
+    let own = scoped_fetch(&conn, &[], &Scope::parse(&mine), &[id]);
+    assert_eq!(own.records.len(), 1, "{own:?}");
+
+    let across = scoped_fetch(&conn, &[], &Scope::parse(&other), &[id]);
+    assert!(across.records.is_empty(), "{across:?}");
+    assert_eq!(
+        across.absent,
+        vec![get::Absent {
+            turn_id: id,
+            reason: Reason::NoSuchTurn { turn_id: id },
+        }]
+    );
+    assert_eq!(across.reads.blobs, 0, "an out-of-scope id read a blob");
+}
+
+/// A turn of an excluded project is absent with the exclusion as its reason.
+///
+/// The read half of ING-08 through this door too: exclusion applies on every
+/// read path, and `recall_get` is the one that would hand back the whole record
+/// rather than a snippet of it.
+#[test]
+fn a_get_of_an_excluded_projects_turn_is_absent_with_a_reason() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let id = turn_at(&conn, "session-recall.jsonl", 0);
+    let project = testkit::fixture_project("session-recall.jsonl", &bench.root);
+    let excluded = project.to_string_lossy().into_owned();
+
+    let fetched = scoped_fetch(&conn, &[&excluded], &Scope::Everything, &[id]);
+    assert!(fetched.records.is_empty(), "{fetched:?}");
+    assert_eq!(fetched.absent.len(), 1, "{fetched:?}");
+    assert!(
+        matches!(
+            fetched.absent[0].reason,
+            Reason::ProjectExcluded { ref project } if project == &excluded
+        ),
+        "{fetched:?}"
+    );
+    assert_eq!(fetched.reads.blobs, 0, "an excluded turn read a blob");
 }

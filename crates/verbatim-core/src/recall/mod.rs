@@ -14,12 +14,14 @@
 
 pub mod context;
 pub mod excerpt;
+pub mod get;
 pub mod query;
 pub mod scope;
 pub mod search;
 
 pub use context::{ContextTurn, Window, MAX_CONTEXT_SIDE};
-pub use excerpt::EXCERPT_CHARS;
+pub use excerpt::{Reads, EXCERPT_CHARS};
+pub use get::{Absent, Fetched, Record};
 pub use query::{EntityMatch, Query, MAX_QUERY_TOKENS};
 pub use scope::{Reason, Scope};
 pub use search::{Filters, Hit, Request, Response, DEFAULT_RESULTS, MAX_RESULTS};
