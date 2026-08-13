@@ -37,10 +37,30 @@ use crate::index::expand::separator_components;
 /// one asked for rather than wrong in an unpredictable direction.
 pub const MAX_QUERY_TOKENS: usize = 32;
 
+/// How a query matched one stored `entities.value_norm` (RCL-04).
+///
+/// The comparison is between the query and a WHOLE stored value, never between
+/// one query token and a whole value: `path` and `error` values are multi-token
+/// by construction - `src/worker/S.ts`, and a whole normalized stderr line - so
+/// a token-equality rule could never fire for the two kinds this phase
+/// headlines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityMatch {
+    /// The value tokenizes to exactly this query, in order: the user asked for
+    /// this stored value and nothing else.
+    Exact,
+    /// Every token of the value is in the query, which asks for more besides.
+    Covered,
+}
+
 /// A user's raw string, reduced to the tokens the index can be asked about.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Query {
     tokens: Vec<String>,
+    /// The same tokens, case-folded, in the same order. Kept rather than
+    /// recomputed because [`Query::matches_entity`] runs once per distinct
+    /// entity value on every candidate turn of every search.
+    folded: Vec<String>,
     truncated: bool,
 }
 
@@ -49,13 +69,15 @@ impl Query {
     /// tokens or none.
     pub fn parse(raw: &str) -> Query {
         let mut tokens: Vec<String> = Vec::new();
+        let mut folded: Vec<String> = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
         let mut truncated = false;
 
         for piece in separator_components(raw) {
             // Case-insensitively, because `unicode61` folds case and asking for
             // `Cargo` and `cargo` as two terms is one term twice.
-            if !seen.insert(piece.to_lowercase()) {
+            let lowered = piece.to_lowercase();
+            if !seen.insert(lowered.clone()) {
                 continue;
             }
             if tokens.len() == MAX_QUERY_TOKENS {
@@ -63,9 +85,43 @@ impl Query {
                 break;
             }
             tokens.push(piece.to_owned());
+            folded.push(lowered);
         }
 
-        Query { tokens, truncated }
+        Query {
+            tokens,
+            folded,
+            truncated,
+        }
+    }
+
+    /// Does this query ask for one whole stored entity value?
+    ///
+    /// The value is tokenized by the same rule the query was, and it matches
+    /// when every one of its tokens is in the query - so a query for
+    /// `src/worker/S.ts` matches the stored path and a query for `worker` alone
+    /// does not. `None` for a value that tokenizes to nothing, which cannot be
+    /// asked for at all.
+    ///
+    /// Equality is compared over the token sequences rather than the raw
+    /// strings. Two spellings of one path differing only in a separator or in
+    /// case are the same value to the index, and a rule that called them
+    /// different would make the strongest match depend on punctuation the
+    /// tokenizer already threw away.
+    pub fn matches_entity(&self, value: &str) -> Option<EntityMatch> {
+        let value_tokens: Vec<String> =
+            separator_components(value).map(str::to_lowercase).collect();
+        if value_tokens.is_empty() {
+            return None;
+        }
+        if !value_tokens.iter().all(|token| self.folded.contains(token)) {
+            return None;
+        }
+        Some(if value_tokens == self.folded {
+            EntityMatch::Exact
+        } else {
+            EntityMatch::Covered
+        })
     }
 
     /// The tokens, in the order the raw string produced them and in the

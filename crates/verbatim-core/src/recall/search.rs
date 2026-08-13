@@ -5,10 +5,13 @@
 //! `verbatim search` (PLAN-3) and `recall_search` (PLAN-4) - so there is one
 //! definition of relevance rather than two that drift.
 
+use std::collections::BTreeMap;
+
 use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::error::Result;
+use crate::recall::query::EntityMatch;
 use crate::recall::scope::{self, Reason, Scope};
 use crate::recall::Query;
 
@@ -114,7 +117,15 @@ pub struct Hit {
     pub project: Option<String>,
     /// A subagent turn (D-07): its session carries a `parent_session_key`.
     pub sidechain: bool,
-    /// Higher is a better match. See [`HEAD`] for where the sign is fixed.
+    /// What RCL-04's exact-match half added to [`Hit::relevance`]. Zero when the
+    /// query matched this turn only as free text.
+    ///
+    /// Reported rather than folded away: it is the difference between "this
+    /// turn ran that command" and "this turn mentions that word", and a caller
+    /// that cannot see it cannot show it or test it.
+    pub entity_score: f64,
+    /// Higher is a better match: the negated bm25 (see [`HEAD`]) plus
+    /// [`Hit::entity_score`].
     pub relevance: f64,
 }
 
@@ -160,10 +171,25 @@ const HEAD: &str = "
 /// a different turn each time. Relevance first, then D-07's rule that a
 /// sidechain turn sorts last at equal score, then the newer turn, then the
 /// lower id.
+///
+/// This orders the CANDIDATES. The entity weighting below then moves rows
+/// within that set and the same comparison is applied again in Rust, which is
+/// why it is written twice: SQL cannot see a score that is computed from a
+/// second table's document frequencies.
 const TAIL: &str = "
     ORDER BY relevance DESC, sidechain ASC, t.ts DESC, t.id ASC
     LIMIT ?
 ";
+
+/// How many turns are ranked before the caller's limit is applied.
+///
+/// The entity weighting can only re-order rows it was given, so a pool no
+/// larger than the limit would mean a turn that carries the exact command the
+/// user asked for could never climb past a turn that merely says the word.
+/// Four times the maximum is a bounded read - the rows are seven small columns
+/// and no blob is touched until after the truncation - and it is the whole of
+/// what a re-rank can reach.
+const CANDIDATE_POOL: usize = MAX_RESULTS * 4;
 
 /// Run one search.
 ///
@@ -208,10 +234,10 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
     );
     request.filters.push_onto(&mut sql, &mut params)?;
     sql.push_str(TAIL);
-    params.push(Box::new(request.effective_limit() as i64));
+    params.push(Box::new(CANDIDATE_POOL as i64));
 
     let mut statement = conn.prepare(&sql)?;
-    let hits = statement
+    let mut hits = statement
         .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok(Hit {
                 turn_id: row.get(0)?,
@@ -220,12 +246,124 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
                 ts: row.get(3)?,
                 project: row.get(4)?,
                 sidechain: row.get::<_, i64>(5)? != 0,
+                entity_score: 0.0,
                 relevance: row.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<Hit>>>()?;
+    drop(statement);
+
+    weight_by_entities(conn, &request.query, &mut hits)?;
+    hits.sort_by(rank);
+    hits.truncate(request.effective_limit());
 
     Ok(Response { hits, reason: None })
+}
+
+/// The same total order [`TAIL`] applies, over scores SQL could not compute.
+fn rank(a: &Hit, b: &Hit) -> std::cmp::Ordering {
+    b.relevance
+        .partial_cmp(&a.relevance)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.sidechain.cmp(&b.sidechain))
+        // Descending, and `None` last, which is where SQL puts it too.
+        .then_with(|| b.ts.cmp(&a.ts))
+        .then_with(|| a.turn_id.cmp(&b.turn_id))
+}
+
+/// An exact match on a whole stored value counts double one that merely
+/// covers it.
+///
+/// The user who typed the command asked for the command; the user who typed it
+/// inside a longer question asked for something the command is part of.
+const EXACT_WEIGHT: f64 = 2.0;
+const COVERED_WEIGHT: f64 = 1.0;
+
+/// RCL-04's query-time half: weight each matched entity by how rare its value
+/// is, and add it to the relevance of every candidate carrying it.
+///
+/// Nothing is rejected and there is no stop-list. "Too common" changes as the
+/// corpus grows and an index-time rejection is irreversible, which is why the
+/// requirement puts this here: a value carried by half the archive still
+/// matches, it just moves a hit almost not at all.
+///
+/// Deterministic, and dependent only on stored rows: the document frequency is
+/// a count over `entities` and the total is a count over `turns`, so two runs
+/// against an unchanged store produce the same order. Phase 5's structural
+/// threshold reads rank 1..3, and a nondeterministic tie would make it fire on
+/// a different turn each time.
+fn weight_by_entities(conn: &Connection, query: &Query, hits: &mut [Hit]) -> Result<()> {
+    if hits.is_empty() || query.is_empty() {
+        return Ok(());
+    }
+
+    let ids: Vec<i64> = hits.iter().map(|hit| hit.turn_id).collect();
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = conn.prepare(&format!(
+        "SELECT turn_id, kind, value_norm FROM entities WHERE turn_id IN ({placeholders})"
+    ))?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<(i64, String, String)>>>()?;
+    drop(statement);
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    // The N of the IDF. Every turn is a document whether or not it carries an
+    // entity, so a value on one turn in the archive is rare in the archive and
+    // not merely rare among the turns that happen to have entities.
+    let total: f64 =
+        conn.query_row("SELECT count(*) FROM turns", [], |r| r.get::<_, i64>(0))? as f64;
+
+    let mut weights: BTreeMap<(String, String), f64> = BTreeMap::new();
+    let mut by_turn: BTreeMap<i64, f64> = BTreeMap::new();
+    let mut frequency = conn.prepare(
+        "SELECT count(DISTINCT turn_id) FROM entities WHERE kind = ?1 AND value_norm = ?2",
+    )?;
+
+    for (turn_id, kind, value) in rows {
+        let key = (kind, value);
+        let weight = match weights.get(&key) {
+            Some(weight) => *weight,
+            None => {
+                let weight = match query.matches_entity(&key.1) {
+                    None => 0.0,
+                    Some(matched) => {
+                        // `idx_entities_lookup` is on exactly (kind, value_norm).
+                        let df: i64 =
+                            frequency.query_row(rusqlite::params![&key.0, &key.1], |r| r.get(0))?;
+                        let idf = (1.0 + total / df.max(1) as f64).ln();
+                        idf * match matched {
+                            EntityMatch::Exact => EXACT_WEIGHT,
+                            EntityMatch::Covered => COVERED_WEIGHT,
+                        }
+                    }
+                };
+                weights.insert(key.clone(), weight);
+                weight
+            }
+        };
+        if weight > 0.0 {
+            *by_turn.entry(turn_id).or_insert(0.0) += weight;
+        }
+    }
+
+    for hit in hits.iter_mut() {
+        if let Some(bonus) = by_turn.get(&hit.turn_id) {
+            hit.entity_score = *bonus;
+            hit.relevance += *bonus;
+        }
+    }
+    Ok(())
 }
 
 impl Filters {

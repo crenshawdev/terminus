@@ -16,6 +16,6 @@ pub mod query;
 pub mod scope;
 pub mod search;
 
-pub use query::{Query, MAX_QUERY_TOKENS};
+pub use query::{EntityMatch, Query, MAX_QUERY_TOKENS};
 pub use scope::{Reason, Scope};
 pub use search::{Filters, Hit, Request, Response, DEFAULT_RESULTS, MAX_RESULTS};

@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use verbatim_core::config::Config;
 use verbatim_core::recall::{
-    search, Filters, Hit, Query, Reason, Request, Response, Scope, MAX_QUERY_TOKENS, MAX_RESULTS,
+    search, EntityMatch, Filters, Hit, Query, Reason, Request, Response, Scope, MAX_QUERY_TOKENS,
+    MAX_RESULTS,
 };
 use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::{ingest, testkit};
@@ -90,6 +91,43 @@ impl Bench {
             body.push('\n');
         }
 
+        self.archive(name, &body)
+    }
+
+    /// A session of `Read` tool calls, one per named path.
+    ///
+    /// A path reaches the `entities` table only from a tool call's own input
+    /// (RCL-02), so a document frequency to weight by is something only a real
+    /// tool record can produce.
+    fn reads(&self, name: &str, paths: &[&str]) -> PathBuf {
+        let mut body = String::new();
+        for (n, file) in paths.iter().enumerate() {
+            let line = serde_json::json!({
+                "parentUuid": null,
+                "isSidechain": false,
+                "cwd": self.work.join("entities").to_string_lossy(),
+                "sessionId": "88888888-8888-4888-8888-888888888888",
+                "type": "assistant",
+                "uuid": format!("eeeeeeee-0000-4000-8000-{n:012}"),
+                "timestamp": format!("2026-08-12T22:{:02}:{:02}.000Z", n / 60, n % 60),
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-5",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": format!("toolu_e{n}"),
+                        "name": "Read",
+                        "input": {"file_path": file},
+                    }],
+                },
+            });
+            body.push_str(&line.to_string());
+            body.push('\n');
+        }
+        self.archive(name, &body)
+    }
+
+    fn archive(&self, name: &str, body: &str) -> PathBuf {
         let path = self.work.join(name);
         std::fs::write(&path, body).unwrap();
         match ingest::run(&self.data_dir, &path).unwrap() {
@@ -817,4 +855,118 @@ fn a_malformed_time_is_a_caller_error() {
             }
         }
     }
+}
+
+/// RCL-04 matches a whole stored value, never one query token against one.
+///
+/// `path` and `error` values are multi-token by construction, so a
+/// token-equality rule could never fire for the two kinds this phase headlines.
+#[test]
+fn an_entity_match_is_against_the_whole_stored_value() {
+    let path = "src/worker/S.ts";
+
+    assert_eq!(
+        Query::parse(path).matches_entity(path),
+        Some(EntityMatch::Exact)
+    );
+    // Spelling that survives the tokenizer is the same value.
+    assert_eq!(
+        Query::parse("SRC worker s TS").matches_entity(path),
+        Some(EntityMatch::Exact)
+    );
+    // The query asks for more than the value, so the value is covered.
+    assert_eq!(
+        Query::parse("who edited src/worker/S.ts today").matches_entity(path),
+        Some(EntityMatch::Covered)
+    );
+    // One token of a multi-token value is not that value.
+    assert_eq!(Query::parse("worker").matches_entity(path), None);
+    assert_eq!(Query::parse("").matches_entity(path), None);
+    // A value that tokenizes to nothing cannot be asked for.
+    assert_eq!(Query::parse("anything").matches_entity("///"), None);
+}
+
+/// RCL-04's point: an exact structural match outranks a free-text one.
+///
+/// The assertion is the reordering itself. `cargo` reaches turns that ran it as
+/// a command and turns that merely say the word, and among them is a pair the
+/// text score ranks the wrong way round - which is what makes this a test of
+/// the entity weight rather than of bm25 agreeing with it.
+#[test]
+fn an_exact_entity_match_outranks_a_free_text_match() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let hits = ranked(&conn, "cargo", MAX_RESULTS);
+    let structural: Vec<&Hit> = hits.iter().filter(|h| h.entity_score > 0.0).collect();
+    let textual: Vec<&Hit> = hits.iter().filter(|h| h.entity_score == 0.0).collect();
+    assert!(!structural.is_empty() && !textual.is_empty(), "{hits:?}");
+
+    // The text score alone, which is what the relevance was before weighting.
+    let text_only = |hit: &Hit| hit.relevance - hit.entity_score;
+
+    let flipped = structural.iter().any(|entity_hit| {
+        textual.iter().any(|text_hit| {
+            text_only(text_hit) > text_only(entity_hit) && entity_hit.relevance > text_hit.relevance
+        })
+    });
+    assert!(
+        flipped,
+        "no turn carrying the exact command climbed past a turn that only says it: {hits:?}"
+    );
+}
+
+/// The same rule for a path: the tool call that opened the file outranks the
+/// sentence about what was in it.
+#[test]
+fn a_path_in_a_tool_call_outranks_the_same_path_in_prose() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let hits = ranked(&conn, "docs/RETRY.md", MAX_RESULTS);
+    assert_eq!(hits.len(), 2, "{hits:?}");
+
+    assert_eq!(
+        tool_of(&conn, hits[0].turn_id).as_deref(),
+        Some("Read"),
+        "the tool call should rank first: {hits:?}"
+    );
+    assert!(hits[0].entity_score > 0.0);
+    assert_eq!(
+        hits[1].entity_score, 0.0,
+        "a path named in prose emits no entity, so it earns no structural weight"
+    );
+}
+
+/// A value half the corpus carries moves a hit far less than a rare one.
+///
+/// Nothing is rejected and there is no stop-list: the common value still
+/// matches, and RCL-04 puts the judgement at query time precisely because "too
+/// common" changes as the archive grows.
+#[test]
+fn a_rare_entity_value_moves_a_hit_more_than_a_common_one() {
+    let bench = bench();
+    let common = "src/common/everywhere.rs";
+    let rare = "src/rare/once.rs";
+    let mut paths: Vec<&str> = vec![common; 30];
+    paths.push(rare);
+    bench.reads("entities.jsonl", &paths);
+    let conn = bench.conn();
+
+    let common_hits = ranked(&conn, common, MAX_RESULTS);
+    let rare_hits = ranked(&conn, rare, MAX_RESULTS);
+    assert_eq!(rare_hits.len(), 1, "{rare_hits:?}");
+    assert!(common_hits.len() > 10, "{}", common_hits.len());
+
+    let common_score = common_hits[0].entity_score;
+    let rare_score = rare_hits[0].entity_score;
+    assert!(common_score > 0.0, "the common value still matches");
+    assert!(
+        rare_score > common_score,
+        "rare {rare_score} should outweigh common {common_score}"
+    );
+
+    // Deterministic: the same store answers the same way twice.
+    assert_eq!(ranked(&conn, rare, MAX_RESULTS), rare_hits);
+    assert_eq!(ranked(&conn, common, MAX_RESULTS), common_hits);
 }
