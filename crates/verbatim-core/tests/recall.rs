@@ -9,13 +9,14 @@
 use std::path::PathBuf;
 
 use rusqlite::Connection;
-use verbatim_core::recall::{Query, MAX_QUERY_TOKENS};
+use verbatim_core::recall::{search, Hit, Query, Request, MAX_QUERY_TOKENS, MAX_RESULTS};
 use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::{ingest, testkit};
 
 struct Bench {
     _dir: tempfile::TempDir,
     data_dir: PathBuf,
+    work: PathBuf,
 }
 
 /// A store with every transcript fixture ingested.
@@ -42,12 +43,53 @@ fn bench() -> Bench {
     Bench {
         _dir: dir,
         data_dir,
+        work,
     }
 }
 
 impl Bench {
     fn conn(&self) -> Connection {
         Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
+    }
+
+    /// Archive one more session, written by the test and ingested through the
+    /// ordinary path.
+    ///
+    /// The fixture corpus is 47 turns and no single term reaches 17 of them, so
+    /// a claim about a result limit in the tens has nothing to be true about
+    /// until a session exists that exceeds it. The records are as thin as the
+    /// parser accepts: what is being measured is how many rows come back, not
+    /// what is in them.
+    fn flood(&self, name: &str, token: &str, records: usize) -> PathBuf {
+        let session = "77777777-7777-4777-8777-777777777777";
+        let mut body = String::new();
+        for n in 0..records {
+            let line = serde_json::json!({
+                "parentUuid": null,
+                "isSidechain": false,
+                // A directory nothing created, so project identity degrades to
+                // the path itself rather than spawning git for an answer.
+                "cwd": self.work.join("flooded").to_string_lossy(),
+                "sessionId": session,
+                "type": "user",
+                "uuid": format!("dddddddd-0000-4000-8000-{n:012}"),
+                "timestamp": format!("2026-08-12T21:{:02}:{:02}.000Z", n / 60, n % 60),
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": format!("{token} line {n}")}],
+                },
+            });
+            body.push_str(&line.to_string());
+            body.push('\n');
+        }
+
+        let path = self.work.join(name);
+        std::fs::write(&path, body).unwrap();
+        match ingest::run(&self.data_dir, &path).unwrap() {
+            ingest::Outcome::Committed(_) => {}
+            other => panic!("{name}: {other:?}"),
+        }
+        path
     }
 }
 
@@ -63,7 +105,7 @@ fn matching(conn: &Connection, expression: &str) -> rusqlite::Result<Vec<i64>> {
 }
 
 /// A user's raw string, run the way a read command will run it.
-fn search(conn: &Connection, raw: &str) -> rusqlite::Result<Vec<i64>> {
+fn search_ids(conn: &Connection, raw: &str) -> rusqlite::Result<Vec<i64>> {
     match Query::parse(raw).match_expression() {
         Some(expression) => matching(conn, &expression),
         // `MATCH ''` is itself an fts5 error, so a query that reduces to no
@@ -121,7 +163,7 @@ fn no_raw_query_reaches_fts5() {
              query layer proves nothing"
         );
 
-        let result = search(&conn, raw);
+        let result = search_ids(&conn, raw);
         assert!(
             result.is_ok(),
             "`{raw}` reached fts5 as written: {:?}",
@@ -144,7 +186,7 @@ fn a_path_query_returns_the_turn_that_contains_it() {
         "the fixture corpus should name that path in exactly one turn"
     );
 
-    let hits = search(&conn, "src/worker/S.ts").unwrap();
+    let hits = search_ids(&conn, "src/worker/S.ts").unwrap();
     assert!(
         hits.contains(&carriers[0]),
         "turn {} carries `src/worker/S.ts` and the search missed it: {hits:?}",
@@ -159,12 +201,15 @@ fn a_query_matching_nothing_is_an_empty_result() {
     let bench = bench();
     let conn = bench.conn();
 
-    assert_eq!(search(&conn, "zzzzunfindable").unwrap(), Vec::<i64>::new());
+    assert_eq!(
+        search_ids(&conn, "zzzzunfindable").unwrap(),
+        Vec::<i64>::new()
+    );
     // A real token beside one nothing carries: the conjunction is what makes
     // this empty, not the absence of any indexable word at all.
-    assert!(!search(&conn, testkit::UNIQUE_TOKEN).unwrap().is_empty());
+    assert!(!search_ids(&conn, testkit::UNIQUE_TOKEN).unwrap().is_empty());
     assert_eq!(
-        search(&conn, &format!("{} zzzzunfindable", testkit::UNIQUE_TOKEN)).unwrap(),
+        search_ids(&conn, &format!("{} zzzzunfindable", testkit::UNIQUE_TOKEN)).unwrap(),
         Vec::<i64>::new()
     );
 }
@@ -216,7 +261,7 @@ fn query_tokens_are_not_expanded() {
 
     for raw in ["SearchManager", "manager"] {
         assert!(
-            search(&conn, raw).unwrap().contains(&carriers[0]),
+            search_ids(&conn, raw).unwrap().contains(&carriers[0]),
             "`{raw}` missed turn {}",
             carriers[0]
         );
@@ -254,8 +299,102 @@ fn the_token_count_is_bounded() {
     );
 
     // And it still runs: a bounded expression is one fts5 accepts.
-    assert_eq!(search(&conn, &pasted).unwrap(), Vec::<i64>::new());
+    assert_eq!(search_ids(&conn, &pasted).unwrap(), Vec::<i64>::new());
 
     let short = Query::parse("one two");
     assert!(!short.truncated());
+}
+
+/// The ranked search, run the way a read command will run it.
+fn ranked(conn: &Connection, raw: &str, limit: usize) -> Vec<Hit> {
+    search::run(conn, &Request::new(Query::parse(raw)).limit(limit)).unwrap()
+}
+
+/// The last component of a session key, which is the fixture's own file name.
+fn fixture_of(hit: &Hit) -> &str {
+    hit.session_key
+        .rsplit(['/', '\\'])
+        .next()
+        .expect("a session key is a path")
+}
+
+/// Hits come back best-first, across every session that matched.
+#[test]
+fn hits_come_back_in_descending_relevance() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let found = ranked(&conn, "cargo", MAX_RESULTS);
+    assert!(found.len() > 2, "{found:?}");
+
+    let mut sessions: Vec<&str> = found.iter().map(fixture_of).collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    assert!(
+        sessions.len() > 1,
+        "one query should reach several fixtures: {sessions:?}"
+    );
+
+    for pair in found.windows(2) {
+        assert!(
+            pair[0].relevance >= pair[1].relevance,
+            "out of order: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+
+    // The sign, which is the thing a "hits came back" assertion cannot see.
+    // bm25 is negative and more negative is better, so a relevance that came
+    // back unnegated would be ordered exactly backwards and still be sorted.
+    assert!(
+        found.iter().all(|hit| hit.relevance > 0.0),
+        "relevance is not the negated bm25: {found:?}"
+    );
+}
+
+/// D-07: a subagent turn is searchable, and at equal score it sorts below the
+/// turn the user actually watched.
+///
+/// The two fixture turns carry the same sentence and nothing else, so their
+/// projected bodies are byte-identical and bm25 scores them identically - which
+/// is what makes this a test of the tie-break rather than of bm25.
+#[test]
+fn a_sidechain_turn_sorts_below_an_identical_top_level_turn() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let found = ranked(
+        &conn,
+        "the echo agent repeats this line exactly",
+        MAX_RESULTS,
+    );
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(
+        found[0].relevance, found[1].relevance,
+        "the two turns should score identically, so the order is the tie-break"
+    );
+
+    assert_eq!(fixture_of(&found[0]), "session-recall.jsonl");
+    assert!(!found[0].sidechain);
+    assert_eq!(fixture_of(&found[1]), "agent-echo.jsonl");
+    assert!(found[1].sidechain);
+}
+
+/// The result limit is a budget the caller may lower and may not raise.
+#[test]
+fn the_result_limit_cannot_be_raised() {
+    let bench = bench();
+    bench.flood("flooded.jsonl", "floodtoken", MAX_RESULTS + 10);
+    let conn = bench.conn();
+
+    assert_eq!(
+        Request::new(Query::parse("floodtoken"))
+            .limit(usize::MAX)
+            .effective_limit(),
+        MAX_RESULTS
+    );
+
+    assert_eq!(ranked(&conn, "floodtoken", usize::MAX).len(), MAX_RESULTS);
+    assert_eq!(ranked(&conn, "floodtoken", 3).len(), 3);
 }
