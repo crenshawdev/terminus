@@ -39,6 +39,13 @@ pub mod code {
     /// on both sides, and a liveness probe answered `-32601` reads as an
     /// unhealthy server and gets the connection torn down mid-session.
     pub const METHOD_NOT_FOUND: i64 = -32601;
+    /// The method exists and the params could not name a call to it: an absent
+    /// tool name, or a tool this server does not have.
+    ///
+    /// A *bad argument* to a tool this server does have is NOT this. That is a
+    /// request the server understood and could not satisfy, which comes back as
+    /// a tool result carrying a reason (RCL-10).
+    pub const INVALID_PARAMS: i64 = -32602;
 }
 
 /// One request that has an id and therefore expects exactly one response.

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use serde_json::{json, Value};
+use verbatim_core::testkit;
 
 /// Every directory a spawned `verbatim` may touch, all of them temporary.
 ///
@@ -31,6 +32,9 @@ struct Bench {
     work: PathBuf,
     config_dir: PathBuf,
     claude_dir: PathBuf,
+    /// The root the rooted fixtures' `cwd` values were substituted with, and so
+    /// the parent of every project directory a spawn can stand in.
+    root: PathBuf,
 }
 
 fn bench() -> Bench {
@@ -39,6 +43,7 @@ fn bench() -> Bench {
     let work = dir.path().join("work");
     let config_dir = dir.path().join("config");
     let claude_dir = dir.path().join("claude");
+    let root = dir.path().join("root");
     std::fs::create_dir_all(&work).unwrap();
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
@@ -48,6 +53,7 @@ fn bench() -> Bench {
         work,
         config_dir,
         claude_dir,
+        root,
     }
 }
 
@@ -62,6 +68,38 @@ impl Bench {
             .env("VERBATIM_CONFIG_DIR", &self.config_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir);
         command
+    }
+
+    /// Archive every fixture through the binary's own ingest path, so what the
+    /// server queries is what a real pass wrote.
+    fn ingest_fixtures(&self) {
+        for fixture in testkit::TRANSCRIPT_FIXTURES {
+            let rooted = testkit::ROOTED_FIXTURES.iter().any(|(f, _)| f == fixture);
+            let path = if rooted {
+                testkit::copy_rooted_fixture_into(fixture, &self.work, &self.root)
+            } else {
+                testkit::copy_fixture_into(fixture, &self.work)
+            };
+            let out = self
+                .command(&self.work, &["ingest", path.to_str().unwrap()])
+                .output()
+                .expect("spawn verbatim");
+            assert!(
+                out.status.success(),
+                "ingest {fixture}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The directory one rooted fixture's project sits at, which a spawn can
+    /// stand in.
+    fn project(&self, fixture: &str) -> PathBuf {
+        testkit::fixture_project(fixture, &self.root)
+    }
+
+    fn config(&self, text: &str) {
+        std::fs::write(self.config_dir.join("verbatim.toml"), text).unwrap();
     }
 
     /// Spawn a live server standing in `dir`, with all three streams piped.
@@ -105,6 +143,33 @@ impl Bench {
             code: out.status.code(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         }
+    }
+
+    /// One `tools/call`, through the handshake a real client performs first.
+    ///
+    /// The value returned is the tool's own document - the JSON its single text
+    /// content block carries - so a test asserts on hits and reasons rather than
+    /// on the envelope around them.
+    fn call(&self, dir: &Path, tool: &str, arguments: Value) -> Value {
+        let conversation = self.talk(
+            dir,
+            &[
+                initialize(),
+                initialized(),
+                json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments},
+                }),
+            ],
+        );
+        conversation.expect_ok();
+        assert_eq!(
+            conversation.responses.len(),
+            2,
+            "one response for initialize and one for the call: {:?}",
+            conversation.responses
+        );
+        content(&conversation.responses[1])
     }
 }
 
@@ -155,6 +220,43 @@ fn initialize() -> Value {
 
 fn initialized() -> Value {
     json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+}
+
+/// The document inside a `tools/call` response's single text content block.
+fn content(response: &Value) -> Value {
+    assert!(
+        response.get("error").is_none(),
+        "a tool call was answered with a JSON-RPC error rather than a result: {response}"
+    );
+    let blocks = response["result"]["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a tool result carries a content array: {response}"));
+    assert_eq!(blocks.len(), 1, "one content block: {response}");
+    assert_eq!(blocks[0]["type"], "text", "{response}");
+    let text = blocks[0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a text block carries text: {response}"));
+    serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("the tool result is not one JSON document ({e}): {text}"))
+}
+
+/// The `hits` of a `recall_search` document, which is always an array.
+fn hits(document: &Value) -> Vec<Value> {
+    document["hits"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a search result carries a hits array: {document}"))
+        .clone()
+}
+
+/// The distinct `project` values a set of hits came from.
+fn projects(hits: &[Value]) -> Vec<String> {
+    let mut out: Vec<String> = hits
+        .iter()
+        .map(|hit| hit["project"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -300,4 +402,170 @@ fn mcp_rejects_an_argument_rather_than_ignoring_it() {
         .expect("spawn verbatim");
     assert_eq!(out.status.code(), Some(2), "{:?}", out);
     assert!(out.stdout.is_empty(), "misuse must print nothing to stdout");
+}
+
+// ---------------------------------------------------------------------------
+// recall_search (RCL-07, AC5)
+// ---------------------------------------------------------------------------
+
+/// The headline call, auto-scoped: a search for a path, made by a server started
+/// inside one project, returns that project's turns and nobody else's.
+///
+/// The scope is not an argument here - it is the process's working directory,
+/// which is what Claude Code sets to the session's own project. A raw
+/// `MATCH 'src/worker/S.ts'` is `fts5: syntax error near "/"` (D-09), so the
+/// path form is also the query shape that would fail without the tokenizer.
+#[test]
+fn recall_search_is_scoped_to_the_directory_the_server_was_started_in() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let alpha = bench.project("session-recall.jsonl");
+    let beta = bench.project("session-errors-a.jsonl");
+    assert_ne!(alpha, beta, "the fixtures must span two projects");
+
+    let found = hits(&bench.call(&alpha, "recall_search", json!({"query": "src/worker/S.ts"})));
+    assert!(!found.is_empty(), "the path query matched nothing");
+    assert_eq!(
+        projects(&found),
+        vec![alpha.to_string_lossy().into_owned()],
+        "a scoped search returned another project's turns"
+    );
+    for hit in &found {
+        for field in [
+            "turn_id",
+            "session_key",
+            "project",
+            "record_type",
+            "ts",
+            "sidechain",
+            "relevance",
+            "entity_score",
+            "excerpt",
+        ] {
+            assert!(hit.get(field).is_some(), "a hit is missing {field}: {hit}");
+        }
+        assert!(
+            hit["excerpt"]
+                .as_str()
+                .is_some_and(|e| e.contains("src/worker/S.ts")),
+            "the excerpt must show what matched (D-05): {hit}"
+        );
+    }
+
+    // A term that lives only in the other project is absent from this one.
+    assert!(
+        hits(&bench.call(&alpha, "recall_search", json!({"query": "cargo"}))).is_empty(),
+        "a search in one project returned another project's turns"
+    );
+}
+
+/// `project: "*"` opts out of the auto-scoping and reaches every project.
+///
+/// Asserted by the project set widening rather than by the hit count: more hits
+/// could mean one project's second turn, and what the argument promises is
+/// turns from projects the caller is not standing in.
+#[test]
+fn the_star_project_reaches_more_than_one_project() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let beta = bench.project("session-errors-a.jsonl");
+    let beta_key = beta.to_string_lossy().into_owned();
+
+    let scoped = hits(&bench.call(&beta, "recall_search", json!({"query": "cargo"})));
+    assert!(!scoped.is_empty(), "this test needs beta cargo turns");
+    assert_eq!(projects(&scoped), vec![beta_key.clone()]);
+
+    let everywhere = hits(&bench.call(
+        &beta,
+        "recall_search",
+        json!({"query": "cargo", "project": "*"}),
+    ));
+    assert!(
+        projects(&everywhere).len() > 1,
+        "`*` reached only one project: {:?}",
+        projects(&everywhere)
+    );
+    assert!(
+        projects(&everywhere).contains(&beta_key),
+        "`*` lost the project the server was standing in"
+    );
+}
+
+/// AC5's exclusion half through the server: with a project excluded, neither the
+/// scoped call nor the `*` call returns any of its turns.
+///
+/// Archived first and excluded second, which is the case a flag written at
+/// ingest could never answer: exclusion is a read-path predicate re-applied on
+/// every read, not a stamp and not a deletion.
+#[test]
+fn an_excluded_projects_turns_are_absent_from_recall_search() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let beta = bench.project("session-errors-a.jsonl");
+    let beta_key = beta.to_string_lossy().into_owned();
+
+    // The control: before the exclusion those turns answer.
+    assert!(!hits(&bench.call(&beta, "recall_search", json!({"query": "cargo"}))).is_empty());
+
+    bench.config(&format!("exclude = [{beta_key:?}]\n"));
+
+    // Standing inside the excluded project: an empty result that says why,
+    // rather than a silent nothing that reads as an empty archive.
+    let document = bench.call(&beta, "recall_search", json!({"query": "cargo"}));
+    assert!(hits(&document).is_empty(), "{document}");
+    assert!(
+        document["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("excluded")),
+        "an excluded scope gave no reason: {document}"
+    );
+
+    // And under `*`, where exclusion stays in force.
+    let everywhere = hits(&bench.call(
+        &beta,
+        "recall_search",
+        json!({"query": "cargo", "project": "*"}),
+    ));
+    assert!(
+        !projects(&everywhere).contains(&beta_key),
+        "an excluded project's turn came back under `*`: {everywhere:?}"
+    );
+}
+
+/// The filters RCL-07 names reach the query layer, and the limit is the
+/// server's to lower.
+#[test]
+fn the_search_filters_and_the_result_budget_reach_the_query_layer() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let beta = bench.project("session-errors-a.jsonl");
+    let found = |arguments: Value| hits(&bench.call(&beta, "recall_search", arguments));
+
+    assert!(!found(json!({"query": "cargo", "tool": "Bash"})).is_empty());
+    assert!(
+        found(json!({"query": "cargo", "tool": "Read"})).is_empty(),
+        "the tool filter narrowed nothing"
+    );
+    assert!(found(json!({"query": "cargo", "until": "2000-01-01"})).is_empty());
+    assert_eq!(found(json!({"query": "cargo", "limit": 1})).len(), 1);
+
+    // A limit above the budget is lowered rather than refused, and the answer
+    // says so instead of quietly returning fewer than asked.
+    let document = bench.call(
+        &beta,
+        "recall_search",
+        json!({"query": "cargo", "limit": 5000}),
+    );
+    assert!(!hits(&document).is_empty(), "{document}");
+    assert!(hits(&document).len() <= 50, "{document}");
+    assert!(
+        document["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("budget")),
+        "the lowered limit was not reported: {document}"
+    );
 }

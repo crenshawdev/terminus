@@ -136,6 +136,14 @@ fn answer(line: &str) -> Option<Value> {
         rpc::Incoming::Request(request) => Some(match request.method.as_str() {
             "initialize" => rpc::result(&request.id, initialize(&request.params)),
             "tools/list" => rpc::result(&request.id, json!({"tools": tools::descriptors()})),
+            // The only method that reads the archive. Its `Err` is a protocol
+            // failure - params that do not name a call this server has - and
+            // never a tool that could not answer, which is a result carrying a
+            // reason (RCL-10).
+            "tools/call" => match tools::call(&request.params) {
+                Ok(result) => rpc::result(&request.id, result),
+                Err((code, message)) => rpc::failure(Some(&request.id), code, &message),
+            },
             // Answered with an empty result, not `-32601`: the bundled client
             // implements `ping` on both sides, and a liveness probe answered
             // "no such method" reads as an unhealthy server.
