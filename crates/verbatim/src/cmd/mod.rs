@@ -10,6 +10,7 @@ pub mod json;
 pub mod read;
 pub mod reindex;
 pub mod search;
+pub mod show;
 pub mod status;
 pub mod verify;
 
@@ -60,6 +61,17 @@ pub const JSON_FLAG: &str = "json";
 ///
 /// Everything else is still rejected. A subcommand that silently ignored an
 /// argument is how `verify --json` came to look supported before it was.
+/// The value of a flag that takes one, as a misuse when it is absent.
+///
+/// Shared by every command that has flags, so "--project with nothing after it"
+/// says the same thing whichever command was asked.
+pub fn value(parser: &mut lexopt::Parser, flag: &str) -> Result<String, Failure> {
+    parser
+        .value()
+        .map_err(|_| Failure::Misuse(format!("--{flag} needs a value")))
+        .map(|v| v.to_string_lossy().into_owned())
+}
+
 pub fn json_flag(parser: &mut lexopt::Parser) -> Result<bool, Failure> {
     use lexopt::prelude::*;
 

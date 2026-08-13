@@ -134,7 +134,7 @@ fn document(output: &Output) -> Value {
 /// One list rather than one test per command: the two behaviours D-10 and D-18
 /// fix are properties of the shared entry point, so a seventh read command added
 /// later is one line here rather than a new test.
-const READ_COMMANDS: &[&[&str]] = &[&["search", "anything"]];
+const READ_COMMANDS: &[&[&str]] = &[&["search", "anything"], &["show", "1"]];
 
 // ---------------------------------------------------------------------------
 // The shared read entry point (D-10, D-18)
@@ -565,4 +565,275 @@ fn the_command_line_filters_reach_the_query_layer() {
 
     // `--limit` bounds the page.
     assert_eq!(hits(&["--limit", "1", "cargo"]).len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// `verbatim show` (RCL-09 plus RCL-08's window)
+// ---------------------------------------------------------------------------
+
+/// The turn id `search` printed for a query, which is the only id a user ever
+/// types into `show`.
+fn one_id(bench: &Bench, query: &str) -> i64 {
+    let out = bench.run(&["search", "--project", "*", "--json", query]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    document(&out)["data"]["hits"]
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap_or_else(|| panic!("{query:?} matched nothing"))["turn_id"]
+        .as_i64()
+        .unwrap()
+}
+
+/// `verbatim show <id>` prints the record's own archived line, byte for byte.
+///
+/// Compared against the transcript file rather than against anything the store
+/// derived. A projection would be prose about the right turn and would pass any
+/// test that only checked the turn was found - and this is the command whose
+/// whole job is that it does not do that.
+#[test]
+fn show_prints_the_records_own_line() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let id = one_id(&bench, "src/worker/S.ts");
+    let out = bench.run(&["show", "--project", "*", &id.to_string()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let text = String::from_utf8(testkit::fixture_bytes("session-recall.jsonl")).unwrap();
+    let expected = text
+        .replace(
+            testkit::FIXTURE_ROOT_TOKEN,
+            &bench.root.to_string_lossy().replace('\\', "\\\\"),
+        )
+        .lines()
+        .nth(1)
+        .expect("the fixture has a second line")
+        .to_owned();
+
+    let printed = stdout(&out);
+    assert!(
+        printed.contains(&expected),
+        "the archived line is not in the output.\nwanted: {expected}\ngot: {printed}"
+    );
+    // The header is there too, and leads with the id the user typed.
+    assert!(
+        printed.starts_with(&format!("{id}  ")),
+        "the header must lead with the id: {printed}"
+    );
+}
+
+/// RCL-08 through the command: `--before`/`--after` return the neighbouring
+/// turns in `turn_seq` order, and the session's own ends are marked.
+///
+/// The boundary flag is the half that could be dropped silently. A window that
+/// asked for five earlier turns and got two says "there is nothing earlier"
+/// rather than leaving a caller to guess whether the archive is short.
+#[test]
+fn show_with_a_window_returns_the_neighbours_and_flags_the_boundary() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    // The first turn of a session: there is nothing before it, by construction.
+    let first: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT id FROM turns WHERE session_key LIKE '%session-recall.jsonl'
+              ORDER BY turn_seq LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let out = bench.run(&[
+        "show",
+        "--project",
+        "*",
+        "--json",
+        "--before",
+        "5",
+        "--after",
+        "2",
+        &first.to_string(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let context = document(&out)["data"]["records"][0]["context"].clone();
+    assert_eq!(
+        context["at_session_start"], true,
+        "the first turn of a session is a boundary: {context}"
+    );
+    assert_eq!(context["at_session_end"], false, "{context}");
+
+    let turns = context["turns"].as_array().unwrap();
+    // Asked for five before and got none, because there are none: the shorter
+    // list is exactly what the flag exists to explain.
+    assert_eq!(turns.len(), 3, "one anchor plus two after: {context}");
+    let seqs: Vec<i64> = turns
+        .iter()
+        .map(|t| t["turn_seq"].as_i64().unwrap())
+        .collect();
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        seqs, sorted,
+        "the window is not in turn_seq order: {seqs:?}"
+    );
+    assert_eq!(
+        turns.iter().filter(|t| t["is_anchor"] == true).count(),
+        1,
+        "exactly one turn is the anchor: {context}"
+    );
+
+    // And the human rendering says the same thing out loud.
+    let out = bench.run(&[
+        "show",
+        "--project",
+        "*",
+        "--before",
+        "5",
+        "--after",
+        "2",
+        &first.to_string(),
+    ]);
+    assert!(
+        stdout(&out).contains("--- start of session ---"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// D-08 through the command: a turn whose session is evicted prints as evicted
+/// and the command still exits 0.
+///
+/// Retention is phase 8 and nothing writes that column before then, so the test
+/// sets it directly - which is also the point. The flag comes off the column and
+/// never off a failed blob read, so this stays distinguishable from the archive
+/// damage `verbatim verify` reports.
+#[test]
+fn show_prints_an_evicted_turn_as_evicted_and_exits_zero() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let id = one_id(&bench, "src/worker/S.ts");
+    bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET is_evicted = 1
+              WHERE session_key = (SELECT session_key FROM turns WHERE id = ?1)",
+            [id],
+        )
+        .unwrap();
+
+    let out = bench.run(&["show", "--project", "*", &id.to_string()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stdout(&out).contains("(body evicted)"), "{}", stdout(&out));
+
+    let out = bench.run(&["show", "--project", "*", "--json", &id.to_string()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let record = document(&out)["data"]["records"][0].clone();
+    assert_eq!(record["body_evicted"], true, "{record}");
+    assert_eq!(record["body"], Value::Null, "{record}");
+    // Everything else about the turn is still known: only its bytes are gone.
+    assert_eq!(record["turn_id"], id);
+    assert!(record["ts"].is_string(), "{record}");
+}
+
+/// An id that is not a number is misuse; an id that names no turn is an empty
+/// result with a reason.
+///
+/// The split is the whole exit-code contract in one command. A word where an id
+/// belongs is a mistake in the command line, and answering "no such turn" would
+/// suggest the archive had been consulted about it.
+#[test]
+fn a_word_is_misuse_and_an_unknown_id_is_a_reason() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    for args in [
+        vec!["show", "notanumber"],
+        vec!["show"],
+        vec!["show", "--before", "lots", "1"],
+    ] {
+        let out = bench.run(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{}` should be misuse: {}",
+            args.join(" "),
+            stderr(&out)
+        );
+        assert_eq!(stdout(&out), "", "misuse must print nothing to stdout");
+    }
+
+    let unknown: i64 = bench
+        .conn()
+        .query_row("SELECT max(id) + 1000 FROM turns", [], |r| r.get(0))
+        .unwrap();
+
+    let out = bench.run(&["show", "--project", "*", &unknown.to_string()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "an unknown id prints no record");
+    assert!(
+        stderr(&out).contains(&format!("no turn {unknown}")),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = bench.run(&["show", "--project", "*", "--json", &unknown.to_string()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let document = document(&out);
+    assert_eq!(document["ok"], true, "{document}");
+    assert_eq!(document["data"]["records"], serde_json::json!([]));
+    assert_eq!(document["data"]["absent"][0]["turn_id"], unknown);
+    assert!(
+        document["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("no turn")),
+        "{document}"
+    );
+}
+
+/// Several ids at once come back in the order they were asked for, and a known
+/// id beside an unknown one still answers.
+#[test]
+fn show_answers_several_ids_and_keeps_the_order_asked_for() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let ids: Vec<i64> = bench
+        .conn()
+        .prepare(
+            "SELECT id FROM turns WHERE session_key LIKE '%session-recall.jsonl'
+              ORDER BY turn_seq DESC LIMIT 3",
+        )
+        .unwrap()
+        .query_map([], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(ids.len(), 3);
+
+    let mut args = vec![
+        "show".to_owned(),
+        "--project".into(),
+        "*".into(),
+        "--json".into(),
+    ];
+    args.extend(ids.iter().map(|id| id.to_string()));
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let out = bench.run(&borrowed);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let returned: Vec<i64> = document(&out)["data"]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["turn_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        returned, ids,
+        "records must come back in the order the ids were given"
+    );
 }

@@ -172,16 +172,16 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
 
     while let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
         match arg {
-            Long("project") => project = Some(value(parser, "project")?),
-            Long("tool") => filters.tool = Some(value(parser, "tool")?),
-            Long("kind") => filters.kind = Some(value(parser, "kind")?),
+            Long("project") => project = Some(super::value(parser, "project")?),
+            Long("tool") => filters.tool = Some(super::value(parser, "tool")?),
+            Long("kind") => filters.kind = Some(super::value(parser, "kind")?),
             // Repeatable: a turn carrying any of the named paths is a hit, and
             // it is one hit however many of them it carries.
-            Long("path") => filters.paths.push(value(parser, "path")?),
-            Long("since") => filters.since = Some(value(parser, "since")?),
-            Long("until") => filters.until = Some(value(parser, "until")?),
+            Long("path") => filters.paths.push(super::value(parser, "path")?),
+            Long("since") => filters.since = Some(super::value(parser, "since")?),
+            Long("until") => filters.until = Some(super::value(parser, "until")?),
             Long("limit") => {
-                let raw = value(parser, "limit")?;
+                let raw = super::value(parser, "limit")?;
                 limit = raw
                     .parse::<usize>()
                     .map_err(|_| Failure::Misuse(format!("--limit {raw:?} is not a number")))?;
@@ -213,12 +213,4 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
         limit,
         json,
     })
-}
-
-/// The value of a flag that takes one, as a misuse when it is absent.
-fn value(parser: &mut lexopt::Parser, flag: &str) -> Result<String, Failure> {
-    parser
-        .value()
-        .map_err(|_| Failure::Misuse(format!("--{flag} needs a value")))
-        .map(|v| v.to_string_lossy().into_owned())
 }
