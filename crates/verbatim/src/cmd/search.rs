@@ -178,8 +178,14 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
             // Repeatable: a turn carrying any of the named paths is a hit, and
             // it is one hit however many of them it carries.
             Long("path") => filters.paths.push(super::value(parser, "path")?),
-            Long("since") => filters.since = Some(super::value(parser, "since")?),
-            Long("until") => filters.until = Some(super::value(parser, "until")?),
+            // Validated here rather than only inside the query layer: a bad
+            // bound must be misuse whatever project the caller is standing in.
+            Long("since") => {
+                filters.since = Some(super::time_bound("since", &super::value(parser, "since")?)?)
+            }
+            Long("until") => {
+                filters.until = Some(super::time_bound("until", &super::value(parser, "until")?)?)
+            }
             Long("limit") => {
                 let raw = super::value(parser, "limit")?;
                 limit = raw

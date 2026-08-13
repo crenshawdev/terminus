@@ -134,7 +134,7 @@ fn document(output: &Output) -> Value {
 /// One list rather than one test per command: the two behaviours D-10 and D-18
 /// fix are properties of the shared entry point, so a seventh read command added
 /// later is one line here rather than a new test.
-const READ_COMMANDS: &[&[&str]] = &[&["search", "anything"], &["show", "1"]];
+const READ_COMMANDS: &[&[&str]] = &[&["search", "anything"], &["show", "1"], &["sessions"]];
 
 // ---------------------------------------------------------------------------
 // The shared read entry point (D-10, D-18)
@@ -836,4 +836,176 @@ fn show_answers_several_ids_and_keeps_the_order_asked_for() {
         returned, ids,
         "records must come back in the order the ids were given"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `verbatim sessions` (RCL-05)
+// ---------------------------------------------------------------------------
+
+/// The `--json` listing, as a vector of session objects.
+fn listing(bench: &Bench, args: &[&str]) -> Vec<Value> {
+    let mut full = vec!["sessions", "--json"];
+    full.extend_from_slice(args);
+    let out = bench.run(&full);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "`{}`: {}",
+        full.join(" "),
+        stderr(&out)
+    );
+    document(&out)["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// Every ingested session is listed, with its project, and the sidecar fixtures
+/// are flagged as sidecars.
+///
+/// The sidecar flag is `session_meta.parent_session_key` being non-null (D-07),
+/// which is the column phase 2 wrote specifically so this phase could tell a
+/// subagent transcript from the session that spawned it - two files that report
+/// the same `sessionId`.
+#[test]
+fn sessions_lists_every_archived_session_and_flags_the_sidecars() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let listed = listing(&bench, &["--project", "*"]);
+    let archived: i64 = bench
+        .conn()
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(listed.len() as i64, archived, "every session is listed");
+
+    for session in &listed {
+        for field in [
+            "session_key",
+            "project",
+            "branch",
+            "first_turn_at",
+            "last_turn_at",
+            "turns",
+            "sidecar",
+            "evicted",
+        ] {
+            assert!(
+                session.get(field).is_some(),
+                "a listed session is missing {field}: {session}"
+            );
+        }
+        assert!(session["turns"].as_i64().unwrap() > 0, "{session}");
+    }
+
+    // The sidecar fixtures, and only those, carry the flag.
+    let flagged: Vec<String> = listed
+        .iter()
+        .filter(|s| s["sidecar"] == true)
+        .map(|s| s["session_key"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(flagged.len(), 3, "three sidecar fixtures: {flagged:?}");
+    for key in &flagged {
+        assert!(
+            key.contains("agent-"),
+            "a non-sidecar was flagged as one: {key}"
+        );
+    }
+
+    // And the human listing says the same, one parseable line per session with
+    // the count kept on stderr.
+    let out = bench.run(&["sessions", "--project", "*"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out).lines().count() as i64,
+        archived,
+        "one line per session: {}",
+        stdout(&out)
+    );
+    assert!(
+        stderr(&out).contains(&format!("{archived} session(s)")),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stdout(&out).contains("(subagent)"), "{}", stdout(&out));
+}
+
+/// AC5's exclusion half, through the listing: an excluded project's sessions are
+/// absent from both outputs while its turns are still in the store.
+///
+/// Archived first, excluded second, which is the case a per-session flag written
+/// at ingest could never answer (D-23). Exclusion is a read-path predicate
+/// re-applied on every read, not a deletion and not a stamp.
+#[test]
+fn an_excluded_projects_sessions_are_absent_from_the_listing() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let beta = bench.project("session-errors-a.jsonl");
+    let beta_key = beta.to_string_lossy().into_owned();
+
+    let before = listing(&bench, &["--project", "*"]);
+    let hidden: Vec<&Value> = before.iter().filter(|s| s["project"] == beta_key).collect();
+    assert_eq!(hidden.len(), 2, "two beta fixtures to hide: {before:?}");
+
+    bench.config(&format!("exclude = [{beta_key:?}]\n"));
+
+    let after = listing(&bench, &["--project", "*"]);
+    assert!(
+        after.iter().all(|s| s["project"] != beta_key),
+        "an excluded project's session was listed: {after:?}"
+    );
+    assert_eq!(
+        after.len(),
+        before.len() - 2,
+        "exactly the excluded sessions went away"
+    );
+
+    // The human output too, and by session key rather than by count, so a
+    // renamed column cannot make this pass.
+    let text = stdout(&bench.run(&["sessions", "--project", "*"]));
+    assert!(!text.contains("session-errors-a"), "{text}");
+    assert!(!text.contains("session-errors-b"), "{text}");
+
+    // Still archived. Exclusion hides; it does not delete.
+    let sessions: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM session_meta WHERE project = ?1",
+            [&beta_key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(sessions, 2, "the excluded project's sessions were deleted");
+}
+
+/// The listing is scoped like every other read path, and `--limit` bounds it.
+#[test]
+fn sessions_scopes_and_bounds_the_listing() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let alpha = bench.project("session-recall.jsonl");
+    let alpha_key = alpha.to_string_lossy().into_owned();
+
+    let scoped = listing(&bench, &["--project", &alpha_key]);
+    assert!(!scoped.is_empty(), "alpha has sessions");
+    for session in &scoped {
+        assert_eq!(session["project"], alpha_key, "{session}");
+    }
+    assert!(
+        scoped.len() < listing(&bench, &["--project", "*"]).len(),
+        "the scope narrowed nothing"
+    );
+
+    assert_eq!(
+        listing(&bench, &["--project", "*", "--limit", "2"]).len(),
+        2
+    );
+
+    // A time window that ends before the corpus begins lists nothing, at exit 0.
+    let out = bench.run(&["sessions", "--project", "*", "--until", "2000-01-01"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).contains("0 session(s)"), "{}", stderr(&out));
 }
