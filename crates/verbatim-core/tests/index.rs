@@ -492,6 +492,35 @@ fn the_entity_rules_are_functions_with_answers() {
         ["a/b.rs", "crates/x/src"]
     );
 
+    // A command line is shell syntax, and a path arrives welded to it. Each of
+    // these stored the punctuation as part of the key, so a lookup for the real
+    // path missed the turn that named it.
+    assert_eq!(
+        path_words("cd /data/code/verbatim && cargo build"),
+        ["/data/code/verbatim"]
+    );
+    assert_eq!(path_words("cd /a/b; make"), ["/a/b"]);
+    assert_eq!(path_words("cargo test 2>/dev/null"), ["/dev/null"]);
+    assert_eq!(path_words("grep -rn foo src/x >>/tmp/out.log"), ["src/x", "/tmp/out.log"]);
+    assert_eq!(path_words("(cd /a/b && ls) | wc -l"), ["/a/b"]);
+    assert_eq!(path_words("git commit -m \"fix /a/b\""), ["/a/b"]);
+
+    // Dropped outright: none of these is a path that happens to be unpopular,
+    // and none is a key an exact-match lookup can ever be handed.
+    assert_eq!(path_words("ls ${ROOT:-/home/john}/x"), Vec::<String>::new());
+    // A substitution opened in one word and closed in the next is past what a
+    // split can see: `$(dirname` is dropped for its `$`, and the rest is judged
+    // on its own bytes. `a/b` is genuinely a path the command named; `/c` is
+    // the fragment after the closing paren. Stated rather than asserted away -
+    // separating them needs a shell parser, for 151 of 21,061 measured words.
+    assert_eq!(path_words("cat $(dirname a/b)/c"), ["a/b", "/c"]);
+    assert_eq!(path_words("rm src/*.rs"), Vec::<String>::new());
+    // The brace list goes; the plain destination beside it stays.
+    assert_eq!(path_words("cp src/{a,b}.rs /tmp"), ["/tmp"]);
+    assert_eq!(path_words("curl https://example.com/x"), Vec::<String>::new());
+    // `2>&1` leaves two words, neither carrying a separator.
+    assert_eq!(path_words("cargo build 2>&1"), Vec::<String>::new());
+
     // Kept exactly as written, minus quotes and a position suffix. Never
     // canonicalized: 52% of the corpus's cwd directories are gone.
     assert_eq!(
