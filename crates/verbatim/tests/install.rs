@@ -1,0 +1,666 @@
+//! `verbatim install`: what it writes, what it refuses to write, and what it
+//! leaves exactly as it found it.
+//!
+//! Every spawn here points `VERBATIM_BIN_DIR`, `CLAUDE_CONFIG_DIR`,
+//! `VERBATIM_DATA_DIR`, `VERBATIM_CONFIG_DIR` and `HOME` at temporary
+//! directories. That is not tidiness: without `VERBATIM_BIN_DIR` a test would
+//! copy a binary over the developer's real `~/.local/bin/verbatim`, and without
+//! `CLAUDE_CONFIG_DIR` it would edit the `settings.json` and `.claude.json`
+//! this machine is running on.
+//!
+//! The assertions are the ones AC4 and AC5 are written in, spelled in Rust
+//! rather than in `jq`: "every other key byte-identical" is a comparison of the
+//! file with verbatim's own additions removed against the file as it was
+//! seeded, and "in its original position" is a comparison of the top-level key
+//! order, which is why these tests read key order out of the raw text instead
+//! of parsing into a map that would sort it.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+
+/// The events install writes an entry for. `cmd::hook::EVENTS` spelled again:
+/// `verbatim` is a binary crate with no library target, so a test cannot name
+/// the constant and has to agree with it.
+const EVENTS: [&str; 4] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "SessionEnd",
+    "PostCompact",
+];
+
+/// A `settings.json` shaped like the real one: several top-level keys in an
+/// order no sort produces, a `hooks` object that already holds the user's own
+/// `UserPromptSubmit` script, and a low `cleanupPeriodDays` for the advisory.
+const SETTINGS: &str = r#"{
+  "cleanupPeriodDays": 7,
+  "env": {
+    "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS": "50000"
+  },
+  "hooks": {
+    "SessionStart": [],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/hooks/terse-answers.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": []
+  },
+  "autoCompactEnabled": true,
+  "theme": "dark"
+}
+"#;
+
+/// A `.claude.json` shaped like the real one: an `mcpServers` object that
+/// already holds another server, and a `projects` object standing in for the
+/// 240 KB of history the real file carries.
+const CLAUDE_JSON: &str = r#"{
+  "numStartups": 412,
+  "mcpServers": {
+    "context7": {
+      "type": "http",
+      "url": "https://example.invalid/mcp"
+    }
+  },
+  "projects": {
+    "/data/code/verbatim": {
+      "allowedTools": [],
+      "history": []
+    },
+    "/data/code/other": {
+      "allowedTools": []
+    }
+  },
+  "oauthAccount": {
+    "emailAddress": "someone@example.invalid"
+  }
+}"#;
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    bin_dir: PathBuf,
+    claude_dir: PathBuf,
+}
+
+fn fixture() -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let bin_dir = root.join("bin");
+    let claude_dir = root.join("claude");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
+    Fixture {
+        _dir: dir,
+        root,
+        bin_dir,
+        claude_dir,
+    }
+}
+
+impl Fixture {
+    /// Where install will put this build.
+    fn stable(&self) -> PathBuf {
+        self.bin_dir.join(if cfg!(windows) {
+            "verbatim.exe"
+        } else {
+            "verbatim"
+        })
+    }
+
+    fn settings(&self) -> PathBuf {
+        self.claude_dir.join("settings.json")
+    }
+
+    fn claude_json(&self) -> PathBuf {
+        self.claude_dir.join(".claude.json")
+    }
+
+    fn seed(&self) -> &Self {
+        std::fs::write(self.settings(), SETTINGS).unwrap();
+        std::fs::write(self.claude_json(), CLAUDE_JSON).unwrap();
+        self
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_verbatim"));
+        command
+            .args(args)
+            .env("VERBATIM_BIN_DIR", &self.bin_dir)
+            .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
+            .env("VERBATIM_DATA_DIR", self.root.join("data"))
+            .env("VERBATIM_CONFIG_DIR", self.root.join("config"))
+            .env("HOME", &self.root)
+            .env("USERPROFILE", &self.root);
+        command
+    }
+
+    /// Run with stdin at end of file, which is what a script that did not
+    /// answer looks like.
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("the binary runs")
+    }
+
+    /// Run and write `answer` to the confirmation.
+    fn answer(&self, args: &[&str], answer: &str) -> Output {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the binary runs");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(answer.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn backups(&self) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(&self.claude_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".verbatim-backup"))
+            .collect();
+        found.sort();
+        found
+    }
+}
+
+fn text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn read(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// The top-level keys of a JSON object as the file spells them, in order.
+///
+/// `serde_json::Value` is a `BTreeMap` and would sort them, which is exactly
+/// the property under test, so this reads the raw text: a scan that tracks
+/// brace depth and string state, and reports the key of every `"key":` at
+/// depth 1.
+fn key_order(path: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(path).unwrap();
+    let bytes = text.as_bytes();
+    let mut keys = Vec::new();
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            b'"' => {
+                let start = at;
+                at += 1;
+                while at < bytes.len() && bytes[at] != b'"' {
+                    at += if bytes[at] == b'\\' { 2 } else { 1 };
+                }
+                let literal = &text[start..(at + 1).min(text.len())];
+                let mut after = at + 1;
+                while after < bytes.len() && bytes[after].is_ascii_whitespace() {
+                    after += 1;
+                }
+                if depth == 1 && bytes.get(after) == Some(&b':') {
+                    keys.push(literal.trim_matches('"').to_owned());
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    keys
+}
+
+/// Every entry in `settings.json` whose command is the stable path.
+fn our_entries(settings: &serde_json::Value, stable: &Path) -> Vec<serde_json::Value> {
+    let want = serde_json::Value::from(stable.display().to_string());
+    settings["hooks"]
+        .as_object()
+        .into_iter()
+        .flat_map(|events| events.values())
+        .filter_map(|groups| groups.as_array())
+        .flatten()
+        .filter_map(|group| group["hooks"].as_array())
+        .flatten()
+        .filter(|entry| entry["command"] == want)
+        .cloned()
+        .collect()
+}
+
+/// The seeded file with everything install added taken back out: its four
+/// groups, and the event keys it had to create to hold them.
+///
+/// The second half is the reason this takes `seeded`. `SessionEnd` and
+/// `PostCompact` are not in the seeded `hooks` object at all, so install
+/// creates them; `SessionStart` is there as an empty array and must come back
+/// as one. "Every other key byte-identical" is a claim about the keys install
+/// did not add, and telling those apart needs the file as it was.
+fn without_ours(
+    mut settings: serde_json::Value,
+    stable: &Path,
+    seeded: &serde_json::Value,
+) -> serde_json::Value {
+    let want = serde_json::Value::from(stable.display().to_string());
+    let events: Vec<String> = settings["hooks"]
+        .as_object()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+    for event in events {
+        let Some(groups) = settings["hooks"][&event].as_array_mut() else {
+            continue;
+        };
+        groups.retain(|group| {
+            !group["hooks"]
+                .as_array()
+                .is_some_and(|entries| entries.iter().any(|entry| entry["command"] == want))
+        });
+        if groups.is_empty() && seeded["hooks"].get(&event).is_none() {
+            settings["hooks"].as_object_mut().unwrap().remove(&event);
+        }
+    }
+    settings
+}
+
+// ---------------------------------------------------------------------------
+// Task 1: the binary at the stable path
+// ---------------------------------------------------------------------------
+
+/// The copy is this build, it is executable, and a second run over it is fine.
+#[test]
+fn install_places_this_build_at_the_stable_path() {
+    let fixture = fixture();
+    fixture.seed();
+
+    let first = fixture.run(&["install", "--yes"]);
+    assert!(first.status.success(), "{}", text(&first));
+
+    let stable = fixture.stable();
+    let version = Command::new(&stable).arg("--version").output().unwrap();
+    assert!(version.status.success(), "{}", text(&version));
+    let ours = Command::new(env!("CARGO_BIN_EXE_verbatim"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout),
+        String::from_utf8_lossy(&ours.stdout),
+        "the copy is not this build"
+    );
+
+    let second = fixture.run(&["install", "--yes"]);
+    assert!(
+        second.status.success(),
+        "a second install over our own copy failed: {}",
+        text(&second)
+    );
+}
+
+/// D-07: a program that is not a verbatim build is refused, not overwritten,
+/// and the refusal names a command that makes the same install succeed.
+#[test]
+fn a_foreign_binary_at_the_stable_path_stops_everything() {
+    let fixture = fixture();
+    fixture.seed();
+
+    // Something small, real and executable that is not this build.
+    let foreign = b"#!/bin/sh\nexit 0\n";
+    std::fs::write(fixture.stable(), foreign).unwrap();
+    let settings_before = std::fs::read_to_string(fixture.settings()).unwrap();
+    let claude_before = std::fs::read_to_string(fixture.claude_json()).unwrap();
+
+    let output = fixture.run(&["install", "--yes"]);
+    assert!(!output.status.success(), "install overwrote a stranger");
+    let said = text(&output);
+    assert!(
+        said.contains(&fixture.stable().display().to_string()),
+        "the refusal did not name the path: {said}"
+    );
+    assert!(
+        said.contains("rm -f") || said.contains("del "),
+        "the refusal printed no command that fixes it: {said}"
+    );
+
+    assert_eq!(std::fs::read(fixture.stable()).unwrap(), foreign);
+    assert_eq!(
+        std::fs::read_to_string(fixture.settings()).unwrap(),
+        settings_before
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        claude_before
+    );
+    assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: the four hook entries
+// ---------------------------------------------------------------------------
+
+/// AC4 and AC5 for `settings.json`: four entries after two runs, the user's own
+/// group untouched, every other key where it was, one backup, and an upgrade
+/// that rewrites no byte of `hooks`.
+#[test]
+fn two_installs_leave_one_hook_entry_per_event_and_change_nothing_else() {
+    let fixture = fixture();
+    fixture.seed();
+    let before_keys = key_order(&fixture.settings());
+
+    assert!(fixture.run(&["install", "--yes"]).status.success());
+    let after_first = std::fs::read_to_string(fixture.settings()).unwrap();
+    assert!(fixture.run(&["install", "--yes"]).status.success());
+
+    let settings = read(&fixture.settings());
+    let ours = our_entries(&settings, &fixture.stable());
+    assert_eq!(ours.len(), 4, "expected one entry per event, got {ours:#?}");
+
+    let mut events: Vec<String> = ours
+        .iter()
+        .map(|entry| entry["args"][1].as_str().unwrap().to_owned())
+        .collect();
+    events.sort();
+    let mut expected: Vec<String> = EVENTS.iter().map(|e| (*e).to_owned()).collect();
+    expected.sort();
+    assert_eq!(events, expected);
+    for entry in &ours {
+        // Exec form (D-01): `args` present, and `hook` in front of the event.
+        assert_eq!(entry["type"], "command");
+        assert_eq!(entry["args"][0], "hook");
+    }
+
+    // The user's own script is still there, unmodified.
+    let prompt = settings["hooks"]["UserPromptSubmit"].as_array().unwrap();
+    assert_eq!(prompt.len(), 2);
+    assert_eq!(
+        prompt[0]["hooks"][0]["command"],
+        serde_json::Value::from("$HOME/.claude/hooks/terse-answers.sh")
+    );
+    assert_eq!(prompt[0]["hooks"][0]["timeout"], serde_json::Value::from(5));
+
+    // Everything install added, taken back out, is the file it was given.
+    let seeded: serde_json::Value = serde_json::from_str(SETTINGS).unwrap();
+    assert_eq!(without_ours(settings, &fixture.stable(), &seeded), seeded);
+    assert_eq!(key_order(&fixture.settings()), before_keys);
+
+    assert_eq!(
+        fixture.backups(),
+        vec![
+            ".claude.json.verbatim-backup",
+            "settings.json.verbatim-backup"
+        ],
+        "expected exactly one backup of each file"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.claude_dir.join("settings.json.verbatim-backup")).unwrap(),
+        SETTINGS,
+        "the backup is not the pre-install bytes"
+    );
+
+    // The second run rewrote nothing at all.
+    assert_eq!(
+        std::fs::read_to_string(fixture.settings()).unwrap(),
+        after_first,
+        "a second install rewrote settings.json"
+    );
+}
+
+/// INST-05: replacing the binary and rerunning install changes no byte of the
+/// `hooks` object, because the path the entries name never moved.
+#[test]
+fn an_upgrade_rewrites_no_byte_of_the_hooks_object() {
+    let fixture = fixture();
+    fixture.seed();
+    assert!(fixture.run(&["install", "--yes"]).status.success());
+    let hooks = read(&fixture.settings())["hooks"].clone();
+    let raw = std::fs::read_to_string(fixture.settings()).unwrap();
+
+    // The upgrade: different bytes at the stable path, still a verbatim build.
+    let mut replacement = std::fs::read(fixture.stable()).unwrap();
+    replacement.extend_from_slice(b"\0a later build\0");
+    std::fs::write(fixture.stable(), &replacement).unwrap();
+
+    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert_eq!(read(&fixture.settings())["hooks"], hooks);
+    assert_eq!(std::fs::read_to_string(fixture.settings()).unwrap(), raw);
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: the MCP registration
+// ---------------------------------------------------------------------------
+
+/// AC4 for `.claude.json`: `context7` keeps its place, `verbatim` is added once
+/// however many times install runs, and nothing else in the file moves.
+#[test]
+fn two_installs_leave_one_mcp_entry_beside_the_servers_already_there() {
+    let fixture = fixture();
+    fixture.seed();
+    let before_keys = key_order(&fixture.claude_json());
+
+    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install", "--yes"]).status.success());
+
+    let claude = read(&fixture.claude_json());
+    let servers = claude["mcpServers"].as_object().unwrap();
+    assert_eq!(servers.len(), 2);
+    assert_eq!(
+        servers["verbatim"]["command"],
+        serde_json::Value::from(fixture.stable().display().to_string())
+    );
+    assert_eq!(servers["verbatim"]["args"][0], "mcp");
+    assert_eq!(servers["verbatim"]["type"], "stdio");
+    assert_eq!(
+        servers["context7"]["url"],
+        serde_json::Value::from("https://example.invalid/mcp")
+    );
+
+    // `del(.mcpServers.verbatim)` is the file it was given.
+    let mut stripped = claude.clone();
+    stripped["mcpServers"]
+        .as_object_mut()
+        .unwrap()
+        .remove("verbatim");
+    let seeded: serde_json::Value = serde_json::from_str(CLAUDE_JSON).unwrap();
+    assert_eq!(stripped, seeded);
+    assert_eq!(key_order(&fixture.claude_json()), before_keys);
+
+    // `mcpServers` keeps its own key order: context7 was there first.
+    let raw = std::fs::read_to_string(fixture.claude_json()).unwrap();
+    assert!(
+        raw.find("\"context7\"").unwrap() < raw.find("\"verbatim\"").unwrap(),
+        "the server object was reordered"
+    );
+    // The file it read had no trailing newline, and neither has the one it wrote.
+    assert!(raw.ends_with('}'), "a trailing newline appeared");
+}
+
+// ---------------------------------------------------------------------------
+// Task 5: the diff, the one confirmation, and --yes
+// ---------------------------------------------------------------------------
+
+/// Nothing to read and no `--yes`: refuse, name `--yes`, and write nothing -
+/// not the settings files, and not the binary either.
+#[test]
+fn without_an_answer_and_without_yes_install_refuses_and_writes_nothing() {
+    let fixture = fixture();
+    fixture.seed();
+
+    let output = fixture.run(&["install"]);
+    assert!(!output.status.success());
+    let said = text(&output);
+    assert!(said.contains("--yes"), "{said}");
+
+    assert!(!fixture.stable().exists(), "a refusal placed the binary");
+    assert_eq!(
+        std::fs::read_to_string(fixture.settings()).unwrap(),
+        SETTINGS
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        CLAUDE_JSON
+    );
+    assert!(fixture.backups().is_empty());
+}
+
+/// A declined confirmation is a success that changed nothing, and it says so.
+#[test]
+fn a_declined_confirmation_changes_nothing_and_exits_zero() {
+    let fixture = fixture();
+    fixture.seed();
+
+    let output = fixture.answer(&["install"], "n\n");
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(text(&output).contains("nothing was changed"));
+
+    assert!(!fixture.stable().exists());
+    assert_eq!(
+        std::fs::read_to_string(fixture.settings()).unwrap(),
+        SETTINGS
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        CLAUDE_JSON
+    );
+    assert!(fixture.backups().is_empty());
+}
+
+/// An accepted confirmation writes all three, and the diff it showed first
+/// carried the change rather than the file.
+#[test]
+fn an_accepted_confirmation_writes_all_three_after_showing_the_diff() {
+    let fixture = fixture();
+    fixture.seed();
+
+    let output = fixture.answer(&["install"], "y\n");
+    assert!(output.status.success(), "{}", text(&output));
+    let said = text(&output);
+    let shown = said
+        .split("apply these changes?")
+        .next()
+        .expect("the confirmation is asked once");
+    assert_eq!(
+        said.matches("apply these changes?").count(),
+        1,
+        "install asked more than once: {said}"
+    );
+    assert!(
+        shown.contains("   + ") && shown.contains("PostCompact"),
+        "no hook diff was shown: {shown}"
+    );
+    assert!(
+        shown.contains("\"verbatim\": {"),
+        "no mcp diff was shown: {shown}"
+    );
+    // A `-` line is only ever a reshaping install caused - `"SessionStart": []`
+    // becoming a populated array, `"PreToolUse": []` gaining a comma. None of
+    // them may carry a line the user wrote.
+    assert!(
+        !shown
+            .lines()
+            .any(|line| line.starts_with("   - ") && line.contains("terse-answers")),
+        "the diff removes the user's own hook: {shown}"
+    );
+    // And it is the change, not the file: neither of these is anywhere near
+    // an insertion point.
+    for untouched in ["oauthAccount", "numStartups", "\"theme\""] {
+        assert!(
+            !shown.contains(untouched),
+            "the diff printed {untouched}, which nothing changed: {shown}"
+        );
+    }
+
+    assert!(fixture.stable().exists());
+    assert_eq!(
+        our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
+        4
+    );
+    assert!(read(&fixture.claude_json())["mcpServers"]["verbatim"].is_object());
+}
+
+/// D-24: `install` is human-only. `--json` is misuse, exit 2.
+#[test]
+fn install_takes_no_json_flag() {
+    let fixture = fixture();
+    fixture.seed();
+    let output = fixture.run(&["install", "--json"]);
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+    assert!(!fixture.stable().exists());
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: the advisories, and the settings install never changes
+// ---------------------------------------------------------------------------
+
+/// INST-04: a low `cleanupPeriodDays` is reported and auto-compact is
+/// recommended, and `--yes` changes neither.
+#[test]
+fn install_reports_the_two_settings_it_never_changes() {
+    let fixture = fixture();
+    fixture.seed();
+    let before = read(&fixture.settings());
+
+    let output = fixture.run(&["install", "--yes"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let said = text(&output);
+    assert!(said.contains("cleanupPeriodDays"), "{said}");
+    assert!(said.contains("autoCompactEnabled"), "{said}");
+
+    let after = read(&fixture.settings());
+    assert_eq!(after["cleanupPeriodDays"], before["cleanupPeriodDays"]);
+    assert_eq!(after["autoCompactEnabled"], before["autoCompactEnabled"]);
+    assert_eq!(after["cleanupPeriodDays"], serde_json::Value::from(7));
+}
+
+/// The closing summary names where things went, and the paths it names are
+/// real: the data directory is `status`'s store's parent, and each backup it
+/// printed exists.
+#[test]
+fn the_summary_names_the_data_directory_and_the_backups_it_wrote() {
+    let fixture = fixture();
+    fixture.seed();
+
+    let output = fixture.run(&["install", "--yes"]);
+    let said = text(&output);
+    let data_dir = said
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("data directory"))
+        .expect("the summary names the data directory")
+        .trim()
+        .to_owned();
+
+    // `status` has to open a store, so ingest once first. `status --json`
+    // reports the store file; its parent is what install printed.
+    assert!(fixture.run(&["ingest"]).status.success());
+    let status = fixture.run(&["status", "--json"]);
+    let document: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status emits one document");
+    let store = PathBuf::from(document["data"]["store"].as_str().unwrap());
+    assert_eq!(store.parent().unwrap(), Path::new(&data_dir));
+
+    for line in said.lines() {
+        if let Some(path) = line.trim().strip_prefix("backup ") {
+            assert!(
+                Path::new(path.trim()).exists(),
+                "the summary named a backup that is not there: {path}"
+            );
+        }
+    }
+    assert_eq!(fixture.backups().len(), 2);
+}
