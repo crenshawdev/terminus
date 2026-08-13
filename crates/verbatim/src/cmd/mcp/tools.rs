@@ -31,7 +31,7 @@
 
 use serde_json::{json, Map, Value};
 
-use verbatim_core::recall::{self, context, search, Filters, Query, Request, Scope};
+use verbatim_core::recall::{self, context, get, search, Filters, Query, Request, Scope};
 use verbatim_core::Error;
 
 use crate::cmd::read::{self, Opened, Reader};
@@ -245,10 +245,7 @@ pub fn call(params: &Value) -> Result<Value, (i64, String)> {
     let outcome = match name {
         RECALL_SEARCH => arguments(params).and_then(|args| run_search(&args)),
         RECALL_CONTEXT => arguments(params).and_then(|args| run_context(&args)),
-        // Task 4 of this plan.
-        RECALL_GET => Err(Refused::archive(format!(
-            "{name} is listed by this build and not yet served"
-        ))),
+        RECALL_GET => arguments(params).and_then(|args| run_get(&args)),
         other => {
             return Err((
                 rpc::code::INVALID_PARAMS,
@@ -458,6 +455,98 @@ fn run_context(args: &Map<String, Value>) -> Result<Value, Refused> {
 }
 
 // ---------------------------------------------------------------------------
+// recall_get (RCL-09)
+// ---------------------------------------------------------------------------
+
+/// The whole verbatim record behind each id.
+///
+/// **This is the one path that hands the truth back.** A search returns an
+/// excerpt and a context window returns projections; this returns the record's
+/// own archived bytes, and each session's blob is decompressed once per request
+/// however many of its turns were asked for (D-20).
+///
+/// **The id list is bounded here and nowhere else.** `recall::get::records`
+/// binds one SQL placeholder per id, so a client-supplied list of thousands is
+/// an operational failure rather than an answer; the terminal path is bounded by
+/// what a person types, and this is where a list arrives that nobody typed.
+/// Over-long is truncated and reported rather than refused, so a caller that
+/// asked for too much still gets the first [`MAX_IDS`] of what it wanted and is
+/// told the rest were not read.
+///
+/// **An evicted body is a flag, not an error (D-08).** It is read off
+/// `session_meta.is_evicted` and never off a failed blob read: a blob that will
+/// not decompress is archive damage for `verbatim verify` to report, and letting
+/// it look like an eviction would report silent data loss as retention working.
+fn run_get(args: &Map<String, Value>) -> Result<Value, Refused> {
+    let asked = required_ids(args, "turn_ids")?;
+    let project = optional_string(args, "project")?;
+    let served = asked.len().min(MAX_IDS);
+
+    let reader = reader()?;
+    let fetched = get::records(
+        reader.store().conn(),
+        reader.config(),
+        &scope(project.as_deref())?,
+        &asked[..served],
+    )
+    .map_err(|error| Refused::archive(error.to_string()))?;
+
+    let records: Vec<Value> = fetched
+        .records
+        .iter()
+        .map(|record| {
+            json!({
+                "turn_id": record.turn_id,
+                "session_key": record.session_key,
+                "turn_seq": record.turn_seq,
+                "record_type": record.record_type,
+                "tool_name": record.tool_name,
+                "ts": record.ts,
+                "project": record.project,
+                // Lossy, and only here: a JSON string is text by definition, so
+                // this is the one rendering that cannot carry a byte that is not
+                // UTF-8. The archive itself keeps the bytes, and `verbatim show`
+                // writes them unconverted.
+                "body": record
+                    .body
+                    .as_ref()
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+                "body_evicted": record.body_evicted,
+            })
+        })
+        .collect();
+
+    // An id that named nothing this caller may see is a row in the answer, not a
+    // failed call: asking for five and getting four records and one reason is an
+    // answer, where a throw would lose the four.
+    let absent: Vec<Value> = fetched
+        .absent
+        .iter()
+        .map(|absent| json!({"turn_id": absent.turn_id, "reason": absent.reason.to_string()}))
+        .collect();
+
+    let mut reason = fetched.reason.as_ref().map(ToString::to_string);
+    if reason.is_none() && asked.len() > served {
+        reason = Some(format!(
+            "only the first {served} of {} ids were read; this server caps one \
+             request at {MAX_IDS}",
+            asked.len()
+        ));
+    }
+    // The reason that explains an answer with no records in it at all. The
+    // per-id reasons are already in `absent`; this is the one a caller reads
+    // first.
+    if reason.is_none() && fetched.records.is_empty() {
+        reason = fetched
+            .absent
+            .first()
+            .map(|absent| absent.reason.to_string());
+    }
+
+    Ok(json!({"records": records, "absent": absent, "reason": reason}))
+}
+
+// ---------------------------------------------------------------------------
 // The store, the scope, and the arguments
 // ---------------------------------------------------------------------------
 
@@ -559,6 +648,38 @@ fn required_id(args: &Map<String, Value>, name: &str) -> Result<i64, Refused> {
             ))
         }),
     }
+}
+
+/// A non-empty list of turn ids.
+///
+/// Each element is checked before any of them reaches a query, so a list with a
+/// string in it is one reason rather than a partial answer plus a surprise.
+fn required_ids(args: &Map<String, Value>, name: &str) -> Result<Vec<i64>, Refused> {
+    let Some(value) = args.get(name).filter(|value| !value.is_null()) else {
+        return Err(Refused::caller(format!("{name} is required")));
+    };
+    let Some(items) = value.as_array() else {
+        return Err(Refused::caller(format!(
+            "{name} must be an array of integer turn ids, not {}",
+            kind(value)
+        )));
+    };
+    if items.is_empty() {
+        return Err(Refused::caller(format!("{name} named no turn")));
+    }
+    let mut ids = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_i64() {
+            Some(id) => ids.push(id),
+            None => {
+                return Err(Refused::caller(format!(
+                    "{name} holds integer turn ids; {} is not one",
+                    kind(item)
+                )))
+            }
+        }
+    }
+    Ok(ids)
 }
 
 fn optional_string(args: &Map<String, Value>, name: &str) -> Result<Option<String>, Refused> {

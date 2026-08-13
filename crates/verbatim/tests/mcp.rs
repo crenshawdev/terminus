@@ -198,6 +198,16 @@ impl Bench {
     /// content block carries - so a test asserts on hits and reasons rather than
     /// on the envelope around them.
     fn call(&self, dir: &Path, tool: &str, arguments: Value) -> Value {
+        self.call_flagged(dir, tool, arguments).0
+    }
+
+    /// The same, with the result's `isError` flag.
+    ///
+    /// Kept separate because most assertions are about the document and only a
+    /// few are about the flag - but the flag is what a client shows the model as
+    /// an error, so "an empty result with a reason" and "a failed call" have to
+    /// be tellable apart somewhere.
+    fn call_flagged(&self, dir: &Path, tool: &str, arguments: Value) -> (Value, bool) {
         let conversation = self.talk(
             dir,
             &[
@@ -216,7 +226,8 @@ impl Bench {
             "one response for initialize and one for the call: {:?}",
             conversation.responses
         );
-        content(&conversation.responses[1])
+        let response = &conversation.responses[1];
+        (content(response), response["result"]["isError"] == true)
     }
 }
 
@@ -784,4 +795,244 @@ fn a_window_larger_than_the_budget_returns_the_budgets_worth() {
     // session ran out".
     assert_eq!(document["at_session_start"], false, "{document}");
     assert_eq!(document["at_session_end"], false, "{document}");
+}
+
+// ---------------------------------------------------------------------------
+// recall_get (RCL-09, AC6)
+// ---------------------------------------------------------------------------
+
+/// The `records` of a `recall_get` document.
+fn records(document: &Value) -> Vec<Value> {
+    document["records"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a get result carries a records array: {document}"))
+        .clone()
+}
+
+/// One fixture's line `index`, with the root token substituted the way ingest
+/// saw it.
+fn fixture_line(bench: &Bench, fixture: &str, index: usize) -> String {
+    let text = String::from_utf8(testkit::fixture_bytes(fixture)).unwrap();
+    text.replace(
+        testkit::FIXTURE_ROOT_TOKEN,
+        &bench.root.to_string_lossy().replace('\\', "\\\\"),
+    )
+    .lines()
+    .nth(index)
+    .unwrap_or_else(|| panic!("{fixture} has no line {index}"))
+    .to_owned()
+}
+
+/// Ids from two sessions come back as the archive holds them: byte for byte the
+/// fixtures' own lines, in the order the ids were asked for.
+///
+/// Compared against the transcript files rather than against anything the store
+/// derived. A projection would be prose about the right turn and would pass any
+/// test that only checked the turn was found - and this is the one tool whose
+/// whole job is that it does not do that.
+#[test]
+fn recall_get_returns_the_archived_lines_of_two_sessions() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let alpha = bench.project("session-recall.jsonl");
+
+    let id_of = |fixture: &str, seq: i64| -> i64 {
+        bench
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT id FROM turns WHERE session_key LIKE '%{fixture}'
+                      ORDER BY turn_seq LIMIT 1 OFFSET {seq}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("{fixture} turn {seq}: {e}"))
+    };
+
+    // Both sessions belong to project-alpha, so one auto-scoped call reaches
+    // them both and the blob grouping has two sessions to group.
+    let recall = id_of("session-recall.jsonl", 1);
+    let echo = id_of("agent-echo.jsonl", 0);
+
+    let document = bench.call(&alpha, "recall_get", json!({"turn_ids": [recall, echo]}));
+    let got = records(&document);
+    assert_eq!(got.len(), 2, "{document}");
+    assert_eq!(
+        got.iter()
+            .map(|record| record["turn_id"].as_i64().unwrap_or_default())
+            .collect::<Vec<i64>>(),
+        vec![recall, echo],
+        "records must come back in the order the ids were given: {document}"
+    );
+
+    assert_eq!(
+        got[0]["body"].as_str().unwrap_or_default(),
+        fixture_line(&bench, "session-recall.jsonl", 1)
+    );
+    assert_eq!(
+        got[1]["body"].as_str().unwrap_or_default(),
+        fixture_line(&bench, "subagents/agent-echo.jsonl", 0)
+    );
+
+    for record in &got {
+        for field in [
+            "turn_id",
+            "session_key",
+            "turn_seq",
+            "record_type",
+            "tool_name",
+            "ts",
+            "project",
+            "body",
+            "body_evicted",
+        ] {
+            assert!(
+                record.get(field).is_some(),
+                "a record is missing {field}: {record}"
+            );
+        }
+        assert_eq!(record["body_evicted"], false, "{record}");
+    }
+}
+
+/// D-08 through the server: a turn whose session is evicted comes back flagged,
+/// with no body, and the call still succeeds.
+///
+/// Retention is phase 8 and nothing writes that column before then, so the test
+/// sets it directly - which is also the point. The flag is read off the column
+/// and never off a failed blob read, so this stays distinguishable from the
+/// archive damage `verbatim verify` reports.
+#[test]
+fn an_evicted_body_is_a_flag_and_not_a_failed_call() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let alpha = bench.project("session-recall.jsonl");
+
+    let id: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT id FROM turns WHERE session_key LIKE '%session-recall.jsonl'
+              ORDER BY turn_seq LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET is_evicted = 1
+              WHERE session_key = (SELECT session_key FROM turns WHERE id = ?1)",
+            [id],
+        )
+        .unwrap();
+
+    let (document, is_error) = bench.call_flagged(&alpha, "recall_get", json!({"turn_ids": [id]}));
+    assert!(
+        !is_error,
+        "an evicted body reported as a failed call: {document}"
+    );
+
+    let got = records(&document);
+    assert_eq!(got.len(), 1, "{document}");
+    assert_eq!(got[0]["body_evicted"], true, "{document}");
+    assert_eq!(got[0]["body"], Value::Null, "{document}");
+    // Everything else about the turn is still known: only its bytes are gone.
+    assert_eq!(got[0]["turn_id"], id);
+    assert!(got[0]["ts"].is_string(), "{document}");
+}
+
+/// An id that names no turn this caller may see is a row in `absent` with a
+/// reason, never a throw - and a known id beside it still answers.
+#[test]
+fn an_unknown_id_is_a_reason_beside_the_records_that_did_answer() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let alpha = bench.project("session-recall.jsonl");
+
+    let known: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT id FROM turns WHERE session_key LIKE '%session-recall.jsonl'
+              ORDER BY turn_seq LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let unknown: i64 = bench
+        .conn()
+        .query_row("SELECT max(id) + 1000 FROM turns", [], |r| r.get(0))
+        .unwrap();
+
+    let document = bench.call(&alpha, "recall_get", json!({"turn_ids": [known, unknown]}));
+    assert_eq!(records(&document).len(), 1, "{document}");
+    let absent = document["absent"].as_array().cloned().unwrap_or_default();
+    assert_eq!(absent.len(), 1, "{document}");
+    assert_eq!(absent[0]["turn_id"], unknown);
+    assert!(
+        absent[0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no turn")),
+        "{document}"
+    );
+
+    // Asked for the unknown id alone, the reason is the one a caller reads
+    // first, not a key buried in a list.
+    let (alone, is_error) =
+        bench.call_flagged(&alpha, "recall_get", json!({"turn_ids": [unknown]}));
+    assert!(
+        !is_error,
+        "an unknown id reported as a failed call: {alone}"
+    );
+    assert!(records(&alone).is_empty(), "{alone}");
+    assert!(
+        alone["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no turn")),
+        "{alone}"
+    );
+}
+
+/// The bound this tool needs and the terminal path does not: a client-supplied
+/// list longer than the cap is truncated and reported, never bound one SQL
+/// placeholder at a time until the query fails.
+#[test]
+fn a_list_longer_than_the_cap_is_truncated_and_said_so() {
+    let bench = bench();
+    let project = bench.long_session("project-window", 60);
+
+    let ids: Vec<i64> = bench
+        .conn()
+        .prepare(
+            "SELECT id FROM turns WHERE session_key LIKE '%project-window.jsonl'
+              ORDER BY turn_seq LIMIT 40",
+        )
+        .unwrap()
+        .query_map([], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(ids.len(), 40, "this test needs more ids than the cap");
+
+    let (document, is_error) =
+        bench.call_flagged(&project, "recall_get", json!({"turn_ids": ids.clone()}));
+    assert!(
+        !is_error,
+        "a bounded answer is not a failed call: {document}"
+    );
+    assert_eq!(records(&document).len(), 25, "{document}");
+    assert_eq!(
+        records(&document)
+            .iter()
+            .map(|record| record["turn_id"].as_i64().unwrap_or_default())
+            .collect::<Vec<i64>>(),
+        ids[..25].to_vec(),
+        "the first ids asked for are the ones served: {document}"
+    );
+    assert!(
+        document["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("caps one request")),
+        "the truncation was not reported: {document}"
+    );
 }
