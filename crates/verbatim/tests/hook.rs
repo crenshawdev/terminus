@@ -312,6 +312,155 @@ fn every_event_exits_zero_with_an_empty_stdout_inside_the_budget() {
     drain(&hook.ingest_argv());
 }
 
+/// A writer that opens stdin, sends no newline and never closes it does not get
+/// to decide when the hook returns.
+///
+/// This is the state the harness itself is never in - Claude Code 2.1.231
+/// writes the payload and calls `stdin.end()` in the same tick - which is
+/// exactly why it has to be tested: nothing in ordinary use would ever show it.
+/// An unbounded blocking read here sits until the harness's hook timeout kills
+/// the process, and on `UserPromptSubmit` that timeout is the user's prompt
+/// waiting.
+///
+/// The bound is 500 ms in `cmd::hook`; the 10 s here is that plus room for a
+/// loaded machine, and it is a bound rather than an unbounded `wait()` so a
+/// regression fails the test instead of hanging the suite.
+#[test]
+fn a_stdin_that_is_opened_and_never_closed_does_not_hold_the_hook() {
+    let hook = hook();
+
+    let mut child = hook
+        .command(&["hook", "UserPromptSubmit"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the hook");
+    // A payload that has begun and will never end: no newline, and the handle
+    // stays in scope for the whole test, so the hook's stdin never sees EOF.
+    let mut stdin = child.stdin.take().expect("the hook's stdin");
+    stdin
+        .write_all(br#"{"session_id":"11111111-1111-4111-8111-111111111111""#)
+        .expect("write a partial payload");
+    stdin.flush().expect("flush the partial payload");
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the hook") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the hook is still running {:?} after a writer stopped writing: it \
+             is blocked in an unbounded read on stdin",
+            started.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    assert!(
+        status.success(),
+        "the hook exited {:?} on an unclosed stdin",
+        status.code()
+    );
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .expect("the hook's stdout")
+        .read_to_end(&mut stdout)
+        .expect("read the hook's stdout");
+    assert!(stdout.is_empty(), "the hook wrote {stdout:?} to stdout");
+    // The module doc's promise for this case: one line on stderr, still exit 0.
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("the hook's stderr")
+        .read_to_string(&mut stderr)
+        .expect("read the hook's stderr");
+    assert!(
+        stderr.lines().count() == 1 && stderr.contains("stdin"),
+        "giving up on stdin should be one line on stderr, got {stderr:?}"
+    );
+
+    drop(stdin);
+    drain(&hook.ingest_argv());
+}
+
+/// A line that never ends is read up to a cap and no further.
+///
+/// The hook reads the payload only so the writer does not see a closed pipe.
+/// Nothing downstream reads a byte of it - the ingest was spawned before the
+/// read - so an unbounded `read_until` on a line with no newline in it is a
+/// `Vec` that grows for as long as something keeps writing.
+///
+/// 64 MiB of unterminated line against a 1 MiB cap: the hook must stop reading
+/// and exit, which the writer sees as a broken pipe well before it has handed
+/// over everything. The byte count is what separates the cap from the deadline:
+/// 500 ms of an uncapped pipe copy would move far more than the 8 MiB asserted
+/// here.
+#[test]
+fn an_unterminated_line_stops_being_read_at_the_cap() {
+    const CHUNK: usize = 64 * 1024;
+    const TOTAL: usize = 64 * 1024 * 1024;
+    const CEILING: usize = 8 * 1024 * 1024;
+
+    let hook = hook();
+    let mut child = hook
+        .command(&["hook", "SessionStart"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the hook");
+    let mut stdin = child.stdin.take().expect("the hook's stdin");
+
+    // No newline anywhere in it, so nothing but a cap can end the read.
+    let chunk = vec![b'x'; CHUNK];
+    let mut written = 0usize;
+    let mut refused = None;
+    while written < TOTAL {
+        match stdin.write_all(&chunk) {
+            Ok(()) => written += CHUNK,
+            Err(e) => {
+                refused = Some(e);
+                break;
+            }
+        }
+    }
+
+    let e = refused.unwrap_or_else(|| {
+        panic!("the hook read all {TOTAL} bytes of a line that never ends");
+    });
+    assert_eq!(
+        e.kind(),
+        std::io::ErrorKind::BrokenPipe,
+        "the writer stopped for a reason other than the hook exiting: {e}"
+    );
+    assert!(
+        written <= CEILING,
+        "the hook read {written} bytes of an unterminated line before it \
+         stopped: that is past any cap worth calling one"
+    );
+
+    let output = child.wait_with_output().expect("wait for the hook");
+    assert!(
+        output.status.success(),
+        "the hook exited {:?} on an oversized payload",
+        output.status.code()
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the hook wrote {:?} to stdout",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    drop(stdin);
+    drain(&hook.ingest_argv());
+}
+
 /// The hook hands the ingest nothing the harness gave it.
 ///
 /// A caller reading the hook's stdout to EOF must get an empty read as soon as
