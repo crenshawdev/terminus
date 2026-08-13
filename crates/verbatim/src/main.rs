@@ -31,6 +31,12 @@ fn main() -> ExitCode {
     // reparenting hand-off `cmd::spawn` uses to put the ingest outside every
     // set Claude Code kills a hook through (D-03). If it is, it has already
     // started the process that does the work and has nothing else to do.
+    //
+    // The test is `cmd::spawn::HANDOFF` as the first argument, so the only way
+    // into this branch is a command line that asks for it. Nothing ambient
+    // reaches it: an environment this process inherited cannot make an ordinary
+    // `verbatim search`, `--version` or unknown hook event return SUCCESS here
+    // with an empty stdout, which is what the exit codes above are worth.
     if cmd::spawn::handed_off() {
         return ExitCode::SUCCESS;
     }

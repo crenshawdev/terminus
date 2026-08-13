@@ -15,13 +15,14 @@
 //! child still parented to the hook is in that walk whatever group it sits in.
 //!
 //! So the working process leaves both sets. [`detached`] spawns an
-//! intermediate in a new process group and marks it with [`REPARENT`]; the
-//! intermediate, at startup and before any argument parsing, re-spawns itself
-//! with the same arguments through this same module and exits. Its child is
-//! reparented to init within microseconds, so it is in no process group the
-//! hook belongs to and under no branch of a descendant walk rooted at the hook.
-//! That is the classic double fork, spelled in [`std::process`] because that is
-//! all this crate is allowed to spell it in.
+//! intermediate in a new process group with [`HANDOFF`] in front of the
+//! arguments; the intermediate, at startup and before any argument parsing,
+//! re-spawns itself with the arguments *behind* the marker through this same
+//! module and exits. Its child is reparented to init within microseconds, so it
+//! is in no process group the hook belongs to and under no branch of a
+//! descendant walk rooted at the hook. That is the classic double fork, spelled
+//! in [`std::process`] because that is all this crate is allowed to spell it
+//! in.
 //!
 //! # `std` alone (D-04)
 //!
@@ -37,12 +38,27 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::process::{Command, Stdio};
 
-/// Marks the intermediate process: set on the child [`detached`] spawns,
-/// cleared on the child that intermediate spawns.
+/// Marks the intermediate process: the first argument of the child [`detached`]
+/// spawns, and absent from the arguments that child hands on.
 ///
-/// Deliberately absent from `USAGE`. It is a mechanism, not an interface, and
-/// nothing outside this module and `main`'s first statement may set it.
-pub const REPARENT: &str = "VERBATIM_REPARENT";
+/// It is an argument and not an environment variable, and that is the whole
+/// point. An environment variable is ambient - inherited by every descendant,
+/// settable from a shell profile or a `.envrc`, and impossible to distinguish
+/// from one this module set - so `verbatim search error` under a stray
+/// `VERBATIM_REPARENT=1` would have re-spawned itself and exited 0 with no
+/// output, turning an unknown hook event into a success instead of a misuse.
+/// An argument is inherited by nothing. What this marker therefore guarantees
+/// is narrow and real: no environment a caller brings, deliberately or by
+/// accident, can put an ordinary invocation on this path.
+///
+/// What it does not claim is that the marker is a secret. Typing it re-spawns
+/// the rest of the command line detached, which grants a caller nothing they
+/// could not do by running the same command themselves, and costs them its
+/// output. It is deliberately absent from `USAGE` for that reason: a mechanism,
+/// not an interface. It is `--` prefixed so that if this hand-off is ever
+/// removed while something still spells it, the parser rejects it as an
+/// unexpected argument (exit 2) rather than accepting it as a positional.
+pub const HANDOFF: &str = "--reparent";
 
 /// Windows: no console, and no parent to be killed with.
 #[cfg(windows)]
@@ -55,7 +71,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The environment is inherited unchanged, which is how `VERBATIM_DATA_DIR`,
 /// `VERBATIM_CONFIG_DIR` and `CLAUDE_CONFIG_DIR` reach the work.
 pub fn detached<S: AsRef<OsStr>>(args: &[S]) -> io::Result<()> {
-    spawn(args, true)
+    let mut marked: Vec<OsString> = Vec::with_capacity(args.len() + 1);
+    marked.push(OsString::from(HANDOFF));
+    marked.extend(args.iter().map(|arg| arg.as_ref().to_os_string()));
+    spawn(&marked)
 }
 
 /// The reparenting hand-off, called by `main` before it parses anything.
@@ -63,19 +82,27 @@ pub fn detached<S: AsRef<OsStr>>(args: &[S]) -> io::Result<()> {
 /// Returns `true` when this process is the intermediate and has done its whole
 /// job - the caller must exit 0 immediately and touch nothing else, because the
 /// arguments it was given belong to the process it just started.
+///
+/// The test is positional: [`HANDOFF`] as the *first* argument and nothing
+/// else. An invocation that merely mentions it later - `verbatim search
+/// --reparent` - is an ordinary command line and reaches its subcommand's own
+/// parser, which rejects it. And the marker is dropped here rather than passed
+/// on, so the working process runs the arguments it was given and cannot hand
+/// them on again.
 pub fn handed_off() -> bool {
-    if std::env::var_os(REPARENT).is_none() {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_none_or(|first| first != HANDOFF) {
         return false;
     }
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let work: Vec<OsString> = args.collect();
     // Nowhere to report to: all three of this process's stdio are already
     // `Stdio::null()`. The hook has returned to the harness either way, which
     // is the property that matters more than this run of the ingest.
-    let _ = spawn(&args, false);
+    let _ = spawn(&work);
     true
 }
 
-fn spawn<S: AsRef<OsStr>>(args: &[S], mark: bool) -> io::Result<()> {
+fn spawn<S: AsRef<OsStr>>(args: &[S]) -> io::Result<()> {
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(args)
@@ -85,13 +112,6 @@ fn spawn<S: AsRef<OsStr>>(args: &[S], mark: bool) -> io::Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if mark {
-        command.env(REPARENT, "1");
-    } else {
-        // Cleared rather than left inherited: the working process must run its
-        // arguments, not hand them on again forever.
-        command.env_remove(REPARENT);
-    }
 
     #[cfg(unix)]
     {

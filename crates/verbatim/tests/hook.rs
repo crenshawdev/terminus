@@ -30,12 +30,19 @@ use rusqlite::{Connection, OpenFlags};
 use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::testkit;
 
-/// Marks the reparenting hand-off. This is `cmd::spawn::REPARENT` spelled
-/// again: `verbatim` is a binary crate with no library target, so a test cannot
-/// name the constant and has to agree with it. Changing one without the other
-/// makes this test's hand-off run an ordinary ingest and the pgid assertion
-/// fail, which is the failure mode that says which way the drift went.
-const REPARENT: &str = "VERBATIM_REPARENT";
+/// The first argument that asks for the reparenting hand-off. This is
+/// `cmd::spawn::HANDOFF` spelled again: `verbatim` is a binary crate with no
+/// library target, so a test cannot name the constant and has to agree with it.
+/// Changing one without the other makes this test's hand-off an unexpected
+/// argument (exit 2), which is the failure mode that says which way the drift
+/// went.
+const HANDOFF: &str = "--reparent";
+
+/// The environment variable the hand-off used to be selected by, kept here with
+/// no code left that reads it. It names the regression
+/// `an_ambient_environment_marker_cannot_divert_an_ordinary_invocation` exists
+/// to hold shut.
+const RETIRED_MARKER: &str = "VERBATIM_REPARENT";
 
 /// Every directory a spawned hook may reach, all temporary, plus a copy of the
 /// binary at a path no other test uses.
@@ -209,9 +216,10 @@ fn await_process(argv: &str) -> Proc {
 /// Task 1 / D-03: the process that does the work is in neither set Claude Code
 /// kills a hook through.
 ///
-/// It is spawned through the hand-off half of `cmd::spawn` directly - the mark
-/// on the environment is what a hook's spawn sets - so this reads the property
-/// off one level of the chain. The kill test reads it off the whole chain.
+/// It is spawned through the hand-off half of `cmd::spawn` directly - the
+/// marker in front of the arguments is what a hook's spawn puts there - so this
+/// reads the property off one level of the chain. The kill test reads it off
+/// the whole chain.
 #[cfg(unix)]
 #[test]
 fn the_working_process_leaves_the_group_and_the_parentage_of_the_process_that_spawned_it() {
@@ -219,8 +227,7 @@ fn the_working_process_leaves_the_group_and_the_parentage_of_the_process_that_sp
     hook.big_transcript("-p", "11111111-1111-4111-8111-111111111111.jsonl", BIG);
 
     let handoff = hook
-        .command(&["ingest"])
-        .env(REPARENT, "1")
+        .command(&[HANDOFF, "ingest"])
         .output()
         .expect("spawn the hand-off");
     assert!(handoff.status.success(), "the hand-off did not exit 0");
@@ -247,6 +254,65 @@ fn the_working_process_leaves_the_group_and_the_parentage_of_the_process_that_sp
     assert!(
         !ps().iter().any(|p| p.pid == worker.ppid && p.argv == hook.ingest_argv()),
         "the ingest is still parented to the process that spawned it"
+    );
+
+    drain(&hook.ingest_argv());
+}
+
+/// Nothing a caller's environment carries can put an ordinary invocation on the
+/// hand-off path.
+///
+/// The hand-off used to be selected by [`RETIRED_MARKER`], read before argument
+/// parsing, so any process that inherited it - a shell export, a `.envrc`, a CI
+/// job, a hook that leaked its own child's environment - made `verbatim`
+/// re-spawn itself and return SUCCESS with an empty stdout for *every* command.
+/// `--version` printed nothing, `search` printed nothing, and an unknown hook
+/// event reported success where the contract says misuse (exit 2), which is the
+/// one exit code `verbatim install`'s settings file is checked by.
+///
+/// A first-argument marker is inherited by nothing, so the two contracts
+/// `main.rs` opens with hold whatever the environment says. That the marker
+/// also does not survive into the working process is proved next door: the
+/// hand-off test finds its ingest by an exact `<exe> ingest` command line, and
+/// a marker passed on would make that argv `<exe> --reparent ingest` and never
+/// match.
+#[test]
+fn an_ambient_environment_marker_cannot_divert_an_ordinary_invocation() {
+    let hook = hook();
+
+    let version = hook
+        .command(&["--version"])
+        .env(RETIRED_MARKER, "1")
+        .output()
+        .expect("run verbatim --version");
+    assert!(
+        version.status.success(),
+        "--version exited {:?} under {RETIRED_MARKER}",
+        version.status.code()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        env!("CARGO_PKG_VERSION"),
+        "--version printed nothing of its own under {RETIRED_MARKER}: the \
+         invocation was diverted"
+    );
+
+    let unknown = hook
+        .command(&["hook", "NotAnEvent"])
+        .env(RETIRED_MARKER, "1")
+        .output()
+        .expect("run verbatim hook NotAnEvent");
+    assert_eq!(
+        unknown.status.code(),
+        Some(2),
+        "an unknown hook event exited {:?} under {RETIRED_MARKER}, not the \
+         misuse code install's settings file is checked by",
+        unknown.status.code()
+    );
+    assert!(
+        unknown.stdout.is_empty(),
+        "the misuse path wrote {:?} to stdout",
+        String::from_utf8_lossy(&unknown.stdout)
     );
 
     drain(&hook.ingest_argv());
