@@ -41,6 +41,7 @@ pub mod reindex;
 pub mod search;
 pub mod sessions;
 pub mod show;
+pub mod spawn;
 pub mod status;
 pub mod verify;
 

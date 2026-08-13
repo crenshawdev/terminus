@@ -26,6 +26,13 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                      every diagnostic on stderr, exit 0 on success including an empty result.";
 
 fn main() -> ExitCode {
+    // Before the parser, and before anything else: this process may be the
+    // reparenting hand-off `cmd::spawn` uses to put the ingest outside every
+    // set Claude Code kills a hook through (D-03). If it is, it has already
+    // started the process that does the work and has nothing else to do.
+    if cmd::spawn::handed_off() {
+        return ExitCode::SUCCESS;
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(Failure::Operational(msg)) => {
