@@ -521,9 +521,10 @@ fn write_atomically(resolved: &Path, contents: &str) -> Result<(), Failure> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "settings".to_owned());
-    let temporary = dir.join(format!(".{name}.verbatim-{}", std::process::id()));
+    // Exclusively, and not with `File::create`: see `super::create_temporary`.
+    let (temporary, file) = super::create_temporary(dir, &format!(".{name}.verbatim-"))?;
 
-    let outcome = fill(&temporary, contents, resolved).and_then(|()| {
+    let outcome = fill(file, &temporary, contents, resolved).and_then(|()| {
         std::fs::rename(&temporary, resolved).map_err(|e| {
             Failure::Operational(format!("{} could not be replaced: {e}", resolved.display()))
         })
@@ -536,10 +537,12 @@ fn write_atomically(resolved: &Path, contents: &str) -> Result<(), Failure> {
     outcome
 }
 
-fn fill(temporary: &Path, contents: &str, target: &Path) -> Result<(), Failure> {
-    let mut file = std::fs::File::create(temporary).map_err(|e| {
-        Failure::Operational(format!("{} could not be created: {e}", temporary.display()))
-    })?;
+fn fill(
+    mut file: std::fs::File,
+    temporary: &Path,
+    contents: &str,
+    target: &Path,
+) -> Result<(), Failure> {
     file.write_all(contents.as_bytes()).map_err(|e| {
         Failure::Operational(format!("{} could not be written: {e}", temporary.display()))
     })?;

@@ -185,8 +185,11 @@ pub fn place(dest: &Path) -> Result<(), Failure> {
         Failure::Operational(format!("{} could not be created: {e}", dir.display()))
     })?;
 
-    let temporary = dir.join(format!(".verbatim-install-{}", std::process::id()));
-    let outcome = copy_into(&source, &temporary).and_then(|()| {
+    // Exclusively, and not with `File::create`: a stale `.verbatim-install-<pid>`
+    // symlink would otherwise be followed, truncating whatever it points at and
+    // then renaming the link itself over the stable path.
+    let (temporary, file) = super::create_temporary(dir, ".verbatim-install-")?;
+    let outcome = copy_into(&source, file, &temporary).and_then(|()| {
         std::fs::rename(&temporary, dest).map_err(|e| {
             Failure::Operational(format!("{} could not be replaced: {e}", dest.display()))
         })
@@ -197,8 +200,11 @@ pub fn place(dest: &Path) -> Result<(), Failure> {
     outcome
 }
 
-fn copy_into(source: &Path, temporary: &Path) -> Result<(), Failure> {
-    std::fs::copy(source, temporary).map_err(|e| {
+fn copy_into(source: &Path, mut file: std::fs::File, temporary: &Path) -> Result<(), Failure> {
+    let mut reading = std::fs::File::open(source).map_err(|e| {
+        Failure::Operational(format!("{} could not be read: {e}", source.display()))
+    })?;
+    std::io::copy(&mut reading, &mut file).map_err(|e| {
         Failure::Operational(format!(
             "{} could not be copied to {}: {e}",
             source.display(),
@@ -208,15 +214,19 @@ fn copy_into(source: &Path, temporary: &Path) -> Result<(), Failure> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o755)).map_err(
-            |e| {
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| {
                 Failure::Operational(format!(
                     "{} could not be made executable: {e}",
                     temporary.display()
                 ))
-            },
-        )?;
+            })?;
     }
+    // Before the rename, not after: a crash between the two would otherwise put
+    // an empty file at the path every hook entry names.
+    file.sync_all().map_err(|e| {
+        Failure::Operational(format!("{} could not be flushed: {e}", temporary.display()))
+    })?;
     Ok(())
 }
 

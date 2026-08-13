@@ -15,9 +15,9 @@
 //! order, which is why these tests read key order out of the raw text instead
 //! of parsing into a map that would sort it.
 
-use std::io::Write;
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 /// The events install writes an entry for. `cmd::hook::EVENTS` spelled again:
 /// `verbatim` is a binary crate with no library target, so a test cannot name
@@ -169,6 +169,38 @@ impl Fixture {
         child.wait_with_output().unwrap()
     }
 
+    /// Spawn install and read up to its confirmation, leaving the question
+    /// unanswered.
+    ///
+    /// The pause is the point: it is the one moment install has decided
+    /// everything it will do and has done none of it, which is where a check
+    /// made before the answer and a write made after it come apart.
+    // The child is waited on in `Paused::answer`, which is the only way to end
+    // one; clippy cannot see across the return.
+    #[allow(clippy::zombie_processes)]
+    fn at_the_prompt(&self, args: &[&str]) -> Paused {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the binary runs");
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut shown = String::new();
+        loop {
+            let mut line = String::new();
+            assert!(
+                out.read_line(&mut line).unwrap() > 0,
+                "install never asked:\n{shown}"
+            );
+            shown.push_str(&line);
+            if line.contains("apply these changes?") {
+                return Paused { child, out, shown };
+            }
+        }
+    }
+
     fn backups(&self) -> Vec<String> {
         let mut found: Vec<String> = std::fs::read_dir(&self.claude_dir)
             .unwrap()
@@ -177,6 +209,42 @@ impl Fixture {
             .collect();
         found.sort();
         found
+    }
+}
+
+/// An install stopped at its confirmation, with everything it printed so far.
+struct Paused {
+    child: Child,
+    out: std::io::BufReader<std::process::ChildStdout>,
+    shown: String,
+}
+
+impl Paused {
+    /// The pid install is running under, and so the pid its temporary file
+    /// names are built from.
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Answer the question and collect what install did with the answer.
+    fn answer(mut self, answer: &str) -> (std::process::ExitStatus, String) {
+        self.child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(answer.as_bytes())
+            .unwrap();
+        let mut rest = String::new();
+        self.out.read_to_string(&mut rest).unwrap();
+        let mut errors = String::new();
+        self.child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut errors)
+            .unwrap();
+        let status = self.child.wait().unwrap();
+        (status, format!("{}{rest}{errors}", self.shown))
     }
 }
 
@@ -401,6 +469,59 @@ fn a_settings_file_with_a_repeated_key_is_refused() {
         CLAUDE_JSON
     );
     assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
+}
+
+/// A stale file at the temporary name install is about to use is stepped over,
+/// not opened through.
+///
+/// Both temporaries are named from the process id, so a symlink left behind by
+/// a crashed run - or one landed on by a pid that came round again - is enough
+/// for `File::create` to truncate whatever it points at and for the rename that
+/// follows to move the link rather than the file.
+#[test]
+#[cfg(unix)]
+fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
+    let fixture = fixture();
+    fixture.seed();
+    let paused = fixture.at_the_prompt(&["install"]);
+    let pid = paused.pid();
+
+    // One victim per temporary install writes, reached through the exact name
+    // it builds out of its own pid.
+    let victims = [
+        (
+            fixture.root.join("victim-binary"),
+            fixture.bin_dir.join(format!(".verbatim-install-{pid}")),
+        ),
+        (
+            fixture.root.join("victim-settings"),
+            fixture
+                .claude_dir
+                .join(format!(".settings.json.verbatim-{pid}")),
+        ),
+    ];
+    for (victim, stale) in &victims {
+        std::fs::write(victim, b"not yours\n").unwrap();
+        std::os::unix::fs::symlink(victim, stale).unwrap();
+    }
+
+    let (status, said) = paused.answer("y\n");
+    assert!(status.success(), "{said}");
+    for (victim, _) in &victims {
+        assert_eq!(
+            std::fs::read(victim).unwrap(),
+            b"not yours\n",
+            "install wrote through a stale temporary name into {}",
+            victim.display()
+        );
+    }
+
+    // And it still did the whole job, under another name.
+    assert!(fixture.stable().exists(), "{said}");
+    assert_eq!(
+        our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
+        4
+    );
 }
 
 // ---------------------------------------------------------------------------

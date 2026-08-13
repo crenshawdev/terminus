@@ -64,6 +64,59 @@ pub struct Options {
     pub yes: bool,
 }
 
+/// A new file in `dir`, created exclusively, and the path it landed at.
+///
+/// Every atomic write install makes - the settings files, the backups, the copy
+/// of this build - goes through a temporary file in the destination directory
+/// and a rename. This is the one place those temporary files are created, and
+/// `create_new` is the reason: it is `O_EXCL`, so it fails on anything already
+/// at that name rather than opening it.
+///
+/// `File::create` would not. It follows symlinks and truncates what it finds, so
+/// a stale `.settings.json.verbatim-<pid>` symlink left behind by a crashed run,
+/// or a pid that has come round again, is enough to truncate an unrelated file
+/// through it, and the rename that follows moves the *link* into place rather
+/// than the file. Neither is atomic and neither is recoverable.
+///
+/// A collision is answered with a different name, never with a reuse: whatever
+/// is at the first one, it is not ours.
+pub(super) fn create_temporary(
+    dir: &Path,
+    prefix: &str,
+) -> Result<(std::path::PathBuf, std::fs::File), Failure> {
+    /// Enough to step over a stale name or two. Past it, something is wrong
+    /// with the directory rather than with the name, and guessing again is not
+    /// going to find out what.
+    const ATTEMPTS: u32 = 64;
+
+    let pid = std::process::id();
+    for attempt in 0..ATTEMPTS {
+        let path = match attempt {
+            0 => dir.join(format!("{prefix}{pid}")),
+            n => dir.join(format!("{prefix}{pid}-{n}")),
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(Failure::Operational(format!(
+                    "{} could not be created: {e}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    Err(Failure::Operational(format!(
+        "{} already holds {ATTEMPTS} files named '{prefix}{pid}...'; verbatim will not write \
+         over any of them. remove them and run install again",
+        dir.display()
+    )))
+}
+
 pub fn parse(parser: &mut lexopt::Parser) -> Result<Options, Failure> {
     use lexopt::prelude::*;
 
