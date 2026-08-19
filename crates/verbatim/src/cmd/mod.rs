@@ -46,6 +46,7 @@ pub mod sessions;
 pub mod show;
 pub mod spawn;
 pub mod status;
+pub mod uninstall;
 pub mod verify;
 
 use std::path::PathBuf;

@@ -167,12 +167,35 @@ impl Json {
         }
     }
 
+    /// Drop the member at `key` and hand back what it held, or `None` when
+    /// this is not an object or has no such key.
+    ///
+    /// The one thing `uninstall` cannot do from outside this module and the
+    /// only removal it gets: [`Member`]'s fields are private, so a sibling can
+    /// neither read a member's key nor drop one. Array elements need no
+    /// equivalent - `Json::Array(Vec<Json>)` is a public variant and a caller
+    /// filters that `Vec` itself.
+    ///
+    /// The members after it keep their order, which is what lets a file that
+    /// loses verbatim's key come back byte-identical to the one that never had
+    /// it (AC7).
+    pub fn remove(&mut self, key: &str) -> Option<Json> {
+        match self {
+            Json::Object(members) => {
+                let at = members.iter().position(|member| member.key == key)?;
+                Some(members.remove(at).value)
+            }
+            _ => None,
+        }
+    }
+
     /// This object's keys, in the order they will be written.
     ///
-    /// Test support: key order is the property AC4 turns on, and asserting it
-    /// through a rendering would be asserting the renderer instead. Nothing in
-    /// the command needs it, so nothing outside a test compiles it.
-    #[cfg(test)]
+    /// Key order is the property AC4 turns on, and asserting it through a
+    /// rendering would be asserting the renderer instead. `uninstall` reads it
+    /// too: an entry of verbatim's is verbatim's whatever event key it sits
+    /// under (D-13), so the removal walks the events the file has rather than
+    /// the four this build would write.
     pub fn keys(&self) -> Vec<&str> {
         match self {
             Json::Object(members) => members.iter().map(|member| member.key.as_str()).collect(),
@@ -340,6 +363,15 @@ impl Document {
         &self.path
     }
 
+    /// Was there a file here when this was read?
+    ///
+    /// The difference between "nothing to remove" and "removed nothing", which
+    /// `uninstall` has to report as two different lines - and the guard that
+    /// keeps it from creating a settings file it was asked to clean up.
+    pub fn exists(&self) -> bool {
+        self.existed
+    }
+
     pub fn value(&self) -> &Json {
         &self.value
     }
@@ -406,18 +438,8 @@ impl Document {
         if !self.existed {
             return Ok(None);
         }
-        let name = match self.resolved.file_name() {
-            Some(name) => name.to_string_lossy().into_owned(),
-            None => {
-                return Err(Failure::Operational(format!(
-                    "{} does not name a file",
-                    self.resolved.display()
-                )))
-            }
-        };
-        let path = self
-            .resolved
-            .with_file_name(format!("{name}{BACKUP_SUFFIX}"));
+        let name = self.file_name()?;
+        let path = self.backup_path()?;
         let dir = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -431,6 +453,41 @@ impl Document {
         // one is not a file to leave beside the user's settings.
         let _ = std::fs::remove_file(&temporary);
         outcome.map(|()| Some(path))
+    }
+
+    /// Where [`Document::backup`] puts its copy, whether or not one is there.
+    ///
+    /// `uninstall` needs the name without making a backup: install's copy is
+    /// what it compares against to decide whether this file is otherwise
+    /// unchanged, and what it puts back when it is (AC7). Beside the *resolved*
+    /// file, for the reason the module header gives - `~/.claude.json` is two
+    /// symlinks from the file it names.
+    pub fn backup_path(&self) -> Result<PathBuf, Failure> {
+        Ok(self
+            .resolved
+            .with_file_name(format!("{}{BACKUP_SUFFIX}", self.file_name()?)))
+    }
+
+    fn file_name(&self) -> Result<String, Failure> {
+        match self.resolved.file_name() {
+            Some(name) => Ok(name.to_string_lossy().into_owned()),
+            None => Err(Failure::Operational(format!(
+                "{} does not name a file",
+                self.resolved.display()
+            ))),
+        }
+    }
+
+    /// Put `contents` at this document's path, atomically, whatever is there.
+    ///
+    /// The one write that is not an edit of the value: `uninstall` restores
+    /// install's backup *as bytes*, because AC7 asks for the pre-install file
+    /// formatting and key order included, and rendering the backup's value
+    /// would give back a file this renderer formatted rather than the one the
+    /// user had. Same temporary-and-rename, same resolved path, same
+    /// permissions as every other write here.
+    pub fn overwrite(&self, contents: &str) -> Result<(), Failure> {
+        write_atomically(&self.resolved, contents)
     }
 
     /// Re-read, re-apply `edit`, and write only if that changed something.
