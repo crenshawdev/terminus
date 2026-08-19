@@ -13,6 +13,7 @@
 //! indentation had changed, which is exactly the failure the whole `json_file`
 //! module exists to prevent.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -159,6 +160,43 @@ impl Fixture {
 
     fn uninstall(&self) -> Output {
         self.run(&["uninstall"])
+    }
+
+    /// Run and type `answer` at the confirmation, the way a user at a terminal
+    /// would.
+    fn answer(&self, args: &[&str], answer: &str) -> Output {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the binary runs");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(answer.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// `verbatim status`'s `size_bytes` for this fixture's store.
+    fn status_size(&self) -> u64 {
+        let output = self.run(&["status", "--json"]);
+        assert!(output.status.success(), "status failed: {}", text(&output));
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("status emits one JSON document");
+        document["data"]["size_bytes"].as_u64().unwrap()
+    }
+
+    /// The three files `--purge` counts, measured with no connection open.
+    fn footprint(&self) -> u64 {
+        ["verbatim.db", "verbatim.db-wal", "verbatim.db-shm"]
+            .iter()
+            .filter_map(|name| std::fs::metadata(self.data_dir().join(name)).ok())
+            .map(|meta| meta.len())
+            .sum()
     }
 
     fn backups(&self) -> Vec<String> {
@@ -467,4 +505,191 @@ fn uninstall_rejects_json() {
     let fixture = fixture();
     let output = fixture.run(&["uninstall", "--json"]);
     assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+}
+
+/// The number `--purge` printed, out of its own last line.
+fn deleted_bytes(output: &Output) -> u64 {
+    let line = out(output)
+        .lines()
+        .find(|line| line.trim_start().starts_with("deleted "))
+        .unwrap_or_else(|| panic!("--purge printed no deletion line:\n{}", text(output)))
+        .to_owned();
+    line.split_whitespace()
+        .nth(1)
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("no byte count in {line:?}"))
+}
+
+/// The archive is the product, so the question is asked and an unanswerable
+/// prompt is a refusal rather than an assumed yes (INST-08, D-20).
+///
+/// This is the shape a script gets: `--purge` with stdin closed and no `--yes`.
+/// Exit non-zero, and every byte still there.
+#[test]
+fn purge_with_nothing_to_read_refuses_and_keeps_the_archive() {
+    let fixture = fixture();
+    fixture.install().ingest();
+    let before = fixture.footprint();
+    assert!(before > 0, "the fixture has no store to purge");
+
+    let output = fixture.run(&["uninstall", "--purge"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an unanswerable purge must not exit 0:\n{}",
+        text(&output)
+    );
+    assert!(
+        fixture.data_dir().join("verbatim.db").is_file(),
+        "the archive was deleted without an answer"
+    );
+    assert_eq!(fixture.footprint(), before, "the store was written to");
+    // Task 5's work still ran: the purge refusal is about the archive alone.
+    assert!(!fixture.stable().exists());
+}
+
+/// Answering the question with anything but yes keeps the archive and exits 0:
+/// a declined delete is a decision, not a failure.
+#[test]
+fn answering_no_keeps_the_archive_and_exits_zero() {
+    let fixture = fixture();
+    fixture.install().ingest();
+
+    let output = fixture.answer(&["uninstall", "--purge"], "n\n");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "declining is not a failure:\n{}",
+        text(&output)
+    );
+    assert!(
+        fixture.data_dir().join("verbatim.db").is_file(),
+        "the archive went anyway"
+    );
+    assert!(
+        out(&output).contains("the archive was kept"),
+        "uninstall did not say the archive was kept:\n{}",
+        text(&output)
+    );
+}
+
+/// The size and the path are shown before the question, and `--yes` deletes.
+///
+/// The byte count is the footprint on disk - the same three files
+/// `verbatim status` reports and the same rule - and it is asserted against a
+/// measurement this test takes for itself. `status`'s own number is larger and
+/// checked as an upper bound instead: it measures while its connection is open,
+/// and the `-shm` it counts exists only for the life of that connection.
+#[test]
+fn purge_with_yes_prints_the_size_and_the_path_then_deletes() {
+    let fixture = fixture();
+    fixture.install().ingest();
+    let footprint = fixture.footprint();
+    let reported = fixture.status_size();
+    assert!(footprint > 0);
+    assert!(
+        footprint <= reported,
+        "status counts the same files plus the sidecars its own connection makes: \
+         {footprint} > {reported}"
+    );
+
+    let output = fixture.run(&["uninstall", "--purge", "--yes"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "purge failed:\n{}",
+        text(&output)
+    );
+    let shown = out(&output);
+    assert!(
+        shown.contains(&fixture.data_dir().display().to_string()),
+        "the path was not shown:\n{shown}"
+    );
+    assert!(
+        shown.contains(&footprint.to_string()),
+        "the size was not shown before the question:\n{shown}"
+    );
+    assert_eq!(deleted_bytes(&output), footprint);
+    assert!(
+        !fixture.data_dir().exists(),
+        "the data directory is still there"
+    );
+}
+
+/// The size is on the screen before the question, never after it.
+///
+/// Ordering is the property: a user is asked to approve the deletion of a
+/// number they have already seen.
+#[test]
+fn the_size_is_shown_before_the_question() {
+    let fixture = fixture();
+    fixture.install().ingest();
+    let footprint = fixture.footprint();
+
+    let output = fixture.answer(&["uninstall", "--purge"], "n\n");
+    let shown = out(&output);
+    let size_at = shown
+        .find(&footprint.to_string())
+        .unwrap_or_else(|| panic!("the size was never shown:\n{shown}"));
+    let question_at = shown
+        .find("delete it?")
+        .unwrap_or_else(|| panic!("nothing was asked:\n{shown}"));
+    assert!(
+        size_at < question_at,
+        "the size was shown after the question:\n{shown}"
+    );
+}
+
+/// A pass that is mid-transaction never has the store deleted out from under
+/// it: `--purge` takes the ingest lock first.
+///
+/// The lock is held by this test process, which is what a detached ingest
+/// spawned by a hook looks like from outside.
+#[test]
+fn purge_refuses_while_an_ingest_holds_the_lock() {
+    let fixture = fixture();
+    fixture.install().ingest();
+
+    let held = match verbatim_core::ingest::lock::try_acquire(&fixture.data_dir()).unwrap() {
+        verbatim_core::ingest::lock::Attempt::Acquired(held) => held,
+        verbatim_core::ingest::lock::Attempt::Held => panic!("nothing else should hold this lock"),
+    };
+
+    let output = fixture.run(&["uninstall", "--purge", "--yes"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "purge deleted a store another process was writing:\n{}",
+        text(&output)
+    );
+    assert!(
+        fixture.data_dir().join("verbatim.db").is_file(),
+        "the archive went while the lock was held"
+    );
+    drop(held);
+
+    // And it goes once the pass is done.
+    let output = fixture.run(&["uninstall", "--purge", "--yes"]);
+    assert!(output.status.success(), "purge failed:\n{}", text(&output));
+    assert!(!fixture.data_dir().exists());
+}
+
+/// `--purge` with no store is a state, not a failure, and deletes nothing.
+#[test]
+fn purge_before_the_first_ingest_deletes_nothing() {
+    let fixture = fixture();
+    fixture.install();
+
+    let output = fixture.run(&["uninstall", "--purge", "--yes"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a machine before its first ingest is not a failure:\n{}",
+        text(&output)
+    );
+    assert!(
+        out(&output).contains("nothing to purge"),
+        "uninstall did not say why it deleted nothing:\n{}",
+        text(&output)
+    );
 }

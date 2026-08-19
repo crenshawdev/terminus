@@ -45,29 +45,49 @@
 //!
 //! # The archive is never collateral (INST-07)
 //!
-//! The data directory is left alone and its path is printed. Nothing in this
-//! command touches it.
+//! The data directory is left alone and its path is printed. `--purge` is the
+//! only thing in this phase that destroys anything the user cannot get back, so
+//! it shows the path and the size first, asks once through install's own
+//! confirmation - same `--yes`, same refusal when there is no answer to read -
+//! and takes the ingest lock before it deletes, so it can never pull the store
+//! out from under a pass that is mid-transaction.
 //!
 //! Human-only, no `--json` (D-24).
 
 use std::cell::Cell;
 use std::path::Path;
 
+use verbatim_core::ingest::lock;
+use verbatim_core::store::DB_FILE_NAME;
+
 use super::install::json_file::{Document, Json};
-use super::install::{binary, targets};
+use super::install::{self, binary, targets};
 use super::Failure;
 
-pub struct Options {}
-
-pub fn parse(parser: &mut lexopt::Parser) -> Result<Options, Failure> {
-    // Every argument is rejected, `--json` deliberately among them (D-24).
-    if let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
-        return Err(Failure::Misuse(crate::unexpected(arg)));
-    }
-    Ok(Options {})
+pub struct Options {
+    pub yes: bool,
+    pub purge: bool,
 }
 
-pub fn run(_options: Options) -> Result<(), Failure> {
+pub fn parse(parser: &mut lexopt::Parser) -> Result<Options, Failure> {
+    use lexopt::prelude::*;
+
+    let mut options = Options {
+        yes: false,
+        purge: false,
+    };
+    while let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
+        match arg {
+            Short('y') | Long("yes") => options.yes = true,
+            Long("purge") => options.purge = true,
+            // Including `--json`, deliberately (D-24).
+            other => return Err(Failure::Misuse(crate::unexpected(other))),
+        }
+    }
+    Ok(options)
+}
+
+pub fn run(options: Options) -> Result<(), Failure> {
     let stable = binary::stable_path()?;
     let data_dir = super::data_dir()?;
 
@@ -83,7 +103,16 @@ pub fn run(_options: Options) -> Result<(), Failure> {
     ok &= unplace(&stable);
 
     println!("  data directory  {}", data_dir.display());
-    println!("    kept: the archive is the product, and uninstall never deletes it.");
+    if !options.purge {
+        println!(
+            "    kept: the archive is the product, and uninstall never deletes it.\n    \
+             to delete it too: verbatim uninstall --purge"
+        );
+        println!();
+        return finish(ok);
+    }
+    println!();
+    purge(&data_dir, options.yes)?;
     println!();
     finish(ok)
 }
@@ -367,6 +396,128 @@ fn unplace(stable: &Path) -> bool {
             println!("    left alone: {}", detail(failure));
             false
         }
+    }
+}
+
+/// `--purge`: the one irreversible thing in this phase.
+///
+/// The path and the size go on the screen before the question and not after
+/// it, because the answer is the last moment either of them can change
+/// anything.
+fn purge(data_dir: &Path, yes: bool) -> Result<(), Failure> {
+    if !data_dir.join(DB_FILE_NAME).exists() {
+        // Either nothing was ever ingested here or this is not a data
+        // directory. Either way there is no store to delete, and
+        // `remove_dir_all` on a directory verbatim cannot recognize is not a
+        // mistake worth the one time it would be right.
+        println!("  no store at that path, so there is nothing to purge");
+        return Ok(());
+    }
+    let bytes = size_bytes(data_dir);
+    println!("  --purge deletes the archive itself. this cannot be undone.");
+    println!("    {}", data_dir.display());
+    println!("    {bytes} byte(s) ({})", human(bytes));
+    println!();
+
+    match answered(data_dir, yes) {
+        Ok(true) => {}
+        Ok(false) => {
+            println!("  the archive was kept.");
+            return Ok(());
+        }
+        Err(failure) => {
+            println!("  the archive was kept.");
+            return Err(failure);
+        }
+    }
+
+    // Under the ingest lock, so a pass mid-transaction is never left writing
+    // into a store that has been unlinked out from under it. The lock file
+    // lives in the directory being deleted, which is why it is released - by
+    // the drop at the end of this scope - only after the delete.
+    let held = match lock::try_acquire(data_dir)? {
+        lock::Attempt::Acquired(held) => held,
+        lock::Attempt::Held => {
+            println!("  an ingest is running, so the archive was kept.");
+            return Err(Failure::Operational(
+                "another verbatim process holds the ingest lock; nothing was deleted".to_owned(),
+            ));
+        }
+    };
+    std::fs::remove_dir_all(data_dir).map_err(|e| {
+        Failure::Operational(format!("{} could not be removed: {e}", data_dir.display()))
+    })?;
+    drop(held);
+    println!("  deleted {bytes} byte(s) at {}", data_dir.display());
+    Ok(())
+}
+
+/// The one question `--purge` asks, and the one place `--yes` means something
+/// different here than it does in install.
+///
+/// Install's `--yes` takes every default; this one takes the delete. The
+/// default for a thing that cannot be undone is no, so a `--yes` that inherited
+/// it would make `uninstall --purge --yes` print the size, decline its own
+/// question and leave - which is not what anyone typing it asked for.
+///
+/// Everything else is [`install::confirm`] unchanged: the same reading of y/n,
+/// the same terminal test, and above all the same refusal when there is no
+/// answer to read rather than an assumed one (INST-08, D-20). That rule is why
+/// this calls into install instead of asking here.
+fn answered(data_dir: &Path, yes: bool) -> Result<bool, Failure> {
+    const QUESTION: &str = "  delete it?";
+
+    if yes {
+        println!("{QUESTION} [y/N] y (--yes)");
+        return Ok(true);
+    }
+    install::confirm(QUESTION, false, false).map_err(|_| {
+        Failure::Operational(format!(
+            "--purge needs an answer and there was none to read; {} is untouched.\n  \
+             rerun with --yes to delete it without being asked",
+            data_dir.display()
+        ))
+    })
+}
+
+/// The store's footprint on disk: the database and its two sidecars.
+///
+/// The same three files and the same rule as `cmd::status`'s `size_bytes`, and
+/// deliberately so - but not always the same number. `status` measures while
+/// its own connection is open, and SQLite's `-shm` and `-wal` exist only for
+/// the life of a connection, so `status` counts them and this, which opens
+/// nothing, does not. Measured 2026-08-18 against a one-session store:
+/// `status --json` reports 159,744 and the directory holds 126,976, the
+/// difference being the 32 KiB `-shm` that goes when the connection does.
+///
+/// What `--purge` shows is therefore what is on disk at that moment, which is
+/// the number that is about to go.
+fn size_bytes(data_dir: &Path) -> u64 {
+    let mut total = 0u64;
+    for name in [
+        DB_FILE_NAME.to_owned(),
+        format!("{DB_FILE_NAME}-wal"),
+        format!("{DB_FILE_NAME}-shm"),
+    ] {
+        if let Ok(meta) = std::fs::metadata(data_dir.join(name)) {
+            total += meta.len();
+        }
+    }
+    total
+}
+
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 

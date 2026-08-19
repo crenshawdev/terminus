@@ -343,7 +343,12 @@ fn current_exe_display() -> String {
 }
 
 /// Ask once, read the answer, and refuse rather than assume one.
-fn confirm(question: &str, default: bool, yes: bool) -> Result<bool, Failure> {
+///
+/// `pub(super)` for `cmd::uninstall`, whose `--purge` asks the same question
+/// about something it cannot undo. The rule that matters is the refusal when
+/// there is no answer to read, and a second copy of it beside a second copy of
+/// `--yes` and the terminal test is exactly how the two come apart.
+pub(super) fn confirm(question: &str, default: bool, yes: bool) -> Result<bool, Failure> {
     let hint = if default { "[Y/n]" } else { "[y/N]" };
     if yes {
         println!(
