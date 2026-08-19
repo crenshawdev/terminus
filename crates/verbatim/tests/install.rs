@@ -680,6 +680,72 @@ fn an_upgrade_rewrites_no_byte_of_the_hooks_object() {
     assert_eq!(std::fs::read_to_string(fixture.settings()).unwrap(), raw);
 }
 
+/// INST-05: an entry that is verbatim's and the wrong shape is repaired, not
+/// counted as done.
+///
+/// A hand edit, or an entry an older verbatim wrote with a different arg shape,
+/// has the right command and the wrong `args`. Idempotence checked by presence
+/// alone would call `SessionStart` handled and leave it with no working hook at
+/// all - permanently, because every later install would agree.
+#[test]
+fn an_entry_of_ours_in_the_wrong_shape_is_repaired_rather_than_skipped() {
+    let fixture = fixture();
+    fixture.seed();
+    // JSON needs the Windows separators doubled; nothing else about the path
+    // changes.
+    let stable = fixture.stable().display().to_string().replace('\\', "\\\\");
+    let seeded = format!(
+        r#"{{
+  "theme": "dark",
+  "hooks": {{
+    "SessionStart": [
+      {{
+        "matcher": "",
+        "hooks": [
+          {{
+            "command": "{stable}",
+            "args": [
+              "hook",
+              "SessionEnd"
+            ],
+            "timeout": 30
+          }}
+        ]
+      }}
+    ]
+  }}
+}}
+"#
+    );
+    std::fs::write(fixture.settings(), &seeded).unwrap();
+
+    assert!(fixture.run(&["install", "--yes"]).status.success());
+
+    let settings = read(&fixture.settings());
+    let groups = settings["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "the repair appended a second group");
+    let entry = &groups[0]["hooks"][0];
+    assert_eq!(entry["type"], "command");
+    assert_eq!(entry["args"][1], "SessionStart");
+    assert_eq!(
+        entry["timeout"],
+        serde_json::Value::from(30),
+        "a key beside ours was dropped"
+    );
+    // AC2 still holds: one entry per event, four in all.
+    assert_eq!(our_entries(&settings, &fixture.stable()).len(), 4);
+
+    // AC3 still holds: with everything in the intended shape, a second install
+    // rewrites nothing.
+    let after_first = std::fs::read_to_string(fixture.settings()).unwrap();
+    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert_eq!(
+        std::fs::read_to_string(fixture.settings()).unwrap(),
+        after_first,
+        "a second install rewrote settings.json"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Task 4: the MCP registration
 // ---------------------------------------------------------------------------
@@ -727,6 +793,48 @@ fn two_installs_leave_one_mcp_entry_beside_the_servers_already_there() {
     );
     // The file it read had no trailing newline, and neither has the one it wrote.
     assert!(raw.ends_with('}'), "a trailing newline appeared");
+}
+
+/// A registration of verbatim's that names a binary path which has moved is
+/// brought up to date.
+///
+/// This is the phase goal at its narrowest: "keeping itself current with no
+/// user action" is exactly what fails if a registration under verbatim's own
+/// key is left alone whatever it holds.
+#[test]
+fn a_stale_mcp_registration_is_brought_up_to_date() {
+    let fixture = fixture();
+    fixture.seed();
+    let stale = CLAUDE_JSON.replace(
+        "    \"context7\": {",
+        "    \"verbatim\": {\n      \"type\": \"sse\",\n      \"command\": \
+         \"/old/bin/verbatim\",\n      \"env\": {\n        \"KEEP\": \"me\"\n      }\n    },\n    \
+         \"context7\": {",
+    );
+    std::fs::write(fixture.claude_json(), &stale).unwrap();
+
+    assert!(fixture.run(&["install", "--yes"]).status.success());
+
+    let servers = read(&fixture.claude_json())["mcpServers"].clone();
+    let ours = &servers["verbatim"];
+    assert_eq!(
+        ours["command"],
+        serde_json::Value::from(fixture.stable().display().to_string()),
+        "the registration still names a binary that is not there"
+    );
+    assert_eq!(ours["type"], "stdio");
+    assert_eq!(ours["args"][0], "mcp");
+    assert_eq!(
+        ours["env"]["KEEP"],
+        serde_json::Value::from("me"),
+        "a key beside ours was dropped"
+    );
+    // And the server that is not ours is exactly as it was.
+    assert_eq!(
+        servers["context7"]["url"],
+        serde_json::Value::from("https://example.invalid/mcp")
+    );
+    assert_eq!(servers.as_object().unwrap().len(), 2);
 }
 
 // ---------------------------------------------------------------------------

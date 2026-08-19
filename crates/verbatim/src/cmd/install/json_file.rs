@@ -151,6 +151,22 @@ impl Json {
         }
     }
 
+    /// The value at `key`, to change in place, when this is an object that has
+    /// one.
+    ///
+    /// Not [`Json::entry`]: this is how a caller reaches into a member it does
+    /// not own, and inserting a default there would be writing into somebody
+    /// else's object to find out it was theirs.
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Json> {
+        match self {
+            Json::Object(members) => members
+                .iter_mut()
+                .find(|member| member.key == key)
+                .map(|member| &mut member.value),
+            _ => None,
+        }
+    }
+
     /// This object's keys, in the order they will be written.
     ///
     /// Test support: key order is the property AC4 turns on, and asserting it
@@ -170,6 +186,15 @@ impl Json {
         match self {
             Json::Array(items) => items,
             _ => &[],
+        }
+    }
+
+    /// The elements to change in place, when this is an array. An empty slice
+    /// otherwise, matching [`Json::items`].
+    pub fn items_mut(&mut self) -> &mut [Json] {
+        match self {
+            Json::Array(items) => items,
+            _ => &mut [],
         }
     }
 

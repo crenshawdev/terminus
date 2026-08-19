@@ -40,11 +40,24 @@
 //!
 //! # Idempotency and upgrade are the same rule (INST-05)
 //!
-//! An entry is verbatim's when its `command` equals the stable path. If one is
-//! there for an event, nothing is written for that event - not a replacement,
-//! not a reordering. Because the stable path never moves (D-08), an upgrade that
-//! replaced the binary finds all four present and rewrites no byte of `hooks`.
-//! That is the version-skew class this design exists to retire.
+//! Two questions, and they are not the same one. **Whose** an entry is: it is
+//! verbatim's when its `command` is the stable path, and anything else is
+//! somebody's and is never touched, read or written. **What shape** it is in:
+//! `type: "command"`, and `args` naming this event. A second install finds its
+//! four entries in the intended shape and writes nothing at all - not a
+//! replacement, not a reordering - so an upgrade that replaced the binary
+//! rewrites no byte of `hooks`, which is the version-skew class this design
+//! exists to retire.
+//!
+//! Idempotence checked by presence alone would be a trap: an entry with the
+//! right command and no `args`, or `args` naming the wrong event - a hand edit,
+//! or an older verbatim's shape - would make install skip that event and leave
+//! it with no working hook at all, for good. So a verbatim entry that is the
+//! wrong shape is repaired in place, keeping its position and any key beside it
+//! the user added, such as a `timeout`. Same rule under `.mcpServers.verbatim`:
+//! a registration pointing at a binary path that has moved is corrected rather
+//! than left to rot, because "keeping itself current with no user action" is
+//! exactly what fails when it is not.
 //!
 //! Nothing here shells out to `claude mcp add -s user` (D-06). Install must not
 //! depend on `claude` being on `PATH`, from a binary whose stated contract is no
@@ -103,29 +116,23 @@ fn non_empty_var(name: &str) -> Option<std::ffi::OsString> {
     }
 }
 
-/// Add the four hook entries that are missing, and nothing else.
+/// Put each event's entry in the shape verbatim writes, adding the ones that
+/// are not there, and change nothing else.
 pub fn add_hooks(root: &mut Json, stable: &Path) -> Result<(), Failure> {
     let stable = stable.display().to_string();
     let hooks = root.entry("hooks", Json::object())?;
     for event in hook::EVENTS {
         let entries = hooks.entry(event, Json::array())?;
-        if holds_command(entries, &stable) {
+        if holds_ours(entries, &stable) {
+            repair_entries(entries, &stable, event)?;
             continue;
         }
-        let mut entry = Json::object();
-        entry.entry("type", Json::string("command"))?;
-        entry.entry("command", Json::string(&stable))?;
-        let mut args = Json::array();
-        args.push(Json::string("hook"))?;
-        args.push(Json::string(event))?;
-        entry.entry("args", args)?;
-
         let mut group = Json::object();
         // The shape every group in a real `settings.json` has: an empty matcher
         // means every invocation of the event.
         group.entry("matcher", Json::string(""))?;
         let mut inner = Json::array();
-        inner.push(entry)?;
+        inner.push(hook_entry(&stable, event)?)?;
         group.entry("hooks", inner)?;
 
         entries.push(group)?;
@@ -133,34 +140,79 @@ pub fn add_hooks(root: &mut Json, stable: &Path) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Is one of this event's groups already ours?
-fn holds_command(entries: &Json, stable: &str) -> bool {
-    entries.items().iter().any(|group| {
-        group
-            .get("hooks")
-            .map(|inner| {
-                inner.items().iter().any(|entry| {
-                    entry.get("command").and_then(Json::as_str).as_deref() == Some(stable)
-                })
-            })
-            .unwrap_or(false)
-    })
+/// The entry verbatim writes for one event, in exec form (D-01).
+fn hook_entry(stable: &str, event: &str) -> Result<Json, Failure> {
+    let mut entry = Json::object();
+    entry.entry("type", Json::string("command"))?;
+    entry.entry("command", Json::string(stable))?;
+    entry.entry("args", hook_args(event))?;
+    Ok(entry)
 }
 
-/// Register the MCP server, unless it is already registered.
+fn hook_args(event: &str) -> Json {
+    Json::Array(vec![Json::string("hook"), Json::string(event)])
+}
+
+/// Does one of this event's groups hold an entry of verbatim's?
+///
+/// Ownership is the command and only the command: an entry whose `command` is
+/// the stable path is verbatim's however wrong the rest of it is, and an entry
+/// whose command is anything else is not read past that field.
+fn holds_ours(entries: &Json, stable: &str) -> bool {
+    entries
+        .items()
+        .iter()
+        .filter_map(|group| group.get("hooks"))
+        .flat_map(|inner| inner.items())
+        .any(|entry| entry.get("command").and_then(Json::as_str).as_deref() == Some(stable))
+}
+
+/// Bring this event's own entries up to the intended shape.
+///
+/// In place, so an entry keeps its position and any key beside it - a `timeout`
+/// the user added stays. Assigning a value it already holds is a no-op all the
+/// way to the bytes, which is what leaves an upgrade rewriting nothing (AC3).
+fn repair_entries(entries: &mut Json, stable: &str, event: &str) -> Result<(), Failure> {
+    for group in entries.items_mut() {
+        let Some(inner) = group.get_mut("hooks") else {
+            continue;
+        };
+        for entry in inner.items_mut() {
+            if entry.get("command").and_then(Json::as_str).as_deref() != Some(stable) {
+                continue;
+            }
+            set(entry, "type", Json::string("command"))?;
+            set(entry, "args", hook_args(event))?;
+        }
+    }
+    Ok(())
+}
+
+/// Register the MCP server, or put the registration back in the shape verbatim
+/// writes.
 pub fn add_mcp_server(root: &mut Json, stable: &Path) -> Result<(), Failure> {
     let stable = stable.display().to_string();
     let servers = root.entry("mcpServers", Json::object())?;
-    if servers.get(MCP_SERVER_KEY).is_some() {
-        return Ok(());
+    let server = servers.entry(MCP_SERVER_KEY, Json::object())?;
+    if !matches!(server, Json::Object(_)) {
+        // Under verbatim's own key, and not a server registration at all. There
+        // is nothing in it to keep.
+        *server = Json::object();
     }
-    let mut server = Json::object();
-    server.entry("type", Json::string("stdio"))?;
-    server.entry("command", Json::string(&stable))?;
-    let mut args = Json::array();
-    args.push(Json::string("mcp"))?;
-    server.entry("args", args)?;
-    servers.entry(MCP_SERVER_KEY, server)?;
+    // The three fields verbatim owns, and no others: a `command` naming a
+    // binary path that has moved is corrected, and an `env` block the user put
+    // beside it survives.
+    set(server, "type", Json::string("stdio"))?;
+    set(server, "command", Json::string(&stable))?;
+    set(server, "args", Json::Array(vec![Json::string("mcp")]))?;
+    Ok(())
+}
+
+/// `object[key] = value`, in place when the key is there and appended when it
+/// is not.
+fn set(object: &mut Json, key: &str, value: Json) -> Result<(), Failure> {
+    let slot = object.entry(key, value.clone())?;
+    *slot = value;
     Ok(())
 }
 
@@ -178,6 +230,18 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(&path, text).unwrap();
         Document::read(&path).unwrap().value().clone()
+    }
+
+    /// Verbatim's own entries among one event's groups - the ones whose
+    /// `command` is the stable path, whatever else they say.
+    fn ours<'a>(groups: &'a Json, stable: &str) -> Vec<&'a Json> {
+        groups
+            .items()
+            .iter()
+            .filter_map(|group| group.get("hooks"))
+            .flat_map(|inner| inner.items())
+            .filter(|entry| entry.get("command").and_then(Json::as_str).as_deref() == Some(stable))
+            .collect()
     }
 
     /// Four entries, exec form, and the user's own `UserPromptSubmit` group
@@ -198,10 +262,15 @@ mod tests {
 
         let hooks = root.get("hooks").unwrap();
         for event in hook::EVENTS {
-            let groups = hooks.get(event).unwrap();
-            assert!(
-                holds_command(groups, &stable().display().to_string()),
-                "{event}"
+            let mine = ours(hooks.get(event).unwrap(), &stable().display().to_string());
+            assert_eq!(mine.len(), 1, "{event}");
+            assert_eq!(
+                mine[0].get("type").and_then(Json::as_str).unwrap(),
+                "command"
+            );
+            assert_eq!(
+                mine[0].get("args").unwrap().items()[1].as_str().unwrap(),
+                *event
             );
         }
         let prompt = hooks.get("UserPromptSubmit").unwrap().items();
@@ -259,6 +328,105 @@ mod tests {
                 .and_then(Json::as_str)
                 .unwrap(),
             stable().display().to_string()
+        );
+    }
+
+    /// An entry of verbatim's that is the wrong shape is repaired where it
+    /// stands, not skipped and not duplicated.
+    ///
+    /// Presence is not the test. This entry has the right command and the wrong
+    /// event in its `args`, which is what a hand edit or an older verbatim
+    /// leaves; matching on the command alone would call `SessionStart` done and
+    /// leave it with no working hook at all.
+    #[test]
+    fn an_entry_of_ours_in_the_wrong_shape_is_repaired_in_place() {
+        let mut root = parsed(
+            r#"{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "", "hooks": [{"command": "/home/someone/.local/bin/verbatim",
+                                 "args": ["hook", "SessionEnd"], "timeout": 30}]}
+    ]
+  }
+}"#,
+        );
+        add_hooks(&mut root, &stable()).unwrap();
+
+        let groups = root.get("hooks").unwrap().get("SessionStart").unwrap();
+        assert_eq!(
+            groups.items().len(),
+            1,
+            "the repair appended a second group"
+        );
+        let mine = ours(groups, &stable().display().to_string());
+        assert_eq!(mine.len(), 1);
+        assert_eq!(
+            mine[0].get("type").and_then(Json::as_str).unwrap(),
+            "command"
+        );
+        assert_eq!(
+            mine[0].get("args").unwrap().items()[1].as_str().unwrap(),
+            "SessionStart"
+        );
+        assert_eq!(
+            mine[0].get("timeout").and_then(Json::as_i64),
+            Some(30),
+            "a key the user put beside ours was dropped"
+        );
+    }
+
+    /// An entry that is not verbatim's is not read past its command, whatever
+    /// shape it is in.
+    #[test]
+    fn an_entry_that_is_not_ours_is_left_exactly_as_it_is() {
+        let text = r#"{
+  "hooks": {
+    "SessionStart": [
+      {"matcher": "", "hooks": [{"command": "/opt/someone-else/verbatim", "args": ["hook"]}]}
+    ]
+  }
+}"#;
+        let mut root = parsed(text);
+        add_hooks(&mut root, &stable()).unwrap();
+
+        let groups = root.get("hooks").unwrap().get("SessionStart").unwrap();
+        assert_eq!(groups.items().len(), 2, "ours should have been appended");
+        assert_eq!(
+            groups.items()[0],
+            parsed(text)
+                .get("hooks")
+                .unwrap()
+                .get("SessionStart")
+                .unwrap()
+                .items()[0],
+            "the entry that is not ours was changed"
+        );
+    }
+
+    /// A registration of ours pointing at a binary path that has moved is
+    /// corrected, and what the user put beside it survives.
+    #[test]
+    fn a_stale_mcp_registration_is_brought_up_to_date() {
+        let mut root = parsed(
+            r#"{"mcpServers": {"verbatim": {"type": "sse", "command": "/old/bin/verbatim",
+             "env": {"KEEP": "me"}}}}"#,
+        );
+        add_mcp_server(&mut root, &stable()).unwrap();
+
+        let server = root.get("mcpServers").unwrap().get("verbatim").unwrap();
+        assert_eq!(server.get("type").and_then(Json::as_str).unwrap(), "stdio");
+        assert_eq!(
+            server.get("command").and_then(Json::as_str).unwrap(),
+            stable().display().to_string()
+        );
+        assert_eq!(
+            server.get("args").unwrap().items()[0].as_str().unwrap(),
+            "mcp"
+        );
+        assert_eq!(
+            server.get("env").unwrap().get("KEEP").unwrap().as_str(),
+            Some("me".to_owned()),
+            "a key the user put beside ours was dropped"
         );
     }
 
