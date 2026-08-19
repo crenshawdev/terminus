@@ -437,3 +437,92 @@ fn an_mcp_registration_that_points_elsewhere_is_a_problem() {
     );
     assert!(report.check("mcp_server").fix.is_some());
 }
+
+// ---------------------------------------------------------------------------
+// The store and the data directory, neither of which doctor creates
+// ---------------------------------------------------------------------------
+
+/// AC6's first half: a machine before its first ingest is a state, not a
+/// failure, and the report leaves it exactly that.
+///
+/// The listing is taken of the *parent*, before and after, so a created WAL
+/// file, a `LOCK`, or a directory made on the way to somewhere else fails this
+/// test too. `Store::open` would create all three (D-12), which is why doctor
+/// opens through the read path instead.
+#[test]
+fn a_data_directory_that_does_not_exist_is_a_state_and_stays_absent() {
+    let fixture = fixture();
+    fixture.install();
+
+    let data_dir = fixture.root.join("data");
+    assert!(!data_dir.exists(), "install created the data directory");
+    let before = entries(&fixture.root);
+
+    let (code, report) = fixture.doctor();
+    assert_eq!(
+        code,
+        Some(0),
+        "a machine that has never ingested is not a failure:\n{}",
+        report.whole
+    );
+    assert_eq!(report.state("store"), "note");
+    assert_eq!(report.state("data_directory"), "note");
+    assert!(
+        report.check("store").finding.contains("no verbatim store"),
+        "{}",
+        report.check("store").finding
+    );
+    assert!(!data_dir.exists(), "doctor created the data directory");
+    assert_eq!(
+        entries(&fixture.root),
+        before,
+        "doctor created something beside the data directory"
+    );
+}
+
+/// After one ingest the same checks carry the numbers, which is the half that
+/// proves the read path was really opened rather than reported as absent.
+#[test]
+fn after_one_ingest_the_store_and_the_last_run_are_reported() {
+    let fixture = fixture();
+    fixture.install();
+
+    // A `<uuid>.jsonl` directly inside a project directory, because that is
+    // what `discover` calls a transcript (D-16); a fixture kept under its own
+    // name would be walked past and the store would stay empty.
+    let project = fixture.claude_dir.join("projects").join("-data-code-x");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("44444444-4444-4444-8444-444444444444.jsonl"),
+        verbatim_core::testkit::fixture_bytes("session-basic.jsonl"),
+    )
+    .unwrap();
+    let ingest = fixture.run(&["ingest"]);
+    assert!(ingest.status.success(), "ingest failed: {}", text(&ingest));
+
+    let (code, report) = fixture.doctor();
+    assert_eq!(code, Some(0), "{}", report.whole);
+    assert_eq!(report.state("store"), "ok");
+    assert!(
+        report.check("store").finding.contains("1 session(s)"),
+        "the store check should carry the session count: {}",
+        report.check("store").finding
+    );
+    assert_eq!(report.state("data_directory"), "ok");
+    assert_eq!(report.state("last_run"), "ok");
+    let last = &report.check("last_run").finding;
+    assert!(
+        last.starts_with("20") && last.contains("committed"),
+        "the last run should be reported by its timestamp: {last}"
+    );
+}
+
+/// Every name directly inside `dir`, sorted.
+fn entries(dir: &Path) -> Vec<String> {
+    let mut found: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    found
+}

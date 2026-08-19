@@ -35,9 +35,13 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use verbatim_core::config::visible;
+use verbatim_core::Config;
+
 use super::install::binary;
 use super::install::json_file::{Document, Json};
 use super::install::targets;
+use super::read::{self, Opened};
 use super::{hook, Failure};
 
 /// The oldest Claude Code verbatim has seen carry exec-form hook `args` (D-16).
@@ -53,6 +57,12 @@ const CLAUDE_FLOOR: &str = "2.1.227";
 /// enough that a wedged binary at the stable path costs a diagnostic rather than
 /// the terminal.
 const VERSION_BUDGET: Duration = Duration::from_millis(2_000);
+
+/// How much of a failed run's error doctor puts on one line.
+///
+/// The whole of it is `verbatim status`'s to print; this is the first line, cut
+/// so a pass that failed on a path 4 KB long is still a report.
+const MAX_ERROR_LINE: usize = 200;
 
 /// What one check found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +129,7 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<(), Failure> {
 pub fn run() -> Result<(), Failure> {
     let mut doctor = Doctor::new();
     doctor.wiring();
+    doctor.archive();
     let checks = doctor.checks;
 
     write_out(&report(&checks))?;
@@ -547,6 +558,296 @@ impl Doctor {
                 format!("claude {version} at {}; {floor_note}", program.display()),
             ));
         }
+    }
+}
+
+/// The last pass an ingest left an account of.
+///
+/// There is no log file, by design, so the `runs` table is the only place a
+/// detached ingest's failure is written down. That is why doctor reports it at
+/// all: the user never saw the process, and this is the record it left.
+struct Run {
+    started_at: String,
+    duration_ms: i64,
+    files_seen: i64,
+    files_committed: i64,
+    files_failed: i64,
+    turns_added: i64,
+    error: Option<String>,
+}
+
+impl Doctor {
+    // -----------------------------------------------------------------------
+    // Verbatim's own state: the roots it walks, the directory it writes into,
+    // the store it keeps, and the last pass that ran.
+    //
+    // All of it through the read path (D-12). `Store::open` would
+    // `create_dir_all`, initialize a database, bring columns forward and set
+    // `journal_mode=wal` - so a doctor built on it would report a store its own
+    // check had just created, on a machine that has never ingested anything.
+    // -----------------------------------------------------------------------
+
+    fn archive(&mut self) {
+        let config = match Config::load() {
+            Ok(config) => {
+                self.roots(&config);
+                Some(config)
+            }
+            Err(error) => {
+                self.push(Check::new(
+                    "config_roots",
+                    State::Problem,
+                    format!("verbatim's own config could not be read: {error}"),
+                ));
+                None
+            }
+        };
+
+        let data_dir = match crate::cmd::data_dir() {
+            Ok(dir) => dir,
+            Err(failure) => {
+                let why = detail(failure);
+                self.push(Check::new(
+                    "data_directory",
+                    State::Problem,
+                    format!("verbatim's data directory could not be resolved: {why}"),
+                ));
+                self.unknown("store", "the data directory could not be resolved");
+                self.unknown("last_run", "the data directory could not be resolved");
+                return;
+            }
+        };
+        self.data_directory(&data_dir);
+
+        match config {
+            Some(config) => self.store(&data_dir, config),
+            None => {
+                // Opening the store without the config would count sessions an
+                // exclusion says a read may not see (ING-08), which is a wrong
+                // number rather than a missing one.
+                self.unknown("store", "verbatim's config could not be read");
+                self.unknown("last_run", "verbatim's config could not be read");
+            }
+        }
+    }
+
+    /// Which Claude config roots resolved, and how many.
+    ///
+    /// More than one is worth naming rather than counting: every root is walked
+    /// for transcripts, and only the first one's `settings.json` carries the
+    /// hooks install wrote.
+    fn roots(&mut self, config: &Config) {
+        let roots = config.roots();
+        let named = roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let check = match roots.len() {
+            0 => Check::new(
+                "config_roots",
+                State::Problem,
+                "no Claude config root resolved, so no transcript tree is walked",
+            ),
+            1 => Check::new("config_roots", State::Ok, format!("1 root: {named}")),
+            count => Check::new(
+                "config_roots",
+                State::Note,
+                format!(
+                    "{count} roots: {named}; all of them are walked for transcripts and only the \
+                     first one's settings file carries the hooks"
+                ),
+            ),
+        };
+        self.push(check);
+    }
+
+    /// The directory the store lives in, without creating it (AC6).
+    ///
+    /// A directory that is not there is what a machine looks like before its
+    /// first ingest, so it is a state and not a failure. Writability is read out
+    /// of the directory's permissions rather than probed with a file, because a
+    /// probe file would create the thing this check is about.
+    fn data_directory(&mut self, dir: &Path) {
+        let check = match std::fs::metadata(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Check::new(
+                "data_directory",
+                State::Note,
+                format!(
+                    "nothing at {} yet; the first ingest creates it",
+                    dir.display()
+                ),
+            ),
+            Err(e) => Check::new(
+                "data_directory",
+                State::Problem,
+                format!("{} could not be read: {e}", dir.display()),
+            ),
+            Ok(meta) if !meta.is_dir() => Check::new(
+                "data_directory",
+                State::Problem,
+                format!("{} is not a directory", dir.display()),
+            ),
+            // The mode's write bits, which is what `std` offers without a
+            // `libc` dependency (D-04). A directory writable by somebody else
+            // and not by this user reads as writable here; the ingest's own
+            // error is the authority, and this catches the ordinary case of a
+            // tree made read-only.
+            Ok(meta) if meta.permissions().readonly() => Check::new(
+                "data_directory",
+                State::Problem,
+                format!("{} is not writable, so no ingest can commit", dir.display()),
+            )
+            .with_fix(if cfg!(windows) {
+                format!("attrib -r \"{}\"", dir.display())
+            } else {
+                format!("chmod u+w '{}'", dir.display())
+            }),
+            Ok(_) => Check::new("data_directory", State::Ok, dir.display().to_string()),
+        };
+        self.push(check);
+    }
+
+    /// The store, its counts, and the last run - one open, read-only, shared.
+    ///
+    /// Deliberately no blob walk: integrity over a 735 MB archive is
+    /// `verbatim verify`'s job and takes minutes, and doctor is what a user runs
+    /// when something looks wrong.
+    fn store(&mut self, data_dir: &Path, config: Config) {
+        let reader = match read::open_in(data_dir, config) {
+            Ok(Opened::Ready(reader)) => reader,
+            Ok(Opened::Nothing(reason)) => {
+                // The ordinary starting state, and `open_in` created nothing
+                // finding it.
+                self.push(Check::new(
+                    "store",
+                    State::Note,
+                    format!("{reason}; the first ingest creates it"),
+                ));
+                self.unknown("last_run", "there is no store yet to read a run from");
+                return;
+            }
+            Err(failure) => {
+                self.push(Check::new("store", State::Problem, detail(failure)));
+                self.unknown("last_run", "the store could not be opened");
+                return;
+            }
+        };
+
+        let path = reader.store().path().display().to_string();
+        let conn = reader.store().conn();
+        let check = match visible::counts(conn, reader.config()) {
+            Err(error) => Check::new(
+                "store",
+                State::Problem,
+                format!("{path} could not be counted: {error}"),
+            ),
+            Ok(counts) => {
+                let finding = format!(
+                    "{path}: {} session(s), {} turn(s), {} watermark(s)",
+                    counts.sessions, counts.turns, counts.watermarks
+                );
+                if reader.store().predates_this_build() {
+                    // Reported, never repaired (D-18). The next ingest rebuilds
+                    // the derived tables on its own, so this is a state with a
+                    // shortcut rather than a problem.
+                    Check::new(
+                        "store",
+                        State::Note,
+                        format!(
+                            "{finding}; its derived tables predate this build, so results may be \
+                             incomplete until the next ingest rebuilds them"
+                        ),
+                    )
+                    .with_fix(format!("{} reindex", self.exe))
+                } else {
+                    Check::new("store", State::Ok, finding)
+                }
+            }
+        };
+        self.push(check);
+
+        let count: Result<i64, String> = conn
+            .query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
+            .map_err(|e| e.to_string());
+        let check = match count {
+            Err(error) => Check::new(
+                "last_run",
+                State::Problem,
+                format!("the runs table could not be read: {error}"),
+            ),
+            Ok(0) => Check::new(
+                "last_run",
+                State::Note,
+                "no ingest has run yet; the next hook Claude Code fires starts one",
+            ),
+            Ok(_) => {
+                let last = conn
+                    .query_row(
+                        "SELECT started_at, coalesce(duration_ms, 0), files_seen, files_committed,
+                                files_failed, turns_added, error
+                         FROM runs ORDER BY id DESC LIMIT 1",
+                        [],
+                        |r| {
+                            Ok(Run {
+                                started_at: r.get(0)?,
+                                duration_ms: r.get(1)?,
+                                files_seen: r.get(2)?,
+                                files_committed: r.get(3)?,
+                                files_failed: r.get(4)?,
+                                turns_added: r.get(5)?,
+                                error: r.get(6)?,
+                            })
+                        },
+                    )
+                    .map_err(|e| e.to_string());
+                match last {
+                    Err(error) => Check::new(
+                        "last_run",
+                        State::Problem,
+                        format!("the last run could not be read: {error}"),
+                    ),
+                    Ok(run) => self.last_run(&run),
+                }
+            }
+        };
+        self.push(check);
+    }
+
+    fn last_run(&self, run: &Run) -> Check {
+        let finding = format!(
+            "{}: {} file(s) walked, {} committed, {} failed, {} turn(s) added in {} ms",
+            run.started_at,
+            run.files_seen,
+            run.files_committed,
+            run.files_failed,
+            run.turns_added,
+            run.duration_ms
+        );
+        match (&run.error, run.files_failed) {
+            (None, 0) => Check::new("last_run", State::Ok, finding),
+            (error, _) => {
+                // The first line only: a pass that failed on many files writes
+                // one line per file, and the whole of it belongs to
+                // `verbatim status`, which prints every line of it.
+                let first = error
+                    .as_deref()
+                    .and_then(|text| text.lines().next())
+                    .unwrap_or("no error was recorded");
+                let mut first = first.to_owned();
+                first.truncate(MAX_ERROR_LINE);
+                Check::new(
+                    "last_run",
+                    State::Problem,
+                    format!("{finding}; {first}. `verbatim status` prints the rest"),
+                )
+                .with_fix(format!("{} ingest", self.exe))
+            }
+        }
+    }
+
+    fn unknown(&mut self, name: &str, why: &str) {
+        self.push(Check::new(name, State::Unknown, why));
     }
 }
 
