@@ -113,6 +113,10 @@ impl Fixture {
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_verbatim"));
         command.args(args);
+        // Inside the fixture, because doctor reads the project settings scopes
+        // relative to the working directory: a `.claude/settings.json` beside
+        // the checkout would otherwise decide what these tests measure.
+        command.current_dir(&self.root);
         self.env(&mut command);
         command
     }
@@ -139,7 +143,16 @@ impl Fixture {
 
     /// `verbatim doctor`, as its exit code and its parsed report.
     fn doctor(&self) -> (Option<i32>, Report) {
-        let out = self.run(&["doctor"]);
+        self.doctor_with(&[])
+    }
+
+    /// The same, with something extra in the environment.
+    fn doctor_with(&self, env: &[(&str, &str)]) -> (Option<i32>, Report) {
+        let mut command = self.command(&["doctor"]);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let out = command.stdin(Stdio::null()).output().expect("the binary runs");
         (out.status.code(), Report::parse(&text(&out)))
     }
 
@@ -525,4 +538,94 @@ fn entries(dir: &Path) -> Vec<String> {
         .collect();
     found.sort();
     found
+}
+
+// ---------------------------------------------------------------------------
+// The two settings doctor reads and never changes
+// ---------------------------------------------------------------------------
+
+/// Both values, the file each came from, and not one byte written back.
+///
+/// The byte comparison is the requirement: INST-06 says doctor never repairs,
+/// and the settings file is the thing it would be most tempting to repair,
+/// since `install` already knows how to raise `cleanupPeriodDays`.
+#[test]
+fn the_settings_it_reads_are_reported_and_left_exactly_as_they_are() {
+    let fixture = fixture();
+    fixture.install();
+
+    let before = std::fs::read(fixture.settings()).unwrap();
+    let (code, report) = fixture.doctor();
+    assert_eq!(code, Some(0), "an advisory is not a failure:\n{}", report.whole);
+
+    let cleanup = &report.check("cleanup_period_days").finding;
+    assert!(
+        cleanup.contains("7") && cleanup.contains(&fixture.settings().display().to_string()),
+        "the finding names neither the value nor the file it came from: {cleanup}"
+    );
+    assert_eq!(report.state("cleanup_period_days"), "note");
+    assert!(report.check("cleanup_period_days").fix.is_some());
+
+    let compact = &report.check("auto_compact").finding;
+    assert!(
+        compact.contains("true") && compact.contains(&fixture.settings().display().to_string()),
+        "the finding names neither the value nor the file it came from: {compact}"
+    );
+
+    assert_eq!(
+        std::fs::read(fixture.settings()).unwrap(),
+        before,
+        "doctor changed the settings file it was reading"
+    );
+}
+
+/// The environment variable outranks the settings file, and the finding says
+/// so rather than reporting the value the file carries.
+#[test]
+fn disable_auto_compact_in_the_environment_wins_and_is_named() {
+    let fixture = fixture();
+    fixture.install();
+
+    let (code, report) = fixture.doctor_with(&[("DISABLE_AUTO_COMPACT", "1")]);
+    assert_eq!(code, Some(0));
+    assert_eq!(report.state("auto_compact"), "ok");
+    let finding = &report.check("auto_compact").finding;
+    assert!(
+        finding.contains("DISABLE_AUTO_COMPACT"),
+        "the winning source is not named: {finding}"
+    );
+    assert!(
+        !finding.contains(&fixture.settings().display().to_string()),
+        "the settings file did not decide this and should not be named: {finding}"
+    );
+}
+
+/// A project scope outranks the user file, which is the order Claude Code
+/// itself resolves them in.
+#[test]
+fn a_project_settings_file_outranks_the_user_one() {
+    let fixture = fixture();
+    fixture.install();
+
+    let project = fixture.root.join(".claude");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("settings.local.json"),
+        r#"{"cleanupPeriodDays": 3650}"#,
+    )
+    .unwrap();
+
+    let (code, report) = fixture.doctor();
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        report.state("cleanup_period_days"),
+        "ok",
+        "the project value should be the effective one:\n{}",
+        report.whole
+    );
+    let finding = &report.check("cleanup_period_days").finding;
+    assert!(
+        finding.contains("3650") && finding.contains("settings.local.json"),
+        "{finding}"
+    );
 }

@@ -31,7 +31,7 @@
 //! the settings checks `cleanupPeriodDays` and `autoCompactEnabled` - and never
 //! renders the file, a diff of it, or any other key back at the terminal.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,22 @@ const VERSION_BUDGET: Duration = Duration::from_millis(2_000);
 /// The whole of it is `verbatim status`'s to print; this is the first line, cut
 /// so a pass that failed on a path 4 KB long is still a report.
 const MAX_ERROR_LINE: usize = 200;
+
+/// The environment variable that turns Claude Code's auto-compaction off, and
+/// the one source that outranks every settings file.
+const AUTO_COMPACT_ENV: &str = "DISABLE_AUTO_COMPACT";
+
+/// Below this many days of Claude Code's own retention, doctor says what that
+/// costs. `cmd::install` holds the same three numbers for the advisory it gives
+/// at install time; they are the same policy said in two places, and a change to
+/// one belongs in both.
+const LOW_CLEANUP_DAYS: i64 = 90;
+
+/// What Claude Code deletes after when `cleanupPeriodDays` is not set at all.
+const CLAUDE_DEFAULT_CLEANUP_DAYS: i64 = 30;
+
+/// What doctor's printed edit sets it to: ten years, which is "keep them".
+const KEEP_CLEANUP_DAYS: i64 = 3650;
 
 /// What one check found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +146,7 @@ pub fn run() -> Result<(), Failure> {
     let mut doctor = Doctor::new();
     doctor.wiring();
     doctor.archive();
+    doctor.claude_settings();
     let checks = doctor.checks;
 
     write_out(&report(&checks))?;
@@ -848,6 +865,213 @@ impl Doctor {
 
     fn unknown(&mut self, name: &str, why: &str) {
         self.push(Check::new(name, State::Unknown, why));
+    }
+
+    // -----------------------------------------------------------------------
+    // The two Claude Code settings verbatim has an opinion about and never
+    // changes (INST-06).
+    //
+    // Reported, and only reported. `cleanupPeriodDays` is how long Claude Code
+    // keeps its own transcripts, which is verbatim's second recovery path for a
+    // session it never got to read; auto-compact spends tokens summarizing
+    // context this store already holds losslessly. Both are the user's to set,
+    // through their own editor or `/config`, and doctor prints the edit rather
+    // than making it.
+    // -----------------------------------------------------------------------
+
+    fn claude_settings(&mut self) {
+        let scopes = settings_scopes();
+        self.cleanup_period(&scopes);
+        self.auto_compact(&scopes);
+    }
+
+    fn cleanup_period(&mut self, scopes: &[(PathBuf, Json)]) {
+        let found = effective(scopes, "cleanupPeriodDays");
+        let (days, source, target) = match found {
+            Some((path, value)) => match value.as_i64() {
+                Some(days) => (days, format!("set in {}", path.display()), path.clone()),
+                None => {
+                    // A value Claude Code will not read as a number either.
+                    self.push(Check::new(
+                        "cleanup_period_days",
+                        State::Problem,
+                        format!("cleanupPeriodDays in {} is not a number", path.display()),
+                    ));
+                    return;
+                }
+            },
+            None => (
+                CLAUDE_DEFAULT_CLEANUP_DAYS,
+                format!("unset, so Claude Code's default of {CLAUDE_DEFAULT_CLEANUP_DAYS} applies"),
+                user_settings_path(scopes),
+            ),
+        };
+
+        let finding = format!("cleanupPeriodDays is {days}, {source}");
+        let check = if days < LOW_CLEANUP_DAYS {
+            Check::new(
+                "cleanup_period_days",
+                State::Note,
+                format!(
+                    "{finding}. Claude Code deletes its own transcripts that many days after they \
+                     are written; what verbatim has archived stays, and a session it never got to \
+                     read goes with them"
+                ),
+            )
+            .with_fix(format!(
+                "set \"cleanupPeriodDays\": {KEEP_CLEANUP_DAYS} in {}",
+                target.display()
+            ))
+        } else {
+            Check::new("cleanup_period_days", State::Ok, finding)
+        };
+        self.push(check);
+    }
+
+    fn auto_compact(&mut self, scopes: &[(PathBuf, Json)]) {
+        // The environment variable outranks every settings file, so it is asked
+        // first and named when it is what decided the answer.
+        if let Some(value) = non_empty_var(AUTO_COMPACT_ENV) {
+            let raw = value.to_string_lossy().into_owned();
+            if disabling(&raw) {
+                self.push(Check::new(
+                    "auto_compact",
+                    State::Ok,
+                    format!("auto-compact is off: {AUTO_COMPACT_ENV}={raw} in this environment"),
+                ));
+                return;
+            }
+        }
+
+        let found = effective(scopes, "autoCompactEnabled");
+        let (enabled, source, target) = match found {
+            Some((path, value)) => match as_bool(value) {
+                Some(enabled) => (enabled, format!("set in {}", path.display()), path.clone()),
+                None => {
+                    self.push(Check::new(
+                        "auto_compact",
+                        State::Problem,
+                        format!(
+                            "autoCompactEnabled in {} is neither true nor false",
+                            path.display()
+                        ),
+                    ));
+                    return;
+                }
+            },
+            None => (
+                true,
+                "unset, so Claude Code's default applies".to_owned(),
+                user_settings_path(scopes),
+            ),
+        };
+
+        let check = if enabled {
+            Check::new(
+                "auto_compact",
+                State::Note,
+                format!(
+                    "autoCompactEnabled is true, {source}. Verbatim never changes it and \
+                     recommends off: compaction spends tokens summarizing context this store \
+                     already holds losslessly, and a fresh session plus targeted recall beats a \
+                     self-summarization"
+                ),
+            )
+            .with_fix(format!(
+                "set \"autoCompactEnabled\": false in {} (or /config inside Claude Code)",
+                target.display()
+            ))
+        } else {
+            Check::new(
+                "auto_compact",
+                State::Ok,
+                format!("autoCompactEnabled is false, {source}"),
+            )
+        };
+        self.push(check);
+    }
+}
+
+/// Every settings file that can carry one of these two keys, lowest precedence
+/// first.
+///
+/// Claude Code's own order: the user file [`super::install`] writes, then the
+/// project's `.claude/settings.json`, then the project's
+/// `.claude/settings.local.json`. A scope with no file is a scope reporting
+/// nothing rather than an error - a user with no project settings is the
+/// ordinary case - and so is one whose file will not parse, because doctor is
+/// reporting what Claude Code would use and reading a file it cannot read is
+/// not that.
+fn settings_scopes() -> Vec<(PathBuf, Json)> {
+    let mut paths = Vec::new();
+    if let Ok(user) = targets::settings_path() {
+        paths.push(user);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        paths.push(cwd.join(".claude").join("settings.json"));
+        paths.push(cwd.join(".claude").join("settings.local.json"));
+    }
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let document = Document::read(&path).ok()?;
+            // A file that is not there reads as an empty object, and an empty
+            // object holds neither key, so it is dropped here rather than
+            // reported as a scope that said nothing.
+            (!document.source().trim().is_empty()).then(|| (path, document.value().clone()))
+        })
+        .collect()
+}
+
+/// The value Claude Code would use for `key`, and the file it would take it
+/// from.
+fn effective<'a>(scopes: &'a [(PathBuf, Json)], key: &str) -> Option<(&'a PathBuf, &'a Json)> {
+    // Reversed: the last scope is the highest precedence, and the first one
+    // holding the key from that end is the one that wins.
+    scopes
+        .iter()
+        .rev()
+        .find_map(|(path, value)| value.get(key).map(|found| (path, found)))
+}
+
+/// Where an edit belongs when no scope sets the key: the user's own file, which
+/// is the one install writes and the one that exists on every machine.
+fn user_settings_path(scopes: &[(PathBuf, Json)]) -> PathBuf {
+    match targets::settings_path() {
+        Ok(path) => path,
+        Err(_) => scopes
+            .first()
+            .map(|(path, _)| path.clone())
+            .unwrap_or_else(|| PathBuf::from("settings.json")),
+    }
+}
+
+/// A JSON `true` or `false`, as the source text it was written as.
+///
+/// `json_file` keeps every scalar as the text it arrived as, so this is the
+/// whole of decoding a boolean, and anything else - `"true"`, `1`, `null` - is
+/// deliberately not one.
+fn as_bool(value: &Json) -> Option<bool> {
+    match value {
+        Json::Scalar(raw) if raw == "true" => Some(true),
+        Json::Scalar(raw) if raw == "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Does this value of `DISABLE_AUTO_COMPACT` actually disable anything?
+///
+/// `0` and `false` are read as "no", because a variable set to `0` that turned
+/// the feature off would be the opposite of what it says, and doctor would then
+/// report auto-compact as off on a machine where it is on.
+fn disabling(raw: &str) -> bool {
+    !matches!(raw.trim().to_ascii_lowercase().as_str(), "0" | "false")
+}
+
+fn non_empty_var(name: &str) -> Option<std::ffi::OsString> {
+    match std::env::var_os(name) {
+        Some(value) if !value.is_empty() => Some(value),
+        _ => None,
     }
 }
 
