@@ -21,6 +21,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        verify                check every blob against its checksum\n  \
                        reindex               rebuild the derived tables from the blobs\n  \
                        status                sizes, counts, watermarks and the last ingest run\n  \
+                       doctor                report what is wired into Claude Code and what is not\n  \
                        mcp                   serve the three recall tools over stdio (for Claude Code)\n  \
                        install               wire verbatim into Claude Code's hooks and mcp servers\n\
                      \n\
@@ -105,6 +106,13 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         // it, nobody types it - and it writes JSON-RPC on stdout rather than
         // anything the `--json` contract above describes.
         "mcp" => cmd::mcp::run(cmd::mcp::parse(parser)?),
+        // Read-only by construction (INST-06, D-12): it opens the store
+        // through the read path, never `Store::open`, and creates no file and
+        // no directory on any path it takes.
+        "doctor" => {
+            cmd::doctor::parse(parser)?;
+            cmd::doctor::run()
+        }
         // Human-only and deliberately not a `--json` data command (D-24): it
         // shows a diff and asks once, and a single JSON document on stdout
         // cannot be both of those things.

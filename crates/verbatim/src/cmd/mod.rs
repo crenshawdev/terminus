@@ -1,5 +1,5 @@
 //! The subcommands: `ingest`, `search`, `show`, `sessions`, `verify`, `reindex`,
-//! `status`, `mcp`.
+//! `status`, `doctor`, `mcp`.
 //!
 //! `mcp` is the one that keeps none of what follows. It is not a data command
 //! typed at a terminal: it is a JSON-RPC server spawned by Claude Code, its
@@ -33,6 +33,7 @@
 //! property across all commands, rather than one test per command, so a seventh
 //! command is one line rather than a new file.
 
+pub mod doctor;
 pub mod hook;
 pub mod ingest;
 pub mod install;
