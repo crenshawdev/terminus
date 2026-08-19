@@ -1,7 +1,7 @@
 //! The one document every `--json` data command writes to stdout (RCL-06).
 //!
-//! **One envelope, six commands.** `search`, `show`, `sessions`, `status`,
-//! `verify` and `reindex` all emit `{command, ok, reason, data}`, so a caller
+//! **One envelope, seven commands.** `search`, `show`, `sessions`, `status`,
+//! `verify`, `reindex` and `doctor` all emit `{command, ok, reason, data}`, so a caller
 //! can tell success from an empty result without parsing prose and without a
 //! per-command decoder for the outcome. `ok` is exactly the exit code's answer -
 //! true for 0, false for 1 - and `reason` is why a result is empty or a command
@@ -119,6 +119,25 @@ impl Document {
     /// `verbatim search --json | jq` work while a warning is still printed.
     pub fn emit(&self) {
         println!("{}", self.render());
+    }
+
+    /// The same write, with its failure returned rather than panicked.
+    ///
+    /// [`Document::emit`] is `println!`, which panics with exit 101 when stdout
+    /// is a closed pipe - so `verbatim doctor --json | head` would report a
+    /// failure that belongs to the pipe rather than to the store. A command
+    /// whose exit code has its own meaning calls this instead and decides what
+    /// a closed reader means to it.
+    ///
+    /// Additive on purpose. The six commands `docs/json-shapes.md` documents
+    /// still call `emit`; moving them is a change to six shipped contracts and
+    /// stays a logged open item rather than a thing done in passing here.
+    pub fn try_emit(&self) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{}", self.render())?;
+        out.flush()
     }
 }
 

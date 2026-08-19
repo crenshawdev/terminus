@@ -168,3 +168,47 @@ in `reason`, not an empty stdout a caller could not tell from a crash.
 
 Without `--json`, `reindex` writes nothing at all to stdout. That is deliberate
 and unchanged.
+
+### `doctor`
+
+```json
+{"binary": {"state": "ok",
+            "finding": "/home/you/.local/bin/verbatim is this build (0.1.0)", "fix": null},
+ "hook_SessionStart": {"state": "problem",
+                       "finding": "/home/you/.claude/settings.json has no verbatim entry for SessionStart",
+                       "fix": "/home/you/.local/bin/verbatim install"},
+ "cleanup_period_days": {"state": "note",
+                         "finding": "cleanupPeriodDays is 7, set in /home/you/.claude/settings.json. ...",
+                         "fix": "set \"cleanupPeriodDays\": 3650 in /home/you/.claude/settings.json"}}
+```
+
+`data`'s keys are the check names, and there is no list: `data` is the checks,
+one object per check.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `state` | string | One of `ok`, `note`, `unknown`, `problem`. Never null. |
+| `finding` | string | One line, always present, never empty. Names the file or path it is about, so a check reads on its own. |
+| `fix` | string or null | What to run, or the settings edit to make. Null whenever there is nothing to do - which is every `ok`, and also a `problem` whose repair is a hand edit (a duplicated hook entry is the one that is). |
+
+- `note` is true, worth saying, and not a failure: a machine before its first
+  ingest, or a setting verbatim would choose differently and never changes
+  itself. `unknown` is doctor declining to guess - no `claude` on `PATH`, a
+  settings file that will not parse - and, like `note`, never reaches the exit
+  code.
+- **Exit 0 unless some check is `problem`**, and `ok` is that same answer. An
+  advisory does not make `doctor` report failure; `reason` on a failure names
+  the count and every problem check by name.
+- The key set does not depend on what doctor found. A check it could not run
+  reports `unknown` rather than going missing, so a caller reads a state instead
+  of testing for a key.
+- `fix` is a shell command wherever one exists. Where the repair is a value in
+  the user's own settings file, it is that edit written out literally, because
+  verbatim never changes either of the two Claude Code settings it reports
+  (INST-06).
+- `doctor` writes nothing anywhere: no file, no directory, on any path,
+  including the data directory it reports as absent.
+
+`install` and `uninstall` deliberately have no `--json` (D-24). They show a diff
+and ask a question, and a single JSON document on stdout cannot be both of
+those things.

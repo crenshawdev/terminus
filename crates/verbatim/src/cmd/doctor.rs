@@ -41,6 +41,7 @@ use verbatim_core::Config;
 use super::install::binary;
 use super::install::json_file::{Document, Json};
 use super::install::targets;
+use super::json::Document as Envelope;
 use super::read::{self, Opened};
 use super::{hook, Failure};
 
@@ -134,30 +135,70 @@ impl Check {
     }
 }
 
-/// Doctor takes no arguments yet; `--json` arrives with the document (D-24).
-pub fn parse(parser: &mut lexopt::Parser) -> Result<(), Failure> {
-    if let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
-        return Err(Failure::Misuse(crate::unexpected(arg)));
-    }
-    Ok(())
-}
-
-pub fn run() -> Result<(), Failure> {
+pub fn run(json: bool) -> Result<(), Failure> {
     let mut doctor = Doctor::new();
     doctor.wiring();
     doctor.archive();
     doctor.claude_settings();
     let checks = doctor.checks;
 
-    write_out(&report(&checks))?;
+    let problems: Vec<&str> = checks
+        .iter()
+        .filter(|check| check.state == State::Problem)
+        .map(|check| check.name.as_str())
+        .collect();
 
-    if checks.iter().any(|check| check.state == State::Problem) {
-        // Silent: every problem has already been printed with the command that
-        // fixes it, and a trailing "verbatim: ..." line would be a second
-        // account of the same thing.
-        return Err(Failure::Silent);
+    if json {
+        emit(&checks, &problems)?;
+    } else {
+        write_out(&report(&checks))?;
     }
-    Ok(())
+
+    if problems.is_empty() {
+        return Ok(());
+    }
+    // Silent: every problem is already in the report, with the command that
+    // fixes it, and a trailing "verbatim: ..." line would be a second account
+    // of the same thing.
+    Err(Failure::Silent)
+}
+
+/// One `{command, ok, reason, data}` document, `data` keyed by check name
+/// (D-24, RCL-06).
+///
+/// `ok` is the exit code's answer, as the envelope requires: a caller that
+/// parses the document and a caller that checks the code never disagree.
+fn emit(checks: &[Check], problems: &[&str]) -> Result<(), Failure> {
+    let mut document = Envelope::new("doctor");
+    for check in checks {
+        document = document.field(
+            &check.name,
+            serde_json::json!({
+                "state": check.state.label(),
+                "finding": check.finding,
+                // Null rather than absent, and null wherever there is nothing
+                // to run - including a problem whose repair is an edit only the
+                // user can make.
+                "fix": check.fix,
+            }),
+        );
+    }
+    if !problems.is_empty() {
+        document = document.failed().because(format!(
+            "{} check(s) reported a problem: {}",
+            problems.len(),
+            problems.join(", ")
+        ));
+    }
+    match document.try_emit() {
+        Ok(()) => Ok(()),
+        // A reader that went away is not a finding about this machine, and the
+        // verdict the checks earned still stands.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(Failure::Operational(format!(
+            "the report could not be written: {e}"
+        ))),
+    }
 }
 
 /// The checks, and the one thing they all need: this build's own path.
@@ -202,12 +243,20 @@ impl Doctor {
             Err(failure) => {
                 // Without it there is no path to check anything against, and
                 // guessing one would be reporting on a file nothing points at.
+                // Every check still reports, as `unknown`: one run's document
+                // carries the same keys as any other's, so a caller reads a
+                // state rather than a missing key (D-24).
                 let why = detail(failure);
                 self.push(Check::new(
                     "binary",
                     State::Unknown,
                     format!("the stable binary path could not be resolved: {why}"),
                 ));
+                let why = format!("the stable binary path could not be resolved: {why}");
+                self.unknown("settings_file", &why);
+                self.unknown_hooks("the stable binary path could not be resolved");
+                self.unknown("mcp_server", &why);
+                self.claude_code();
                 return;
             }
         };
@@ -223,7 +272,11 @@ impl Doctor {
             Err(failure) => Check::new(
                 "binary",
                 State::Problem,
-                format!("{} could not be read: {}", stable.display(), detail(failure)),
+                format!(
+                    "{} could not be read: {}",
+                    stable.display(),
+                    detail(failure)
+                ),
             )
             .with_fix(self.install_command()),
             Ok(binary::Occupant::Vacant) => Check::new(
@@ -311,11 +364,7 @@ impl Doctor {
             Err(failure) => {
                 // Unreadable or not JSON. Install refuses to write a settings
                 // file it cannot read, so this is why nothing is wired up.
-                self.push(Check::new(
-                    "settings_file",
-                    State::Problem,
-                    detail(failure),
-                ));
+                self.push(Check::new("settings_file", State::Problem, detail(failure)));
                 self.unknown_hooks("the settings file could not be read");
                 return;
             }
@@ -385,10 +434,7 @@ impl Doctor {
 
         let Some(entry) = ours.first() else {
             let finding = match elsewhere.first() {
-                Some(other) => format!(
-                    "{} runs {other} for {event}, not {stable}",
-                    path.display()
-                ),
+                Some(other) => format!("{} runs {other} for {event}, not {stable}", path.display()),
                 None => format!("{} has no verbatim entry for {event}", path.display()),
             };
             return Check::new(name, State::Problem, finding).with_fix(self.install_command());
@@ -474,13 +520,16 @@ impl Doctor {
                     let stdio =
                         server.get("type").and_then(Json::as_str).as_deref() == Some("stdio");
                     let args = server.get("args").map(Json::items).unwrap_or(&[]);
-                    let addressed =
-                        args.len() == 1 && args[0].as_str().as_deref() == Some("mcp");
+                    let addressed = args.len() == 1 && args[0].as_str().as_deref() == Some("mcp");
                     if stdio && addressed {
                         Check::new(
                             "mcp_server",
                             State::Ok,
-                            format!("{} runs {stable} as the '{}' server", path.display(), targets::MCP_SERVER_KEY),
+                            format!(
+                                "{} runs {stable} as the '{}' server",
+                                path.display(),
+                                targets::MCP_SERVER_KEY
+                            ),
                         )
                     } else {
                         Check::new(
@@ -524,7 +573,11 @@ impl Doctor {
     /// Is the Claude Code on this machine one verbatim has seen run exec-form
     /// hooks (D-16)?
     fn claude_code(&mut self) {
-        let name = if cfg!(windows) { "claude.exe" } else { "claude" };
+        let name = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
         let Some(program) = on_path(name) else {
             self.push(Check::new(
                 "claude_code",
@@ -547,7 +600,10 @@ impl Doctor {
             self.push(Check::new(
                 "claude_code",
                 State::Unknown,
-                format!("{} reported {reported:?}, which is not a version", program.display()),
+                format!(
+                    "{} reported {reported:?}, which is not a version",
+                    program.display()
+                ),
             ));
             return;
         };
@@ -1213,7 +1269,11 @@ fn detail(failure: Failure) -> String {
 /// Built and then written once rather than printed line by line, so a closed
 /// stdout is one error to answer instead of a panic in the middle of a page.
 fn report(checks: &[Check]) -> String {
-    let width = checks.iter().map(|check| check.name.len()).max().unwrap_or(0);
+    let width = checks
+        .iter()
+        .map(|check| check.name.len())
+        .max()
+        .unwrap_or(0);
     let mut out = String::from("verbatim doctor\n\n");
     for check in checks {
         out.push_str(&format!(

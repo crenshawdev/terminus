@@ -152,7 +152,10 @@ impl Fixture {
         for (name, value) in env {
             command.env(name, value);
         }
-        let out = command.stdin(Stdio::null()).output().expect("the binary runs");
+        let out = command
+            .stdin(Stdio::null())
+            .output()
+            .expect("the binary runs");
         (out.status.code(), Report::parse(&text(&out)))
     }
 
@@ -210,14 +213,16 @@ impl Report {
             };
             if first == "fix" {
                 let last = order.last().expect("a fix line before any check");
-                checks.get_mut(last).unwrap().fix =
-                    Some(fields.collect::<Vec<_>>().join(" "));
+                checks.get_mut(last).unwrap().fix = Some(fields.collect::<Vec<_>>().join(" "));
                 continue;
             }
             if !STATES.contains(&first) {
                 continue;
             }
-            let name = fields.next().expect("a check line carries a name").to_owned();
+            let name = fields
+                .next()
+                .expect("a check line carries a name")
+                .to_owned();
             let finding = fields.collect::<Vec<_>>().join(" ");
             order.push(name.clone());
             checks.insert(
@@ -364,7 +369,10 @@ fn an_entry_pointing_somewhere_else_names_its_event() {
             }
         }
     }
-    assert_eq!(rewritten, 1, "install wrote no SessionStart entry to rewrite");
+    assert_eq!(
+        rewritten, 1,
+        "install wrote no SessionStart entry to rewrite"
+    );
     write(&fixture.settings(), &settings);
 
     let (code, report) = fixture.doctor();
@@ -402,7 +410,10 @@ fn a_duplicated_entry_is_its_own_finding() {
     assert_eq!(code, Some(1));
     assert_eq!(report.state("hook_SessionEnd"), "problem");
     assert!(
-        report.check("hook_SessionEnd").finding.contains("SessionEnd"),
+        report
+            .check("hook_SessionEnd")
+            .finding
+            .contains("SessionEnd"),
         "{}",
         report.check("hook_SessionEnd").finding
     );
@@ -444,7 +455,10 @@ fn an_mcp_registration_that_points_elsewhere_is_a_problem() {
     let (_, report) = fixture.doctor();
     assert_eq!(report.state("mcp_server"), "problem");
     assert!(
-        report.check("mcp_server").finding.contains("/old/bin/verbatim"),
+        report
+            .check("mcp_server")
+            .finding
+            .contains("/old/bin/verbatim"),
         "{}",
         report.check("mcp_server").finding
     );
@@ -556,7 +570,12 @@ fn the_settings_it_reads_are_reported_and_left_exactly_as_they_are() {
 
     let before = std::fs::read(fixture.settings()).unwrap();
     let (code, report) = fixture.doctor();
-    assert_eq!(code, Some(0), "an advisory is not a failure:\n{}", report.whole);
+    assert_eq!(
+        code,
+        Some(0),
+        "an advisory is not a failure:\n{}",
+        report.whole
+    );
 
     let cleanup = &report.check("cleanup_period_days").finding;
     assert!(
@@ -627,5 +646,116 @@ fn a_project_settings_file_outranks_the_user_one() {
     assert!(
         finding.contains("3650") && finding.contains("settings.local.json"),
         "{finding}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `doctor --json`
+// ---------------------------------------------------------------------------
+
+/// One document, the envelope's four keys, and `data` keyed by check name with
+/// the same three fields under every one of them (D-24, RCL-06).
+#[test]
+fn the_json_document_carries_every_check_by_name() {
+    let fixture = fixture();
+    fixture.install();
+
+    let out = fixture.run(&["doctor", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "a --json run writes exactly one line to stdout: {stdout}"
+    );
+
+    let document: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let mut envelope: Vec<&str> = document
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    envelope.sort_unstable();
+    assert_eq!(envelope, ["command", "data", "ok", "reason"]);
+    assert_eq!(document["command"], serde_json::Value::from("doctor"));
+    assert_eq!(document["ok"], serde_json::Value::from(true));
+    assert_eq!(document["reason"], serde_json::Value::Null);
+
+    let data = document["data"].as_object().expect("data is an object");
+    assert!(!data.is_empty(), "no checks in the document");
+    // The same names the human report prints, so a reader of one is a reader of
+    // the other.
+    let (_, report) = fixture.doctor();
+    for name in &report.order {
+        assert!(data.contains_key(name), "{name} is missing from --json");
+    }
+    for (name, check) in data {
+        let state = check["state"].as_str().unwrap_or_else(|| panic!("{name}"));
+        assert!(
+            ["ok", "note", "unknown", "problem"].contains(&state),
+            "{name} has state {state:?}"
+        );
+        assert!(check["finding"].is_string(), "{name} has no finding");
+        assert!(
+            check["fix"].is_string() || check["fix"].is_null(),
+            "{name}'s fix is neither a command nor null"
+        );
+    }
+}
+
+/// A reader that stops reading is not a finding about this machine.
+///
+/// `Document::emit` is `println!`, which panics with exit 101 on a closed pipe;
+/// `verbatim doctor --json | head` would then report a failure that is doctor's
+/// own. This closes the pipe after one byte, which is what `head -c 1` does.
+#[test]
+fn a_closed_stdout_is_not_a_failure_of_doctors_own() {
+    let fixture = fixture();
+    fixture.install();
+
+    let mut child = fixture
+        .command(&["doctor", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the binary runs");
+    let mut out = child.stdout.take().unwrap();
+    let mut first = [0u8; 1];
+    let _ = std::io::Read::read(&mut out, &mut first);
+    drop(out);
+
+    let status = child.wait().unwrap();
+    assert_ne!(status.code(), Some(101), "doctor panicked on a closed pipe");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an installed machine with a closed reader is still an installed machine"
+    );
+}
+
+/// `ok` is the exit code's answer, and the reason names what went wrong.
+#[test]
+fn a_missing_binary_makes_the_document_say_so() {
+    let fixture = fixture();
+    fixture.install();
+    std::fs::remove_file(fixture.stable()).unwrap();
+
+    let out = fixture.run(&["doctor", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).expect("valid JSON");
+
+    assert_eq!(document["ok"], serde_json::Value::from(false));
+    let reason = document["reason"].as_str().expect("a reason");
+    assert!(reason.contains("binary"), "{reason}");
+    assert_eq!(
+        document["data"]["binary"]["state"],
+        serde_json::Value::from("problem")
+    );
+    assert!(
+        document["data"]["binary"]["fix"].is_string(),
+        "the problem carries no command"
     );
 }

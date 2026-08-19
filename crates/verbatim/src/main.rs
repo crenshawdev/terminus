@@ -109,10 +109,7 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         // Read-only by construction (INST-06, D-12): it opens the store
         // through the read path, never `Store::open`, and creates no file and
         // no directory on any path it takes.
-        "doctor" => {
-            cmd::doctor::parse(parser)?;
-            cmd::doctor::run()
-        }
+        "doctor" => cmd::doctor::run(cmd::json_flag(parser)?),
         // Human-only and deliberately not a `--json` data command (D-24): it
         // shows a diff and asks once, and a single JSON document on stdout
         // cannot be both of those things.
