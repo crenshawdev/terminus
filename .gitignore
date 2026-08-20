@@ -8,3 +8,4 @@
 npm/platforms/*/bin/verbatim
 npm/platforms/*/bin/verbatim.exe
 npm/**/*.tgz
+npm/**/node_modules/
