@@ -715,3 +715,77 @@ fn the_echo_sidecar_repeats_a_top_level_turn_word_for_word() {
         "the echo sidecar is the no-meta case"
     );
 }
+
+// --- Phase 5 -----------------------------------------------------------------
+
+/// D-05: `session-edits.jsonl` stores an ABSOLUTE path, the way the real corpus
+/// does, and its tool turn carries a second entity beside it.
+///
+/// Both halves are what AC3 rests on. The absolute spelling is the one a stored
+/// `path` entity almost always has - 1,029 absolute against 2 relative over 120
+/// sampled real transcripts - and `Query::matches_entity` needs every token of
+/// that value present in the query, so a prompt naming the file relatively can
+/// only match it after resolution. The second entity is INJ-03's co-occurrence
+/// condition having something to fire on: one turn, two independent facts.
+///
+/// The root token is substituted here rather than left literal, because
+/// `{{ROOT}}/...` is not an absolute path on any platform and asserting over it
+/// would be asserting over the fixture's placeholder.
+#[test]
+fn the_edits_fixture_stores_an_absolute_path_and_a_second_entity() {
+    use std::path::Path;
+
+    let root = std::env::temp_dir();
+    let text = String::from_utf8(testkit::fixture_bytes("session-edits.jsonl")).unwrap();
+    let rooted = text.replace(
+        testkit::FIXTURE_ROOT_TOKEN,
+        &root.to_string_lossy().replace('\\', "\\\\"),
+    );
+
+    let mut structural = 0;
+    let mut prose = 0;
+    for line in rooted.lines() {
+        let record: serde_json::Value = serde_json::from_str(line).expect("one JSON object");
+        let entities = verbatim_core::index::entities(&record);
+        let paths: Vec<&str> = entities
+            .iter()
+            .filter(|e| e.kind == verbatim_core::index::entity::PATH)
+            .map(|e| e.value.as_str())
+            .collect();
+        if paths.is_empty() {
+            // The prose turn names the same file and emits nothing: entities
+            // come from structured tool records, never from a sentence.
+            if message_text(&record).contains("lantern.rs") {
+                prose += 1;
+                assert!(entities.is_empty(), "prose emitted {entities:?}");
+            }
+            continue;
+        }
+
+        structural += 1;
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(
+            Path::new(paths[0]).is_absolute(),
+            "{} is not absolute, so no relative prompt could ever resolve to it",
+            paths[0]
+        );
+        assert!(
+            paths[0].starts_with(root.to_string_lossy().as_ref()),
+            "{} is not beneath the root the fixture's own cwd names",
+            paths[0]
+        );
+
+        let distinct: BTreeSet<(&str, &str)> = entities
+            .iter()
+            .map(|e| (e.kind, e.value.as_str()))
+            .collect();
+        assert!(
+            distinct.len() >= 2,
+            "one entity on the tool turn leaves the co-occurrence half of \
+             INJ-03 nothing to fire on: {entities:?}"
+        );
+    }
+
+    assert_eq!(structural, 1, "exactly one turn stores the path");
+    assert_eq!(prose, 1, "exactly one turn names it in prose only");
+}

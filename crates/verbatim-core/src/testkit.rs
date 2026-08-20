@@ -24,6 +24,7 @@ pub const TRANSCRIPT_FIXTURES: &[&str] = &[
     "session-errors-a.jsonl",
     "session-errors-b.jsonl",
     "subagents/agent-echo.jsonl",
+    "session-edits.jsonl",
 ];
 
 /// The token the phase 3 fixtures carry where a real transcript carries an
@@ -40,13 +41,22 @@ pub const FIXTURE_ROOT_TOKEN: &str = "{{ROOT}}";
 /// The fixtures carrying [`FIXTURE_ROOT_TOKEN`], and the project directory each
 /// one's `cwd` names beneath the substituted root.
 ///
-/// Two distinct projects across the four, which is what lets a scoped search
-/// have something to be both true and false about.
+/// Two distinct projects across them, which is what lets a scoped search have
+/// something to be both true and false about.
+///
+/// `session-edits.jsonl` is the phase 5 one, and it needs the root for a second
+/// reason the others do not: the path its `Edit` call stores is ABSOLUTE
+/// beneath that same root, which is how the real corpus spells a path (1,029
+/// absolute against 2 relative over 120 sampled transcripts, D-05). A fixture
+/// that hardcoded an absolute path would name a directory this machine does not
+/// own, and one that stored a relative path would be the spelling the archive
+/// almost never holds.
 pub const ROOTED_FIXTURES: &[(&str, &str)] = &[
     ("session-recall.jsonl", "project-alpha"),
     ("subagents/agent-echo.jsonl", "project-alpha"),
     ("session-errors-a.jsonl", "project-beta"),
     ("session-errors-b.jsonl", "project-beta"),
+    ("session-edits.jsonl", "project-alpha"),
 ];
 
 /// The project directory one rooted fixture's `cwd` names beneath `root`.

@@ -18,6 +18,7 @@ by hand without re-deriving the others will fail
 | `session-truncated.jsonl` | D-14: a watermark that must stop at the last `\n`, not at end-of-file |
 | `session-compacted.jsonl` | D-21/D-08: a session ending in a `compact_boundary` record whose `compactMetadata` bytes are stored verbatim |
 | `session-recall.jsonl` | Phase 3 D-01/D-13: a `SearchManager` turn, an `src/worker/S.ts` turn, and AC3's structured-versus-prose pair - a `Read` `tool_use` naming a file against an assistant turn naming that same file in prose |
+| `session-edits.jsonl` | Phase 5 D-05: an `Edit` `tool_use` storing an **absolute** path beneath the fixture root, the spelling the real corpus almost always uses, with symbols beside it so one turn carries two independent entities - and a prose turn naming the same file structurally invisibly |
 | `session-errors-a.jsonl` | Phase 3 D-03/D-04: `tool_result` blocks with `is_error` and a `toolUseResult` carrying `stdout`/`stderr`/`interrupted`, holding the a-half of both stderr pairs |
 | `session-errors-b.jsonl` | Phase 3 D-04, the b-half: one stderr differing from a's only in the parts normalization strips, one differing only in a bare integer it must not |
 | `subagents/agent-alpha.jsonl` | D-01: a sidecar reporting its *parent's* `sessionId` |
@@ -212,15 +213,37 @@ identically under BM25. That is what makes "a sidechain turn ranks below a
 top-level turn of equal score" a statement a test can hold to, rather than one
 that passes because the scores happened to differ.
 
+**`session-edits.jsonl`** is the phase 5 injection fixture, and what it holds
+that nothing else does is an **absolute** path. D-05 measured 1,029 absolute
+against 2 relative `file_path` values over 120 sampled real transcripts, so an
+archived `path` entity is almost always absolute while the user types a relative
+one - and `Query::matches_entity` needs every token of the stored value present
+in the query, so the two cannot meet without resolving the relative spelling
+against the payload's `cwd`. A fixture storing a relative path would let a test
+of that resolution pass without the resolution.
+
+Its `Edit` call names `{{ROOT}}/project-alpha/crates/gizmo/lantern.rs` and
+carries `lanternFlicker` and `lanternSteady` across its two edit sides, so one
+turn emits four distinct entities - a tool, a path and two symbols - which is
+what INJ-03's "two or more independent entities co-occurring" needs to have
+something to fire on. Its third turn names that same absolute path in **prose**
+and emits no entity at all, so "matched structurally" and "mentions the words"
+stay two different answers about one file, the way `session-recall.jsonl`
+already does for the relative case.
+
 ## The rooted `cwd`
 
-The phase 1 and 2 fixtures hardcode `"cwd": "/data/code/verbatim"`. The four
-phase 3 fixtures carry `{{ROOT}}` instead, and `testkit::copy_rooted_fixture_into`
-rewrites it to a root the test owns, creating the project directory it names.
-Two projects exist across the four - `project-alpha` for `session-recall.jsonl`
-and its sidecar, `project-beta` for the two error sessions - so a project-scoped
-search has something to be both true and false about, on any checkout and
-without a project key that depends on where this repository happens to sit.
+The phase 1 and 2 fixtures hardcode `"cwd": "/data/code/verbatim"`. The five
+phase 3 and 5 fixtures carry `{{ROOT}}` instead, and
+`testkit::copy_rooted_fixture_into` rewrites it to a root the test owns,
+creating the project directory it names. Two projects exist across them -
+`project-alpha` for `session-recall.jsonl`, its sidecar and `session-edits.jsonl`,
+`project-beta` for the two error sessions - so a project-scoped search has
+something to be both true and false about, on any checkout and without a project
+key that depends on where this repository happens to sit. `session-edits.jsonl`
+needs the root for a second reason: the absolute path it stores has to be
+beneath the same root its own `cwd` names, or no prompt resolved against that
+`cwd` could reach it.
 
 Every transcript fixture except `session-truncated.jsonl` ends with a trailing
 `\n`, and no fixture contains a `\r` byte (D-14).
