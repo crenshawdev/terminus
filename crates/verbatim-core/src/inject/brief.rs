@@ -24,6 +24,16 @@
 //! anywhere in this module; the model can check live git itself in one cheap
 //! tool call, and this brief tells it what the archive knew.
 //!
+//! **Nothing here reads a clock (INJ-02).** No `SystemTime`, no `Instant`, no
+//! elapsed-time or "as of" phrasing, and no count that depends on when the read
+//! happened: every value is a stored one, dates are rendered at day resolution,
+//! and anything ordered is ordered by a stored key with a TOTAL order - the
+//! reason `recall::search`'s `TAIL` is total as well. A tie broken differently
+//! between two runs is a brief that changed while the archive did not, which is
+//! the same defect as a timestamp in it. The stated rationale is the Anthropic
+//! prefix cache, which nothing local can observe; the byte identity is the
+//! property actually built here and it stands on its own.
+//!
 //! **Nothing here fails.** Every block is an `Option` and the brief is the ones
 //! that rendered: a session with no meta row, no branch, no timestamp or a blob
 //! that will not open drops that block and keeps the rest, because a brief that
