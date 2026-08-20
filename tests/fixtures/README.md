@@ -49,6 +49,31 @@ the line and drops it. They are shaped correctly anyway because phase 5 reads
 them, and a fixture invented then would be a fixture invented against the code
 that consumes it.
 
+`hooks/session-start-compact.json` is the fifth, and the only one of the five
+that is a *recording* rather than a reading of the schema. Phase 5 D-08 builds
+INJ-05's trigger on a `SessionStart` whose `source` is `"compact"`, and until
+2026-08-20 nothing here had seen one: the enum was verified present in bundle
+2.1.237 but the emit site was never located. It was then captured live - a
+temporary matcher-less `SessionStart` entry appending its stdin to a file, a
+fresh session, then `/compact` - and **a compaction does fire a `SessionStart`,
+with `hook_event_name` `SessionStart` and `source` `"compact"`**, after the
+compaction completes and under the same `session_id` as the `"startup"` line
+that opened the session. So this is the affirmative case, not D-08's fallback.
+
+The capture is those bytes with the identifying fields replaced, because this
+repository is public and a real transcript never enters it: `session_id`,
+`transcript_path` and `cwd` carry the same synthetic values as the other four,
+`prompt_id` is the same synthetic UUID they use, and `model` is theirs rather
+than the build-specific name the live session reported. `hook_event_name` and
+`source` are exactly as captured, and they are the two fields anything reads.
+
+Two things that capture contradicts about the paragraph above it, left standing
+because nothing yet reads the fields involved. The live `"compact"` line carries
+`prompt_id` and the live `"startup"` line does not, so `prompt_id` is not an
+unconditional base field; and neither live line carried `permission_mode`,
+`agent_type` or `session_title` at all. A phase that starts reading one of those
+three should re-observe it rather than trust the four older fixtures.
+
 Each is one line with a trailing newline, matching `stdin.write(payload + "\n")`.
 
 ## What each one pins

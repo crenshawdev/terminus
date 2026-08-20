@@ -132,6 +132,26 @@ pub struct Payload {
     pub prompt: Option<String>,
     /// Why the session started. `SessionStart` only, one of
     /// `startup`, `resume`, `clear`, `compact`, `fork`.
+    ///
+    /// **Compaction does fire a `SessionStart`, and its `source` is
+    /// `"compact"`** - observed 2026-08-20, not inferred from the bundle. A
+    /// temporary matcher-less `SessionStart` entry appending its stdin to a
+    /// file, a fresh session, then `/compact`, produced two lines under one
+    /// `session_id`: `hook_event_name` `SessionStart` with `source` `"startup"`
+    /// at session start, then `hook_event_name` `SessionStart` with `source`
+    /// `"compact"` once the compaction finished. That is the fact D-08 builds
+    /// INJ-05's trigger on and the only one nothing in this repository had
+    /// observed; D-08's fallback (reading the boundary row at
+    /// `UserPromptSubmit` and accepting the ingest race) is not needed.
+    /// `tests/fixtures/hooks/session-start-compact.json` is that second line.
+    ///
+    /// Two things the capture contradicts about the recorded payloads. The
+    /// compact line carries a `prompt_id` the startup line does not, so
+    /// `prompt_id` is not the unconditional base field
+    /// `tests/fixtures/README.md` describes; and neither live line carried
+    /// `permission_mode`, `agent_type` or `session_title` at all. Nothing here
+    /// reads those three, so the four older fixtures are left as they were -
+    /// but a phase that starts reading one should re-observe it first.
     pub source: Option<String>,
 }
 
@@ -414,6 +434,15 @@ mod tests {
         // `trigger`, not `source`: PostCompact carries a different key, and
         // reading `source` off it must not invent one.
         assert_eq!(compact.source, None);
+
+        // The one payload captured from a live compaction rather than read off
+        // a schema, and the whole reason D-08 has a trigger to build on.
+        let after_compact =
+            Payload::parse(&testkit::fixture_bytes("hooks/session-start-compact.json"));
+        assert_eq!(after_compact.session_id.as_deref(), Some(session));
+        assert_eq!(after_compact.cwd.as_deref(), Some("/data/code/verbatim"));
+        assert_eq!(after_compact.source.as_deref(), Some("compact"));
+        assert_eq!(after_compact.prompt, None);
     }
 
     /// Nothing about a malformed payload is an error. Each of these is a real
