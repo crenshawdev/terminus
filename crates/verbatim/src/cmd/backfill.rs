@@ -282,20 +282,36 @@ pub fn run(args: Args) -> Result<(), Failure> {
 /// [`crate::cmd::read`] refuses to bring into being. The estimate is already
 /// the count of what is there, so this costs no second walk.
 pub fn start(data_dir: &Path, estimate: &Estimate) -> Result<bool, Failure> {
+    start_from(None, data_dir, estimate)
+}
+
+/// [`start`], with the executable to spawn named explicitly.
+///
+/// `exe` is `None` for every caller but `install`, which passes the stable path
+/// it has just renamed a binary over - see [`super::spawn::detached_from`] for
+/// why its own `current_exe()` no longer resolves by then.
+pub fn start_from(
+    exe: Option<&Path>,
+    data_dir: &Path,
+    estimate: &Estimate,
+) -> Result<bool, Failure> {
     if estimate.transcripts == 0 {
         return Ok(false);
     }
-    super::spawn::detached(&["backfill", &format!("--{WORK_FLAG}")])
-        .map(|()| true)
-        .map_err(|e| {
-            Failure::Operational(format!(
-                "the backfill could not be started: {e}. \
-                 run `verbatim ingest` to archive the tree in the foreground, or let the \
-                 next hook do it - the work is the same either way, and the store at {} \
-                 is untouched",
-                data_dir.display()
-            ))
-        })
+    let args = ["backfill".to_string(), format!("--{WORK_FLAG}")];
+    let started = match exe {
+        Some(exe) => super::spawn::detached_from(exe, &args),
+        None => super::spawn::detached(&args),
+    };
+    started.map(|()| true).map_err(|e| {
+        Failure::Operational(format!(
+            "the backfill could not be started: {e}. \
+             run `verbatim ingest` to archive the tree in the foreground, or let the \
+             next hook do it - the work is the same either way, and the store at {} \
+             is untouched",
+            data_dir.display()
+        ))
+    })
 }
 
 /// The detached child: one tree pass across [`WORKERS`] threads, and nothing on

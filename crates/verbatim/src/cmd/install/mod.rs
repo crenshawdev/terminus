@@ -245,7 +245,7 @@ pub fn run(options: Options) -> Result<(), Failure> {
     );
 
     // Step 6, and the last thing install does.
-    start_backfill(&data_dir, &config);
+    start_backfill(&stable, &data_dir, &config);
     Ok(())
 }
 
@@ -265,7 +265,7 @@ pub fn run(options: Options) -> Result<(), Failure> {
 /// gigabyte is still being read. There is no log file by design, so the summary
 /// has to say where to watch it - `verbatim status` reads the `runs` row the
 /// pass writes.
-fn start_backfill(data_dir: &Path, config: &Config) {
+fn start_backfill(stable: &Path, data_dir: &Path, config: &Config) {
     use crate::cmd::backfill;
 
     println!();
@@ -282,7 +282,12 @@ fn start_backfill(data_dir: &Path, config: &Config) {
     };
     backfill::print_estimate(&estimate);
 
-    match backfill::start(data_dir, &estimate) {
+    // The stable path, not this process. `binary::place` renamed a new binary
+    // over it a moment ago, which unlinked the inode this process was exec'd
+    // from - so when install is itself run from the stable path, its own
+    // `current_exe()` names a deleted file and the spawn fails ENOENT. Which is
+    // the case `doctor`'s own fix line and a plain rerun both put a user in.
+    match backfill::start_from(Some(stable), data_dir, &estimate) {
         Ok(true) => println!(
             "archiving that now, in a detached process - this install is done and the\n\
              archive fills in behind it. `verbatim status` is where to watch it: there is\n\

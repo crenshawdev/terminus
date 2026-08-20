@@ -130,7 +130,15 @@ impl Fixture {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_verbatim"));
+        self.command_at(Path::new(env!("CARGO_BIN_EXE_verbatim")), args)
+    }
+
+    /// The same environment, but from a named binary rather than the build's.
+    ///
+    /// Only the stable-path rerun needs it: running install *from* the copy it
+    /// placed last time is the case where `current_exe()` stops resolving.
+    fn command_at(&self, exe: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(exe);
         command
             .args(args)
             .env("VERBATIM_BIN_DIR", &self.bin_dir)
@@ -1060,4 +1068,83 @@ fn the_summary_names_the_data_directory_and_the_backups_it_wrote() {
         }
     }
     assert_eq!(fixture.backups().len(), 2);
+}
+
+/// AC8/ING-11, the case a user actually hits: `~/.local/bin/verbatim install`.
+///
+/// `binary::place` renames a new binary over the stable path, which unlinks the
+/// inode the running process was exec'd from. Install then asks for a backfill.
+/// Spawning `current_exe()` at that point spawns a deleted file and fails
+/// ENOENT, so the backfill install has just announced never starts and the
+/// store does not grow - silently, because a backfill cannot fail an install.
+/// The rerun install is exactly what doctor's own fix line tells a user to run.
+#[test]
+fn install_from_the_stable_path_still_starts_its_backfill() {
+    let fixture = fixture();
+    fixture.seed();
+
+    let project = fixture.claude_dir.join("projects").join("-tmp-install");
+    std::fs::create_dir_all(&project).unwrap();
+    let transcript = |name: &str, fixture_name: &str| {
+        std::fs::copy(
+            verbatim_core::testkit::fixture_path(fixture_name),
+            project.join(name),
+        )
+        .unwrap();
+    };
+
+    transcript(
+        "11111111-1111-4111-8111-111111111111.jsonl",
+        "session-basic.jsonl",
+    );
+    assert!(fixture.run(&["install", "--yes"]).status.success());
+    wait_for_sessions(&fixture, 1);
+
+    // A second session, so the rerun has work to find and the assertion is
+    // about this install rather than the first one.
+    transcript(
+        "22222222-2222-4222-8222-222222222222.jsonl",
+        "session-continuation.jsonl",
+    );
+
+    let output = fixture
+        .command_at(&fixture.stable(), &["install", "--yes"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("the placed binary runs");
+    let said = text(&output);
+    assert!(output.status.success(), "the rerun install failed: {said}");
+    assert!(
+        !said.contains("the backfill could not be started"),
+        "install spawned a binary it had just replaced: {said}"
+    );
+
+    wait_for_sessions(&fixture, 2);
+}
+
+/// Block until the store holds `expected` sessions, or fail.
+fn wait_for_sessions(fixture: &Fixture, expected: i64) {
+    let db = fixture
+        .root
+        .join("data")
+        .join(verbatim_core::store::DB_FILE_NAME);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let count = || -> i64 {
+        if !db.exists() {
+            return 0;
+        }
+        let Ok(conn) = rusqlite::Connection::open(&db) else {
+            return 0;
+        };
+        conn.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+            .unwrap_or(0)
+    };
+    while count() < expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the detached backfill never archived {expected} sessions: {} after 30s",
+            count()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }

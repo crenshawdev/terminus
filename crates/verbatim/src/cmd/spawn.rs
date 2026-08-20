@@ -36,6 +36,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Marks the intermediate process: the first argument of the child [`detached`]
@@ -71,10 +72,26 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The environment is inherited unchanged, which is how `VERBATIM_DATA_DIR`,
 /// `VERBATIM_CONFIG_DIR` and `CLAUDE_CONFIG_DIR` reach the work.
 pub fn detached<S: AsRef<OsStr>>(args: &[S]) -> io::Result<()> {
+    detached_from(&std::env::current_exe()?, args)
+}
+
+/// [`detached`], but from a named executable rather than this one.
+///
+/// `install` needs this and nothing else does. It has just renamed a new binary
+/// over the stable path, which unlinks the inode the running process was
+/// exec'd from - so by the time it asks for the backfill, its own
+/// `current_exe()` names a deleted file and the spawn fails `ENOENT`. Passing
+/// the stable path spawns the build install just placed, which is also the
+/// build every hook entry points at.
+///
+/// Only the first hop needs it. The intermediate is exec'd from `exe`, so its
+/// own `current_exe()` is that path and the hand-off below resolves correctly
+/// without carrying it any further.
+pub fn detached_from<S: AsRef<OsStr>>(exe: &Path, args: &[S]) -> io::Result<()> {
     let mut marked: Vec<OsString> = Vec::with_capacity(args.len() + 1);
     marked.push(OsString::from(HANDOFF));
     marked.extend(args.iter().map(|arg| arg.as_ref().to_os_string()));
-    spawn(&marked)
+    spawn_from(exe, &marked)
 }
 
 /// The reparenting hand-off, called by `main` before it parses anything.
@@ -103,7 +120,11 @@ pub fn handed_off() -> bool {
 }
 
 fn spawn<S: AsRef<OsStr>>(args: &[S]) -> io::Result<()> {
-    let mut command = Command::new(std::env::current_exe()?);
+    spawn_from(&std::env::current_exe()?, args)
+}
+
+fn spawn_from<S: AsRef<OsStr>>(exe: &Path, args: &[S]) -> io::Result<()> {
+    let mut command = Command::new(exe);
     command
         .args(args)
         // A hook that leaves the write end of its stdout pipe open in a child
