@@ -92,10 +92,42 @@ struct FileConfig {
     /// are never read and never returned by a read path.
     #[serde(default)]
     exclude: Vec<String>,
+    /// How much context injection may write, per event (INJ-01, D-18).
+    #[serde(default)]
+    injection: FileInjection,
 }
 
+/// The `[injection]` table of `verbatim.toml`.
+///
+/// Every key is optional so that a table naming one budget leaves the other at
+/// its default, and an unrecognized key inside it is ignored under the same
+/// rule as one at the top level.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FileInjection {
+    brief_chars: Option<usize>,
+    prompt_chars: Option<usize>,
+}
+
+/// The resume brief's budget when nothing configures one.
+///
+/// Characters, not tokens (D-16): the workspace has eight dependencies, each
+/// justified in the root `Cargo.toml` against a measured 0.408 ms startup
+/// floor, and none of them is a tokenizer - the existing budgets
+/// ([`crate::recall::EXCERPT_CHARS`], `index::MAX_BODY_BYTES`) are already
+/// byte-shaped for the same reason. 6,000 is roughly 1.5k tokens at four
+/// characters a token, and it is under the 10,000-character ceiling past which
+/// Claude Code 2.1.237 persists a hook's stdout to disk and replaces it with a
+/// reference - a brief past that stops being context and becomes a file path.
+pub const DEFAULT_BRIEF_CHARS: usize = 6_000;
+
+/// The prompt injection's budget when nothing configures one.
+///
+/// Smaller than [`DEFAULT_BRIEF_CHARS`] because it is paid on every prompt
+/// rather than once a session, and because INJ-03 caps it at three turns.
+pub const DEFAULT_PROMPT_CHARS: usize = 4_000;
+
 /// The resolved config.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     roots: Vec<PathBuf>,
     exclusions: Vec<String>,
@@ -103,6 +135,23 @@ pub struct Config {
     /// computed once so the pre-open test costs a comparison per project
     /// directory rather than a re-encode.
     encoded_exclusions: Vec<String>,
+    brief_chars: usize,
+    prompt_chars: usize,
+}
+
+/// The defaults, spelled once. Derived `Default` would give both budgets zero,
+/// which is a config that silently injects nothing - and `Config::default()` is
+/// what several callers build when they have no file to read.
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            roots: Vec::new(),
+            exclusions: Vec::new(),
+            encoded_exclusions: Vec::new(),
+            brief_chars: DEFAULT_BRIEF_CHARS,
+            prompt_chars: DEFAULT_PROMPT_CHARS,
+        }
+    }
 }
 
 impl Config {
@@ -136,6 +185,10 @@ impl Config {
 
     /// A config built in memory, for callers that have no file. Test support
     /// and nothing else uses this today.
+    ///
+    /// The signature is the one every existing caller passes, and the injection
+    /// budgets it does not name come out at their defaults: a new argument here
+    /// would be an edit to every test in the workspace that builds a config.
     pub fn from_parts(roots: Vec<PathBuf>, exclusions: Vec<String>) -> Config {
         let exclusions: Vec<String> = exclusions.iter().filter_map(|e| normalize(e)).collect();
         let encoded_exclusions = exclusions.iter().map(|e| fold(&encode(e))).collect();
@@ -143,6 +196,7 @@ impl Config {
             roots,
             exclusions,
             encoded_exclusions,
+            ..Config::default()
         }
     }
 
@@ -156,7 +210,24 @@ impl Config {
         } else {
             vec![home_dir()?.join(DEFAULT_CLAUDE_DIR)]
         };
-        Ok(Config::from_parts(roots, file.exclude))
+        let mut config = Config::from_parts(roots, file.exclude);
+        if let Some(chars) = file.injection.brief_chars {
+            config.brief_chars = chars;
+        }
+        if let Some(chars) = file.injection.prompt_chars {
+            config.prompt_chars = chars;
+        }
+        Ok(config)
+    }
+
+    /// How many characters the SessionStart resume brief may carry (INJ-01).
+    pub fn brief_chars(&self) -> usize {
+        self.brief_chars
+    }
+
+    /// How many characters one UserPromptSubmit injection may carry (INJ-03).
+    pub fn prompt_chars(&self) -> usize {
+        self.prompt_chars
     }
 
     /// The Claude config directories, in the order they were configured.

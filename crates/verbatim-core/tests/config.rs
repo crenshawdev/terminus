@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use verbatim_core::config::{
-    Config, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME, DEFAULT_CLAUDE_DIR, PROJECTS_SUBDIR,
+    Config, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME, DEFAULT_BRIEF_CHARS, DEFAULT_CLAUDE_DIR,
+    DEFAULT_PROMPT_CHARS, PROJECTS_SUBDIR,
 };
 use verbatim_core::Error;
 
@@ -413,4 +414,72 @@ fn an_exclusion_spelled_with_a_parent_or_a_tilde_still_names_its_project() {
             "`{relative}` was kept as an exclusion no path can match"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The `[injection]` table (INJ-01, D-18)
+
+/// Every key present: the file's numbers are the budgets, not the defaults.
+#[test]
+fn an_injection_table_resolves_to_the_numbers_it_names() {
+    let dir = config_dir_holding(&[(
+        CONFIG_FILE_NAME,
+        "[injection]\nbrief_chars = 1200\nprompt_chars = 800\n",
+    )]);
+    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).unwrap()
+    });
+
+    assert_eq!(config.brief_chars(), 1200);
+    assert_eq!(config.prompt_chars(), 800);
+}
+
+/// The state every user starts in. A file with no `[injection]` table at all -
+/// and the missing file the test above this section covers - resolves to the
+/// documented defaults rather than to zero, which would be a config that
+/// silently injects nothing.
+#[test]
+fn a_config_without_an_injection_table_resolves_to_the_defaults() {
+    let dir = config_dir_holding(&[(CONFIG_FILE_NAME, "exclude = [\"/data/private\"]\n")]);
+    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).unwrap()
+    });
+
+    assert_eq!(config.brief_chars(), DEFAULT_BRIEF_CHARS);
+    assert_eq!(config.prompt_chars(), DEFAULT_PROMPT_CHARS);
+    assert_eq!(
+        Config::default().brief_chars(),
+        DEFAULT_BRIEF_CHARS,
+        "a config built with no file carries the same budgets as one read from a file with no table"
+    );
+    assert_eq!(Config::default().prompt_chars(), DEFAULT_PROMPT_CHARS);
+}
+
+/// One key configured leaves the other at its default, which is why each is an
+/// `Option` on the way in rather than a `#[serde(default)]` zero.
+#[test]
+fn one_configured_budget_does_not_take_the_other_with_it() {
+    let dir = config_dir_holding(&[(CONFIG_FILE_NAME, "[injection]\nprompt_chars = 250\n")]);
+    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).unwrap()
+    });
+
+    assert_eq!(config.prompt_chars(), 250);
+    assert_eq!(config.brief_chars(), DEFAULT_BRIEF_CHARS);
+}
+
+/// The documented rule holds one level down: this file grows every phase, and a
+/// key a later build writes must not make this one refuse to start.
+#[test]
+fn an_unknown_key_inside_the_injection_table_is_ignored_rather_than_rejected() {
+    let dir = config_dir_holding(&[(
+        CONFIG_FILE_NAME,
+        "[injection]\nbrief_chars = 900\nsomething_phase_9_writes = \"whatever\"\n",
+    )]);
+    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).expect("an unknown injection key is not an error")
+    });
+
+    assert_eq!(config.brief_chars(), 900);
+    assert_eq!(config.prompt_chars(), DEFAULT_PROMPT_CHARS);
 }
