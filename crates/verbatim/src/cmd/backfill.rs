@@ -25,6 +25,19 @@
 //! Each file contributes its length minus its stored watermark. A half-ingested
 //! corpus therefore estimates what is left, which is what makes the number mean
 //! something on the second run and after a kill.
+//!
+//! # Then the shell comes back
+//!
+//! The work runs in a process detached through the same double fork the hooks
+//! use ([`crate::cmd::spawn`], D-03), so `verbatim backfill` returns in
+//! milliseconds with a gigabyte still to archive. There is no log file by
+//! design: the `runs` row the pass writes is the record, and `verbatim status`
+//! is where it is read.
+//!
+//! Resumability needs nothing here (D-22). It is the per-file watermarks and
+//! the per-file transactions phase 2 already ships, which is why a killed
+//! backfill converges on the same store as an uninterrupted one without this
+//! module holding any state of its own.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -182,22 +195,98 @@ fn duration(elapsed: std::time::Duration) -> String {
     format!("{}h {}m", secs / 3_600, (secs % 3_600) / 60)
 }
 
-/// The parsed command line for `backfill`.
-pub struct Args;
+/// The internal argument that means "you are the working process".
+///
+/// Without it a backfill prints an estimate and spawns a detached copy of
+/// itself; with it, it prints nothing and does the pass. That asymmetry is the
+/// whole reason the flag exists: a child invoked with the same command line as
+/// its parent would print an estimate and spawn again, forever.
+///
+/// Deliberately absent from `USAGE`, like [`crate::cmd::spawn::HANDOFF`] and
+/// for the same reason - it is a mechanism, not an interface. Typing it runs
+/// the pass in the foreground, which is a thing a caller could already do with
+/// `verbatim ingest`, so nothing is granted by knowing it. It is the argument
+/// the crash harness uses, because the working process is the one worth
+/// killing and the detached one cannot be reached from the shell that started
+/// it.
+pub const WORK_FLAG: &str = "work";
 
-pub fn run(_args: Args) -> Result<(), Failure> {
+/// The parsed command line for `backfill`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Args {
+    /// True in the detached child: do the work, print no estimate, spawn
+    /// nothing.
+    pub work: bool,
+}
+
+pub fn run(args: Args) -> Result<(), Failure> {
     let data_dir = super::data_dir()?;
+    if args.work {
+        return work(&data_dir);
+    }
+
     let config = Config::load()?;
     let estimate = estimate(&data_dir, &config)?;
     print_estimate(&estimate);
+    start(&data_dir)
+}
+
+/// Hand the work to a process that outlives this one, and return (AC8,
+/// ING-11).
+///
+/// Through the same double fork the hooks use (D-03), so a backfill started
+/// from a shell that is then closed, or from a hook Claude Code later kills,
+/// keeps going. Nothing is waited for: the point of the command is that the
+/// shell comes back.
+pub fn start(data_dir: &Path) -> Result<(), Failure> {
+    super::spawn::detached(&["backfill", &format!("--{WORK_FLAG}")]).map_err(|e| {
+        Failure::Operational(format!(
+            "the backfill could not be started: {e}. \
+             run `verbatim ingest` to archive the tree in the foreground, or let the \
+             next hook do it - the work is the same either way, and the store at {} \
+             is untouched",
+            data_dir.display()
+        ))
+    })
+}
+
+/// The detached child: one ordinary tree pass, and nothing on stdout.
+///
+/// The pass takes the ingest lock before it opens the store, so a hook firing
+/// during a backfill loses the race and exits 0 immediately with empty stdout
+/// (D-18) - nothing here is needed for that, and nothing here may be added that
+/// would weaken it.
+fn work(data_dir: &Path) -> Result<(), Failure> {
+    use verbatim_core::ingest::pass::{self, PassOutcome};
+
+    let summary = match pass::run(data_dir)? {
+        // Another pass is already running. Not a failure: the whole point of
+        // one lock and no daemon.
+        PassOutcome::LockHeld => return Ok(()),
+        PassOutcome::Ran(summary) => summary,
+    };
+
+    // All three of this process's stdio are `Stdio::null()` when it was
+    // spawned, so this reaches nobody in the ordinary case - the `runs` row is
+    // the durable record and `verbatim status` is where it is read. It is here
+    // for the case where a person ran the flag by hand.
+    for (path, reason) in summary.failures.iter().chain(&summary.unreadable) {
+        eprintln!("{}", pass::note(path, reason));
+    }
     Ok(())
 }
 
 pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
-    if let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
-        return Err(Failure::Misuse(crate::unexpected(arg)));
+    use lexopt::prelude::*;
+
+    let mut work = false;
+    while let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
+        match arg {
+            Long(WORK_FLAG) => work = true,
+            other => return Err(Failure::Misuse(crate::unexpected(other))),
+        }
     }
-    Ok(Args)
+    Ok(Args { work })
 }
 
 #[cfg(test)]
