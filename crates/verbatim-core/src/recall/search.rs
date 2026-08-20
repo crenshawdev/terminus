@@ -5,7 +5,7 @@
 //! `verbatim search` (PLAN-3) and `recall_search` (PLAN-4) - so there is one
 //! definition of relevance rather than two that drift.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::Connection;
 
@@ -125,6 +125,25 @@ pub struct Hit {
     /// turn ran that command" and "this turn mentions that word", and a caller
     /// that cannot see it cannot show it or test it.
     pub entity_score: f64,
+    /// How the query matched this turn's entities at its strongest, or `None`
+    /// when it matched no entity on this turn at all (D-04).
+    ///
+    /// [`EntityMatch::Exact`] outranks [`EntityMatch::Covered`]: a turn
+    /// carrying one value the query asked for whole reports `Exact` however
+    /// many other values it merely covered. This is the fact
+    /// [`Hit::entity_score`] cannot carry - a scalar built from an IDF times a
+    /// weight cannot say which of the two produced it, and phase 5's
+    /// structural threshold is written on the kind rather than on a score
+    /// cutoff, which `DESIGN-BRIEF.md:245` forbids outright.
+    pub entity_match: Option<EntityMatch>,
+    /// How many DISTINCT `(kind, value_norm)` pairs on this turn the query
+    /// matched.
+    ///
+    /// Distinct, and that is load-bearing: one path named by three tool calls
+    /// of one turn is one piece of evidence, and INJ-03's second condition is
+    /// about independent entities co-occurring - so counting rows would let a
+    /// single repeated value pass a threshold meant for two different facts.
+    pub entity_count: usize,
     /// Higher is a better match: the negated bm25 (see [`HEAD`]) plus
     /// [`Hit::entity_score`].
     pub relevance: f64,
@@ -255,6 +274,8 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
                 project: row.get(4)?,
                 sidechain: row.get::<_, i64>(5)? != 0,
                 entity_score: 0.0,
+                entity_match: None,
+                entity_count: 0,
                 relevance: row.get(6)?,
                 excerpt: String::new(),
             })
@@ -294,6 +315,42 @@ fn rank(a: &Hit, b: &Hit) -> std::cmp::Ordering {
 /// inside a longer question asked for something the command is part of.
 const EXACT_WEIGHT: f64 = 2.0;
 const COVERED_WEIGHT: f64 = 1.0;
+
+/// What the query matched on one candidate turn, beside the score it earned.
+///
+/// The score is what re-ranks; the other two are what phase 5's structural
+/// threshold reads. They are collected in the same pass because they come off
+/// the same rows: recomputing them later would mean a second scan of
+/// `entities` and a second definition of "matched".
+#[derive(Default)]
+struct Matched {
+    score: f64,
+    /// The strongest [`EntityMatch`] seen on this turn.
+    kind: Option<EntityMatch>,
+    /// The distinct `(kind, value_norm)` pairs matched, as a set rather than a
+    /// counter: `entities` declares no uniqueness constraint, so two identical
+    /// rows for one turn are a shape the table permits and must not count
+    /// twice.
+    values: BTreeSet<(String, String)>,
+}
+
+impl Matched {
+    /// Fold in one matched `(kind, value_norm)` row.
+    ///
+    /// The score accumulates per ROW and the set per VALUE, which is the
+    /// arithmetic that was here before this reporting was added: a change to
+    /// the summing is a re-ranking, and a re-ranking hidden inside a reporting
+    /// change is the regression every existing test still passes.
+    fn saw(&mut self, key: &(String, String), matched: EntityMatch, weight: f64) {
+        self.score += weight;
+        self.values.insert(key.clone());
+        // `Exact` outranks `Covered`, and the strongest wins whatever order
+        // the rows arrived in.
+        if matched == EntityMatch::Exact || self.kind.is_none() {
+            self.kind = Some(matched);
+        }
+    }
+}
 
 /// RCL-04's query-time half: weight each matched entity by how rare its value
 /// is, and add it to the relevance of every candidate carrying it.
@@ -340,43 +397,54 @@ fn weight_by_entities(conn: &Connection, query: &Query, hits: &mut [Hit]) -> Res
     let total: f64 =
         conn.query_row("SELECT count(*) FROM turns", [], |r| r.get::<_, i64>(0))? as f64;
 
-    let mut weights: BTreeMap<(String, String), f64> = BTreeMap::new();
-    let mut by_turn: BTreeMap<i64, f64> = BTreeMap::new();
+    let mut weights: BTreeMap<(String, String), Option<(EntityMatch, f64)>> = BTreeMap::new();
+    let mut by_turn: BTreeMap<i64, Matched> = BTreeMap::new();
     let mut frequency = conn.prepare(
         "SELECT count(DISTINCT turn_id) FROM entities WHERE kind = ?1 AND value_norm = ?2",
     )?;
 
     for (turn_id, kind, value) in rows {
         let key = (kind, value);
-        let weight = match weights.get(&key) {
-            Some(weight) => *weight,
+        let scored = match weights.get(&key) {
+            Some(scored) => *scored,
             None => {
-                let weight = match query.matches_entity(&key.1) {
-                    None => 0.0,
+                let scored = match query.matches_entity(&key.1) {
+                    None => None,
                     Some(matched) => {
                         // `idx_entities_lookup` is on exactly (kind, value_norm).
                         let df: i64 =
                             frequency.query_row(rusqlite::params![&key.0, &key.1], |r| r.get(0))?;
                         let idf = (1.0 + total / df.max(1) as f64).ln();
-                        idf * match matched {
-                            EntityMatch::Exact => EXACT_WEIGHT,
-                            EntityMatch::Covered => COVERED_WEIGHT,
-                        }
+                        let weight = idf
+                            * match matched {
+                                EntityMatch::Exact => EXACT_WEIGHT,
+                                EntityMatch::Covered => COVERED_WEIGHT,
+                            };
+                        Some((matched, weight))
                     }
                 };
-                weights.insert(key.clone(), weight);
-                weight
+                weights.insert(key.clone(), scored);
+                scored
             }
         };
-        if weight > 0.0 {
-            *by_turn.entry(turn_id).or_insert(0.0) += weight;
+        // A match with a zero weight is still a match. The two were one fact
+        // while `entity_score` was the only thing reported, and separating
+        // them is the whole of D-04: a value the whole archive carries scores
+        // almost nothing and is still the query naming a stored value.
+        if let Some((matched, weight)) = scored {
+            by_turn
+                .entry(turn_id)
+                .or_default()
+                .saw(&key, matched, weight);
         }
     }
 
     for hit in hits.iter_mut() {
-        if let Some(bonus) = by_turn.get(&hit.turn_id) {
-            hit.entity_score = *bonus;
-            hit.relevance += *bonus;
+        if let Some(matched) = by_turn.get(&hit.turn_id) {
+            hit.entity_score = matched.score;
+            hit.entity_match = matched.kind;
+            hit.entity_count = matched.values.len();
+            hit.relevance += matched.score;
         }
     }
     Ok(())

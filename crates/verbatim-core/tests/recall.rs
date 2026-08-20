@@ -998,6 +998,136 @@ fn a_rare_entity_value_moves_a_hit_more_than_a_common_one() {
     assert_eq!(ranked(&conn, common, MAX_RESULTS), common_hits);
 }
 
+/// The stored `path` entity of `session-recall.jsonl`, which is the file its
+/// `Read` tool call opened.
+///
+/// **Not `src/worker/S.ts`.** That path is in the fixture too, and it is in
+/// prose only - RCL-02 extracts entities from structured tool records and never
+/// from a sentence - so it is the free-text control below rather than a stored
+/// value anything can match structurally.
+const STORED_PATH: &str = "docs/RETRY.md";
+
+/// The hit on the turn that made the `Read` call, out of a ranked set.
+fn read_hit<'a>(conn: &Connection, hits: &'a [Hit]) -> &'a Hit {
+    hits.iter()
+        .find(|hit| tool_of(conn, hit.turn_id).as_deref() == Some("Read"))
+        .unwrap_or_else(|| panic!("no Read turn among {hits:?}"))
+}
+
+/// D-04: a hit says HOW its entities matched, not just how much they scored.
+///
+/// The kind is what phase 5's structural threshold reads. `entity_score`
+/// collapses it - an IDF times a weight cannot say which of the two weights
+/// produced it - and approximating the threshold with a score cutoff instead is
+/// what `DESIGN-BRIEF.md:245` forbids outright, since bm25 scores are not
+/// comparable across queries.
+#[test]
+fn a_hit_reports_whether_the_query_asked_for_the_whole_stored_value() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    // The query IS the stored value: it asked for that path and nothing else.
+    let exact = ranked(&conn, STORED_PATH, MAX_RESULTS);
+    assert_eq!(
+        read_hit(&conn, &exact).entity_match,
+        Some(EntityMatch::Exact)
+    );
+
+    // The same path inside a longer query: it asks for more besides, so the
+    // stored value is covered rather than asked for.
+    //
+    // The extra token is one the turn itself carries, because a search query
+    // is conjunctive (D-09): "who edited docs/RETRY.md yesterday" reports no
+    // kind on that turn for the plainer reason that it returns no hits at all.
+    let covered = ranked(&conn, &format!("Read {STORED_PATH}"), MAX_RESULTS);
+    assert_eq!(
+        read_hit(&conn, &covered).entity_match,
+        Some(EntityMatch::Covered)
+    );
+}
+
+/// D-04's other half: how many DISTINCT entities of that turn the query matched.
+///
+/// One turn naming one file three times is one piece of evidence, and INJ-03's
+/// co-occurrence condition is about two independent facts - so the count is
+/// over distinct `(kind, value_norm)` pairs and never over rows.
+#[test]
+fn a_hit_counts_distinct_matched_entities_and_not_repeats() {
+    let bench = bench();
+
+    // One turn, one path, named three times: as the tool's own `file_path`,
+    // again in its result's `filePath`, and again in the nested `file` object
+    // every real `Read` result carries.
+    let repeated = "src/repeat/thrice.rs";
+    bench.archive(
+        "repeats.jsonl",
+        &format!(
+            "{}\n",
+            serde_json::json!({
+                "parentUuid": null,
+                "isSidechain": false,
+                "cwd": bench.work.join("repeats").to_string_lossy(),
+                "sessionId": "66666666-6666-4666-8666-666666666666",
+                "type": "assistant",
+                "uuid": "cccccccc-0000-4000-8000-000000000001",
+                "timestamp": "2026-08-12T23:00:00.000Z",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-opus-5",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_r1",
+                        "name": "Read",
+                        "input": {"file_path": repeated},
+                    }],
+                },
+                "toolUseResult": {
+                    "filePath": repeated,
+                    "file": {"filePath": repeated},
+                    "stdout": "",
+                    "stderr": "",
+                    "interrupted": false,
+                },
+            })
+        ),
+    );
+    let conn = bench.conn();
+
+    let once = ranked(&conn, repeated, MAX_RESULTS);
+    assert_eq!(once.len(), 1, "{once:?}");
+    assert_eq!(
+        once[0].entity_count, 1,
+        "three mentions of one path are one matched entity: {once:?}"
+    );
+
+    // Two different facts on one turn: the file the call opened and the tool
+    // that opened it. The query names both, so both are matched.
+    let both = ranked(&conn, &format!("Read {STORED_PATH}"), MAX_RESULTS);
+    let hit = read_hit(&conn, &both);
+    assert_eq!(hit.entity_count, 2, "{both:?}");
+    assert!(hit.entity_match.is_some());
+}
+
+/// A turn the query reached only through its text reports no kind and no count.
+///
+/// This is the weakest signal in `DESIGN-BRIEF.md`'s hierarchy and the one
+/// INJ-03 never fires on, so it has to be distinguishable from a weak entity
+/// match rather than a small `entity_score`.
+#[test]
+fn a_free_text_only_hit_reports_no_entity_match_at_all() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let prose = "src/worker/S.ts";
+    let hits = ranked(&conn, prose, MAX_RESULTS);
+    assert!(!hits.is_empty(), "the fixture names {prose} in prose");
+    for hit in &hits {
+        assert_eq!(hit.entity_match, None, "{hit:?}");
+        assert_eq!(hit.entity_count, 0, "{hit:?}");
+        assert_eq!(hit.entity_score, 0.0, "{hit:?}");
+    }
+}
+
 /// D-05: every hit carries an excerpt cut from the archive, showing the text
 /// that matched.
 ///
