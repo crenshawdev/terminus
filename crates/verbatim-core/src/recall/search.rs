@@ -66,6 +66,41 @@ pub struct Request {
     /// How many hits the caller wants. Silently clamped to [`MAX_RESULTS`] -
     /// see [`Request::effective_limit`].
     pub limit: usize,
+    /// Whole spellings to match ANY of, instead of every token of
+    /// [`Request::query`]. Empty for every caller but injection.
+    ///
+    /// A `verbatim search` query is a search string: the user typed the terms
+    /// they want and conjoining them is what "search" means. A prompt is a
+    /// SENTENCE, and conjoining every word of it asks the archive for a turn
+    /// that repeats the sentence - measured, not assumed: `who edited
+    /// docs/RETRY.md yesterday` returns zero hits against a store whose `Read`
+    /// call opened exactly that file, because no turn also says `who`,
+    /// `yesterday` and `edited`. Injection built on that expression would be
+    /// permanent silence with every fixture green.
+    ///
+    /// So injection hands over the spellings it wants candidates FOR - the
+    /// resolved paths and the identifier-shaped tokens of the prompt - each
+    /// conjoined within itself and the lot of them disjoined, and the prose
+    /// stays in [`Request::query`], where it still weighs and excerpts what
+    /// comes back. Nothing loosens for either front end: an empty list is the
+    /// expression this module always built.
+    ///
+    /// This is a recall net and not a decision. What may actually be injected
+    /// is decided structurally afterwards, on [`Hit::entity_match`] and
+    /// [`Hit::entity_count`], so a candidate that matched only as free text
+    /// costs a row here and injects nothing (INJ-03).
+    pub candidates: Vec<Query>,
+    /// Whether every returned hit gets an excerpt cut from its session blob.
+    ///
+    /// On for both front ends, because a hit with no text under it is not a
+    /// search result. Off for injection until its threshold has fired: an
+    /// excerpt materializes a WHOLE compressed session - p50 273 KB, p90
+    /// 1.03 MB, p99 2.6 MB, max 10.1 MB uncompressed over the real corpus -
+    /// and the prompt path stays silent most of the time by design, so paying
+    /// for text nobody will read is the one cost D-13 rules out. The caller
+    /// attaches them itself, through [`excerpt::attach`], for the at-most-three
+    /// turns that fired.
+    pub excerpts: bool,
 }
 
 impl Request {
@@ -83,11 +118,25 @@ impl Request {
             scope,
             filters: Filters::default(),
             limit: DEFAULT_RESULTS,
+            candidates: Vec::new(),
+            excerpts: true,
         }
     }
 
     pub fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Match any of these whole spellings - see [`Request::candidates`].
+    pub fn candidates(mut self, candidates: Vec<Query>) -> Self {
+        self.candidates = candidates;
+        self
+    }
+
+    /// Cut an excerpt for every hit, or none - see [`Request::excerpts`].
+    pub fn excerpts(mut self, excerpts: bool) -> Self {
+        self.excerpts = excerpts;
         self
     }
 
@@ -232,7 +281,7 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
         });
     }
 
-    let Some(expression) = request.query.match_expression() else {
+    let Some(expression) = expression(request) else {
         return Ok(Response::default());
     };
 
@@ -288,13 +337,40 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
     hits.truncate(request.effective_limit());
     // After the truncation, never before: an excerpt costs a whole decompressed
     // session and the candidate pool is four times what the caller asked for.
-    let reads = excerpt::attach(conn, &request.query, &mut hits)?;
+    // And not at all when the caller said so - see [`Request::excerpts`].
+    let reads = if request.excerpts {
+        excerpt::attach(conn, &request.query, &mut hits)?
+    } else {
+        excerpt::Reads::default()
+    };
 
     Ok(Response {
         hits,
         reason: None,
         reads,
     })
+}
+
+/// The fts5 expression one request asks for, or `None` when it asks nothing.
+///
+/// Every term still goes through [`Query::match_expression`], which is the one
+/// place a token becomes a quoted fts5 string: a caller hands over tokenized
+/// spellings and never an expression, so there is no path by which a prompt -
+/// which is untrusted text - reaches `MATCH` as written. Each spelling is
+/// parenthesized before the `OR`, because fts5 binds `AND` tighter than `OR`
+/// and a missing group would silently make one spelling's last token an
+/// alternative to the whole of the next.
+fn expression(request: &Request) -> Option<String> {
+    if request.candidates.is_empty() {
+        return request.query.match_expression();
+    }
+    let parts: Vec<String> = request
+        .candidates
+        .iter()
+        .filter_map(Query::match_expression)
+        .map(|part| format!("({part})"))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" OR "))
 }
 
 /// The same total order [`TAIL`] applies, over scores SQL could not compute.
