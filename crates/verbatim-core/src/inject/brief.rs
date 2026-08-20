@@ -61,11 +61,39 @@ use crate::recall::{excerpt, Query};
 /// no archived project covers, and in an excluded project. It is also every
 /// failure: see the module doc on `inject`.
 pub fn session_start(data_dir: &Path, config: &Config, payload: &Payload) -> Option<String> {
+    // First, and before anything that can decline to render: the flag is what
+    // INJ-05 is owed, and a machine whose store is not there yet still just
+    // compacted a session (D-08).
+    if payload.source == Some(super::COMPACT_SOURCE) {
+        owe_compaction(data_dir, payload);
+    }
     let store = super::open(data_dir)?;
     let scoped = super::scoped(store.conn(), config, payload)?;
     let brief = render(store.conn(), &scoped, config.brief_chars())?;
     remember(data_dir, payload, &brief);
     Some(brief.text)
+}
+
+/// Leave the next prompt an injection to make (INJ-05, D-08).
+///
+/// A compaction fires a `SessionStart` of its own, and the brief it renders is
+/// the ordinary one - what changed is that the model just lost most of its
+/// context, and the turns it lost are worth offering back to whatever it asks
+/// next. That cannot be answered here: the boundary row is written by the
+/// ingest this hook spawned, the prompt has not been typed, and the brief is on
+/// a single-digit-millisecond budget. So it becomes a flag, and the prompt arm
+/// spends it.
+///
+/// A flag rather than a timestamp comparison, and it persists until it fires:
+/// if the boundary row is not committed by the time the next prompt arrives,
+/// the debt carries rather than being dropped on the losing side of that race.
+fn owe_compaction(data_dir: &Path, payload: &Payload) {
+    let mut state = super::state::State::load(data_dir, payload.session_id);
+    if state.compaction_owed {
+        return;
+    }
+    state.compaction_owed = true;
+    state.save(data_dir, payload.session_id);
 }
 
 /// Tell this session's state file which turns the brief just quoted (INJ-04).

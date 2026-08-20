@@ -38,6 +38,20 @@ const RELATIVE: &str = "crates/gizmo/lantern.rs";
 /// reaching outside the temporary tree.
 const ABSENT: &str = "no-such-session.jsonl";
 
+/// The file the compacted session's two tool turns both name, and the symbol
+/// only the preserved one carries.
+const GADGET: &str = "crates/gizmo/gadget.rs";
+const SYMBOL: &str = "gadgetSpin";
+
+/// The archived compaction: where it is, and the two turns AC5 is about.
+struct Compacted {
+    path: PathBuf,
+    /// The turn `preservedMessages.uuids` leaves out.
+    fell_out: i64,
+    /// The turn it names, which outranks the other and is never injected.
+    preserved: i64,
+}
+
 struct Bench {
     _dir: tempfile::TempDir,
     data_dir: PathBuf,
@@ -133,6 +147,115 @@ impl Bench {
         std::fs::write(&path, body).unwrap();
         self.ingest(&path);
         path
+    }
+
+    /// A session that has just been compacted, archived: three turns and the
+    /// `compact_boundary` record saying which of them survived.
+    ///
+    /// The two tool turns name one file, and only the LATER one is preserved -
+    /// so the turn INJ-05 is about is the earlier one, and a reading that took
+    /// "everything the prompt matches" or "everything still in the session"
+    /// would return the preserved turn instead and be caught.
+    fn compacted(&self) -> Compacted {
+        const SESSION: &str = "dddddddd-0000-4000-8000-000000000000";
+        let uuid = |n: usize| format!("{SESSION}-{n}");
+        let gadget = self.project().join(GADGET);
+        let gadget = gadget.to_str().unwrap().to_owned();
+
+        let mut records = [
+            serde_json::json!({
+                "type": "user",
+                "uuid": uuid(0),
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "keep going until the context runs out"}
+                ]},
+            }),
+            // Dropped: the model no longer has this, and it is what the prompt
+            // after the compaction should be given back.
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": uuid(1),
+                "message": {"role": "assistant", "model": "claude-opus-5", "content": [
+                    {"type": "tool_use", "id": "toolu_g1", "name": "Read",
+                     "input": {"file_path": gadget}}
+                ]},
+            }),
+            // Preserved: two entities against the prompt's one, so it outranks
+            // the dropped turn and must STILL never be injected.
+            serde_json::json!({
+                "type": "assistant",
+                "uuid": uuid(2),
+                "message": {"role": "assistant", "model": "claude-opus-5", "content": [
+                    {"type": "tool_use", "id": "toolu_g2", "name": "Edit", "input": {
+                        "file_path": gadget,
+                        "old_string": format!("    let spin = {SYMBOL}(seed);"),
+                        "new_string": "    let spin = gadgetHold(seed);",
+                    }}
+                ]},
+            }),
+            serde_json::json!({
+                "type": "system",
+                "subtype": "compact_boundary",
+                "uuid": uuid(3),
+                "content": "Conversation compacted",
+                "level": "info",
+                "compactMetadata": {
+                    "trigger": "auto",
+                    "preTokens": 45500,
+                    "postTokens": 7436,
+                    "cumulativeDroppedTokens": 38064,
+                    "durationMs": 45468,
+                    "preservedSegment": {
+                        "headUuid": uuid(0),
+                        "anchorUuid": uuid(2),
+                        "tailUuid": uuid(2),
+                    },
+                    "preservedMessages": {
+                        "anchorUuid": uuid(2),
+                        "uuids": [uuid(2)],
+                        "allUuids": [uuid(0), uuid(1), uuid(2)],
+                    },
+                },
+            }),
+        ];
+
+        let mut body = String::new();
+        for (n, record) in records.iter_mut().enumerate() {
+            let object = record.as_object_mut().unwrap();
+            object.insert("parentUuid".into(), Value::Null);
+            object.insert("isSidechain".into(), Value::Bool(false));
+            object.insert(
+                "cwd".into(),
+                Value::String(self.project().to_string_lossy().into_owned()),
+            );
+            object.insert("sessionId".into(), Value::String(SESSION.to_string()));
+            object.insert(
+                "timestamp".into(),
+                Value::String(format!("2026-08-16T11:{n:02}:00.000Z")),
+            );
+            body.push_str(&record.to_string());
+            body.push('\n');
+        }
+
+        let path = self.work.join("session-context.jsonl");
+        std::fs::write(&path, body).unwrap();
+        self.ingest(&path);
+        Compacted {
+            fell_out: self.turn_of(&uuid(1)),
+            preserved: self.turn_of(&uuid(2)),
+            path,
+        }
+    }
+
+    fn store(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.data_dir.join(verbatim_core::store::DB_FILE_NAME)).unwrap()
+    }
+
+    /// The `turns.id` one archived uuid became.
+    fn turn_of(&self, uuid: &str) -> i64 {
+        self.store()
+            .query_row("SELECT id FROM turns WHERE uuid = ?1", [uuid], |r| r.get(0))
+            .unwrap_or_else(|e| panic!("{uuid} is not archived: {e}"))
     }
 
     /// One hook invocation: the payload on stdin, then EOF, the way Claude Code
@@ -442,4 +565,158 @@ fn a_turn_the_brief_already_quoted_is_not_injected_again() {
         control.contains("beaconWaver"),
         "the prompt does not reach the edit at all: {control}"
     );
+}
+
+/// Does the injection name this turn?
+///
+/// The trailing space and bracket matter: `turn 12` is a prefix of `turn 123`,
+/// and an assertion that a turn was NOT injected has to be able to tell them
+/// apart.
+fn names(text: &str, turn_id: i64) -> bool {
+    text.contains(&format!("turn {turn_id} ("))
+}
+
+/// AC5: the prompt after a compaction is answered out of what fell out of the
+/// model's context, and the one after that is not.
+///
+/// Four claims in one test because they are one mechanism: the flag is set, it
+/// is spent, it restricts what may be injected while it is set, and it is gone
+/// afterwards. Split apart, each half would pass against a build that never
+/// restricted anything.
+#[test]
+fn after_a_compaction_the_next_prompt_draws_from_what_fell_out() {
+    const SESSION: &str = "dddddddd-1111-4000-8000-000000000001";
+    const CONTROL: &str = "dddddddd-1111-4000-8000-000000000002";
+    const RESTRICTED: &str = "dddddddd-1111-4000-8000-000000000003";
+
+    let bench = bench();
+    bench.ingest_fixture();
+    let compacted = bench.compacted();
+    let asked = format!("what happened to {SYMBOL} in {GADGET}");
+
+    // The control first, and it is the falsifier for everything below: with no
+    // compaction owed, this prompt reaches BOTH turns and ranks the preserved
+    // one first. So the restricted answer cannot be an artifact of a prompt
+    // that only ever matched one turn.
+    let control = injected(
+        &bench.prompt(CONTROL, &bench.work.join(ABSENT), &asked),
+        "UserPromptSubmit",
+    );
+    assert!(
+        names(&control, compacted.preserved) && names(&control, compacted.fell_out),
+        "the prompt does not reach both turns: {control}"
+    );
+    assert!(
+        control.find(&format!("turn {} (", compacted.preserved))
+            < control.find(&format!("turn {} (", compacted.fell_out)),
+        "the preserved turn does not outrank the dropped one, so \"never a \
+         preserved one even when it matches better\" is untested: {control}"
+    );
+
+    injected(&bench.session_start(SESSION, "compact"), "SessionStart");
+    assert_eq!(
+        bench.state(SESSION)["compaction_owed"],
+        Value::Bool(true),
+        "a SessionStart whose source is compact left nothing owed"
+    );
+
+    let after = injected(
+        &bench.prompt(SESSION, &compacted.path, &asked),
+        "UserPromptSubmit",
+    );
+    assert!(
+        names(&after, compacted.fell_out),
+        "the turn that fell out of context was not offered back: {after}"
+    );
+    assert!(
+        !names(&after, compacted.preserved),
+        "a turn still in the model's context was injected: {after}"
+    );
+    assert_eq!(
+        bench.state(SESSION)["compaction_owed"],
+        Value::Bool(false),
+        "the flag survived the prompt that spent it"
+    );
+
+    // The pool really is a restriction: the same flag, a prompt about another
+    // session's turn, and nothing comes back - even though that same prompt is
+    // answered below once the flag is gone.
+    injected(&bench.session_start(RESTRICTED, "compact"), "SessionStart");
+    let elsewhere = format!("what changed in {RELATIVE}");
+    silent(
+        &bench.prompt(RESTRICTED, &compacted.path, &elsewhere),
+        "a prompt outside the dropped set while a compaction is owed",
+    );
+
+    // And the session that already spent its flag is on the ordinary path
+    // again: the same prompt, answered.
+    let later = injected(
+        &bench.prompt(SESSION, &compacted.path, &elsewhere),
+        "UserPromptSubmit",
+    );
+    assert!(
+        later.contains("lanternFlicker"),
+        "a later prompt is still restricted to the dropped set: {later}"
+    );
+}
+
+/// D-08's race, which is the reason the flag persists instead of being read
+/// off the store: the ingest that commits the boundary row is running against
+/// the prompt that needs it.
+///
+/// The row is removed rather than the ingest delayed, because what is under
+/// test is the reader's behaviour when the row is not there yet, and a test
+/// built on a sleep would assert about a scheduler.
+#[test]
+fn a_compaction_whose_boundary_is_not_committed_yet_keeps_the_debt() {
+    const SESSION: &str = "eeeeeeee-1111-4000-8000-000000000001";
+
+    let bench = bench();
+    bench.ingest_fixture();
+    let compacted = bench.compacted();
+    let asked = format!("what happened to {SYMBOL} in {GADGET}");
+
+    let row: (i64, Vec<u8>) = bench
+        .store()
+        .query_row(
+            "SELECT turn_id, metadata FROM compaction_boundaries",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("the compacted session archived a boundary");
+    bench
+        .store()
+        .execute("DELETE FROM compaction_boundaries", [])
+        .unwrap();
+
+    injected(&bench.session_start(SESSION, "compact"), "SessionStart");
+    silent(
+        &bench.prompt(SESSION, &compacted.path, &asked),
+        "the first prompt after a compaction whose boundary is not committed",
+    );
+    assert_eq!(
+        bench.state(SESSION)["compaction_owed"],
+        Value::Bool(true),
+        "the debt was settled against a boundary row that was not there"
+    );
+
+    // The ingest lands.
+    bench
+        .store()
+        .execute(
+            "INSERT INTO compaction_boundaries (turn_id, metadata) VALUES (?1, ?2)",
+            rusqlite::params![row.0, row.1],
+        )
+        .unwrap();
+
+    let after = injected(
+        &bench.prompt(SESSION, &compacted.path, &asked),
+        "UserPromptSubmit",
+    );
+    assert!(
+        names(&after, compacted.fell_out),
+        "the carried debt did not fire on the following prompt: {after}"
+    );
+    assert!(!names(&after, compacted.preserved), "{after}");
+    assert_eq!(bench.state(SESSION)["compaction_owed"], Value::Bool(false));
 }

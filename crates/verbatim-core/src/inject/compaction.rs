@@ -25,13 +25,18 @@
 //!   of turn - recent, dropped, and the most likely thing the session was just
 //!   working on - is exactly what INJ-05 exists to offer back.
 //!
-//! **Every failure is an empty set, never an error.** A session with no
-//! boundary, a boundary whose metadata is null, bytes that are not JSON, JSON
-//! that is not an object and an object with no `preservedMessages.uuids` all
-//! read as "nothing is known to have been dropped", which is the same silence
-//! the rest of injection answers with. The format is one undocumented example
-//! wide; a reader that threw would turn a shape change upstream into a prompt
-//! that fails.
+//! **Every failure is an empty set, never an error.** A boundary whose
+//! metadata is null, bytes that are not JSON, JSON that is not an object and an
+//! object with no `preservedMessages.uuids` all read as "nothing is known to
+//! have been dropped", which is the same silence the rest of injection answers
+//! with. The format is one undocumented example wide; a reader that threw would
+//! turn a shape change upstream into a prompt that fails.
+//!
+//! **A session with no boundary row is `None`, not an empty set**, and the
+//! difference is what D-08's flag turns on: an empty set means the compaction
+//! is accounted for and the debt is paid, while no row at all may only mean the
+//! ingest that commits it is still running. Collapsing the two would drop a
+//! compaction's turns on exactly the contended machine that produced them.
 
 use std::collections::BTreeSet;
 
@@ -39,9 +44,11 @@ use rusqlite::{Connection, OptionalExtension};
 
 /// The turns of `session_key` that the most recent compaction dropped.
 ///
-/// Empty for a session that has never been compacted, and empty for every
-/// unreadable boundary - see the module doc. The ids are `turns.id`, so a
-/// caller filters candidates against this set without a second query.
+/// `None` when this session has no boundary row: nothing compacted it, or the
+/// ingest that would say so has not committed yet. `Some` when a boundary was
+/// there, empty for every unreadable one - see the module doc. The ids are
+/// `turns.id`, so a caller filters candidates against the set without a second
+/// query.
 ///
 /// **The most recent boundary and not every boundary.** A session compacted
 /// twice dropped the first boundary's turns long ago and the model has been
@@ -49,30 +56,30 @@ use rusqlite::{Connection, OptionalExtension};
 /// now. Ordered by `turn_seq`, which is byte order within the transcript and
 /// total, rather than by `ts` - 31 of 62 sampled real transcripts carry a
 /// record whose timestamp runs backwards.
-pub fn dropped(conn: &Connection, session_key: &str) -> BTreeSet<i64> {
-    let Some((turn_seq, metadata)) = boundary(conn, session_key) else {
-        return BTreeSet::new();
-    };
+pub fn dropped(conn: &Connection, session_key: &str) -> Option<BTreeSet<i64>> {
+    let (turn_seq, metadata) = boundary(conn, session_key)?;
     let preserved = preserved_uuids(metadata.as_deref());
     if preserved.is_empty() {
         // Not "everything before the boundary was dropped": an unreadable
         // metadata blob says nothing about what survived, and reading it as
         // "all of it" would offer the model back the turns it is still looking
-        // at.
-        return BTreeSet::new();
+        // at. The boundary was still there, so the compaction is accounted for.
+        return Some(BTreeSet::new());
     }
-    turns_before(conn, session_key, turn_seq)
-        .into_iter()
-        .filter(|(_, uuid)| match uuid {
-            Some(uuid) => !preserved.contains(uuid),
-            // A turn the transcript gave no uuid cannot be shown to have been
-            // dropped, only to be absent from a list it could never appear in.
-            // Injection is precision-first (`DESIGN-BRIEF.md:245`), so the
-            // unprovable case is left out.
-            None => false,
-        })
-        .map(|(id, _)| id)
-        .collect()
+    Some(
+        turns_before(conn, session_key, turn_seq)
+            .into_iter()
+            .filter(|(_, uuid)| match uuid {
+                Some(uuid) => !preserved.contains(uuid),
+                // A turn the transcript gave no uuid cannot be shown to have
+                // been dropped, only to be absent from a list it could never
+                // appear in. Injection is precision-first
+                // (`DESIGN-BRIEF.md:245`), so the unprovable case is left out.
+                None => false,
+            })
+            .map(|(id, _)| id)
+            .collect(),
+    )
 }
 
 /// `(turn_seq, metadata)` of the session's most recent compaction boundary.

@@ -66,6 +66,16 @@ pub struct Payload<'a> {
     pub source: Option<&'a str>,
 }
 
+/// The `SessionStart` `source` a compaction fires under (D-08).
+///
+/// Observed rather than inferred: a temporary matcher-less `SessionStart` entry
+/// appending its stdin to a file produced `source` `"startup"` at session start
+/// and `source` `"compact"` once a `/compact` finished, under one `session_id`
+/// (`crates/verbatim/src/cmd/hook.rs`, PLAN-1 task 5). That is what makes
+/// INJ-05's trigger the event rather than D-08's fallback of reading the
+/// boundary row at every prompt and racing the ingest for it.
+pub const COMPACT_SOURCE: &str = "compact";
+
 /// How long an injection read waits behind a writer before giving up.
 ///
 /// `store::open` sets five seconds, which is right for a writer and wrong here

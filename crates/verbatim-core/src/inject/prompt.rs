@@ -33,6 +33,15 @@
 //! scores are not comparable across queries, and free text is the weakest
 //! signal in the hierarchy and the one that fires the most false positives.
 //!
+//! **The one prompt after a compaction asks a different pool (INJ-05).** A
+//! `SessionStart` whose `source` is `compact` leaves a flag in the session's
+//! state file; the next prompt spends it, looks through a wider ranked window,
+//! and keeps only the turns that just fell out of the model's context (D-07).
+//! The threshold is NOT relaxed inside that pool and the suppressions still
+//! apply - one definition of relevance for both paths - and the flag clears
+//! only once a boundary row was actually there to read, so a prompt that beat
+//! the ingest to it carries the debt forward rather than losing it.
+//!
 //! **Nothing decompresses a session until something has fired.** One excerpt
 //! materializes a whole compressed session - p90 1.03 MB, max 10.1 MB over the
 //! real corpus - so the search runs with excerpts off (D-13) and the at most
@@ -41,8 +50,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use rusqlite::Connection;
+
 use super::state::{Reason, State};
-use super::Payload;
+use super::{compaction, Payload};
 use crate::config::Config;
 use crate::index::entity::{self, normalize_path};
 use crate::recall::search::{self, Request};
@@ -54,6 +65,18 @@ use crate::recall::{excerpt, Hit, Query, Scope};
 /// seen below the top three, and far narrower than `CANDIDATE_POOL`, which the
 /// re-rank already fixes: ten rows of seven small columns, no blob touched.
 const RANKED: usize = 10;
+
+/// How many ranked hits the one prompt after a compaction looks through
+/// (INJ-05).
+///
+/// Wider than [`RANKED`] because that window is about to be cut down to one
+/// session's dropped turns, and a window of ten would mostly return turns the
+/// pool then discards. It costs what a wider window costs and no more: the
+/// excerpt step is already skipped until the threshold has fired (D-13), so
+/// these are small columns and no blob is touched. It is [`search::MAX_RESULTS`]
+/// because that is the ceiling `search::run` clamps to anyway, and asking for
+/// more would be a number that reads as a decision and is not one.
+const COMPACTED_RANKED: usize = search::MAX_RESULTS;
 
 /// The rank within which one matched entity is enough (INJ-03).
 const ENTITY_RANK: usize = 3;
@@ -195,17 +218,35 @@ fn selected(data_dir: &Path, config: &Config, payload: &Payload) -> Option<Fired
 
     let store = super::open(data_dir)?;
     let conn = store.conn();
+
+    let mut state = State::load(data_dir, payload.session_id);
+    let before = state.clone();
+    let current = current_session(payload);
+    // D-08: what a compaction owes this session, or nothing. Derived before the
+    // search because it is what decides how wide the search is.
+    let dropped = owed(conn, &mut state, current.as_deref());
+
     let request = Request::new(query_of(prompt, Some(cwd)), Scope::Directory(cwd.into()))
-        .limit(RANKED)
+        .limit(if dropped.is_some() {
+            COMPACTED_RANKED
+        } else {
+            RANKED
+        })
         .candidates(candidates)
         .excerpts(false);
     // D-12: the scope is the payload's `cwd` and `search::run` resolves it,
     // which is also where an excluded project becomes an empty result.
-    let response = search::run(conn, config, &request).ok()?;
+    let response = match search::run(conn, config, &request) {
+        Ok(response) => response.hits,
+        // Not a `?`: the flag may have just been consumed, and losing that
+        // write would offer the same compaction's turns again on the next
+        // prompt.
+        Err(_) => Vec::new(),
+    };
 
-    let mut state = State::load(data_dir, payload.session_id);
-    let before = state.clone();
-    let mut hits = surviving(&mut state, eligible(response.hits), payload);
+    let threshold = eligible(response);
+    let pooled = within(threshold, dropped.as_ref());
+    let mut hits = surviving(&mut state, pooled, current.as_deref(), dropped.as_ref());
 
     // Now, and only now, is a session worth decompressing - and only for the
     // turns that survived both the threshold and the suppressions, since a
@@ -257,6 +298,45 @@ fn eligible(hits: Vec<Hit>) -> Vec<Hit> {
         .collect()
 }
 
+/// What a compaction owes this session, consuming the flag that says so (D-08).
+///
+/// `None` on the ordinary path, which is every prompt but one per compaction:
+/// no flag, no query, no cost. `None` too when the flag is set and the answer
+/// cannot be had yet - a payload naming no transcript this archive knows, or a
+/// boundary row the ingest that is racing this prompt has not committed. Those
+/// leave the flag SET, which is the whole of why it is a flag: the debt carries
+/// to the following prompt instead of being lost to the race.
+///
+/// `Some` means a boundary row was there and the compaction is accounted for,
+/// so the flag clears - even when the set is empty, and even if nothing that
+/// follows passes the threshold. INJ-05 is one prompt's worth of debt, not a
+/// standing mode the session never leaves.
+fn owed(conn: &Connection, state: &mut State, current: Option<&str>) -> Option<BTreeSet<i64>> {
+    if !state.compaction_owed {
+        return None;
+    }
+    let dropped = compaction::dropped(conn, current?)?;
+    state.compaction_owed = false;
+    Some(dropped)
+}
+
+/// The turns of `hits` the compaction pool admits.
+///
+/// Everything, on the ordinary path. On the one prompt after a compaction, only
+/// what fell out of the model's context - and applied AFTER the threshold, on
+/// purpose: filtering first would renumber the ranks, and a turn that placed
+/// twentieth overall would arrive at the threshold looking like a rank-1 hit.
+/// One definition of relevance for both paths (INJ-03), and "never on a
+/// free-text-only match" is not conditioned on a compaction having happened.
+fn within(hits: Vec<Hit>, dropped: Option<&BTreeSet<i64>>) -> Vec<Hit> {
+    let Some(dropped) = dropped else {
+        return hits;
+    };
+    hits.into_iter()
+        .filter(|hit| dropped.contains(&hit.turn_id))
+        .collect()
+}
+
 /// The turns that pass INJ-04, capped at [`MAX_TURNS`], recording every refusal
 /// in `state`.
 ///
@@ -264,11 +344,15 @@ fn eligible(hits: Vec<Hit>) -> Vec<Hit> {
 /// that answers is the one recorded: they can overlap - the brief's own session
 /// can be the one the user is looking at after a resume - and a turn refused
 /// twice for two reasons would say no more than a turn refused once.
-fn surviving(state: &mut State, hits: Vec<Hit>, payload: &Payload) -> Vec<Hit> {
-    let current = current_session(payload);
+fn surviving(
+    state: &mut State,
+    hits: Vec<Hit>,
+    current: Option<&str>,
+    dropped: Option<&BTreeSet<i64>>,
+) -> Vec<Hit> {
     let mut out: Vec<Hit> = Vec::new();
     for hit in hits {
-        match refusal(state, &hit, current.as_deref()) {
+        match refusal(state, &hit, current, dropped) {
             Some(reason) => state.record_suppressed(hit.turn_id, reason),
             None => out.push(hit),
         }
@@ -280,11 +364,24 @@ fn surviving(state: &mut State, hits: Vec<Hit>, payload: &Payload) -> Vec<Hit> {
 }
 
 /// Why this turn may not be injected, or `None` if it may.
-fn refusal(state: &State, hit: &Hit, current: Option<&str>) -> Option<Reason> {
+///
+/// "Visible in this session" means in this session AND not known to have fallen
+/// out of the model's context. Without that second half INJ-04 would suppress
+/// the whole of INJ-05: every turn a compaction dropped belongs to the session
+/// the user is looking at, which is exactly why it is worth offering back. On
+/// the ordinary path no dropped set is derived - that is a query per prompt for
+/// a fact almost every prompt has no use for - so nothing is exempt there.
+fn refusal(
+    state: &State,
+    hit: &Hit,
+    current: Option<&str>,
+    dropped: Option<&BTreeSet<i64>>,
+) -> Option<Reason> {
     if state.was_injected(hit.turn_id) {
         return Some(Reason::AlreadyInjected);
     }
-    if current == Some(hit.session_key.as_str()) {
+    let fell_out = dropped.is_some_and(|dropped| dropped.contains(&hit.turn_id));
+    if current == Some(hit.session_key.as_str()) && !fell_out {
         return Some(Reason::VisibleInSession);
     }
     if state.was_briefed(hit.turn_id) {

@@ -93,8 +93,11 @@ impl Bench {
             .collect()
     }
 
+    /// The dropped set of a session that HAS a boundary, which every case here
+    /// but the last one is about.
     fn dropped(&self) -> Vec<i64> {
         compaction::dropped(&self.conn(), &self.session_key)
+            .expect("the fixture archived a boundary")
             .into_iter()
             .collect()
     }
@@ -205,14 +208,29 @@ fn a_boundary_that_cannot_be_read_drops_nothing() {
 
 /// A session nothing ever compacted, which is nearly every session: no
 /// boundary row, no dropped set, no error.
+///
+/// `None` rather than an empty set, and the two are not the same answer. An
+/// empty set means a boundary was read and dropped nothing this build can
+/// name; `None` means no boundary is there yet, which on the prompt path is a
+/// debt to carry rather than one to settle (D-08).
 #[test]
-fn a_session_with_no_boundary_drops_nothing() {
+fn a_session_with_no_boundary_is_not_a_session_that_dropped_nothing() {
     let bench = bench();
-    assert!(compaction::dropped(&bench.conn(), "/no/such/session.jsonl").is_empty());
+    assert_eq!(
+        compaction::dropped(&bench.conn(), "/no/such/session.jsonl"),
+        None
+    );
 
-    bench
-        .conn()
-        .execute("DELETE FROM compaction_boundaries", [])
+    let conn = bench.conn();
+    conn.execute("UPDATE compaction_boundaries SET metadata = x'6e6f'", [])
         .unwrap();
-    assert!(bench.dropped().is_empty());
+    assert_eq!(
+        compaction::dropped(&conn, &bench.session_key),
+        Some(std::collections::BTreeSet::new()),
+        "an unreadable boundary is still a boundary"
+    );
+
+    conn.execute("DELETE FROM compaction_boundaries", [])
+        .unwrap();
+    assert_eq!(compaction::dropped(&conn, &bench.session_key), None);
 }
