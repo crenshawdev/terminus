@@ -1,13 +1,16 @@
 //! `verbatim install`: one command wires verbatim into Claude Code.
 //!
-//! It does four things and refuses to do any of them halfway:
+//! It does five things and refuses to do any of the first four halfway:
 //!
 //! 1. puts this build at the canonical stable path ([`binary`], D-08, INST-02),
 //! 2. writes the four exec-form hook entries into `settings.json`
 //!    ([`targets`], D-01),
 //! 3. registers the MCP server in `.claude.json` ([`targets`], D-05),
 //! 4. says what a low `cleanupPeriodDays` costs and what auto-compact costs, and
-//!    changes neither by itself (INST-04).
+//!    changes neither by itself (INST-04),
+//! 5. starts the backfill ([`start_backfill`], ING-11) - which is the one step
+//!    that cannot fail the install, because by then everything above it has
+//!    already succeeded.
 //!
 //! # Nothing is written before the answer (INST-03)
 //!
@@ -240,7 +243,69 @@ pub fn run(options: Options) -> Result<(), Failure> {
          settings.json are picked up by a session that is already running, with no restart.\n\
          That is measured behaviour rather than a documented contract."
     );
+
+    // Step 6, and the last thing install does.
+    start_backfill(&data_dir, &config);
     Ok(())
+}
+
+/// Start archiving the history that is already on disk, and return (ING-11).
+///
+/// The design brief's step 6, and deliberately the last thing install does: it
+/// gates nothing above it, and it returns nothing. Both halves of that matter.
+///
+/// **It cannot fail an install.** By the time this runs the binary is placed and
+/// both settings files are written, so the install has succeeded whatever
+/// happens here - and the next hook that fires would archive the same tree
+/// anyway, which is why a backfill that will not start is one reported line
+/// rather than a non-zero exit. Returning `()` is how that is enforced rather
+/// than remembered: there is no error for a caller to propagate by accident.
+///
+/// **It does not wait.** The work runs detached, so install returns while a
+/// gigabyte is still being read. There is no log file by design, so the summary
+/// has to say where to watch it - `verbatim status` reads the `runs` row the
+/// pass writes.
+fn start_backfill(data_dir: &Path, config: &Config) {
+    use crate::cmd::backfill;
+
+    println!();
+    let estimate = match backfill::estimate(data_dir, config) {
+        Ok(estimate) => estimate,
+        Err(why) => {
+            println!(
+                "  problem: the backfill could not be sized ({}).",
+                reason(why)
+            );
+            println!("  nothing else is affected; the next hook archives the same tree.");
+            return;
+        }
+    };
+    backfill::print_estimate(&estimate);
+
+    match backfill::start(data_dir, &estimate) {
+        Ok(true) => println!(
+            "archiving that now, in a detached process - this install is done and the\n\
+             archive fills in behind it. `verbatim status` is where to watch it: there is\n\
+             no log file by design, and the pass writes a `runs` row this reads."
+        ),
+        // Nothing on disk to archive, so nothing was started and no store was
+        // created by installing. The hooks take it from the first session.
+        Ok(false) => println!(
+            "nothing to archive yet - the hooks above start doing that from your next\n\
+             session, and `verbatim status` is where to watch it."
+        ),
+        Err(why) => {
+            println!("  problem: {}", reason(why));
+        }
+    }
+}
+
+/// A [`Failure`]'s text, for a line that reports rather than returns.
+fn reason(failure: Failure) -> String {
+    match failure {
+        Failure::Operational(why) | Failure::Misuse(why) => why,
+        Failure::Silent => "no reason was recorded".to_owned(),
+    }
 }
 
 /// The advisories install gives and the settings it never changes (INST-04).

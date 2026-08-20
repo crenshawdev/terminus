@@ -81,12 +81,19 @@ const MEASURED_BYTES: u64 = 1_413_907_546;
 const MEASURED_MS: u64 = 49_089;
 
 /// What a backfill would have to read, before it reads any of it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Estimate {
     /// Transcripts discovery yields under the configured roots.
     pub transcripts: usize,
     /// Bytes past the stored watermarks: the work that is actually left.
     pub unread_bytes: u64,
+    /// Directories the walk could not list, with why.
+    ///
+    /// Part of the estimate rather than a separate failure, because that is
+    /// what they are: a tree that cannot be listed is not zero transcripts, it
+    /// is an unknown number of them, and a count printed without saying so
+    /// would read as "there is nothing to archive".
+    pub unreadable: Vec<(std::path::PathBuf, String)>,
 }
 
 impl Estimate {
@@ -123,6 +130,7 @@ pub fn estimate(data_dir: &Path, config: &Config) -> Result<Estimate, Failure> {
     Ok(Estimate {
         transcripts: found.transcripts.len(),
         unread_bytes,
+        unreadable: found.unreadable,
     })
 }
 
@@ -154,7 +162,13 @@ fn watermarks(data_dir: &Path, config: Config) -> Result<HashMap<String, u64>, F
     Ok(out)
 }
 
-/// The estimate as the three lines a user reads.
+/// The estimate as the lines a user reads.
+///
+/// All of it on stdout, problems included, and that is deliberate: `backfill`
+/// is a human-only command like `install` and `uninstall` (D-24) with no
+/// `--json` document to keep clean, and `install` prints this block inside its
+/// own summary. A directory that could not be listed belongs beside the count
+/// it silently reduced, not on a different stream.
 pub fn print_estimate(estimate: &Estimate) {
     println!(
         "{} transcript(s), {} not yet archived",
@@ -168,6 +182,13 @@ pub fn print_estimate(estimate: &Estimate) {
         bytes(MEASURED_BYTES),
         duration(std::time::Duration::from_millis(MEASURED_MS)),
     );
+    for (path, reason) in &estimate.unreadable {
+        println!(
+            "  problem: {} could not be listed ({reason}), so nothing under it is counted \
+             above and nothing under it will be archived",
+            path.display()
+        );
+    }
 }
 
 /// A byte count a human reads, in powers of ten because that is how disk sizes
@@ -241,7 +262,9 @@ pub fn run(args: Args) -> Result<(), Failure> {
     let config = Config::load()?;
     let estimate = estimate(&data_dir, &config)?;
     print_estimate(&estimate);
-    start(&data_dir)
+    // The zeroes printed above already say why nothing started, so an empty
+    // tree needs no line of its own here.
+    start(&data_dir, &estimate).map(drop)
 }
 
 /// Hand the work to a process that outlives this one, and return (AC8,
@@ -251,16 +274,28 @@ pub fn run(args: Args) -> Result<(), Failure> {
 /// from a shell that is then closed, or from a hook Claude Code later kills,
 /// keeps going. Nothing is waited for: the point of the command is that the
 /// shell comes back.
-pub fn start(data_dir: &Path) -> Result<(), Failure> {
-    super::spawn::detached(&["backfill", &format!("--{WORK_FLAG}")]).map_err(|e| {
-        Failure::Operational(format!(
-            "the backfill could not be started: {e}. \
-             run `verbatim ingest` to archive the tree in the foreground, or let the \
-             next hook do it - the work is the same either way, and the store at {} \
-             is untouched",
-            data_dir.display()
-        ))
-    })
+///
+/// `false` means there was nothing to hand over. A tree with no transcripts in
+/// it is archived by doing nothing, and a pass over it would create a store and
+/// a WAL as the side effect of an install on a machine that has never run
+/// Claude Code - the exact state AC6 asks `doctor` to leave alone and
+/// [`crate::cmd::read`] refuses to bring into being. The estimate is already
+/// the count of what is there, so this costs no second walk.
+pub fn start(data_dir: &Path, estimate: &Estimate) -> Result<bool, Failure> {
+    if estimate.transcripts == 0 {
+        return Ok(false);
+    }
+    super::spawn::detached(&["backfill", &format!("--{WORK_FLAG}")])
+        .map(|()| true)
+        .map_err(|e| {
+            Failure::Operational(format!(
+                "the backfill could not be started: {e}. \
+                 run `verbatim ingest` to archive the tree in the foreground, or let the \
+                 next hook do it - the work is the same either way, and the store at {} \
+                 is untouched",
+                data_dir.display()
+            ))
+        })
 }
 
 /// The detached child: one tree pass across [`WORKERS`] threads, and nothing on
@@ -362,6 +397,7 @@ mod tests {
         let whole = Estimate {
             transcripts: 3_120,
             unread_bytes: MEASURED_BYTES,
+            unreadable: Vec::new(),
         };
         assert_eq!(
             whole.duration(),
