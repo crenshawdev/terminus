@@ -99,6 +99,18 @@
       `cargo test --workspace` runs 0 of their 41 tests and still reports 304
       passed / 0 failed, so the two binaries carrying AC5/AC6/AC7's
       process-level assertions are silently absent from the default command.
+- [ ] (phase 4) The npm shim does not forward signals to the child: spawnSync blocks the event loop, so a SIGTERM aimed at the shim's own PID kills node and orphans the binary. Ctrl-C and job control signal the whole process group and are unaffected. risk_surface review finding, adjudicated downgraded (medium).
+- [ ] (phase 4) Hoist pass::record_pass and pass::walk's per-file failure arm into ingest/mod.rs (or make them pub(crate)) so pass and backfill share one runs-row writer and one skip rule. Needs a plan whose lease covers crates/verbatim-core/src/ingest/pass.rs.
+- [ ] (phase 4) The four-worker backfill pipeline is only 8% faster than the sequential pass on the real corpus (49,089 ms vs 53,007 ms). The remaining cost is the single SQLite writer's: batch derived-row inserts, or move derive_turn's text expansion and entity extraction onto the workers. Measurement-led task, not a guess.
+- [ ] (phase 4) verbatim status can fail with 'sqlite: database is locked' in the ~1 ms window while a backfill creates the store and sets journal_mode=wal (1 of 20 polls, at t=1 ms). Pre-existing in Store::open.
+- [ ] (phase 4) AC3's Windows half - no console window, no handle inherited from the hook - is unrunnable on Linux and stays a human-verify on a Windows machine.
+- [ ] (phase 4) npm's os/cpu selection of an optionalDependency cannot be exercised locally, only the shim's resolution of an already-placed platform package. AC9's remaining risk lives in the publish step (D-21).
+- [ ] (phase 4) Four of the five npm platform packages carry no binary; they arrive with cross-compilation in a later shipping step. pack-local.sh fails with a named message on any host it cannot stage.
+- [ ] (phase 4) The npm name 'verbatim' and the '@verbatim' scope have not been checked for availability, and crates.io's 'verbatim' is already taken. Publish-step question for the human.
+- [ ] (phase 4) ingest::backfill deliberately does not honour fault::pass_fails_after (the 'a pass that died still leaves its runs row' fault). The sequential walk still has it; add it if a later task wants to kill a backfill's walk rather than its process.
+- [ ] (phase 4) cargo fmt --check reports two pre-existing diffs in crates/verbatim/tests/hook.rs, both on lines committed in plan 1 and neither in code any later pass wrote. cargo fmt closes them whenever the file is next edited for its own reasons.
+- [ ] (phase 4) Declined an engines.node field on the thin npm package - nothing in the Verify exercises a Node floor and the shim uses only long-present APIs. Add one when a task states a minimum.
+- [ ] (phase 4) shellcheck is not installed on this machine, so npm/pack-local.sh's static analysis was bash -n only.
 
 
 ## Seeds
