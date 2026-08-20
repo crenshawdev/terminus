@@ -1,0 +1,35 @@
+{
+  "phase": "4",
+  "trigger": "risk_surface",
+  "discriminator": "verify-5c20a4c",
+  "round": 1,
+  "base": "3f8e8f2",
+  "head": "5c20a4c",
+  "base_id": "3f8e8f2dfd00018473824aae23ce98a35a4eaa79",
+  "head_id": "5c20a4c8c957eb0f2e6bd91e60257de08185b003",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim/src/cmd/spawn.rs",
+      "line": 81,
+      "severity": "medium",
+      "claim": "`detached_from()` only fixes the first exec target; the handoff path still depends on `current_exe()` in the intermediate process, so this does not survive a stable-path swap/re-target between the initial spawn and the re-exec.",
+      "failure_scenario": "If another install/package-manager action replaces or retargets the stable entry after `install` renames the binary but before the handoff child re-execs, the child resolves the changed path and either gets `ENOENT` or runs a different build, so the detached backfill still never starts.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": "Real mechanism, but it describes a property the double-fork hand-off already had rather than one this fix introduces, and it needs a second installer landing a rename inside the microseconds between the parent spawn and the intermediate's re-exec. Every hook spawn on the branch has always re-exec'd through current_exe() with the same window, so the fix strictly reduces the failure set it was written for and adds none. Below the blocker/high bar this gate halts on; recorded as an open item instead.",
+      "base_id": "3f8e8f2dfd00018473824aae23ce98a35a4eaa79",
+      "head_id": "5c20a4c8c957eb0f2e6bd91e60257de08185b003"
+    }
+  ]
+}
