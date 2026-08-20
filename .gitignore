@@ -1,3 +1,11 @@
 # Cadence's joined run record - local diagnostics only, one machine's routing/provider/worker events
 .planning/trace.jsonl
 /target
+
+# npm packaging artifacts. The per-platform packages carry a ~5 MB prebuilt
+# binary that npm/pack-local.sh stages in at pack time; the manifests are the
+# tracked part, the binaries never are. Same for the tarballs pack produces.
+npm/platforms/*/bin/verbatim
+npm/platforms/*/bin/verbatim.exe
+npm/**/*.tgz
+npm/**/node_modules/
