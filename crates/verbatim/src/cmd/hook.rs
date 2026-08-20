@@ -94,6 +94,19 @@ const MAX_PAYLOAD: u64 = 1 << 20;
 /// killing the hook.
 const DRAIN_DEADLINE: Duration = Duration::from_millis(500);
 
+/// The longest the hook waits on its own injection before abandoning it and
+/// writing nothing (INJ-06, D-03).
+///
+/// 50 ms is five times the 10 ms p99 wall budget
+/// `crates/verbatim/tests/hook.rs` asserts over 100 runs of every event - so an
+/// ordinary injection is never near it - and a hundredth of the five-second
+/// wait `store::open`'s default busy handler would impose on a prompt submitted
+/// while a backfill holds the store, which was measured at 49 s over the real
+/// corpus. The number that matters is the one it is far below: the user is
+/// waiting on this, and a memory system that costs a visible pause on every
+/// prompt has already lost the argument for existing.
+const INJECT_DEADLINE: Duration = Duration::from_millis(50);
+
 /// The five fields of the hook payload injection reads.
 ///
 /// Owned `String`s rather than borrows of the drained buffer, because the
@@ -169,31 +182,82 @@ pub fn run(event: &str) -> Result<(), Failure> {
     }
 
     let payload = drain(event);
-    if let Some(text) = inject(event, &payload) {
+    if let Some(text) = inject(event, payload) {
         emit(event, &text);
     }
 
     Ok(())
 }
 
-/// The text this event injects, or nothing.
+/// One event's injection arm, as the library declares it.
+type Arm = fn(&std::path::Path, &verbatim_core::Config, &inject::Payload) -> Option<String>;
+
+/// The text this event injects, or nothing, and never later than
+/// [`INJECT_DEADLINE`].
 ///
 /// Two of the four events have an `additionalContext` variant and the other two
 /// return here without opening anything - a `SessionEnd` that read the store
-/// would be paying for an answer with nowhere to go. Resolving the data
-/// directory and loading the config are inside the `Option` rather than ahead
-/// of it for the same reason INJ-06 gives about the store: a `verbatim.toml`
-/// that does not parse is a config error on a `verbatim search` and one
-/// uninjected event here.
-fn inject(event: &str, payload: &Payload) -> Option<String> {
-    let arm = match event {
+/// would be paying for an answer with nowhere to go.
+///
+/// **The work runs on a thread this command starts and never joins**, the same
+/// shape and the same reason as [`drain`]: a blocking SQLite call cannot be
+/// cancelled with `std` alone, so the only way to stop waiting is to stop
+/// waiting and let process exit take the thread with it. Abandoning it is safe
+/// because nothing on that thread writes, creates a directory or takes the
+/// ingest lock (INJ-06). This is the second of D-03's two mechanisms: the busy
+/// timeout `verbatim_core::inject` sets turns lock contention into an immediate
+/// `SQLITE_BUSY`, and this catches what a busy timeout cannot see - a slow
+/// query, a large blob, a `verbatim.toml` on a filesystem that has stopped
+/// answering.
+///
+/// **A panic is one silent event, not a wedged hook.** The unwind is caught and
+/// becomes no injection; the default panic hook has already said what happened
+/// on stderr, so nothing is added to it. `crates/verbatim-core`'s `977d0b4` is
+/// the precedent - the same failure, one layer down.
+///
+/// Resolving the data directory and loading the config happen inside the thread
+/// rather than ahead of it, so that they are inside the deadline too: a
+/// `verbatim.toml` that does not parse is a reported error on `verbatim search`
+/// and one uninjected event here.
+fn inject(event: &str, payload: Payload) -> Option<String> {
+    let arm: Arm = match event {
         "SessionStart" => inject::brief::session_start,
         "UserPromptSubmit" => inject::prompt::user_prompt_submit,
         _ => return None,
     };
-    let data_dir = super::data_dir().ok()?;
-    let config = verbatim_core::Config::load().ok()?;
-    arm(&data_dir, &config, &payload.borrowed())
+
+    let (done, injected) = mpsc::sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("verbatim-hook-inject".to_string())
+        .spawn(move || {
+            let text = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let data_dir = super::data_dir().ok()?;
+                let config = verbatim_core::Config::load().ok()?;
+                arm(&data_dir, &config, &payload.borrowed())
+            }))
+            .ok()
+            .flatten();
+            // The main thread may have given up and gone; a send with no
+            // receiver left is the timeout case reporting itself.
+            let _ = done.send(text);
+        });
+    if let Err(e) = worker {
+        eprintln!("verbatim: {event} could not start its injection: {e}");
+        return None;
+    }
+
+    match injected.recv_timeout(INJECT_DEADLINE) {
+        Ok(text) => text,
+        Err(RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "verbatim: {event} abandoned its injection after {} ms",
+                INJECT_DEADLINE.as_millis()
+            );
+            None
+        }
+        // The worker panicked and the default hook has already printed it.
+        Err(RecvTimeoutError::Disconnected) => None,
+    }
 }
 
 /// Write the one object the harness accepts, on one line.

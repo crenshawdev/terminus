@@ -30,6 +30,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use verbatim_core::testkit;
@@ -292,4 +293,105 @@ fn a_machine_with_no_archive_writes_nothing() {
         &payload("SessionStart", &bench.project(FIXTURE)),
     );
     empty_stdout(&output, "SessionStart with no store");
+}
+
+// ---------------------------------------------------------------------------
+// AC6: every way injection can fail is silence, inside the deadline
+
+/// How long a hook may take on a store it cannot read.
+///
+/// The deadline `cmd::hook` enforces is 50 ms and a debug-build spawn of this
+/// binary is tens of milliseconds, so a second is generous for both. It is what
+/// separates the two outcomes that matter: the abandoned work is bounded, or
+/// the user is looking at the five-second wait a default SQLite busy handler
+/// imposes - which is what one of these three cases really costs on the thread
+/// the hook walked away from.
+const DEADLINE: Duration = Duration::from_secs(1);
+
+/// One `UserPromptSubmit` against a broken store: exit 0, nothing on stdout,
+/// back inside the deadline.
+fn silent_inside_the_deadline(bench: &Bench, what: &str) {
+    let started = Instant::now();
+    let output = bench.hook(
+        "UserPromptSubmit",
+        &payload("UserPromptSubmit", &bench.project(FIXTURE)),
+    );
+    let elapsed = started.elapsed();
+
+    empty_stdout(&output, what);
+    assert!(
+        elapsed < DEADLINE,
+        "UserPromptSubmit took {elapsed:?} against {what}: the injection was \
+         not abandoned, it was waited on"
+    );
+}
+
+/// The store file deleted out from under a data directory that has one - an
+/// archive moved, a disk cleaned up, a `--purge` half way through.
+#[test]
+fn a_deleted_store_is_silence_inside_the_deadline() {
+    let bench = bench();
+    bench.ingest(FIXTURE);
+    std::fs::remove_file(bench.data_dir.join(verbatim_core::store::DB_FILE_NAME))
+        .expect("delete the store");
+
+    silent_inside_the_deadline(&bench, "a deleted store");
+}
+
+/// The store held outright by another connection, past the deadline.
+///
+/// `PRAGMA locking_mode = EXCLUSIVE` and not a bare `BEGIN EXCLUSIVE`: the
+/// store is in WAL mode, where a writer deliberately does not block readers, so
+/// the write lock alone would leave this test asserting nothing. Exclusive
+/// locking mode is what actually keeps a reader out.
+///
+/// Measured 2026-08-20, and worth writing down because it is not what the
+/// design assumed: with the holder in ANOTHER process, as here and as on a real
+/// machine, `Store::open_read_only` fails in about 6 ms rather than waiting out
+/// the five-second busy timeout it sets - SQLite reports the wal-index conflict
+/// straight back. The same lock held by a connection in the SAME process does
+/// wait the full five seconds (`verbatim_core::inject`'s unit test). So this
+/// case is bounded by SQLite and the hook's watchdog is not what saves it; the
+/// watchdog is still the only bound on the cases SQLite does not report at
+/// all: a slow query, a large blob, a config file on a filesystem that stopped
+/// answering.
+#[test]
+fn a_store_held_by_an_exclusive_writer_is_silence_inside_the_deadline() {
+    let bench = bench();
+    bench.ingest(FIXTURE);
+
+    let holder =
+        rusqlite::Connection::open(bench.data_dir.join(verbatim_core::store::DB_FILE_NAME))
+            .expect("open the store as the holder");
+    holder
+        .pragma_update(None, "locking_mode", "exclusive")
+        .unwrap();
+    holder
+        .execute_batch("BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS held (x);")
+        .expect("take the exclusive lock");
+
+    silent_inside_the_deadline(&bench, "a store held by an exclusive writer");
+
+    // Held for the whole of it: a lock released early would make the timing
+    // assertion above true for the wrong reason.
+    holder
+        .query_row("SELECT count(*) FROM held", [], |r| r.get::<_, i64>(0))
+        .expect("the holder still holds the store");
+    drop(holder);
+}
+
+/// A `verbatim.db` that is not a database: a half-restored backup, a
+/// sync-conflict file, a truncated copy.
+#[test]
+fn a_store_that_is_not_a_database_is_silence_inside_the_deadline() {
+    let bench = bench();
+    std::fs::create_dir_all(&bench.data_dir).unwrap();
+    std::fs::create_dir_all(bench.project(FIXTURE)).unwrap();
+    std::fs::write(
+        bench.data_dir.join(verbatim_core::store::DB_FILE_NAME),
+        b"this is not a database, it is a note about one",
+    )
+    .unwrap();
+
+    silent_inside_the_deadline(&bench, "a verbatim.db that is not a database");
 }
