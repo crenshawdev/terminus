@@ -82,13 +82,83 @@ pub struct Fired {
 
 /// Render the injection for one `UserPromptSubmit`, or nothing.
 ///
-/// Nothing is the ordinary answer and the one this arm exists to protect.
-pub fn user_prompt_submit(
-    _data_dir: &Path,
-    _config: &Config,
-    _payload: &Payload,
-) -> Option<String> {
-    None
+/// Nothing is the ordinary answer and the one this arm exists to protect: the
+/// hook then writes nothing at all and exits 0, which is what every prompt that
+/// names something the archive has not seen gets.
+pub fn user_prompt_submit(data_dir: &Path, config: &Config, payload: &Payload) -> Option<String> {
+    render(
+        &select(data_dir, config, payload).hits,
+        config.prompt_chars(),
+    )
+}
+
+/// The ceiling on one injection, whatever `verbatim.toml` configures.
+///
+/// Bundle 2.1.237 persists a hook stdout longer than 10,000 characters to disk
+/// and hands the model a reference to the file instead of the text - so past
+/// that, injected context stops being context and becomes a path. The same
+/// number bounds the brief, for the same reason and from the same measurement.
+pub const MAX_PROMPT_CHARS: usize = 10_000;
+
+/// The turns that fired, as the text the hook emits, inside `budget`.
+///
+/// Deterministic: the ranked order, stored timestamps at day resolution, no
+/// clock read anywhere. Two runs of one prompt against an unchanged store
+/// render the same bytes, which is the same property INJ-02 asks of the brief
+/// and is worth as much here - an injection that changes while the archive does
+/// not is one nobody can reason about.
+fn render(hits: &[Hit], budget: usize) -> Option<String> {
+    if hits.is_empty() {
+        return None;
+    }
+    let budget = budget.min(MAX_PROMPT_CHARS);
+
+    // What the lines cost with no text in them: the ids, the dates and the
+    // head. Measured rather than estimated, so the share below is what is
+    // actually left.
+    let empty: Vec<String> = hits.iter().map(|_| String::new()).collect();
+    let bare = super::chars(&assemble(hits, &empty));
+    let share = budget.saturating_sub(bare) / hits.len();
+
+    let texts: Vec<String> = hits
+        .iter()
+        .map(|hit| super::clip(hit.excerpt.trim(), share))
+        .collect();
+    // The final clip is the backstop and only that: it fires when the ids and
+    // dates alone are over budget, which no cut to the quoted turns can fix.
+    Some(super::clip(&assemble(hits, &texts), budget))
+}
+
+/// The head line and one line per turn.
+///
+/// The turn id is first on each line and unmissable, because it is the argument
+/// `recall_get` and `verbatim show` take: the model that wants the whole turn
+/// rather than the sentence has to be able to ask for it.
+fn assemble(hits: &[Hit], texts: &[String]) -> String {
+    let mut out = String::from(
+        "Verbatim recall - past turns from this project that match what was just asked:",
+    );
+    for (hit, text) in hits.iter().zip(texts) {
+        out.push_str("\n- turn ");
+        out.push_str(&hit.turn_id.to_string());
+        if let Some(day) = hit.ts.as_deref().map(day) {
+            out.push_str(&format!(" ({day})"));
+        }
+        out.push_str(": ");
+        out.push_str(text);
+    }
+    out
+}
+
+/// The day of a stored timestamp, at day resolution.
+///
+/// `get` and not `&ts[..10]`, for the reason `cmd::search::day` states: `len`
+/// counts bytes, the slice needs a char boundary, and a stored `ts` is any JSON
+/// string the transcript carried. A timestamp with a multi-byte character
+/// across byte 10 panicked a whole command once already, and a panic here is a
+/// prompt that emits nothing.
+fn day(ts: &str) -> &str {
+    ts.get(..10).unwrap_or(ts)
 }
 
 /// The turns one prompt fires on: the whole of INJ-03's decision.

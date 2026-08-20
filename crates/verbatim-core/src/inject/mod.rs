@@ -162,6 +162,35 @@ pub(crate) fn push_exclusion(
     sql.push_str("))");
 }
 
+/// How many characters a string is, which is what an injection budget counts
+/// (D-16).
+///
+/// Characters and not bytes and not tokens: the workspace has no tokenizer and
+/// will not grow one on the cold-start path, and bytes would under-count the
+/// same text by a factor of three in another script.
+pub(crate) fn chars(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// `text`, cut to `budget` characters with [`crate::recall::excerpt::ELISION`]
+/// where it was cut.
+///
+/// One spelling of three dots in the product, and cut on a character boundary:
+/// a byte-indexed slice through a multi-byte character is a panic, and a panic
+/// on either injection path is an event that emits nothing.
+pub(crate) fn clip(text: &str, budget: usize) -> String {
+    if chars(text) <= budget {
+        return text.to_owned();
+    }
+    let marker = chars(crate::recall::excerpt::ELISION);
+    if budget <= marker {
+        return text.chars().take(budget).collect();
+    }
+    let mut out: String = text.chars().take(budget - marker).collect();
+    out.push_str(crate::recall::excerpt::ELISION);
+    out
+}
+
 /// One count over the visible rows of a scoped project.
 pub(crate) fn count(conn: &Connection, head: &str, scoped: &Scoped) -> Result<i64> {
     let mut sql = String::from(head);

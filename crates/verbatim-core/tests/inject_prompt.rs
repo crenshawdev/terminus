@@ -510,3 +510,86 @@ fn two_entities_on_one_turn_fire_from_below_the_top_three() {
     assert!(!injected.contains(&single));
     assert_eq!(fired.reads.blobs, 1);
 }
+
+/// A config whose `[injection] prompt_chars` is what the test says, loaded
+/// through the file the binary loads one from - the budget has to reach the
+/// render, and a struct built in memory would not prove that it does.
+fn config_with(bench: &Bench, prompt_chars: usize) -> Config {
+    let dir = bench.work.join(format!("config-{prompt_chars}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("verbatim.toml"),
+        format!("[injection]\nprompt_chars = {prompt_chars}\n"),
+    )
+    .unwrap();
+    Config::load_from(&dir).unwrap()
+}
+
+/// What the hook actually emits: the turn id, the day, the text - and the same
+/// bytes twice against an unchanged store.
+#[test]
+fn the_injected_text_names_the_turn_and_the_day_and_repeats_itself() {
+    let bench = bench();
+    let cwd = bench.project();
+    let raw = format!("what changed in {RELATIVE}");
+    let payload = bench.payload(&cwd, &raw);
+
+    let text = prompt::user_prompt_submit(&bench.data_dir, &Config::default(), &payload)
+        .expect("the prompt names a path the archive stored");
+    let fired = bench.fired(&cwd, &raw);
+    assert!(
+        text.contains(&fired.hits[0].turn_id.to_string()),
+        "the id `recall_get` takes is not in the injection: {text}"
+    );
+    assert!(
+        text.contains("2026-08-13"),
+        "no day-resolution date: {text}"
+    );
+    assert!(
+        !text.contains("09:00"),
+        "a time of day is volatile text: {text}"
+    );
+    assert!(
+        text.contains("lanternFlicker"),
+        "the injected text is not the edit's own: {text}"
+    );
+
+    assert_eq!(
+        prompt::user_prompt_submit(&bench.data_dir, &Config::default(), &payload),
+        Some(text),
+        "two runs against an unchanged store rendered different bytes"
+    );
+
+    // The other half of AC3, at the same seam.
+    let bare = bench.payload(&cwd, "what changed");
+    assert_eq!(
+        prompt::user_prompt_submit(&bench.data_dir, &Config::default(), &bare),
+        None
+    );
+}
+
+/// D-16: the budget is enforced in characters, and it binds.
+///
+/// The small budget is the point. At the default of 4,000 nothing the fixture
+/// produces is ever cut, so a test that only ran at the default would assert
+/// that the budget was never reached rather than that it holds.
+#[test]
+fn the_injection_is_cut_to_the_configured_budget() {
+    let bench = bench();
+    let cwd = bench.project();
+    let raw = format!("what changed in {RELATIVE}");
+    let payload = bench.payload(&cwd, &raw);
+
+    let full = prompt::user_prompt_submit(&bench.data_dir, &Config::default(), &payload).unwrap();
+    for budget in [100, 90, 3] {
+        let text =
+            prompt::user_prompt_submit(&bench.data_dir, &config_with(&bench, budget), &payload)
+                .unwrap();
+        assert!(
+            text.chars().count() <= budget,
+            "{} characters against a budget of {budget}: {text}",
+            text.chars().count()
+        );
+        assert!(text.chars().count() < full.chars().count());
+    }
+}
