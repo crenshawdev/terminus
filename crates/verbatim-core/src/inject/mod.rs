@@ -33,6 +33,7 @@
 //! the wrong project or to `Reason::UnknownProject`.
 
 pub mod brief;
+pub mod compaction;
 pub mod prompt;
 pub mod state;
 
