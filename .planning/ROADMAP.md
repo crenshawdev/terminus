@@ -10,7 +10,7 @@ The archive is the product, so it is built first and everything else is built on
 - [x] **Phase 2: Ingest At Scale** - discovery, identity, exclusion and crash resilience over a real transcript tree
 - [x] **Phase 3: Recall** - Rust-side expansion, entity extraction, terminal search, and the three MCP tools
 - [x] **Phase 4: Hooks And Install** - detached hook spawn, npm install, backfill, doctor and uninstall
-- [ ] **Phase 5: Context Injection** - the SessionStart resume brief and precision-first prompt injection
+- [x] **Phase 5: Context Injection** - the SessionStart resume brief and precision-first prompt injection
 - [ ] **Phase 6: Feedback Loop** - decision logging, outcome labels, offline replay, and stats that prove precision
 - [ ] **Phase 7: Observations** - mechanical facts, opt-in LLM judgment, and the egress boundary
 - [ ] **Phase 8: Retention And Lifecycle** - retention actions, capture mode, compaction, usage, snapshots, export and relocation

@@ -66,9 +66,9 @@ evidence: a_prompt_that_matches_only_free_text_writes_nothing passes for both sh
 
 ### 8. Live resume brief in a real session
 expected: Starting a real Claude Code session in a project with indexed history, the session begins with the resume brief: last session's date, branch, and final exchange, with no error banner from the hook.
-status: pending
+status: pass
 first_pass: fail
-reported: nothing shows up
+reported: that was a quick answer no search - fresh interactive session in /code/cadence answered the last-session branch question from injected context, no error banner
 severity: major
 cause: Nothing from phase 5 is deployed. ~/.local/bin/verbatim is a stale Aug 8 binary from an earlier incarnation (subcommands precompact/inject, no `hook <event>` dispatch); even its hooks report all four entries missing from settings.json. The current repo has never been built (no target/ dir), no hooks are wired anywhere (0 verbatim mentions in user or project settings), and no store/indexed history exists. The brief cannot appear: no hook fires, and there is no binary or index for it to read.
 fix: deployment, not code: built current binary, verbatim install --yes wired 4 hooks + mcp, backfill archived 3206 sessions / 401306 turns; doctor clean; direct SessionStart probe emits the brief. Retest in a fresh session
@@ -77,9 +77,9 @@ fix: deployment, not code: built current binary, verbatim install --yes wired 4 
 expected: The session begins with the resume brief - last session's date, branch and final exchange - and no red hook_non_blocking_error banner appears.
 origin: verifier
 why_human: Out-of-reach resource: it needs an interactive Claude Code harness rendering hook stdout. The brief bytes themselves were produced and inspected here from the real binary; what cannot be observed from this process is the harness accepting and displaying them.
-status: pending
+status: pass
 first_pass: fail
-reported: nothing shows up (same live-session observation as item 8)
+reported: same interactive session: brief present in context, no hook error banner rendered
 severity: major
 cause: Same as item 8: current binary never built or installed, hooks unwired, no store.
 fix: same deployment fix as item 8, retest
@@ -87,9 +87,9 @@ fix: same deployment fix as item 8, retest
 ## Summary
 
 total: 9
-passed: 7
+passed: 9
 failed: 0
-pending: 2
+pending: 0
 skipped: 0
 blocked: 0
 reworked: 2
