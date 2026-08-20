@@ -551,6 +551,37 @@ pub mod fault {
     /// cannot reach another.
     pub const AFTER_FILES_COUNT: &str = "VERBATIM_FAULT_AFTER_FILES";
 
+    /// A transcript with this file name makes the worker that prepares it
+    /// panic, which is how "one worker panicking does not wedge the pass"
+    /// becomes testable.
+    ///
+    /// The fault rides the transcript's own NAME rather than an environment
+    /// variable or a file in the data directory. A worker holds the path it was
+    /// handed and nothing else - no data directory, no config - so a file-based
+    /// fault has nowhere to be read from; and an env var is process-global,
+    /// which would let a fault aimed at one test reach another running beside it
+    /// in the same binary. A name is scoped to the one tree a test built.
+    ///
+    /// It is spelled as a sidecar (`agent-*.jsonl`) because `discover` admits a
+    /// file on its NAME alone (D-16) - a `<uuid>.jsonl` at project depth, or an
+    /// `agent-*.jsonl` below one, and nothing else. A fault file named anything
+    /// more legible is never discovered, so it is never walked, so it never
+    /// reaches a worker and the test that armed it passes vacuously.
+    pub const PANIC_PREPARING: &str = "agent-fault-panic-preparing.jsonl";
+
+    /// Panic if this is the transcript a test armed. Inert without the feature,
+    /// and inert on every other name.
+    #[cfg(feature = "testkit")]
+    pub fn panic_preparing(path: &std::path::Path) {
+        if path.file_name().is_some_and(|name| name == PANIC_PREPARING) {
+            panic!("fault: preparing {} panicked on purpose", path.display());
+        }
+    }
+
+    #[cfg(not(feature = "testkit"))]
+    #[inline(always)]
+    pub fn panic_preparing(_path: &std::path::Path) {}
+
     /// Stall the walk once `committed` files have committed, if a kill is aimed
     /// there. Inert without the count, and inert without [`AT`].
     #[cfg(feature = "testkit")]

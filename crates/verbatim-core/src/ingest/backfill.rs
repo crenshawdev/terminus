@@ -52,7 +52,7 @@ use std::thread::ThreadId;
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ingest::lock::{self, Attempt};
 use crate::ingest::pass::{note, PassOutcome, Summary};
 use crate::ingest::{Existing, Outcome, Prepared, RunRow};
@@ -156,6 +156,33 @@ pub fn run_with(data_dir: &Path, config: &Config, workers: usize) -> Result<Repo
     }
 }
 
+/// A worker panic, turned into that file's own failure.
+///
+/// The drain loop in [`dispatch_round`] waits for exactly as many `Done`
+/// messages as it sent, and its disconnect arm only fires once EVERY worker is
+/// gone. So a single worker panicking inside `prepare` used to wedge the pass in
+/// the worst way available: its `Done` never arrived, the surviving workers kept
+/// `done_rx` connected so the disconnect arm never fired, and the scope could
+/// not join to re-raise the panic because its own closure was the thing
+/// blocked. The backfill simply stopped, with no error and no exit.
+///
+/// Catching it here restores the invariant the drain loop is written against -
+/// every job sent comes back exactly once - and costs nothing else: D-12
+/// already says one damaged transcript is not a reason to archive none of the
+/// tree, and a panic is only the loudest way for one to be damaged. The file is
+/// recorded and skipped like any other per-file failure.
+fn panic_error(path: &Path, payload: Box<dyn std::any::Any + Send>) -> Error {
+    let detail = payload
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panicked".to_string());
+    Error::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::other(format!("preparing this file panicked: {detail}")),
+    }
+}
+
 /// One file handed to a worker: everything preparing it needs and nothing that
 /// needs a connection.
 struct Job {
@@ -220,8 +247,18 @@ fn pipeline(
                         // The writer dropped its end: the walk is over.
                         return;
                     };
-                    let prepared =
-                        crate::ingest::prepare(&job.path, job.session_key, &job.existing);
+                    // Every job that was sent comes back exactly once,
+                    // whatever happened to it - see `panic_error`.
+                    let path = job.path.clone();
+                    let prepared = match std::panic::catch_unwind(
+                        std::panic::AssertUnwindSafe(|| {
+                            crate::ingest::fault::panic_preparing(&job.path);
+                            crate::ingest::prepare(&job.path, job.session_key, &job.existing)
+                        }),
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(payload) => Err(panic_error(&path, payload)),
+                    };
                     if done
                         .send(Done {
                             slot,

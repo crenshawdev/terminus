@@ -246,3 +246,90 @@ fn a_tree_with_more_files_than_workers_leaves_none_unprocessed() {
         .unwrap();
     assert_eq!(runs, 1, "a backfill must leave exactly one runs row");
 }
+
+/// A worker that panics is one file's failure, not the pass's deadlock.
+///
+/// The drain loop waits for exactly as many `Done` messages as it sent, and its
+/// disconnect arm only fires once EVERY worker is gone. Before `panic_error`,
+/// one worker panicking inside `prepare` therefore hung the whole backfill: the
+/// message never arrived, the surviving workers held `done_rx` open so the
+/// disconnect arm never fired, and the scope could not join to re-raise the
+/// panic because its own closure was what was blocked.
+///
+/// The assertion is a WALL CLOCK one, because the defect's symptom is that the
+/// call never returns - there is no wrong value to compare against. The pass is
+/// run on its own thread and the result collected with `recv_timeout`, so the
+/// failure mode is a reported timeout rather than a test binary that hangs
+/// forever and takes CI with it.
+#[test]
+fn one_worker_panicking_is_a_skipped_file_and_not_a_wedged_pass() {
+    // Generous: this tree takes well under a second, and the bound only has to
+    // tell "returned" from "never returns".
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let tree = Tree::build();
+    // Arm the fault: one more transcript, in a project of its own, whose name
+    // is the one `fault::panic_preparing` fires on.
+    let armed = tree
+        .claude_dir
+        .join("projects")
+        .join("-tmp-project-panic")
+        .join("deadbeef-2222-4222-8222-222222222222")
+        .join("subagents")
+        .join(verbatim_core::ingest::fault::PANIC_PREPARING);
+    std::fs::create_dir_all(armed.parent().unwrap()).unwrap();
+    std::fs::copy(
+        testkit::fixture_path(testkit::TRANSCRIPT_FIXTURES[0]),
+        &armed,
+    )
+    .unwrap();
+
+    let expected = COPIES * testkit::TRANSCRIPT_FIXTURES.len() + 1;
+    assert_eq!(
+        tree.transcripts().len(),
+        expected,
+        "the armed transcript is not in the tree, so this test would pass vacuously"
+    );
+
+    let data_dir = tree.data("panic");
+    let config = tree.config();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // The panic is caught inside the worker, so this is the ordinary
+        // `Ok` path - a `Result` crossing the channel, not a caught unwind.
+        let _ = tx.send(backfill::run_with(&data_dir, &config, WORKERS));
+    });
+
+    let report = rx
+        .recv_timeout(BUDGET)
+        .expect("the backfill never returned: a panicking worker wedged the pass")
+        .expect("a per-file panic is not a failure of the pass as a whole");
+    let summary = ran(&report);
+
+    assert_eq!(
+        summary.files_walked, expected,
+        "every file is walked, the armed one included"
+    );
+    assert_eq!(
+        summary.files_committed,
+        expected - 1,
+        "every file but the armed one commits"
+    );
+
+    let failures: Vec<_> = summary
+        .failures
+        .iter()
+        .filter(|(path, _)| path == &armed)
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "the armed file is recorded exactly once, as a failure: {:?}",
+        summary.failures
+    );
+    assert!(
+        failures[0].1.contains("panicked"),
+        "the recorded reason says what happened: {}",
+        failures[0].1
+    );
+}
