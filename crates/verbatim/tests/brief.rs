@@ -27,6 +27,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::time::Instant;
 
 use serde_json::Value;
 use verbatim_core::testkit;
@@ -193,4 +194,91 @@ fn two_session_starts_against_an_unchanged_store_are_byte_identical() {
         None,
         "the brief carries a time of day: {text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// AC1: the brief inside its wall budget, over a hundred runs
+
+/// AC1. A hundred `SessionStart` spawns against a store with history: one
+/// object each, inside the configured budget, at p99 under the wall budget.
+///
+/// The 10 ms is the same number `tests/hook.rs` asserts for the four events
+/// that write nothing, and D-11 says it now has to absorb a read-only store
+/// open, the two counts, the last-session lookup and one blob decompression on
+/// top of the 0.65-0.76 ms that file measured in a debug build. That headroom
+/// is the whole reason the budget did not have to move.
+///
+/// The percentiles are printed as well as asserted: a regression that says
+/// "p99 12.4 ms against 10 ms" is a number the next run can be compared
+/// against, where a bare failed assertion is not.
+#[test]
+fn a_hundred_session_starts_stay_inside_the_budget_and_the_wall_clock() {
+    const RUNS: usize = 100;
+    const WALL_MS: f64 = 10.0;
+    /// The `[injection] brief_chars` this test configures, well above the
+    /// brief the fixture produces: what is measured here is the wall clock,
+    /// and `verbatim-core`'s `tests/inject_brief.rs` is where a budget that
+    /// binds is asserted.
+    const BUDGET: usize = 1_200;
+
+    let bench = bench();
+    bench.ingest(FIXTURE);
+    std::fs::write(
+        bench.config_dir.join("verbatim.toml"),
+        format!("[injection]\nbrief_chars = {BUDGET}\n"),
+    )
+    .unwrap();
+    let payload = payload(&bench.project(FIXTURE));
+
+    let mut millis = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let started = Instant::now();
+        let output = bench.hook("SessionStart", &payload);
+        millis.push(started.elapsed().as_secs_f64() * 1000.0);
+
+        assert!(
+            output.status.success(),
+            "run {run} exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut lines = text.lines();
+        let first = lines
+            .next()
+            .unwrap_or_else(|| panic!("run {run} wrote nothing to stdout"));
+        assert_eq!(
+            lines.next(),
+            None,
+            "run {run} wrote more than the one object: {text:?}"
+        );
+        let document: Value = serde_json::from_str(first)
+            .unwrap_or_else(|e| panic!("run {run} is not one JSON object ({e}): {text:?}"));
+
+        let inner = document
+            .get("hookSpecificOutput")
+            .unwrap_or_else(|| panic!("run {run} carries no hookSpecificOutput: {document}"));
+        assert_eq!(
+            inner.get("hookEventName").and_then(Value::as_str),
+            Some("SessionStart"),
+            "the harness throws `Hook returned incorrect event name` on a \
+             mismatch: {document}"
+        );
+        let context = inner
+            .get("additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("run {run} carries no additionalContext: {document}"));
+        assert!(
+            context.chars().count() <= BUDGET,
+            "run {run} is {} characters against a configured budget of {BUDGET}",
+            context.chars().count()
+        );
+    }
+
+    millis.sort_by(f64::total_cmp);
+    let p50 = millis[RUNS / 2 - 1];
+    let p99 = millis[(RUNS * 99) / 100 - 1];
+    println!("SessionStart brief: p50 {p50:.2} ms, p99 {p99:.2} ms over {RUNS} runs");
+    assert!(p99 < WALL_MS, "p99 {p99:.2} ms is over {WALL_MS} ms");
 }
