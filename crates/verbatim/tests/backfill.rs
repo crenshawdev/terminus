@@ -13,19 +13,32 @@
 //!    0 in under 50 ms with empty stdout, exactly as `tests/lock_race.rs`
 //!    asserts for two ingests (D-18).
 //!
+//! and two more that are about what the work leaves behind:
+//!
+//! 4. a backfill SIGKILLed at randomized points and rerun converges on the store
+//!    an uninterrupted one reaches (AC8, D-22) - the shape `tests/crash.rs`
+//!    already uses, aimed at the pipeline rather than at the sequential pass;
+//! 5. over the real corpus, a backfill and a `verbatim ingest` tree pass archive
+//!    the same sessions and the same turns.
+//!
 //! The tree is deliberately larger than the fixture set: a backfill over three
 //! small transcripts finishes inside the 100 ms budget, and every assertion
 //! about "still empty at that instant" would then be a coin flip. A megabyte of
 //! transcript makes the window real.
+//!
+//! The kills are aimed at `backfill --work`, the process that does the work.
+//! Killing `backfill` itself would kill a process that has already returned;
+//! that its child survives such a kill is what `tests/hook.rs` proves, and it
+//! is not what this file is about.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use verbatim_core::ingest::{self, Attempt};
 use verbatim_core::store::DB_FILE_NAME;
-use verbatim_core::testkit;
+use verbatim_core::testkit::{self, Rng};
 
 /// AC8's budget for handing the shell back.
 const RETURN_BUDGET: Duration = Duration::from_millis(100);
@@ -46,6 +59,7 @@ const COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
 /// temp directory on every `cargo test`. All three variables, every time.
 pub struct Dirs {
     _dir: tempfile::TempDir,
+    root: PathBuf,
     data: PathBuf,
     config: PathBuf,
     claude: PathBuf,
@@ -62,6 +76,7 @@ impl Dirs {
         std::fs::create_dir_all(claude.join("projects")).unwrap();
         Dirs {
             _dir: dir,
+            root,
             data,
             config,
             claude,
@@ -69,10 +84,16 @@ impl Dirs {
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_in(&self.data, args)
+    }
+
+    /// The same, against a data directory this test names - the convergence
+    /// runs need one per iteration.
+    fn command_in(&self, data: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_verbatim"));
         command
             .args(args)
-            .env("VERBATIM_DATA_DIR", &self.data)
+            .env("VERBATIM_DATA_DIR", data)
             .env("VERBATIM_CONFIG_DIR", &self.config)
             .env("CLAUDE_CONFIG_DIR", &self.claude);
         command
@@ -281,4 +302,219 @@ fn an_ingest_during_a_backfill_loses_the_race_and_exits_at_once() {
 
     // And the backfill it lost to still finishes.
     dirs.wait_for_sessions(sessions);
+}
+
+/// How many kills the convergence test aims at a backfill.
+const KILLS: usize = 8;
+
+/// What a store holds, minus everything a pass count changes.
+///
+/// `runs` is excluded on purpose, exactly as `tests/crash.rs` excludes it: an
+/// interrupted store reaches the same contents in more passes than an
+/// uninterrupted one, and one row per pass is the record those passes are
+/// supposed to leave.
+#[derive(Debug, PartialEq, Eq)]
+struct Snapshot {
+    blobs: Vec<(String, Vec<u8>)>,
+    turns: Vec<(i64, String, i64, String, i64, i64)>,
+    fts: Vec<i64>,
+    watermarks: Vec<(String, i64)>,
+}
+
+impl Snapshot {
+    fn of(data_dir: &Path) -> Snapshot {
+        let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+        // Bound rather than returned directly: the statements borrow `conn` and
+        // a tail expression drops the locals first.
+        let snapshot = Snapshot {
+            blobs: conn
+                .prepare("SELECT session_key, blob FROM sessions ORDER BY session_key")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect(),
+            turns: conn
+                .prepare(
+                    "SELECT id, session_key, turn_seq, record_type, stream_offset, byte_len
+                     FROM turns ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect(),
+            fts: conn
+                .prepare("SELECT rowid FROM turns_fts ORDER BY rowid")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect(),
+            watermarks: conn
+                .prepare("SELECT transcript_path, byte_offset FROM watermarks ORDER BY 1")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect(),
+        };
+        snapshot
+    }
+}
+
+/// `SIGKILL` on Unix, `TerminateProcess` on Windows: un-catchable either way,
+/// which is the point - a signal the process could handle would let it tidy up
+/// and prove nothing.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    child.wait().unwrap();
+}
+
+/// Run the working process to completion.
+fn work_fully(dirs: &Dirs, data_dir: &Path) {
+    let out = dirs
+        .command_in(data_dir, &["backfill", "--work"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the completing backfill failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// AC8's second half, and D-22: a killed backfill converges.
+#[test]
+fn a_killed_backfill_converges_on_the_store_an_uninterrupted_one_reaches() {
+    let dirs = Dirs::new();
+    build_tree(&dirs.claude);
+
+    // The reference: one uninterrupted run, and how long it takes.
+    let reference_dir = dirs.root.join("reference");
+    let started = Instant::now();
+    work_fully(&dirs, &reference_dir);
+    let pass_time = started.elapsed();
+    let reference = Snapshot::of(&reference_dir);
+    assert!(
+        !reference.turns.is_empty(),
+        "the reference run archived nothing, so nothing below can converge on it"
+    );
+    println!(
+        "uninterrupted backfill: {pass_time:?}, {} turns",
+        reference.turns.len()
+    );
+
+    let mut rng = Rng(testkit::seed(
+        "a_killed_backfill_converges_on_the_store_an_uninterrupted_one_reaches",
+    ));
+    // A window a little wider than the pass itself, so a kill lands anywhere in
+    // it - including after it, which is the iteration that proves the harness
+    // is not simply always killing an empty store.
+    let window = (pass_time.as_micros() as u64 * 3 / 2).max(1_000);
+    let mut interrupted = 0usize;
+
+    for index in 0..KILLS {
+        let data_dir = dirs.root.join(format!("killed-{index}"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let mut child = dirs
+            .command_in(&data_dir, &["backfill", "--work"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_micros(rng.below(window)));
+        kill_and_reap(&mut child);
+
+        let mid = data_dir.join(DB_FILE_NAME).exists() && Snapshot::of(&data_dir) != reference;
+        if mid {
+            interrupted += 1;
+        }
+
+        // Rerun until it completes. One completing run is enough - the
+        // watermarks say where to resume and the loop is here so that a run
+        // which loses a race to a straggler process is not a test failure.
+        for attempt in 0..3 {
+            work_fully(&dirs, &data_dir);
+            if Snapshot::of(&data_dir) == reference {
+                break;
+            }
+            assert!(attempt < 2, "kill {index} never converged");
+        }
+        assert_eq!(
+            Snapshot::of(&data_dir),
+            reference,
+            "kill {index} converged on a different store"
+        );
+    }
+
+    assert!(
+        interrupted >= 2,
+        "only {interrupted} of {KILLS} kills interrupted anything; the harness is testing \
+         a race it always loses"
+    );
+}
+
+/// The same two passes over the real corpus, when there is one to measure
+/// against (`.planning/PROJECT.md`'s testing constraint).
+///
+/// Session and turn counts rather than a full snapshot: the two runs archive
+/// 2,244 sessions and 274,422 turns each, and a blob-for-blob comparison of two
+/// 735 MB stores is a different test with a different cost. The equality that
+/// matters here is that the pipeline sees every file the sequential walk sees.
+#[test]
+fn over_the_real_corpus_a_backfill_and_an_ingest_agree() {
+    let Some(corpus) = testkit::corpus_dir() else {
+        return;
+    };
+
+    let dirs = Dirs::new();
+    let ingest_dir = dirs.root.join("ingest");
+    let backfill_dir = dirs.root.join("backfill");
+
+    let started = Instant::now();
+    let out = dirs
+        .command_in(&ingest_dir, &["ingest"])
+        .env("CLAUDE_CONFIG_DIR", &corpus)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the tree pass failed");
+    println!("sequential ingest: {:?}", started.elapsed());
+
+    let started = Instant::now();
+    let out = dirs
+        .command_in(&backfill_dir, &["backfill", "--work"])
+        .env("CLAUDE_CONFIG_DIR", &corpus)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the backfill failed");
+    println!("parallel backfill: {:?}", started.elapsed());
+
+    assert_eq!(
+        counts(&ingest_dir),
+        counts(&backfill_dir),
+        "the backfill and the tree pass archived different corpora"
+    );
+    let (sessions, turns) = counts(&ingest_dir);
+    assert!(sessions > 0 && turns > 0, "the corpus archived nothing");
+    println!("both archived {sessions} sessions and {turns} turns");
+}
+
+/// Sessions and turns in one store.
+fn counts(data_dir: &Path) -> (i64, i64) {
+    let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+    (
+        conn.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+            .unwrap(),
+        conn.query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
+            .unwrap(),
+    )
 }

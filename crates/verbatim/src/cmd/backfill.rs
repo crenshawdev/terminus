@@ -49,22 +49,36 @@ use super::Failure;
 
 /// How many threads the backfill parses and compresses on (D-11).
 ///
-/// Fixed here, in one place, and deliberately small: the ceiling is SQLite's
-/// single writer rather than the core count, and compression is the only stage
-/// that scales with threads. It is also what the estimate divides the measured
-/// single-threaded rate by, so the number a user is shown and the number of
-/// workers that turn up are the same fact.
+/// Fixed here, in one place: the pipeline is started with it, the estimate names
+/// it, and [`MEASURED_MS`] was measured at it, so the number a user is shown and
+/// the number of workers that turn up cannot drift apart. Changing it invalidates
+/// the measured rate below, which is the reason both live in this file.
+///
+/// Deliberately small, and deliberately not derived from the machine's core
+/// count: the ceiling on a backfill is SQLite's single writer, compression is
+/// the only stage that scales, and a backfill is something a user runs while
+/// they are trying to do other work.
 pub const WORKERS: usize = 4;
 
-/// D-23's measured rate: the full real corpus, 1.1 GB across 2,248 files,
-/// ingested single-threaded in 36,582 ms on 2026-08-13.
+/// The pipeline's own measured rate: 1,413,907,546 bytes of real corpus
+/// archived in 49,089 ms across [`WORKERS`] workers on 2026-08-20.
 ///
-/// A measurement rather than a guess, and it is stated as one in the output.
-/// The two numbers are kept side by side rather than pre-divided so the
-/// provenance survives: a later measurement replaces a pair that can be read
-/// off a `runs` row.
-const MEASURED_BYTES: u64 = 1_181_116_006;
-const MEASURED_MS: u64 = 36_582;
+/// The pair is kept whole rather than pre-divided so the provenance survives; a
+/// later measurement replaces two numbers that can be read straight off a `runs`
+/// row.
+///
+/// **It is not D-23's single-threaded rate divided by the worker count, and
+/// that difference is measured rather than assumed.** The same corpus on the
+/// same machine took 53,007 ms through the sequential `pass::run`, so four
+/// workers bought 8%, not 4x. D-11 predicts exactly this and says why: SQLite
+/// has one writer, and on real transcripts the writer's own work - the
+/// transaction, the derived rows, the FTS index - dominates the parse and the
+/// compression that were moved off it. Dividing by the worker count would print
+/// "about 10s" over a corpus that takes fifty, which is the one thing an
+/// estimate must not do. D-23 asks for a measured rate; this is the measured
+/// rate of the thing that actually runs.
+const MEASURED_BYTES: u64 = 1_413_907_546;
+const MEASURED_MS: u64 = 49_089;
 
 /// What a backfill would have to read, before it reads any of it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,12 +90,11 @@ pub struct Estimate {
 }
 
 impl Estimate {
-    /// How long that is likely to take, from [`MEASURED_BYTES`] over
-    /// [`MEASURED_MS`], divided across [`WORKERS`].
+    /// How long that is likely to take, at [`MEASURED_BYTES`] over
+    /// [`MEASURED_MS`].
     pub fn duration(&self) -> std::time::Duration {
-        let ms = u128::from(self.unread_bytes) * u128::from(MEASURED_MS)
-            / u128::from(MEASURED_BYTES)
-            / WORKERS as u128;
+        let ms =
+            u128::from(self.unread_bytes) * u128::from(MEASURED_MS) / u128::from(MEASURED_BYTES);
         std::time::Duration::from_millis(ms.min(u128::from(u64::MAX)) as u64)
     }
 }
@@ -150,7 +163,7 @@ pub fn print_estimate(estimate: &Estimate) {
     );
     println!(
         "about {} across {WORKERS} workers - an estimate from a measured rate \
-         ({} in {}, single-threaded), not a promise",
+         ({} in {}), not a promise",
         duration(estimate.duration()),
         bytes(MEASURED_BYTES),
         duration(std::time::Duration::from_millis(MEASURED_MS)),
@@ -250,16 +263,21 @@ pub fn start(data_dir: &Path) -> Result<(), Failure> {
     })
 }
 
-/// The detached child: one ordinary tree pass, and nothing on stdout.
+/// The detached child: one tree pass across [`WORKERS`] threads, and nothing on
+/// stdout.
 ///
 /// The pass takes the ingest lock before it opens the store, so a hook firing
 /// during a backfill loses the race and exits 0 immediately with empty stdout
 /// (D-18) - nothing here is needed for that, and nothing here may be added that
-/// would weaken it.
+/// would weaken it. Nothing else about the invocation differs from the
+/// sequential pass either: same lock, same recovery, same per-file
+/// transactions, same single `runs` row, which is why a killed backfill resumes
+/// exactly as phase 2's crash harness proves a killed pass does (D-22).
 fn work(data_dir: &Path) -> Result<(), Failure> {
+    use verbatim_core::ingest::backfill;
     use verbatim_core::ingest::pass::{self, PassOutcome};
 
-    let summary = match pass::run(data_dir)? {
+    let summary = match backfill::run(data_dir, WORKERS)?.outcome {
         // Another pass is already running. Not a failure: the whole point of
         // one lock and no daemon.
         PassOutcome::LockHeld => return Ok(()),
@@ -333,17 +351,31 @@ mod tests {
     }
 
     /// The measured rate, applied to the corpus it was measured over, returns
-    /// the measurement divided by the worker count - which is the only claim
-    /// the printed time makes.
+    /// the measurement itself - which is the only claim the printed time makes.
+    ///
+    /// The second half is the one worth having a test for: the estimate must
+    /// NOT be the single-threaded rate divided by the worker count. That model
+    /// was measured wrong (four workers bought 8%, not 4x), and an estimate
+    /// four times short of the truth is worse than none.
     #[test]
-    fn the_estimate_is_the_measured_rate_over_the_workers() {
+    fn the_estimate_is_the_rate_the_pipeline_was_measured_at() {
         let whole = Estimate {
-            transcripts: 2_248,
+            transcripts: 3_120,
             unread_bytes: MEASURED_BYTES,
         };
         assert_eq!(
             whole.duration(),
-            std::time::Duration::from_millis(MEASURED_MS / WORKERS as u64)
+            std::time::Duration::from_millis(MEASURED_MS)
+        );
+
+        /// D-23's single-threaded measurement, kept here and nowhere else: it
+        /// is the number this estimate is deliberately not derived from.
+        const SINGLE_THREADED: (u64, u64) = (1_181_116_006, 36_582);
+        let divided = SINGLE_THREADED.1 * MEASURED_BYTES / SINGLE_THREADED.0 / WORKERS as u64;
+        assert!(
+            whole.duration().as_millis() as u64 > divided * 3,
+            "the estimate is close to the single-threaded rate over {WORKERS} workers, \
+             which is the model the corpus measurement refuted"
         );
     }
 }
