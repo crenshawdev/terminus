@@ -60,7 +60,7 @@ Committed scope. Each maps to exactly one roadmap phase.
 
 ### Injection (INJ)
 
-- **INJ-01**: SessionStart emits a resume brief covering the last session in this project, the working-state delta, the index pointer and observations when enabled, inside its token budget and a single-digit-millisecond wall budget.
+- **INJ-01**: SessionStart emits a resume brief covering the last session in this project, the branch that session ended on, the index pointer and observations when enabled, inside its token budget and a single-digit-millisecond wall budget. The working-state delta is branch-only because `session_meta.branch` is the sole git fact the archive holds and a `git` subprocess costs 10-30 ms against a single-digit-millisecond budget (Phase 5 D-10).
 - **INJ-02**: The resume brief contains no volatile text — stable ordering, dates rounded to the day — so unchanged state produces byte-identical output across runs and does not bust the prefix cache.
 - **INJ-03**: UserPromptSubmit injects between 0 and 3 turns, firing only on a structural threshold (a rank 1–3 exact entity match, or two or more independent entities co-occurring in one turn), and never on a free-text-only match.
 - **INJ-04**: A turn already injected this session, already visible in the session, or already carried by the resume brief is suppressed rather than injected again.
