@@ -1,13 +1,22 @@
 //! `verbatim hook <event>`: the entry point Claude Code calls.
 //!
-//! Four events, one behaviour: start the ingest, read the payload, say nothing,
-//! exit 0. Everything that makes this command interesting is a negative.
+//! Four events, one behaviour: start the ingest, read the payload, say at most
+//! one thing, exit 0. Most of what makes this command interesting is still a
+//! negative.
 //!
-//! **It writes nothing to stdout, on any path (D-15).** Claude Code 2.1.231
-//! validates any hook stdout that parses as JSON against the event name, so a
-//! stray line is not ignored, it is a protocol error. The resume brief and the
-//! prompt injection that will one day be written here are phase 5's
-//! (INJ-01..INJ-06) and are deliberately absent.
+//! **It writes one JSON object to stdout, or nothing, and never anything else
+//! (D-01, D-15).** Claude Code validates any hook stdout that parses as JSON
+//! against the event name, so a stray line is not ignored, it is a protocol
+//! error - and a document that starts with `{` and fails schema validation is a
+//! red `hook_non_blocking_error` banner shown to the user rather than silence.
+//! The object carries `hookSpecificOutput.hookEventName` equal to the event
+//! that fired and the injected text in `hookSpecificOutput.additionalContext`,
+//! and it is built with `serde_json` and never with `format!` (the D-25 rule
+//! `cmd::json` states), because injected text is arbitrary transcript bytes.
+//! Only `SessionStart` and `UserPromptSubmit` have that variant in the
+//! harness's union: `SessionEnd` and `PostCompact` write nothing on every path,
+//! against every store. Text that is empty or whitespace is nothing too, not an
+//! empty `additionalContext`.
 //!
 //! **It exits 0 once the event name is known, whatever happens next.** A
 //! `UserPromptSubmit` hook that exits non-zero can block the prompt the user
@@ -45,6 +54,8 @@
 use std::io::{BufRead, Read};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
+
+use verbatim_core::inject;
 
 use super::{spawn, Failure};
 
@@ -112,6 +123,17 @@ pub struct Payload {
 }
 
 impl Payload {
+    /// The same five fields as the borrowed shape the library takes.
+    fn borrowed(&self) -> inject::Payload<'_> {
+        inject::Payload {
+            session_id: self.session_id.as_deref(),
+            transcript_path: self.transcript_path.as_deref(),
+            cwd: self.cwd.as_deref(),
+            prompt: self.prompt.as_deref(),
+            source: self.source.as_deref(),
+        }
+    }
+
     /// The fields of one drained line, or an empty payload.
     ///
     /// Bytes that are not JSON, or JSON that is not an object, or an object
@@ -146,9 +168,49 @@ pub fn run(event: &str) -> Result<(), Failure> {
         eprintln!("verbatim: {event} could not start an ingest: {e}");
     }
 
-    let _payload = drain(event);
+    let payload = drain(event);
+    if let Some(text) = inject(event, &payload) {
+        emit(event, &text);
+    }
 
     Ok(())
+}
+
+/// The text this event injects, or nothing.
+///
+/// Two of the four events have an `additionalContext` variant and the other two
+/// return here without opening anything - a `SessionEnd` that read the store
+/// would be paying for an answer with nowhere to go. Resolving the data
+/// directory and loading the config are inside the `Option` rather than ahead
+/// of it for the same reason INJ-06 gives about the store: a `verbatim.toml`
+/// that does not parse is a config error on a `verbatim search` and one
+/// uninjected event here.
+fn inject(event: &str, payload: &Payload) -> Option<String> {
+    let arm = match event {
+        "SessionStart" => inject::brief::session_start,
+        "UserPromptSubmit" => inject::prompt::user_prompt_submit,
+        _ => return None,
+    };
+    let data_dir = super::data_dir().ok()?;
+    let config = verbatim_core::Config::load().ok()?;
+    arm(&data_dir, &config, &payload.borrowed())
+}
+
+/// Write the one object the harness accepts, on one line.
+fn emit(event: &str, text: &str) {
+    // Whitespace is not context. An `additionalContext` of `"  "` is a
+    // validated document whose only effect is to make the next one less
+    // trusted.
+    if text.trim().is_empty() {
+        return;
+    }
+    let document = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": text,
+        }
+    });
+    println!("{document}");
 }
 
 /// Read the one line the harness owes us (D-14), but never let the harness

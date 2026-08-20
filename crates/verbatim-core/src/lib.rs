@@ -22,6 +22,7 @@ pub mod discover;
 pub mod error;
 pub mod index;
 pub mod ingest;
+pub mod inject;
 pub mod lineage;
 pub mod parse;
 pub mod project;
