@@ -14,6 +14,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                      commands:\n  \
                        ingest                archive every transcript under the configured roots\n  \
                        ingest <path.jsonl>   archive one transcript file\n  \
+                       backfill              archive every transcript already on disk\n  \
                        hook <event>          start an ingest for a Claude Code hook event\n  \
                        search <words>        find a past turn by text, path, error or identifier\n  \
                        show <id>...          print the archived record behind a turn id\n  \
@@ -88,6 +89,11 @@ fn run() -> Result<(), Failure> {
 fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
     match name {
         "ingest" => cmd::ingest::run(cmd::ingest::parse(parser)?),
+        // The whole history, once, without the shell waiting for it (ING-11).
+        // It prints an estimate first and does the work in a detached process,
+        // which is why it is a command of its own rather than a flag on
+        // `ingest`: the two return at different times and mean different things.
+        "backfill" => cmd::backfill::run(cmd::backfill::parse(parser)?),
         // Written into settings.json by `verbatim install` and never typed by
         // hand. It writes nothing to stdout and exits 0 once its event name is
         // known, because a hook that fails is a hook that can block a prompt.
