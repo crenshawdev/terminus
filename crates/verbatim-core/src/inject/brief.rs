@@ -34,6 +34,12 @@
 //! prefix cache, which nothing local can observe; the byte identity is the
 //! property actually built here and it stands on its own.
 //!
+//! **The one thing it writes is which turns it quoted.** A brief that rendered
+//! records its turn ids in the session's [`super::state`] file, so that the
+//! prompt arm does not spend a prompt re-injecting a turn already sitting on
+//! screen above it (INJ-04). Nothing else here writes anything, and a brief
+//! that rendered nothing writes nothing at all.
+//!
 //! **Nothing here fails.** Every block is an `Option` and the brief is the ones
 //! that rendered: a session with no meta row, no branch, no timestamp or a blob
 //! that will not open drops that block and keeps the rest, because a brief that
@@ -57,7 +63,31 @@ use crate::recall::{excerpt, Query};
 pub fn session_start(data_dir: &Path, config: &Config, payload: &Payload) -> Option<String> {
     let store = super::open(data_dir)?;
     let scoped = super::scoped(store.conn(), config, payload)?;
-    render(store.conn(), &scoped, config.brief_chars())
+    let brief = render(store.conn(), &scoped, config.brief_chars())?;
+    remember(data_dir, payload, &brief);
+    Some(brief.text)
+}
+
+/// Tell this session's state file which turns the brief just quoted (INJ-04).
+///
+/// The one write this arm makes, and the reason it exists is on the other side:
+/// the prompt arm refuses to inject a turn the session already has, and a turn
+/// the brief quoted at `SessionStart` is one the session already has. Without
+/// this, the first prompt naming what the last session was doing would be
+/// answered with the exact text sitting above it on screen.
+///
+/// **Only after the brief has actually rendered**, and only for the turns that
+/// survived the budget into it: a machine with no archive acquires no files
+/// from asking, and a quotation the budget cut away was never carried.
+fn remember(data_dir: &Path, payload: &Payload, brief: &Brief) {
+    if brief.turns.is_empty() {
+        return;
+    }
+    let mut state = super::state::State::load(data_dir, payload.session_id);
+    for turn_id in &brief.turns {
+        state.record_brief(*turn_id);
+    }
+    state.save(data_dir, payload.session_id);
 }
 
 /// The ceiling on a brief, whatever `verbatim.toml` configures.
@@ -69,12 +99,23 @@ pub fn session_start(data_dir: &Path, config: &Config, payload: &Payload) -> Opt
 /// the largest brief that is still a brief.
 pub const MAX_BRIEF_CHARS: usize = 10_000;
 
+/// A rendered brief: the text the hook emits and the turns it quoted.
+///
+/// The ids travel with the text rather than being recovered from it, because
+/// the brief does not name them - it is prose, and INJ-01 wants it to stay
+/// prose - while INJ-04 still has to know which turns this session was handed.
+struct Brief {
+    text: String,
+    /// The turns quoted in [`Brief::text`], after the budget had its say.
+    turns: Vec<i64>,
+}
+
 /// The brief's blocks, in order, joined by a blank line, inside `budget`.
 ///
 /// The last session first and the index pointer last: continuity is what the
 /// session is resuming, and the pointer is the standing fact that outlives it.
 /// A block that cannot be rendered is dropped rather than failing the brief.
-fn render(conn: &Connection, scoped: &Scoped, budget: usize) -> Option<String> {
+fn render(conn: &Connection, scoped: &Scoped, budget: usize) -> Option<Brief> {
     let budget = budget.min(MAX_BRIEF_CHARS);
     let continuity = last_session(conn, scoped);
     let pointer = index_pointer(conn, scoped);
@@ -84,7 +125,10 @@ fn render(conn: &Connection, scoped: &Scoped, budget: usize) -> Option<String> {
 
     let full = assemble(continuity.as_ref(), pointer.as_deref());
     if chars(&full) <= budget {
-        return Some(full);
+        return Some(Brief {
+            turns: quoted(continuity.as_ref()),
+            text: full,
+        });
     }
 
     // The variable-length parts are cut first and the blocks are not dropped:
@@ -99,7 +143,27 @@ fn render(conn: &Connection, scoped: &Scoped, budget: usize) -> Option<String> {
     let cut = continuity.map(|continuity| continuity.within(budget.saturating_sub(spent)));
     // The backstop, and only that: it fires when the head line and the pointer
     // alone are over budget, which no cut to the quoted turns can fix.
-    Some(clip(&assemble(cut.as_ref(), pointer.as_deref()), budget))
+    Some(Brief {
+        turns: quoted(cut.as_ref()),
+        text: clip(&assemble(cut.as_ref(), pointer.as_deref()), budget),
+    })
+}
+
+/// The turns a rendered continuity block quotes.
+///
+/// Read off the block that was actually assembled, never off the one that was
+/// selected: a quotation the budget cut down to nothing is dropped from the
+/// text (see [`Continuity::within`]), and a turn the model was not shown is a
+/// turn the prompt arm must still be free to inject.
+fn quoted(continuity: Option<&Continuity>) -> Vec<i64> {
+    let Some(continuity) = continuity else {
+        return Vec::new();
+    };
+    [continuity.prompt.as_ref(), continuity.reply.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|quote| quote.turn_id)
+        .collect()
 }
 
 /// The brief as text: the continuity block, then the pointer.
@@ -121,18 +185,28 @@ fn assemble(continuity: Option<&Continuity>, pointer: Option<&str>) -> String {
 /// separately is what lets the budget cut the second without touching the first.
 struct Continuity {
     head: String,
-    prompt: Option<String>,
-    reply: Option<String>,
+    prompt: Option<Quote>,
+    reply: Option<Quote>,
+}
+
+/// One quoted turn: the text the brief shows and the id it came from.
+///
+/// The id is never rendered - the brief is prose - and is carried only so that
+/// [`remember`] can tell the prompt arm what this session has already been
+/// shown (INJ-04).
+struct Quote {
+    turn_id: i64,
+    text: String,
 }
 
 impl Continuity {
     fn text(&self) -> String {
         let mut out = self.head.clone();
         if let Some(prompt) = &self.prompt {
-            out.push_str(&format!("\nIt last asked: {prompt}"));
+            out.push_str(&format!("\nIt last asked: {}", prompt.text));
         }
         if let Some(reply) = &self.reply {
-            out.push_str(&format!("\nIt last answered: {reply}"));
+            out.push_str(&format!("\nIt last answered: {}", reply.text));
         }
         out
     }
@@ -141,10 +215,16 @@ impl Continuity {
     /// fixed parts cost. It keeps the labels, so the measurement is an upper
     /// bound on the fixed cost and never an under-count.
     fn bare(&self) -> Continuity {
+        let empty = |quote: &Option<Quote>| {
+            quote.as_ref().map(|quote| Quote {
+                turn_id: quote.turn_id,
+                text: String::new(),
+            })
+        };
         Continuity {
             head: self.head.clone(),
-            prompt: self.prompt.as_ref().map(|_| String::new()),
-            reply: self.reply.as_ref().map(|_| String::new()),
+            prompt: empty(&self.prompt),
+            reply: empty(&self.reply),
         }
     }
 
@@ -156,7 +236,7 @@ impl Continuity {
     /// share is nothing is dropped rather than rendered as a label with an
     /// empty quotation.
     fn within(self, allowance: usize) -> Continuity {
-        let (prompt, reply) = shares(self.prompt.as_deref(), self.reply.as_deref(), allowance);
+        let (prompt, reply) = shares(self.prompt.as_ref(), self.reply.as_ref(), allowance);
         Continuity {
             head: self.head,
             prompt,
@@ -167,11 +247,11 @@ impl Continuity {
 
 /// Split `allowance` characters between the two quoted turns.
 fn shares(
-    prompt: Option<&str>,
-    reply: Option<&str>,
+    prompt: Option<&Quote>,
+    reply: Option<&Quote>,
     allowance: usize,
-) -> (Option<String>, Option<String>) {
-    let want = |text: Option<&str>| text.map(chars).unwrap_or(0);
+) -> (Option<Quote>, Option<Quote>) {
+    let want = |quote: Option<&Quote>| quote.map(|quote| chars(&quote.text)).unwrap_or(0);
     let half = allowance / 2;
 
     // First pass: nobody takes more than half, and nobody takes more than it
@@ -188,9 +268,12 @@ fn shares(
         spare -= extra;
     }
 
-    let cut = |text: Option<&str>, given: usize| -> Option<String> {
-        let text = text?;
-        (given > 0).then(|| clip(text, given))
+    let cut = |quote: Option<&Quote>, given: usize| -> Option<Quote> {
+        let quote = quote?;
+        (given > 0).then(|| Quote {
+            turn_id: quote.turn_id,
+            text: clip(&quote.text, given),
+        })
     };
     (cut(prompt, given_prompt), cut(reply, given_reply))
 }
@@ -351,7 +434,7 @@ fn day(ts: &str) -> &str {
 /// thing to keep true. The query is empty because there is no query here: the
 /// window then falls back to the head of the turn, which is what the turn
 /// opened with.
-fn last_exchange(conn: &Connection, session_key: &str) -> (Option<String>, Option<String>) {
+fn last_exchange(conn: &Connection, session_key: &str) -> (Option<Quote>, Option<Quote>) {
     let prompt = last_turn(conn, session_key, "user");
     let reply = last_turn(conn, session_key, "assistant");
     if prompt.is_none() && reply.is_none() {
@@ -375,26 +458,28 @@ fn last_exchange(conn: &Connection, session_key: &str) -> (Option<String>, Optio
     };
 
     let query = Query::parse("");
-    let cut = |coordinates: Option<(i64, i64)>| -> Option<String> {
-        let (offset, len) = coordinates?;
+    let cut = |coordinates: Option<(i64, i64, i64)>| -> Option<Quote> {
+        let (turn_id, offset, len) = coordinates?;
         let bytes = reader.read_range(offset as u64, len as u64).ok()?;
         let text = excerpt::of_record(&query, &bytes);
-        (!text.trim().is_empty()).then_some(text)
+        (!text.trim().is_empty()).then_some(Quote { turn_id, text })
     };
     (cut(prompt), cut(reply))
 }
 
-/// `(stream_offset, byte_len)` of one session's last turn of a record type.
+/// `(id, stream_offset, byte_len)` of one session's last turn of a record type.
 ///
-/// D-04: both address the UNCOMPRESSED session stream, never the blob.
-/// `UNIQUE (session_key, turn_seq)` covers the lookup.
-fn last_turn(conn: &Connection, session_key: &str, record_type: &str) -> Option<(i64, i64)> {
+/// D-04: both offsets address the UNCOMPRESSED session stream, never the blob.
+/// `UNIQUE (session_key, turn_seq)` covers the lookup. The id comes back too
+/// because INJ-04 suppresses a turn the brief quoted and cannot recognize one
+/// from its text.
+fn last_turn(conn: &Connection, session_key: &str, record_type: &str) -> Option<(i64, i64, i64)> {
     conn.query_row(
-        "SELECT stream_offset, byte_len FROM turns \
+        "SELECT id, stream_offset, byte_len FROM turns \
          WHERE session_key = ?1 AND record_type = ?2 \
          ORDER BY turn_seq DESC LIMIT 1",
         rusqlite::params![session_key, record_type],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )
     .optional()
     .ok()

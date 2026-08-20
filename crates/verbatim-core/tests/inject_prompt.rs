@@ -24,6 +24,9 @@ use verbatim_core::{ingest, testkit};
 const FIXTURE: &str = "session-edits.jsonl";
 const RELATIVE: &str = "crates/gizmo/lantern.rs";
 
+/// The `session_id` a payload carries unless the test names another.
+const SESSION: &str = "0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55";
+
 struct Bench {
     _dir: tempfile::TempDir,
     data_dir: PathBuf,
@@ -88,8 +91,20 @@ impl Bench {
 
     /// What a `UserPromptSubmit` in this project carries.
     fn payload<'a>(&self, cwd: &'a str, prompt: &'a str) -> Payload<'a> {
+        self.payload_of(SESSION, cwd, prompt)
+    }
+
+    /// The same, under a `session_id` the caller names.
+    ///
+    /// INJ-04 suppresses a turn the session it is asked under has already been
+    /// given, so a test that asks one question twice is asking about
+    /// suppression unless it says otherwise. Every assertion here is about
+    /// retrieval, the threshold or the rendering, so a repeated call takes a
+    /// session of its own and leaves the suppression to
+    /// `crates/verbatim/tests/suppression.rs`, which is about nothing else.
+    fn payload_of<'a>(&self, session: &'a str, cwd: &'a str, prompt: &'a str) -> Payload<'a> {
         Payload {
-            session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
+            session_id: Some(session),
             transcript_path: None,
             cwd: Some(cwd),
             prompt: Some(prompt),
@@ -527,16 +542,26 @@ fn config_with(bench: &Bench, prompt_chars: usize) -> Config {
 
 /// What the hook actually emits: the turn id, the day, the text - and the same
 /// bytes twice against an unchanged store.
+///
+/// Each call takes a `session_id` of its own, which is what keeps this an
+/// assertion about the RENDERING: two runs under one session would be answered
+/// by INJ-04's already-injected suppression on the second, and "the same bytes
+/// twice" would be a claim about a store that is unchanged AND a session that
+/// has not seen the answer yet.
 #[test]
 fn the_injected_text_names_the_turn_and_the_day_and_repeats_itself() {
     let bench = bench();
     let cwd = bench.project();
     let raw = format!("what changed in {RELATIVE}");
-    let payload = bench.payload(&cwd, &raw);
+    let payload = bench.payload_of("11111111-0000-4000-8000-000000000001", &cwd, &raw);
 
     let text = prompt::user_prompt_submit(&bench.data_dir, &Config::default(), &payload)
         .expect("the prompt names a path the archive stored");
-    let fired = bench.fired(&cwd, &raw);
+    let fired = prompt::select(
+        &bench.data_dir,
+        &Config::default(),
+        &bench.payload_of("11111111-0000-4000-8000-000000000002", &cwd, &raw),
+    );
     assert!(
         text.contains(&fired.hits[0].turn_id.to_string()),
         "the id `recall_get` takes is not in the injection: {text}"
@@ -554,8 +579,9 @@ fn the_injected_text_names_the_turn_and_the_day_and_repeats_itself() {
         "the injected text is not the edit's own: {text}"
     );
 
+    let again = bench.payload_of("11111111-0000-4000-8000-000000000003", &cwd, &raw);
     assert_eq!(
-        prompt::user_prompt_submit(&bench.data_dir, &Config::default(), &payload),
+        prompt::user_prompt_submit(&bench.data_dir, &Config::default(), &again),
         Some(text),
         "two runs against an unchanged store rendered different bytes"
     );
@@ -573,15 +599,21 @@ fn the_injected_text_names_the_turn_and_the_day_and_repeats_itself() {
 /// The small budget is the point. At the default of 4,000 nothing the fixture
 /// produces is ever cut, so a test that only ran at the default would assert
 /// that the budget was never reached rather than that it holds.
+///
+/// One `session_id` per budget, for the reason the test above states: the same
+/// prompt asked four times under one session is answered once, and this test is
+/// about what four answers look like.
 #[test]
 fn the_injection_is_cut_to_the_configured_budget() {
     let bench = bench();
     let cwd = bench.project();
     let raw = format!("what changed in {RELATIVE}");
-    let payload = bench.payload(&cwd, &raw);
+    let payload = bench.payload_of("22222222-0000-4000-8000-000000000000", &cwd, &raw);
 
     let full = prompt::user_prompt_submit(&bench.data_dir, &Config::default(), &payload).unwrap();
     for budget in [100, 90, 3] {
+        let session = format!("22222222-0000-4000-8000-{budget:012}");
+        let payload = bench.payload_of(&session, &cwd, &raw);
         let text =
             prompt::user_prompt_submit(&bench.data_dir, &config_with(&bench, budget), &payload)
                 .unwrap();

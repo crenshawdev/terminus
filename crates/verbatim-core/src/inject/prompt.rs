@@ -6,7 +6,13 @@
 //! a rank-1-to-3 exact entity, or two independent entities co-occurring - and
 //! never on a BM25 score, which is not comparable across queries.
 //!
-//! PLAN-4 adds the suppressions; the retrieval and the threshold are here.
+//! **What has already been given is never given again (INJ-04).** Three
+//! suppressions, applied to the turns that passed the threshold and BEFORE the
+//! cap of three, so a refused turn does not spend a slot: a turn an earlier
+//! prompt of this session already injected, a turn of the session the user is
+//! looking at, and a turn the resume brief quoted. Each is written into the
+//! session's [`state`] file with its reason, which is the file AC4 asks to be
+//! able to read.
 //!
 //! **What a prompt is asked about.** Not the sentence. A `Query` is
 //! conjunctive by construction (D-09), so handing the whole prompt to
@@ -35,6 +41,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use super::state::{Reason, State};
 use super::Payload;
 use crate::config::Config;
 use crate::index::entity::{self, normalize_path};
@@ -196,13 +203,38 @@ fn selected(data_dir: &Path, config: &Config, payload: &Payload) -> Option<Fired
     // which is also where an excluded project becomes an empty result.
     let response = search::run(conn, config, &request).ok()?;
 
-    let mut hits = eligible(response.hits);
-    if hits.is_empty() {
-        return None;
+    let mut state = State::load(data_dir, payload.session_id);
+    let before = state.clone();
+    let mut hits = surviving(&mut state, eligible(response.hits), payload);
+
+    // Now, and only now, is a session worth decompressing - and only for the
+    // turns that survived both the threshold and the suppressions, since a
+    // suppressed turn is not injected and its blob is not read.
+    let fired = if hits.is_empty() {
+        None
+    } else {
+        match excerpt::attach(conn, &request.query, &mut hits) {
+            Ok(reads) => {
+                for hit in &hits {
+                    state.record_injected(hit.turn_id);
+                }
+                Some(Fired { hits, reads })
+            }
+            // The excerpt is what makes an injection worth reading, so a blob
+            // that will not open is silence rather than a line of turn ids -
+            // and nothing was injected, so nothing is remembered as injected.
+            Err(_) => None,
+        }
+    };
+
+    // After the outcome is known and whatever it was: the prompt that injected
+    // nothing because everything was suppressed is exactly the one AC4 reads
+    // this file for. Written only when this prompt changed it, so a session
+    // whose every prompt fires on nothing acquires no file at all.
+    if state != before {
+        state.save(data_dir, payload.session_id);
     }
-    // Now, and only now, is a session worth decompressing.
-    let reads = excerpt::attach(conn, &request.query, &mut hits).ok()?;
-    Some(Fired { hits, reads })
+    fired
 }
 
 /// INJ-03's threshold, applied over the ranked order.
@@ -210,6 +242,10 @@ fn selected(data_dir: &Path, config: &Config, payload: &Payload) -> Option<Fired
 /// The rank is the position in that order and nothing else - `recall::search`'s
 /// order is total on purpose, so two runs over an unchanged store agree about
 /// which turns were in the top three.
+///
+/// **The cap is not applied here.** INJ-04's suppressions run between the two
+/// (see [`surviving`]), so that a turn this session has already been given does
+/// not consume one of the three slots on its way to being refused.
 fn eligible(hits: Vec<Hit>) -> Vec<Hit> {
     hits.into_iter()
         .enumerate()
@@ -218,8 +254,66 @@ fn eligible(hits: Vec<Hit>) -> Vec<Hit> {
             hit.entity_match.is_some() && (*rank < ENTITY_RANK || hit.entity_count >= CO_OCCURRING)
         })
         .map(|(_, hit)| hit)
-        .take(MAX_TURNS)
         .collect()
+}
+
+/// The turns that pass INJ-04, capped at [`MAX_TURNS`], recording every refusal
+/// in `state`.
+///
+/// The reasons are checked in the order INJ-04 lists them and the first one
+/// that answers is the one recorded: they can overlap - the brief's own session
+/// can be the one the user is looking at after a resume - and a turn refused
+/// twice for two reasons would say no more than a turn refused once.
+fn surviving(state: &mut State, hits: Vec<Hit>, payload: &Payload) -> Vec<Hit> {
+    let current = current_session(payload);
+    let mut out: Vec<Hit> = Vec::new();
+    for hit in hits {
+        match refusal(state, &hit, current.as_deref()) {
+            Some(reason) => state.record_suppressed(hit.turn_id, reason),
+            None => out.push(hit),
+        }
+        if out.len() == MAX_TURNS {
+            break;
+        }
+    }
+    out
+}
+
+/// Why this turn may not be injected, or `None` if it may.
+fn refusal(state: &State, hit: &Hit, current: Option<&str>) -> Option<Reason> {
+    if state.was_injected(hit.turn_id) {
+        return Some(Reason::AlreadyInjected);
+    }
+    if current == Some(hit.session_key.as_str()) {
+        return Some(Reason::VisibleInSession);
+    }
+    if state.was_briefed(hit.turn_id) {
+        return Some(Reason::CarriedByBrief);
+    }
+    None
+}
+
+/// The `session_key` of the session the user is looking at, or nothing (D-15).
+///
+/// The archive's own key for the payload's `transcript_path`, canonicalized the
+/// way ingest keys a session so that the two spellings are comparable at all:
+/// `~/.claude` is a symlink chain on the development machine, and a raw string
+/// comparison would call one session two and suppress nothing.
+///
+/// `None` for a payload with no `transcript_path`, and for a path that will not
+/// canonicalize - a session whose file Claude Code has not created yet, or one
+/// on a filesystem that has stopped answering. Both suppress nothing, which is
+/// one turn possibly repeated rather than a prompt that fails.
+///
+/// **The live transcript is never read.** The question is which session a
+/// candidate belongs to, not what is in it, and reading the file would cost the
+/// measured p90 of 1.03 MB per prompt to learn something a string comparison
+/// already answers. The archive lags the file by whatever the last ingest
+/// missed, so a turn written seconds ago may not be keyed yet: that is the
+/// small duplication window at the head of a session D-15 accepts.
+fn current_session(payload: &Payload) -> Option<String> {
+    let canonical = Path::new(payload.transcript_path?).canonicalize().ok()?;
+    crate::ingest::path_key(&canonical).ok()
 }
 
 /// The spellings this prompt asks the archive about, strongest first.

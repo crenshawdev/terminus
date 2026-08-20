@@ -59,6 +59,14 @@ const FORMAT: u32 = 1;
 const MIN_NAME: usize = 8;
 const MAX_NAME: usize = 64;
 
+/// How many suppressions one session's file keeps.
+///
+/// The list is a record to read and not a fact anything decides on, so it is
+/// the one part of this document that forgets. A ranked window is ten
+/// candidates and every one of them can be refused, so an unbounded list would
+/// grow by ten a prompt for as long as a session lasts.
+const MAX_SUPPRESSED: usize = 100;
+
 /// Why a candidate turn was not injected (INJ-04).
 ///
 /// Exactly the three distinctions INJ-04 draws and no more. Entities,
@@ -157,6 +165,55 @@ impl State {
         };
         write_atomically(&path, self).is_some()
     }
+
+    /// Has an earlier prompt in this session already been given this turn?
+    pub fn was_injected(&self, turn_id: i64) -> bool {
+        self.injected.contains(&turn_id)
+    }
+
+    /// Did the resume brief quote this turn?
+    pub fn was_briefed(&self, turn_id: i64) -> bool {
+        self.brief.contains(&turn_id)
+    }
+
+    /// Remember that this prompt injected `turn_id`.
+    ///
+    /// Idempotent, because the list is the answer to `was_injected` and a turn
+    /// recorded twice would say nothing the first entry does not. It is not
+    /// capped: it is what INJ-04's first suppression is decided on, and a
+    /// forgotten id is a turn injected twice - three per prompt, so a session
+    /// long enough for the size to matter has other problems.
+    pub fn record_injected(&mut self, turn_id: i64) {
+        if !self.injected.contains(&turn_id) {
+            self.injected.push(turn_id);
+        }
+    }
+
+    /// Remember that the resume brief quoted `turn_id`.
+    pub fn record_brief(&mut self, turn_id: i64) {
+        if !self.brief.contains(&turn_id) {
+            self.brief.push(turn_id);
+        }
+    }
+
+    /// Remember that `turn_id` was refused, and why.
+    ///
+    /// Capped, unlike the two lists above, and that asymmetry is the design:
+    /// this one is a record for a person to read (AC4) rather than a fact
+    /// anything decides on, and it grows by up to one entry per ranked
+    /// candidate per prompt instead of by at most three. The oldest go first,
+    /// so what is in the file is what the session just did.
+    pub fn record_suppressed(&mut self, turn_id: i64, reason: Reason) {
+        let entry = Suppressed { turn_id, reason };
+        if self.suppressed.contains(&entry) {
+            return;
+        }
+        self.suppressed.push(entry);
+        if self.suppressed.len() > MAX_SUPPRESSED {
+            let excess = self.suppressed.len() - MAX_SUPPRESSED;
+            self.suppressed.drain(..excess);
+        }
+    }
 }
 
 /// The file one `session_id` names, or nothing.
@@ -195,6 +252,12 @@ fn file_name(session_id: &str) -> Option<String> {
 /// last byte must not leave a half-written document where the next prompt
 /// expects one. A rename within a directory is atomic, so a reader sees the old
 /// file or the new one and never a prefix of either.
+///
+/// The same property is what makes this safe on the hook's abandoned thread:
+/// the injection runs on a thread the binary never joins and process exit takes
+/// it wherever it got to (D-03), so a write cut off at the deadline leaves the
+/// target holding its previous content and at worst a `.inject-*.tmp` beside
+/// it - never a document the next prompt reads half of.
 ///
 /// No `fsync`. The rename is what buys the atomicity a reader cares about;
 /// `fsync` would only add durability across a power cut, and this is
