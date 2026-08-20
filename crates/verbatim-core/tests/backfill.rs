@@ -1,0 +1,248 @@
+//! D-11 / ING-11: the bounded-parallelism pass lands where the sequential one
+//! lands.
+//!
+//! The whole value of a second implementation of the walk is that it is not a
+//! second implementation of the ingest, so the assertion that matters is
+//! equality with `pass::run_with` over the same tree: every table's row count,
+//! every session's blob checksum, every watermark, and the archive digest that
+//! covers the blobs themselves.
+//!
+//! `#![cfg(feature = "testkit")]` gates the file, which is load-bearing and also
+//! a hazard `.planning/CAPTURE.md` records: `cargo test -p verbatim-core`
+//! without the feature compiles this to an empty test binary and reports it
+//! green. The command is
+//! `cargo test -p verbatim-core --features testkit --test backfill`, and the
+//! only thing that tells a real run from a vacuous one is the count in its
+//! output - a self-test cannot say it, because a file that compiled to nothing
+//! has no test left to run. Two live here, so `running 2 tests` is the line to
+//! read, and it was read.
+
+#![cfg(feature = "testkit")]
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use rusqlite::Connection;
+use verbatim_core::config::Config;
+use verbatim_core::ingest::backfill;
+use verbatim_core::ingest::pass::{self, PassOutcome, Summary};
+use verbatim_core::store::{DB_FILE_NAME, TABLES};
+use verbatim_core::{discover, testkit};
+
+/// The worker count the plan's `Verify` names, and enough to be more than one.
+const WORKERS: usize = 4;
+
+/// How many copies of the fixture set the tree holds.
+///
+/// Three, so the tree has 33 transcripts against 4 workers: "more files than
+/// workers" has to be true by a margin, and every worker needs a plausible
+/// chance at a file for the thread-spread assertion to mean anything.
+const COPIES: usize = 3;
+
+struct Tree {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    claude_dir: PathBuf,
+}
+
+impl Tree {
+    /// Every fixture transcript, [`COPIES`] times over, across one project
+    /// directory per copy. Sidecars keep their `agent-*.jsonl` names and sit at
+    /// the depth real ones sit at.
+    fn build() -> Tree {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let claude_dir = root.join("claude");
+        let projects = claude_dir.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        for copy in 0..COPIES {
+            let project = projects.join(format!("-tmp-project-{copy}"));
+            std::fs::create_dir_all(&project).unwrap();
+            for (index, fixture) in testkit::TRANSCRIPT_FIXTURES.iter().enumerate() {
+                let n = (copy * 100 + index) as u32;
+                let dest = if fixture.contains('/') {
+                    // A sidecar: `<project>/<sessionId>/subagents/agent-*.jsonl`.
+                    project
+                        .join(format!("{n:08x}-2222-4222-8222-222222222222"))
+                        .join("subagents")
+                        .join(format!("agent-{n}.jsonl"))
+                } else {
+                    project.join(format!("{n:08x}-1111-4111-8111-111111111111.jsonl"))
+                };
+                std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+                std::fs::copy(testkit::fixture_path(fixture), &dest).unwrap();
+            }
+        }
+
+        Tree {
+            _dir: dir,
+            root,
+            claude_dir,
+        }
+    }
+
+    fn config(&self) -> Config {
+        Config::from_parts(vec![self.claude_dir.clone()], Vec::new())
+    }
+
+    fn data(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
+
+    fn transcripts(&self) -> Vec<PathBuf> {
+        discover::discover(&self.config()).transcripts
+    }
+}
+
+/// Everything two passes over one tree must agree on.
+#[derive(Debug, PartialEq, Eq)]
+struct Snapshot {
+    /// One count per table in `store::TABLES`, in that order.
+    counts: Vec<(String, i64)>,
+    /// The per-session blob checksum, keyed by session.
+    checksums: BTreeMap<String, String>,
+    watermarks: BTreeMap<String, i64>,
+    /// A digest over every `sessions` and `session_meta` row, blobs included.
+    archive: String,
+}
+
+fn snapshot(data_dir: &Path) -> Snapshot {
+    let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+    Snapshot {
+        counts: TABLES
+            .iter()
+            .map(|table| {
+                let count: i64 = conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap_or_else(|e| panic!("count {table}: {e}"));
+                ((*table).to_owned(), count)
+            })
+            .collect(),
+        checksums: pairs(&conn, "SELECT session_key, hex(checksum) FROM session_meta"),
+        watermarks: pairs(&conn, "SELECT transcript_path, byte_offset FROM watermarks"),
+        archive: testkit::archive_digest(&conn),
+    }
+}
+
+fn pairs<V: rusqlite::types::FromSql + Ord>(conn: &Connection, sql: &str) -> BTreeMap<String, V> {
+    conn.prepare(sql)
+        .unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, V>(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn sequential(tree: &Tree, data_dir: &Path) -> Summary {
+    match pass::run_with(data_dir, &tree.config()).unwrap() {
+        PassOutcome::Ran(summary) => summary,
+        PassOutcome::LockHeld => panic!("nothing else holds the lock in this test"),
+    }
+}
+
+fn parallel(tree: &Tree, data_dir: &Path) -> backfill::Report {
+    backfill::run_with(data_dir, &tree.config(), WORKERS).unwrap()
+}
+
+fn ran(report: &backfill::Report) -> &Summary {
+    match &report.outcome {
+        PassOutcome::Ran(summary) => summary,
+        PassOutcome::LockHeld => panic!("nothing else holds the lock in this test"),
+    }
+}
+
+/// The claim the whole module exists for: the two passes are the same pass.
+#[test]
+fn the_pipeline_lands_on_the_same_store_as_the_sequential_pass() {
+    let tree = Tree::build();
+    let files = tree.transcripts().len();
+    assert_eq!(
+        files,
+        COPIES * testkit::TRANSCRIPT_FIXTURES.len(),
+        "the tree is not the one this test builds"
+    );
+
+    let sequential_dir = tree.data("sequential");
+    let parallel_dir = tree.data("parallel");
+    let reference = sequential(&tree, &sequential_dir);
+    let report = parallel(&tree, &parallel_dir);
+    let summary = ran(&report);
+
+    assert_eq!(summary.files_walked, reference.files_walked);
+    assert_eq!(summary.files_committed, reference.files_committed);
+    assert_eq!(summary.bytes_read, reference.bytes_read);
+    assert_eq!(summary.turns_added, reference.turns_added);
+    assert_eq!(summary.failures, reference.failures);
+
+    let expected = snapshot(&sequential_dir);
+    let actual = snapshot(&parallel_dir);
+    assert_eq!(
+        actual.counts, expected.counts,
+        "the two passes disagree on a table's row count"
+    );
+    assert_eq!(
+        actual.checksums, expected.checksums,
+        "the two passes disagree on a session's blob checksum"
+    );
+    assert_eq!(
+        actual.watermarks, expected.watermarks,
+        "the two passes disagree on a watermark"
+    );
+    assert_eq!(
+        actual.archive, expected.archive,
+        "the two passes archived different bytes"
+    );
+
+    // Without this the whole comparison is satisfied by a pipeline that runs
+    // everything on the thread that called it.
+    assert_eq!(report.workers, WORKERS);
+    assert!(
+        report.threads_used > 1,
+        "the pipeline prepared {files} files on {} thread(s), so nothing was parallel",
+        report.threads_used
+    );
+    assert!(
+        report.threads_used <= WORKERS,
+        "the pipeline used {} threads for {WORKERS} workers",
+        report.threads_used
+    );
+}
+
+/// More files than workers, and not one of them left behind.
+#[test]
+fn a_tree_with_more_files_than_workers_leaves_none_unprocessed() {
+    let tree = Tree::build();
+    let transcripts = tree.transcripts();
+    assert!(
+        transcripts.len() > WORKERS,
+        "the tree must hold more files than there are workers"
+    );
+
+    let data_dir = tree.data("parallel");
+    let report = parallel(&tree, &data_dir);
+    let summary = ran(&report);
+
+    assert_eq!(summary.files_walked, transcripts.len());
+    assert_eq!(summary.failures, Vec::new());
+    assert_eq!(summary.files_committed, transcripts.len());
+
+    // A watermark per file is the durable proof, and the thing a resumed pass
+    // reads: a file the pipeline dropped on the floor has none.
+    let marks = snapshot(&data_dir).watermarks;
+    for path in &transcripts {
+        let key = path.to_str().unwrap();
+        assert!(
+            marks.contains_key(key),
+            "no watermark for {key}: the pipeline never processed it"
+        );
+    }
+    assert_eq!(marks.len(), transcripts.len());
+
+    // One `runs` row for the whole pass, not one per file (D-10).
+    let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+    let runs: i64 = conn
+        .query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(runs, 1, "a backfill must leave exactly one runs row");
+}

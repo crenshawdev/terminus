@@ -1,4 +1,5 @@
-//! Ingest: one named transcript here, a whole tree in [`pass`].
+//! Ingest: one named transcript here, a whole tree in [`pass`], and the same
+//! tree across a fixed set of worker threads in [`backfill`].
 //!
 //! The order of the first steps is the design. The path is canonicalized before
 //! anything else, the lock is taken **before** the store is opened (D-15), and
@@ -12,6 +13,7 @@
 //! transaction held for a whole pass stops MCP readers - the reason redb was
 //! rejected (`DESIGN-BRIEF.md:83`).
 
+pub mod backfill;
 pub mod lock;
 pub mod pass;
 
@@ -151,8 +153,53 @@ pub(crate) fn ingest_locked(
     // sessionId, and keying on that overwrites a parent session's blob with a
     // 3 KB agent transcript. The watermark is keyed on the same value.
     let session_key = path_key(path)?;
-
     let existing = Existing::read(store.conn(), &session_key)?;
+    let prepared = prepare(path, session_key, &existing)?;
+    apply(store, prepared, started, run_row, projects)
+}
+
+/// Everything one file's pass produces before anything is written.
+///
+/// The split into [`prepare`] and [`apply`] is what makes D-11's backfill
+/// possible: prepare touches no connection at all, so it can run on a worker
+/// thread, and apply is the only half that writes, so one thread can own the
+/// writable connection for the whole run. The sequential path composes them
+/// back together in [`ingest_locked`] and behaves exactly as it did before -
+/// same order, same faults, same one transaction.
+pub(crate) struct Prepared {
+    session_key: String,
+    path: PathBuf,
+    /// D-13's flag is clear again: the file was flagged and its archived prefix
+    /// still matches. The clear is a WRITE, so it happens in [`apply`], and it
+    /// happens whether or not there are new bytes - a flagged session with
+    /// nothing new must still stop being flagged.
+    clear_divergence: bool,
+    /// `None` when there is no complete record past the watermark.
+    work: Option<Work>,
+}
+
+/// The compressed, parsed result of reading one file's tail.
+struct Work {
+    existing_watermark: u64,
+    /// The `session_no` this session already has, or `None` for one that has
+    /// never been archived and needs the next free number - which only the
+    /// writer can allocate.
+    existing_session_no: Option<i64>,
+    scan: Scan,
+    fresh: Vec<u8>,
+    bytes: Vec<u8>,
+    checksum: [u8; 32],
+    uncompressed_len: u64,
+    parent_session_key: Option<String>,
+    agent_meta: Option<Vec<u8>>,
+    pass: Pass,
+}
+
+/// Read, parse and compress one transcript's tail. Touches no connection.
+///
+/// Every expensive thing a pass does is here - the file read, the JSON scan and
+/// the zstd compression - and none of the cheap ones that need the store.
+pub(crate) fn prepare(path: &Path, session_key: String, existing: &Existing) -> Result<Prepared> {
     let tail = read_tail(path, existing.watermark)?;
 
     // A flagged session stops being flagged only when the file is provably the
@@ -169,8 +216,9 @@ pub(crate) fn ingest_locked(
     // decompression and a re-read of the session, and it is paid only by a
     // session that is actually flagged - the steady state reads the flag, finds
     // it clear, and issues neither.
+    let mut clear_divergence = false;
     if existing.diverged {
-        if !prefix_matches(path, &existing, existing.watermark)? {
+        if !prefix_matches(path, existing, existing.watermark)? {
             // Still divergent, and now for a reason a length test cannot see.
             // Skipped exactly like the shortened case, flag left set.
             return Err(Error::TranscriptRewritten {
@@ -178,7 +226,7 @@ pub(crate) fn ingest_locked(
                 watermark: existing.watermark,
             });
         }
-        set_divergence(store.conn(), &session_key, false)?;
+        clear_divergence = true;
     }
 
     let scan = parse::scan_from(&tail, existing.watermark, existing.turn_count);
@@ -186,7 +234,12 @@ pub(crate) fn ingest_locked(
     if consumed == 0 {
         // No complete record past the watermark. A rerun on an unchanged file
         // lands here, and adds no row to any table.
-        return Ok(Outcome::UpToDate);
+        return Ok(Prepared {
+            session_key,
+            path: path.to_path_buf(),
+            clear_divergence,
+            work: None,
+        });
     }
     let fresh = &tail[..consumed];
 
@@ -204,20 +257,6 @@ pub(crate) fn ingest_locked(
             (written.bytes, written.checksum, written.uncompressed_len)
         }
     };
-
-    let session_no = match &existing.session {
-        Some(session) => session.session_no,
-        None => next_session_no(store.conn())?,
-    };
-    let continues_from = continues_from(store.conn(), &session_key, &scan)?;
-
-    // D-20: the project comes from the session's FIRST `cwd` record, and the
-    // upsert below coalesces it, so a tail pass never revises what the first
-    // pass established - 19 of 1,253 real transcripts carry more than one
-    // distinct `cwd` and belong to the directory the session started in.
-    // Resolution happens here, outside the transaction: it may spawn git, and a
-    // write transaction held across a subprocess would stop MCP readers.
-    let project = first_cwd(&scan).map(|cwd| projects.resolve(&cwd));
 
     // D-03: a sidecar's parent comes from its path and never from its records,
     // which all report the parent's `sessionId` and so distinguish nothing. The
@@ -244,6 +283,85 @@ pub(crate) fn ingest_locked(
     };
 
     fault::stall(fault::AFTER_BLOB);
+
+    Ok(Prepared {
+        path: path.to_path_buf(),
+        clear_divergence,
+        work: Some(Work {
+            existing_watermark: existing.watermark,
+            existing_session_no: existing.session.as_ref().map(|s| s.session_no),
+            scan,
+            fresh: fresh.to_vec(),
+            bytes,
+            checksum,
+            uncompressed_len,
+            parent_session_key,
+            agent_meta,
+            pass,
+        }),
+        session_key,
+    })
+}
+
+/// Write what [`prepare`] produced, in one transaction (STOR-02).
+///
+/// The only half that touches the store, and the only half a backfill runs on
+/// its writer thread. Everything it does that is not the transaction itself
+/// needs the connection: allocating a `session_no`, resolving a predecessor,
+/// clearing D-13's flag.
+pub(crate) fn apply(
+    store: &mut Store,
+    prepared: Prepared,
+    started: Instant,
+    run_row: RunRow,
+    projects: &mut Resolver,
+) -> Result<Outcome> {
+    let Prepared {
+        session_key,
+        path,
+        clear_divergence,
+        work,
+    } = prepared;
+
+    // Before anything else, and on both arms: a session that is whole again
+    // stops being flagged even when the pass has nothing new to add (D-13).
+    if clear_divergence {
+        set_divergence(store.conn(), &session_key, false)?;
+    }
+
+    let Some(work) = work else {
+        return Ok(Outcome::UpToDate);
+    };
+    let Work {
+        existing_watermark,
+        existing_session_no,
+        scan,
+        fresh,
+        bytes,
+        checksum,
+        uncompressed_len,
+        parent_session_key,
+        agent_meta,
+        pass,
+    } = work;
+    let path = path.as_path();
+
+    let session_no = match existing_session_no {
+        Some(session_no) => session_no,
+        None => next_session_no(store.conn())?,
+    };
+    let continues_from = continues_from(store.conn(), &session_key, &scan)?;
+
+    // D-20: the project comes from the session's FIRST `cwd` record, and the
+    // upsert below coalesces it, so a tail pass never revises what the first
+    // pass established - 19 of 1,253 real transcripts carry more than one
+    // distinct `cwd` and belong to the directory the session started in.
+    // Resolution happens here, on the writer, and outside the transaction: it
+    // may spawn git, and a write transaction held across a subprocess would
+    // stop MCP readers. Keeping it off the workers also keeps the memo a plain
+    // `&mut Resolver` rather than a lock every worker would queue on for the
+    // 63 distinct `cwd` values a whole real corpus has.
+    let project = first_cwd(&scan).map(|cwd| projects.resolve(&cwd));
 
     // The fault the crash harness must be able to catch, and the reason that
     // harness is worth anything: with this on, the watermark commits in a
@@ -284,7 +402,7 @@ pub(crate) fn ingest_locked(
         // function, which is what stops it from drifting from what ingest wrote
         // (STOR-04). `fresh` starts at the watermark, so a record's stream
         // offset has to be rebased to index it.
-        let from = (record.offset - existing.watermark) as usize;
+        let from = (record.offset - existing_watermark) as usize;
         derive::derive_turn(
             &tx,
             derive::TurnRow {
@@ -523,7 +641,10 @@ pub mod fault {
 }
 
 /// What the store already holds for this transcript.
-struct Existing {
+///
+/// Read by the writer - it is four queries - and handed to [`prepare`], which
+/// is what lets prepare run on a thread with no connection of its own.
+pub(crate) struct Existing {
     watermark: u64,
     /// Whether `session_meta.agent_meta` already holds this sidecar's meta
     /// bytes, so a steady-state pass reopens nothing to rewrite them (D-04).
@@ -547,7 +668,7 @@ struct ExistingSession {
 }
 
 impl Existing {
-    fn read(conn: &Connection, session_key: &str) -> Result<Existing> {
+    pub(crate) fn read(conn: &Connection, session_key: &str) -> Result<Existing> {
         let watermark: Option<i64> = conn
             .query_row(
                 "SELECT byte_offset FROM watermarks WHERE transcript_path = ?1",
@@ -642,7 +763,7 @@ impl Existing {
 }
 
 /// The session key: the canonical path, as text.
-fn path_key(path: &Path) -> Result<String> {
+pub(crate) fn path_key(path: &Path) -> Result<String> {
     path.to_str().map(str::to_owned).ok_or_else(|| {
         Error::io(
             path,
