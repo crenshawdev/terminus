@@ -18,13 +18,17 @@
 //! `verbatim install` writes these entries and an unknown one means a broken
 //! settings file rather than a routine event.
 //!
-//! **It reads no field of the payload, and the read is bounded twice.**
-//! Deserializing a shape phase 5 owns would be inventing it a phase early. The
-//! line is read and dropped; reading it at all is only what keeps the writer
-//! from seeing a closed pipe, and because the ingest is already running by then
-//! (below) not one byte of it is on a data path. A courtesy is bounded like
-//! one: at most [`MAX_PAYLOAD`] bytes, so a line that never ends cannot grow a
-//! buffer without limit, and at most [`DRAIN_DEADLINE`] of waiting, because the
+//! **It reads five fields of the payload, and the read is still bounded
+//! twice.** Phase 5 needs `session_id`, `transcript_path`, `cwd`, `prompt` and
+//! `source` to inject anything, and D-02 says they arrive here or nowhere: the
+//! argv stays `["hook", "<event>"]` and gains no flag, because
+//! `cmd::install::targets` writes those entries once and never rewrites them
+//! (INST-05), so a new argument would mean editing every user's `settings.json`
+//! on upgrade. Every field is optional at the type level - a payload that omits
+//! one is a payload that gets less injection, never an error - and the bounds
+//! the read had when the bytes were dropped are the bounds it still has: at
+//! most [`MAX_PAYLOAD`] bytes, so a line that never ends cannot grow a buffer
+//! without limit, and at most [`DRAIN_DEADLINE`] of waiting, because the
 //! reading happens on a thread this command starts and never joins. A writer
 //! that opens stdin and then neither writes a newline nor closes it gets the
 //! one line on stderr the paragraph above promises, rather than holding the
@@ -64,9 +68,10 @@ pub const EVENTS: &[&str] = &[
 /// measured in kilobytes even when it carries a whole compact summary.
 ///
 /// The cap is on the read, not on the writer, so a line that never ends is a
-/// megabyte read and dropped rather than a `Vec` that grows until the machine
-/// is out of memory. Nothing downstream reads these bytes, so being one byte
-/// short of a payload costs nothing at all.
+/// megabyte read and discarded rather than a `Vec` that grows until the machine
+/// is out of memory. A payload cut off at the cap stops being JSON, so it parses
+/// to a [`Payload`] with every field absent - which is one uninjected event and
+/// not a failure.
 const MAX_PAYLOAD: u64 = 1 << 20;
 
 /// The longest the hook waits on a writer before it stops caring.
@@ -78,57 +83,126 @@ const MAX_PAYLOAD: u64 = 1 << 20;
 /// killing the hook.
 const DRAIN_DEADLINE: Duration = Duration::from_millis(500);
 
+/// The five fields of the hook payload injection reads.
+///
+/// Owned `String`s rather than borrows of the drained buffer, because the
+/// buffer belongs to a thread this command may have stopped waiting on.
+///
+/// Read off a [`serde_json::Value`] rather than deserialized into a derived
+/// struct: this crate depends on `serde_json` and deliberately not on `serde`'s
+/// derive (`crates/verbatim/Cargo.toml`), and the hook path is the startup floor
+/// the whole architecture is shaped around. Every field is an `Option` on
+/// purpose - the harness sends a different set per event, and an absent field is
+/// an event that gets less injection rather than an error.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Payload {
+    /// The Claude Code session this event belongs to. Present on all four.
+    pub session_id: Option<String>,
+    /// The transcript file Claude Code is appending to, which is what ingest
+    /// keys a session on once it is canonicalized.
+    pub transcript_path: Option<String>,
+    /// The working directory of the session - never this process's own, which
+    /// on a hook is whatever directory the harness happened to choose (D-12).
+    pub cwd: Option<String>,
+    /// The text the user just submitted. `UserPromptSubmit` only.
+    pub prompt: Option<String>,
+    /// Why the session started. `SessionStart` only, one of
+    /// `startup`, `resume`, `clear`, `compact`, `fork`.
+    pub source: Option<String>,
+}
+
+impl Payload {
+    /// The fields of one drained line, or an empty payload.
+    ///
+    /// Bytes that are not JSON, or JSON that is not an object, or an object
+    /// whose fields are numbers instead of strings, all read as absent. This is
+    /// the only parse on the hook path and it must not have a failing arm: a
+    /// malformed payload is upstream's, and a hook that reported it would be
+    /// spending the user's prompt on a diagnostic about a field nothing here
+    /// requires.
+    fn parse(line: &[u8]) -> Payload {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return Payload::default();
+        };
+        let field = |name: &str| {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        };
+        Payload {
+            session_id: field("session_id"),
+            transcript_path: field("transcript_path"),
+            cwd: field("cwd"),
+            prompt: field("prompt"),
+            source: field("source"),
+        }
+    }
+}
+
 pub fn run(event: &str) -> Result<(), Failure> {
     // First, and before stdin is touched.
     if let Err(e) = spawn::detached(&["ingest"]) {
         eprintln!("verbatim: {event} could not start an ingest: {e}");
     }
 
-    drain(event);
+    let _payload = drain(event);
 
     Ok(())
 }
 
-/// Read the one line the harness owes us (D-14) and drop it, but never let the
-/// harness decide how long that takes or how much of it there is.
+/// Read the one line the harness owes us (D-14), but never let the harness
+/// decide how long that takes or how much of it there is.
 ///
 /// The read runs on a thread that is deliberately not joined: a blocking read
 /// on a pipe nobody closes cannot be cancelled with `std` alone (D-04), so the
 /// only way to stop an idle writer from holding this process is to stop waiting
-/// on the reader and let process exit take the thread with it. That is safe
-/// precisely because the bytes are dropped - there is no half-finished work to
-/// abandon, and the ingest was started before any of this.
-fn drain(event: &str) {
+/// on the reader and let process exit take the thread with it. Abandoning it
+/// costs nothing beyond the injection it would have fed: there is no
+/// half-finished work to leave behind, nothing here writes, and the ingest was
+/// started before any of it.
+fn drain(event: &str) -> Payload {
     let (done, drained) = mpsc::sync_channel(1);
     // Bytes rather than a `String`: a payload that is not UTF-8 is still a
-    // payload that has been drained, and an encoding error here would be a
-    // diagnostic about something nothing reads.
+    // payload that has been drained, and `serde_json` reads a slice directly.
     let reader = std::thread::Builder::new()
         .name("verbatim-hook-stdin".to_string())
         .spawn(move || {
-            let mut payload = Vec::new();
+            let mut line = Vec::new();
             let outcome = std::io::stdin()
                 .lock()
                 .take(MAX_PAYLOAD)
-                .read_until(b'\n', &mut payload);
+                .read_until(b'\n', &mut line);
             // The main thread may have given up and gone; a send with no
             // receiver left is the timeout case reporting itself.
-            let _ = done.send(outcome.err());
+            //
+            // Parsed on this thread rather than the main one so a payload that
+            // arrives after the deadline costs the caller nothing at all.
+            let _ = done.send((Payload::parse(&line), outcome.err()));
         });
     if let Err(e) = reader {
         eprintln!("verbatim: {event} could not read its payload: {e}");
-        return;
+        return Payload::default();
     }
 
     match drained.recv_timeout(DRAIN_DEADLINE) {
-        Ok(None) => {}
-        Ok(Some(e)) => eprintln!("verbatim: {event} could not read its payload: {e}"),
-        Err(RecvTimeoutError::Timeout) => eprintln!(
-            "verbatim: {event} stopped waiting on a stdin that stayed open for {} ms",
-            DRAIN_DEADLINE.as_millis()
-        ),
+        Ok((payload, None)) => payload,
+        // A read that failed part way still parses what arrived, which is
+        // almost always nothing. The line on stderr is the same one it was.
+        Ok((payload, Some(e))) => {
+            eprintln!("verbatim: {event} could not read its payload: {e}");
+            payload
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            eprintln!(
+                "verbatim: {event} stopped waiting on a stdin that stayed open for {} ms",
+                DRAIN_DEADLINE.as_millis()
+            );
+            Payload::default()
+        }
         Err(RecvTimeoutError::Disconnected) => {
-            eprintln!("verbatim: {event} lost the thread reading its payload")
+            eprintln!("verbatim: {event} lost the thread reading its payload");
+            Payload::default()
         }
     }
 }
@@ -162,4 +236,80 @@ fn known(name: &str) -> Result<&'static str, Failure> {
                 EVENTS.join(", ")
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use verbatim_core::testkit;
+
+    /// Every fixture payload, and the field values it spells for itself.
+    ///
+    /// `tests/fixtures/hooks/*.json` are the bytes Claude Code 2.1.231 was
+    /// observed writing (`tests/fixtures/README.md`), so this asserts the parse
+    /// against a recording of the harness rather than against a shape invented
+    /// here. The `None`s are as load-bearing as the values: a `prompt` on a
+    /// `SessionStart` or a `source` on a `SessionEnd` would mean the parse is
+    /// reading a field the event does not carry.
+    #[test]
+    fn each_recorded_payload_yields_the_fields_it_spells() {
+        let session = "0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55";
+
+        let start = Payload::parse(&testkit::fixture_bytes("hooks/session-start.json"));
+        assert_eq!(start.session_id.as_deref(), Some(session));
+        assert_eq!(start.cwd.as_deref(), Some("/data/code/verbatim"));
+        assert!(start
+            .transcript_path
+            .as_deref()
+            .is_some_and(|p| p.ends_with(".jsonl")));
+        assert_eq!(start.source.as_deref(), Some("resume"));
+        assert_eq!(start.prompt, None);
+
+        let prompt = Payload::parse(&testkit::fixture_bytes("hooks/user-prompt-submit.json"));
+        assert_eq!(prompt.session_id.as_deref(), Some(session));
+        assert_eq!(prompt.cwd.as_deref(), Some("/data/code/verbatim"));
+        assert_eq!(
+            prompt.prompt.as_deref(),
+            Some("where did we settle the detached spawn's kill behaviour")
+        );
+        assert_eq!(prompt.source, None);
+
+        let end = Payload::parse(&testkit::fixture_bytes("hooks/session-end.json"));
+        assert_eq!(end.session_id.as_deref(), Some(session));
+        assert_eq!(end.cwd.as_deref(), Some("/data/code/verbatim"));
+        assert_eq!(end.prompt, None);
+        assert_eq!(end.source, None);
+
+        let compact = Payload::parse(&testkit::fixture_bytes("hooks/post-compact.json"));
+        assert_eq!(compact.session_id.as_deref(), Some(session));
+        assert_eq!(compact.cwd.as_deref(), Some("/data/code/verbatim"));
+        assert_eq!(compact.prompt, None);
+        // `trigger`, not `source`: PostCompact carries a different key, and
+        // reading `source` off it must not invent one.
+        assert_eq!(compact.source, None);
+    }
+
+    /// Nothing about a malformed payload is an error. Each of these is a real
+    /// way stdin arrives: a writer that sent nothing, a writer that sent prose,
+    /// a truncated line (what [`MAX_PAYLOAD`] leaves), a JSON value that is not
+    /// an object, and an object whose fields are the wrong type.
+    #[test]
+    fn a_payload_that_is_not_an_object_of_strings_has_every_field_absent() {
+        for line in [
+            &b""[..],
+            &b"not json at all"[..],
+            &br#"{"session_id":"0e5e6a1e-9f2b-4c7a-8d31-6b4f2a"#[..],
+            &b"[1, 2, 3]"[..],
+            &b"\"a bare string\""[..],
+            &br#"{"session_id":7,"cwd":null,"prompt":{"text":"hi"},"source":[]}"#[..],
+        ] {
+            assert_eq!(
+                Payload::parse(line),
+                Payload::default(),
+                "parsing {:?} found a field in it",
+                String::from_utf8_lossy(line)
+            );
+        }
+    }
 }
