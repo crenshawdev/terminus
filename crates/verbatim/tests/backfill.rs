@@ -322,6 +322,35 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    /// The store as it stands mid-pass, or `None` when there is nothing to read
+    /// yet.
+    ///
+    /// `Store::open` creates the database file before it commits the schema, so
+    /// a `SIGKILL` landing in that window leaves a file with no `sessions`
+    /// table. That is a pass killed before its first commit - a real state this
+    /// test is trying to produce, not a broken store - and [`Snapshot::of`]
+    /// unwraps its way to a panic on it, failing the test before the
+    /// convergence assertion it exists for ever runs.
+    fn started(data_dir: &Path) -> Option<Snapshot> {
+        let db = data_dir.join(DB_FILE_NAME);
+        if !db.exists() {
+            return None;
+        }
+        let conn = Connection::open(&db).ok()?;
+        let schema: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()?;
+        if schema == 0 {
+            return None;
+        }
+        drop(conn);
+        Some(Snapshot::of(data_dir))
+    }
+
     fn of(data_dir: &Path) -> Snapshot {
         let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
         // Bound rather than returned directly: the statements borrow `conn` and
@@ -434,7 +463,12 @@ fn a_killed_backfill_converges_on_the_store_an_uninterrupted_one_reaches() {
         std::thread::sleep(Duration::from_micros(rng.below(window)));
         kill_and_reap(&mut child);
 
-        let mid = data_dir.join(DB_FILE_NAME).exists() && Snapshot::of(&data_dir) != reference;
+        // A store with no schema yet is a pass killed before its first commit:
+        // interrupted, and trivially unlike the reference.
+        let mid = match Snapshot::started(&data_dir) {
+            Some(snapshot) => snapshot != reference,
+            None => data_dir.join(DB_FILE_NAME).exists(),
+        };
         if mid {
             interrupted += 1;
         }
