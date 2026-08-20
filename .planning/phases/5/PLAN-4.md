@@ -11,6 +11,11 @@ files:
   - crates/verbatim-core/src/inject/prompt.rs
   - crates/verbatim-core/src/inject/brief.rs
   - crates/verbatim-core/tests/inject_state.rs
+  # Lease extended at the task-2 checkpoint (approved): two PLAN-3 assertions
+  # re-invoke `prompt::user_prompt_submit` under ONE `session_id`, which AC4's
+  # dedupe answers with silence. Each repeated call gets a `session_id` of its
+  # own so they keep asserting rendering and budget.
+  - crates/verbatim-core/tests/inject_prompt.rs
   - crates/verbatim-core/tests/inject_compaction.rs
   - crates/verbatim/tests/suppression.rs
 ---

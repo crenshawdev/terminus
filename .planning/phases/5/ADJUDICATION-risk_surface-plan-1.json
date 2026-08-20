@@ -1,0 +1,57 @@
+{
+  "phase": "5",
+  "trigger": "risk_surface",
+  "discriminator": "plan-1",
+  "round": 1,
+  "base": "3fd5b19",
+  "head": "d1fe832",
+  "base_id": "3fd5b1976658be1c1672a129700982d05a27b19a",
+  "head_id": "d1fe8326f97a1b95941c94a4752a64deceec3887",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/inject/prompt.rs",
+      "line": 27,
+      "severity": "blocker",
+      "claim": "`user_prompt_submit` is a hard-coded `None`, so the `UserPromptSubmit` arm never emits any injected context at all.",
+      "failure_scenario": "On any real prompt submit in a project that has matching archive rows, the hook still writes nothing to stdout. The user never receives the relevance injection this phase is supposed to provide, so the prompt-injection half of the feature is absent.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/inject/prompt.rs",
+        "line": 20,
+        "note": "The module doc in this same diff states PLAN-3 lands the retrieval and PLAN-4 the suppressions, and that None-until-then is this commit's specified behaviour (an event with no injection writes nothing and exits 0). plan-overlap confirms .planning/phases/5/PLAN-3.md and PLAN-4.md both declare inject/prompt.rs. PLAN-1's deliverable is the seam; the phase is mid-sequence, not defective."
+      },
+      "base_id": "3fd5b1976658be1c1672a129700982d05a27b19a",
+      "head_id": "d1fe8326f97a1b95941c94a4752a64deceec3887"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/inject/brief.rs",
+      "line": 23,
+      "severity": "medium",
+      "claim": "The session-start brief never consults `config.brief_chars()`, so the new `[injection].brief_chars` budget is inert.",
+      "failure_scenario": "If a user sets `brief_chars = 1` in `verbatim.toml` and opens an indexed project, the hook still emits the full resume brief instead of a 1-character cap. That makes the new configuration knob ineffective and can still produce stdout larger than the declared budget.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/inject/brief.rs",
+        "line": 38,
+        "note": "The render doc in this same diff assigns the budget over the whole brief to PLAN-2, and plan-overlap shows .planning/phases/5/PLAN-2.md declares inject/brief.rs. PLAN-1 landed the brief_chars parsing (config.rs, tested at crates/verbatim-core/tests/config.rs:427-483); its consumer is PLAN-2's declared work in this same phase."
+      },
+      "base_id": "3fd5b1976658be1c1672a129700982d05a27b19a",
+      "head_id": "d1fe8326f97a1b95941c94a4752a64deceec3887"
+    }
+  ]
+}

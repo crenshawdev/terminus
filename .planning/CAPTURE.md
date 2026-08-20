@@ -111,6 +111,14 @@
 - [ ] (phase 4) cargo fmt --check reports two pre-existing diffs in crates/verbatim/tests/hook.rs, both on lines committed in plan 1 and neither in code any later pass wrote. cargo fmt closes them whenever the file is next edited for its own reasons.
 - [ ] (phase 4) Declined an engines.node field on the thin npm package - nothing in the Verify exercises a Node floor and the shim uses only long-present APIs. Add one when a task states a minimum.
 - [ ] (phase 4) shellcheck is not installed on this machine, so npm/pack-local.sh's static analysis was bash -n only.
+- [ ] (phase 5) AC6's watchdog timeout arm has no test that forces it: the exclusive-writer case is bounded by SQLite before the 50 ms watchdog fires on Linux. Forcing it needs a fault point in the injection path (phase 4's testkit pattern).
+- [ ] (phase 5) crates/verbatim/tests/hook.rs flakes with ETXTBSY at its spawn-the-copied-binary sites under parallel tests; reproduced on the pre-phase-5 baseline 3fd5b19, so it pre-dates phase 5.
+- [ ] (phase 5) cargo fmt --check reports pre-existing diffs in crates/verbatim-core/src/ingest/backfill.rs:250 and crates/verbatim/tests/hook.rs:252,681 under rustfmt 1.9.0; every phase-5 file is clean.
+- [ ] (phase 5) inject/brief.rs keeps a private chars/clip pair identical to the shared definitions PLAN-3 put in inject/mod.rs; brief.rs was out of that plan's lease, so the fold-together is one pending deletion.
+- [ ] (phase 5) entity_score dwarfs bm25 whenever query terms are common (measured: -bm25 ~1e-6 per row vs entity weight 1.2-2.4 over a 48-turn store), so rank 1..3 is closer to "the three strongest entity matches" than a text ranking; phase 6's auto-tuner gates should be told before tuning anything.
+- [ ] (phase 5) The error entity kind has no candidate spelling of its own in the UserPromptSubmit query: a failure whose text is pure prose and numbers names no candidate and opens no store. Left because a normalized stderr line is not a spelling a user retypes.
+- [ ] (phase 5) inject::state::MAX_SUPPRESSED caps the suppression list at 100 oldest-dropped while injected/brief are uncapped; a very long session's state file forgets its earliest refusals. Nothing in phase 5 reads them back; FEED-01 owns the durable record.
+- [ ] (phase 5) crates/verbatim/src/cmd/hook.rs's inject doc says the abandoned injection thread writes nothing; since plan 4 task 2 it writes the D-06 per-session scratch file (the store still never sees a write). One clause of one comment, outside plan 4's lease.
 
 
 ## Seeds
