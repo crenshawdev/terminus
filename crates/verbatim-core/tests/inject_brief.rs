@@ -95,8 +95,31 @@ impl Bench {
         }
     }
 
-    /// The brief a `SessionStart` in one project would carry.
+    /// A config whose `[injection] brief_chars` is what the test says, loaded
+    /// through the file the binary loads one from - the budget has to reach the
+    /// query, and a struct built in memory would not prove that it does.
+    fn config(&self, brief_chars: usize) -> Config {
+        let dir = self.work.join(format!("config-{brief_chars}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("verbatim.toml"),
+            format!(
+                "roots = [{:?}]\n\n[injection]\nbrief_chars = {brief_chars}\n",
+                self.work.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        Config::load_from(&dir).unwrap()
+    }
+
+    /// The brief a `SessionStart` in one project would carry, at the default
+    /// budget.
     fn brief(&self, project: &str) -> Option<String> {
+        self.brief_with(project, &Config::default())
+    }
+
+    /// The brief a `SessionStart` in one project would carry, under one config.
+    fn brief_with(&self, project: &str, config: &Config) -> Option<String> {
         let cwd = self.project(project);
         let payload = Payload {
             session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
@@ -105,7 +128,7 @@ impl Bench {
             prompt: None,
             source: Some("startup"),
         };
-        brief::session_start(&self.data_dir, &Config::default(), &payload)
+        brief::session_start(&self.data_dir, config, &payload)
     }
 }
 
@@ -276,4 +299,99 @@ fn nothing_in_the_injection_path_spawns_a_process_or_reads_observations() {
         checked += 1;
     }
     assert!(checked >= 3, "only {checked} files in {}", dir.display());
+}
+
+// ---------------------------------------------------------------------------
+// The budget (INJ-01, D-16)
+
+/// A turn long enough that the brief cannot carry both of them whole.
+fn long_turn(subject: &str) -> String {
+    format!("{subject} ").repeat(400)
+}
+
+/// The variable parts are cut and the fixed ones survive: a budget is a reason
+/// to quote less of the last exchange, never a reason to drop the date, the
+/// branch or the pointer.
+#[test]
+fn a_configured_budget_cuts_the_quoted_turns_and_keeps_the_date_branch_and_counts() {
+    let bench = bench();
+    let prompt = long_turn("a very long prompt about sprockets");
+    let reply = long_turn("a very long reply about sprockets");
+    bench.archive(&Session {
+        prompt: &prompt,
+        reply: &reply,
+        ..LATE
+    });
+
+    const BUDGET: usize = 500;
+    let brief = bench
+        .brief_with("project-alpha", &bench.config(BUDGET))
+        .expect("a brief");
+
+    // The falsifying half: an uncut brief is longer than the budget, so what
+    // follows is a cut and not a brief that happened to fit.
+    let uncut = bench.brief("project-alpha").expect("a brief");
+    assert!(
+        uncut.chars().count() > BUDGET,
+        "the unbudgeted brief is only {} characters, so this test proves \
+         nothing about cutting: {uncut}",
+        uncut.chars().count()
+    );
+
+    assert!(
+        brief.chars().count() <= BUDGET,
+        "the brief is {} characters against a budget of {BUDGET}: {brief}",
+        brief.chars().count()
+    );
+    for kept in [
+        LATE.day,
+        LATE.branch.unwrap(),
+        "1 session",
+        "2 turns",
+        "recall_search",
+    ] {
+        assert!(
+            brief.contains(kept),
+            "the budget dropped {kept:?} instead of cutting a quoted turn: {brief}"
+        );
+    }
+    assert!(
+        brief.contains(verbatim_core::recall::excerpt::ELISION),
+        "the brief was cut without saying so: {brief}"
+    );
+}
+
+/// The ceiling that is not the user's to raise (bundle 2.1.237 persists a hook
+/// stdout over 10,000 characters to disk and hands the model a file reference
+/// instead of the text).
+///
+/// The over-long part here is the project key itself, which is the one piece of
+/// a brief with no bound of its own: it is a `cwd` string out of a transcript,
+/// it appears twice, and no cut to the quoted turns can shorten it. A path this
+/// long cannot exist on disk, which is exactly why the resolver degrades to the
+/// string and the key becomes it.
+#[test]
+fn no_brief_exceeds_the_ceiling_whatever_the_config_says() {
+    let bench = bench();
+    let huge = format!("project-{}", "d".repeat(11_000));
+    bench.archive(&Session {
+        file: "huge.jsonl",
+        project: &huge,
+        ..LATE
+    });
+
+    let brief = bench
+        .brief_with(&huge, &bench.config(brief::MAX_BRIEF_CHARS * 2))
+        .expect("a brief");
+
+    assert!(
+        brief.chars().count() <= brief::MAX_BRIEF_CHARS,
+        "the brief is {} characters against a ceiling of {}",
+        brief.chars().count(),
+        brief::MAX_BRIEF_CHARS
+    );
+    assert!(
+        brief.ends_with(verbatim_core::recall::excerpt::ELISION),
+        "the brief was cut at the ceiling without saying so"
+    );
 }

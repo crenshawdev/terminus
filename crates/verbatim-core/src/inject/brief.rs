@@ -47,24 +47,169 @@ use crate::recall::{excerpt, Query};
 pub fn session_start(data_dir: &Path, config: &Config, payload: &Payload) -> Option<String> {
     let store = super::open(data_dir)?;
     let scoped = super::scoped(store.conn(), config, payload)?;
-    render(store.conn(), &scoped)
+    render(store.conn(), &scoped, config.brief_chars())
 }
 
-/// The brief's blocks, in order, joined by a blank line.
+/// The ceiling on a brief, whatever `verbatim.toml` configures.
+///
+/// Bundle 2.1.237 persists a hook stdout longer than 10,000 characters to disk
+/// and hands the model a reference to the file instead of the text. A brief
+/// past that stops being context and becomes a path, so the configured budget
+/// is clamped here rather than trusted: a user who writes a larger number gets
+/// the largest brief that is still a brief.
+pub const MAX_BRIEF_CHARS: usize = 10_000;
+
+/// The brief's blocks, in order, joined by a blank line, inside `budget`.
 ///
 /// The last session first and the index pointer last: continuity is what the
 /// session is resuming, and the pointer is the standing fact that outlives it.
-/// The shape is a list so that a block which cannot be rendered is dropped
-/// rather than failing the brief.
-fn render(conn: &Connection, scoped: &Scoped) -> Option<String> {
-    let blocks: Vec<String> = [last_session(conn, scoped), index_pointer(conn, scoped)]
-        .into_iter()
-        .flatten()
-        .collect();
-    if blocks.is_empty() {
+/// A block that cannot be rendered is dropped rather than failing the brief.
+fn render(conn: &Connection, scoped: &Scoped, budget: usize) -> Option<String> {
+    let budget = budget.min(MAX_BRIEF_CHARS);
+    let continuity = last_session(conn, scoped);
+    let pointer = index_pointer(conn, scoped);
+    if continuity.is_none() && pointer.is_none() {
         return None;
     }
-    Some(blocks.join("\n\n"))
+
+    let full = assemble(continuity.as_ref(), pointer.as_deref());
+    if chars(&full) <= budget {
+        return Some(full);
+    }
+
+    // The variable-length parts are cut first and the blocks are not dropped:
+    // the head line and the pointer are the cheapest text in the brief and the
+    // most useful - the pointer is the ~30 tokens that tell the model
+    // searchable memory exists at all - while the quoted prompt and reply are
+    // the only parts whose size the archive controls.
+    let spent = chars(&assemble(
+        continuity.as_ref().map(Continuity::bare).as_ref(),
+        pointer.as_deref(),
+    ));
+    let cut = continuity.map(|continuity| continuity.within(budget.saturating_sub(spent)));
+    // The backstop, and only that: it fires when the head line and the pointer
+    // alone are over budget, which no cut to the quoted turns can fix.
+    Some(clip(&assemble(cut.as_ref(), pointer.as_deref()), budget))
+}
+
+/// The brief as text: the continuity block, then the pointer.
+fn assemble(continuity: Option<&Continuity>, pointer: Option<&str>) -> String {
+    let mut blocks: Vec<String> = Vec::new();
+    if let Some(continuity) = continuity {
+        blocks.push(continuity.text());
+    }
+    if let Some(pointer) = pointer {
+        blocks.push(pointer.to_owned());
+    }
+    blocks.join("\n\n")
+}
+
+/// INJ-01's continuity block, kept in pieces until the budget is known.
+///
+/// The head is fixed-length in everything but the project key and the branch
+/// name; the two quoted turns are whatever the archive holds. Rendering them
+/// separately is what lets the budget cut the second without touching the first.
+struct Continuity {
+    head: String,
+    prompt: Option<String>,
+    reply: Option<String>,
+}
+
+impl Continuity {
+    fn text(&self) -> String {
+        let mut out = self.head.clone();
+        if let Some(prompt) = &self.prompt {
+            out.push_str(&format!("\nIt last asked: {prompt}"));
+        }
+        if let Some(reply) = &self.reply {
+            out.push_str(&format!("\nIt last answered: {reply}"));
+        }
+        out
+    }
+
+    /// The same block with both quoted turns emptied, for measuring what the
+    /// fixed parts cost. It keeps the labels, so the measurement is an upper
+    /// bound on the fixed cost and never an under-count.
+    fn bare(&self) -> Continuity {
+        Continuity {
+            head: self.head.clone(),
+            prompt: self.prompt.as_ref().map(|_| String::new()),
+            reply: self.reply.as_ref().map(|_| String::new()),
+        }
+    }
+
+    /// The block with its two quoted turns sharing `allowance` characters.
+    ///
+    /// Even shares, except that a turn shorter than its half hands the
+    /// remainder to the other rather than wasting it - a one-line prompt
+    /// against a long reply is the ordinary shape of a session. A turn whose
+    /// share is nothing is dropped rather than rendered as a label with an
+    /// empty quotation.
+    fn within(self, allowance: usize) -> Continuity {
+        let (prompt, reply) = shares(self.prompt.as_deref(), self.reply.as_deref(), allowance);
+        Continuity {
+            head: self.head,
+            prompt,
+            reply,
+        }
+    }
+}
+
+/// Split `allowance` characters between the two quoted turns.
+fn shares(
+    prompt: Option<&str>,
+    reply: Option<&str>,
+    allowance: usize,
+) -> (Option<String>, Option<String>) {
+    let want = |text: Option<&str>| text.map(chars).unwrap_or(0);
+    let half = allowance / 2;
+
+    // First pass: nobody takes more than half, and nobody takes more than it
+    // has. What is left over is then offered to whichever still wants it.
+    let mut given_prompt = want(prompt).min(half);
+    let mut given_reply = want(reply).min(allowance - half);
+    let mut spare = allowance - given_prompt - given_reply;
+    for (given, wanted) in [
+        (&mut given_prompt, want(prompt)),
+        (&mut given_reply, want(reply)),
+    ] {
+        let extra = wanted.saturating_sub(*given).min(spare);
+        *given += extra;
+        spare -= extra;
+    }
+
+    let cut = |text: Option<&str>, given: usize| -> Option<String> {
+        let text = text?;
+        (given > 0).then(|| clip(text, given))
+    };
+    (cut(prompt, given_prompt), cut(reply, given_reply))
+}
+
+/// How many characters a string is, which is what the budget counts (D-16).
+///
+/// Characters and not bytes and not tokens: the workspace has no tokenizer and
+/// will not grow one on the cold-start path, and bytes would under-count a brief
+/// by a factor of three against the same text in another script.
+fn chars(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// `text`, cut to `budget` characters with [`excerpt::ELISION`] where it was cut.
+///
+/// One spelling of three dots in the product, and cut on a character boundary:
+/// a byte-indexed slice through a multi-byte character is a panic, and a panic
+/// on this path is a `SessionStart` that emits nothing.
+fn clip(text: &str, budget: usize) -> String {
+    if chars(text) <= budget {
+        return text.to_owned();
+    }
+    let marker = chars(excerpt::ELISION);
+    if budget <= marker {
+        return text.chars().take(budget).collect();
+    }
+    let mut out: String = text.chars().take(budget - marker).collect();
+    out.push_str(excerpt::ELISION);
+    out
 }
 
 /// What the brief calls the project it is about.
@@ -84,12 +229,12 @@ struct LastSession {
 
 /// INJ-01's continuity blocks: which session was last here, when it ended, on
 /// what branch, and the last thing said in each direction.
-fn last_session(conn: &Connection, scoped: &Scoped) -> Option<String> {
+fn last_session(conn: &Connection, scoped: &Scoped) -> Option<Continuity> {
     let row = last_session_row(conn, scoped).ok()??;
     let project = project_label(scoped);
 
     let day = row.last_turn_at.as_deref().map(day);
-    let mut block = match (day, row.branch.as_deref()) {
+    let head = match (day, row.branch.as_deref()) {
         (Some(day), Some(branch)) => {
             format!("The last session in {project} ended {day}, on branch {branch}.")
         }
@@ -99,13 +244,11 @@ fn last_session(conn: &Connection, scoped: &Scoped) -> Option<String> {
     };
 
     let (prompt, reply) = last_exchange(conn, &row.session_key);
-    if let Some(prompt) = prompt {
-        block.push_str(&format!("\nIt last asked: {prompt}"));
-    }
-    if let Some(reply) = reply {
-        block.push_str(&format!("\nIt last answered: {reply}"));
-    }
-    Some(block)
+    Some(Continuity {
+        head,
+        prompt,
+        reply,
+    })
 }
 
 /// The greatest `last_turn_at` among the scoped project's own sessions.
