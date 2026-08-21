@@ -95,6 +95,31 @@ struct FileConfig {
     /// How much context injection may write, per event (INJ-01, D-18).
     #[serde(default)]
     injection: FileInjection,
+    /// The model provider observations may ask for judgment (OBS-05, D-10).
+    #[serde(default)]
+    provider: FileProvider,
+}
+
+/// The `[provider]` table of `verbatim.toml` (D-10).
+///
+/// Every key optional, an unrecognized key ignored under the same rule as one
+/// at the top level, and a missing table meaning the defaults - which are "ask
+/// no model anything".
+///
+/// `api_key` arrives as a plain `String` and is wrapped in a [`Secret`] by
+/// [`Config::resolve`] rather than being deserialized straight into one. A
+/// serde error names the type it wanted, and the one place a value can still
+/// reach a stream from here is the TOML parser's own excerpt of a malformed
+/// line - which [`withhold_secret_excerpt`] takes out.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FileProvider {
+    enabled: Option<bool>,
+    base_url: Option<String>,
+    model: Option<String>,
+    name: Option<String>,
+    api_key: Option<String>,
+    local: Option<bool>,
+    daily_token_budget: Option<u64>,
 }
 
 /// The `[injection]` table of `verbatim.toml`.
@@ -126,6 +151,86 @@ pub const DEFAULT_BRIEF_CHARS: usize = 6_000;
 /// rather than once a session, and because INJ-03 caps it at three turns.
 pub const DEFAULT_PROMPT_CHARS: usize = 4_000;
 
+/// What a [`Secret`] renders as, everywhere, under every formatter.
+///
+/// A fixed marker rather than an empty string, so a reader of a message can
+/// tell "there was a credential here and it was withheld" from "there was
+/// nothing here" - the second would make a missing key look like a wrong one.
+pub const REDACTED: &str = "[redacted]";
+
+/// A credential value, in the one wrapper in this workspace that cannot print
+/// itself.
+///
+/// **The point is what it does NOT have.** No `Debug` that shows the value, no
+/// `Display`, no `AsRef<str>`, no `Deref`, no `Into<String>`. The only way to
+/// the bytes is [`Secret::expose`], which is spelled to be conspicuous at the
+/// call site and is called in exactly the places that build a request. Every
+/// other route - a formatted config, a `{}` in an error message, a `{:?}` in a
+/// panic - renders [`REDACTED`].
+///
+/// `Config` derives `Debug` and is formatted whole in more than one place; this
+/// type is what makes that derive safe (PRIV-01).
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Wrap a credential value.
+    pub fn new(value: impl Into<String>) -> Secret {
+        Secret(value.into())
+    }
+
+    /// The value itself, for the one caller that has to put it on the wire.
+    ///
+    /// Named `expose` and not `as_str` on purpose: a reviewer grepping for
+    /// where a credential leaves its wrapper finds every site in one search,
+    /// and a call added in the wrong place is visible in a diff.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Is the wrapped value empty?
+    ///
+    /// An empty string in a config or an environment variable means "unset"
+    /// wherever it appears in this workspace ([`non_empty_var`]), and the
+    /// caller cannot ask by looking.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
+
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
+
+/// The resolved `[provider]` block (OBS-05, D-05, D-10).
+///
+/// Base URL, model and key are the only things that differ between a local
+/// ollama and a remote OpenAI-compatible endpoint; there is no second request
+/// shape behind any of these fields.
+///
+/// Nothing here is parsed as a URL, resolved as a host or looked up in DNS.
+/// There is no `url` crate in this workspace on purpose (D-13): a name
+/// resolution is itself a connection PRIV-03 bars, and it would happen while
+/// merely reading a config file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Provider {
+    enabled: bool,
+    base_url: Option<String>,
+    model: Option<String>,
+    name: Option<String>,
+    api_key: Option<Secret>,
+    local: bool,
+    daily_token_budget: Option<u64>,
+}
+
 /// The resolved config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -137,6 +242,7 @@ pub struct Config {
     encoded_exclusions: Vec<String>,
     brief_chars: usize,
     prompt_chars: usize,
+    provider: Provider,
 }
 
 /// The defaults, spelled once. Derived `Default` would give both budgets zero,
@@ -150,6 +256,11 @@ impl Default for Config {
             encoded_exclusions: Vec::new(),
             brief_chars: DEFAULT_BRIEF_CHARS,
             prompt_chars: DEFAULT_PROMPT_CHARS,
+            // Every field false, absent or zero, and that is the right default
+            // here where it is the wrong one for the budgets: judgment is
+            // opt-in and off (OBS-02), and `local` absent means remote and
+            // therefore filtered (D-13).
+            provider: Provider::default(),
         }
     }
 }
@@ -174,7 +285,7 @@ impl Config {
                 // falling back to defaults and walking the wrong tree.
                 Error::ConfigParse {
                     path: path.clone(),
-                    detail: source.to_string(),
+                    detail: withhold_secret_excerpt(&source.to_string()),
                 }
             })?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
@@ -217,7 +328,84 @@ impl Config {
         if let Some(chars) = file.injection.prompt_chars {
             config.prompt_chars = chars;
         }
+        config.provider = Provider {
+            enabled: file.provider.enabled.unwrap_or(false),
+            base_url: non_empty(file.provider.base_url),
+            model: non_empty(file.provider.model),
+            name: non_empty(file.provider.name),
+            api_key: non_empty(file.provider.api_key).map(Secret::new),
+            local: file.provider.local.unwrap_or(false),
+            daily_token_budget: file.provider.daily_token_budget,
+        };
         Ok(config)
+    }
+
+    /// May observations ask a model for judgment (OBS-02)?
+    ///
+    /// False unless the config says otherwise, including for a config file that
+    /// has no `[provider]` table at all. Nothing in this workspace resolves a
+    /// credential or builds a request while this is false.
+    pub fn provider_enabled(&self) -> bool {
+        self.provider.enabled
+    }
+
+    /// The endpoint's base, which `chat/completions` is appended to (D-05).
+    ///
+    /// Handed back exactly as written. It is not parsed, not validated and not
+    /// resolved (D-13): there is no `url` crate here, and a DNS lookup is a
+    /// connection PRIV-03 bars.
+    pub fn provider_base_url(&self) -> Option<&str> {
+        self.provider.base_url.as_deref()
+    }
+
+    /// The model name to put in the request body.
+    pub fn provider_model(&self) -> Option<&str> {
+        self.provider.model.as_deref()
+    }
+
+    /// The provider namespace all three credential tiers key off (D-14).
+    ///
+    /// It names the section of the shared credentials file and the spelling of
+    /// the environment variable; `crate::credentials` documents both. With no
+    /// name there is no namespace to look a credential up under, so only the
+    /// `api_key` written in this file can be found.
+    pub fn provider_name(&self) -> Option<&str> {
+        self.provider.name.as_deref()
+    }
+
+    /// The product-config tier of D-14's precedence: a value, not a reference.
+    ///
+    /// Behind [`Secret`], so a `{:?}` of the whole config cannot render it.
+    pub fn provider_api_key(&self) -> Option<&Secret> {
+        self.provider.api_key.as_ref()
+    }
+
+    /// Is the configured provider on this machine (D-13)?
+    ///
+    /// **This key describes the DESTINATION, not the address.** It is declared
+    /// and never inferred: nothing here looks at the base URL to decide, because
+    /// deciding would mean parsing a host and resolving a name, and a name
+    /// resolution is itself a connection PRIV-03 bars.
+    ///
+    /// Absent or false means remote, and therefore filtered, so a user who
+    /// forgets the key pays the egress filter unnecessarily - which is
+    /// harmless. The failure that is not harmless is the other direction: set
+    /// `local = true` on a reverse proxy that forwards offsite and unfiltered
+    /// session text goes offsite. The address being `127.0.0.1` is not the
+    /// question; where the bytes end up is.
+    pub fn provider_local(&self) -> bool {
+        self.provider.local
+    }
+
+    /// How many tokens a day the provider may be paid for (OBS-06, D-11).
+    ///
+    /// The one cost control that is a config key, because it is the one facing
+    /// money. The minimum turn count and the truncation budget are quality
+    /// knobs and stay compile-time constants. `None` is no cap - which is the
+    /// safe default only because judgment is off unless
+    /// [`Config::provider_enabled`] says otherwise.
+    pub fn provider_daily_token_budget(&self) -> Option<u64> {
+        self.provider.daily_token_budget
     }
 
     /// How many characters the SessionStart resume brief may carry (INJ-01).
@@ -549,6 +737,48 @@ fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| Error::ConfigUnresolved {
             detail: "USERPROFILE is not set".into(),
         })
+}
+
+/// A configured string set to `""` is treated as unset, the way an empty
+/// environment variable is ([`non_empty_var`]).
+///
+/// One rule for both sources, because the alternative is a `base_url = ""` that
+/// resolves to a request against the empty string and an `api_key = ""` that
+/// outranks a real key in the shared file for being "present".
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.is_empty())
+}
+
+/// The one place a credential can still reach a stream from a config file, shut
+/// (PRIV-01).
+///
+/// A TOML parse error renders the offending line back at the reader:
+///
+/// ```text
+/// TOML parse error at line 2, column 11
+///   |
+/// 2 | api_key = sk-not-a-quoted-string
+///   |           ^
+/// ```
+///
+/// Forgetting the quotes around a key is an ordinary mistake, and the reward
+/// for making it must not be the key on stderr - `verbatim doctor` and every
+/// command that loads a config would print it. When the parser's rendering
+/// names `api_key` at all, its excerpt is dropped and only the position
+/// survives, which is what the user needs to find the line in their own file.
+///
+/// Deliberately blunt: it withholds the excerpt whenever that string appears
+/// anywhere in the error, including when the broken line is somewhere else
+/// entirely. Withholding too much costs a reader one look at their own file;
+/// withholding too little costs a key rotation.
+fn withhold_secret_excerpt(detail: &str) -> String {
+    if !detail.contains("api_key") {
+        return detail.to_owned();
+    }
+    let position = detail.lines().next().unwrap_or_default();
+    format!(
+        "{position} (the parser's excerpt of the file is withheld here because it names api_key)"
+    )
 }
 
 /// An environment variable set to the empty string is treated as unset: an

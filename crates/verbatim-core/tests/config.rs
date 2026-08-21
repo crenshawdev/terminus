@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use verbatim_core::config::{
-    Config, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME, DEFAULT_BRIEF_CHARS, DEFAULT_CLAUDE_DIR,
-    DEFAULT_PROMPT_CHARS, PROJECTS_SUBDIR,
+    Config, Secret, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME, DEFAULT_BRIEF_CHARS,
+    DEFAULT_CLAUDE_DIR, DEFAULT_PROMPT_CHARS, PROJECTS_SUBDIR, REDACTED,
 };
 use verbatim_core::Error;
 
@@ -482,4 +482,195 @@ fn an_unknown_key_inside_the_injection_table_is_ignored_rather_than_rejected() {
 
     assert_eq!(config.brief_chars(), 900);
     assert_eq!(config.prompt_chars(), DEFAULT_PROMPT_CHARS);
+}
+
+// ---------------------------------------------------------------------------
+// The `[provider]` table (OBS-05, D-05, D-10, D-13)
+
+/// A value distinctive enough that finding any part of it in a rendered string
+/// is unambiguous evidence of a leak rather than a coincidence.
+const KEY: &str = "sk-VERBATIMTESTKEY-9f3a1c-do-not-log";
+
+/// The state every user starts in, and the one OBS-02 requires: a config with
+/// no `[provider]` table asks no model anything and holds no credential.
+#[test]
+fn a_config_without_a_provider_table_is_not_enabled_and_has_no_key() {
+    let dir = config_dir_holding(&[(CONFIG_FILE_NAME, "exclude = [\"/data/private\"]\n")]);
+    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).unwrap()
+    });
+
+    assert!(!config.provider_enabled());
+    assert!(config.provider_api_key().is_none());
+    assert_eq!(config.provider_base_url(), None);
+    assert_eq!(config.provider_model(), None);
+    assert_eq!(config.provider_name(), None);
+    assert_eq!(config.provider_daily_token_budget(), None);
+    assert!(
+        !config.provider_local(),
+        "an absent `local` means remote and therefore filtered (D-13)"
+    );
+    assert!(
+        !Config::default().provider_enabled(),
+        "a config built with no file at all agrees with one read from a file with no table"
+    );
+}
+
+/// One key configured leaves the rest alone, which is why every key is an
+/// `Option` on the way in rather than a `#[serde(default)]` zero.
+#[test]
+fn a_provider_table_naming_only_a_model_leaves_the_other_keys_at_their_defaults() {
+    let dir = config_dir_holding(&[(CONFIG_FILE_NAME, "[provider]\nmodel = \"qwen3:8b\"\n")]);
+    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).unwrap()
+    });
+
+    assert_eq!(config.provider_model(), Some("qwen3:8b"));
+    assert!(
+        !config.provider_enabled(),
+        "naming a model is not asking for judgment"
+    );
+    assert!(
+        !config.provider_local(),
+        "a table that does not declare its destination is remote (D-13)"
+    );
+    assert_eq!(config.provider_base_url(), None);
+    assert_eq!(config.provider_name(), None);
+    assert!(config.provider_api_key().is_none());
+    assert_eq!(config.provider_daily_token_budget(), None);
+}
+
+/// Every key at once, so the accessors are proven to read the keys they name
+/// rather than each other.
+#[test]
+fn a_full_provider_table_resolves_to_the_values_it_names() {
+    let dir = config_dir_holding(&[(
+        CONFIG_FILE_NAME,
+        &format!(
+            "[provider]\n\
+             enabled = true\n\
+             base_url = \"http://localhost:11434/v1/\"\n\
+             model = \"qwen3:8b\"\n\
+             name = \"ollama\"\n\
+             api_key = \"{KEY}\"\n\
+             local = true\n\
+             daily_token_budget = 50000\n"
+        ),
+    )]);
+    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).unwrap()
+    });
+
+    assert!(config.provider_enabled());
+    assert_eq!(
+        config.provider_base_url(),
+        Some("http://localhost:11434/v1/")
+    );
+    assert_eq!(config.provider_model(), Some("qwen3:8b"));
+    assert_eq!(config.provider_name(), Some("ollama"));
+    assert!(config.provider_local());
+    assert_eq!(config.provider_daily_token_budget(), Some(50_000));
+    assert_eq!(
+        config.provider_api_key().map(Secret::expose),
+        Some(KEY),
+        "the one accessor that reaches the value has to reach it"
+    );
+}
+
+/// The documented rule holds one level down: this file grows every phase, and a
+/// key a later build writes must not make this one refuse to start.
+#[test]
+fn an_unknown_key_inside_the_provider_table_is_ignored_rather_than_rejected() {
+    let dir = config_dir_holding(&[(
+        CONFIG_FILE_NAME,
+        "[provider]\nmodel = \"qwen3:8b\"\nsomething_phase_9_writes = \"whatever\"\n",
+    )]);
+    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).expect("an unknown provider key is not an error")
+    });
+
+    assert_eq!(config.provider_model(), Some("qwen3:8b"));
+}
+
+/// PRIV-01: `Config` derives `Debug`, and nothing that derive can reach may
+/// render the key.
+#[test]
+fn a_config_carrying_an_api_key_formats_with_no_byte_of_it() {
+    let dir = config_dir_holding(&[(
+        CONFIG_FILE_NAME,
+        &format!("[provider]\nenabled = true\napi_key = \"{KEY}\"\n"),
+    )]);
+    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).unwrap()
+    });
+
+    // The falsifying half: the key really is in there, so the assertions below
+    // are about a formatter and not about an empty config.
+    assert_eq!(config.provider_api_key().map(Secret::expose), Some(KEY));
+
+    let rendered = format!("{config:?}");
+    for fragment in [KEY, "VERBATIMTESTKEY", "9f3a1c"] {
+        assert!(
+            !rendered.contains(fragment),
+            "the formatted config carries {fragment:?}: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains(REDACTED),
+        "the formatted config does not say a credential was withheld: {rendered}"
+    );
+
+    let secret = config.provider_api_key().unwrap();
+    assert_eq!(format!("{secret:?}"), REDACTED);
+    assert_eq!(format!("{secret}"), REDACTED);
+}
+
+/// The other way a config file can put a key on a stream: forget the quotes and
+/// let the TOML parser echo the line back (PRIV-01).
+#[test]
+fn a_malformed_api_key_line_is_not_echoed_by_the_parse_error() {
+    let dir = config_dir_holding(&[(
+        CONFIG_FILE_NAME,
+        // Unquoted, which is a syntax error, and the parser's rendering of it
+        // points a caret at the value.
+        &format!("[provider]\napi_key = {KEY}\n"),
+    )]);
+    let error = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).expect_err("an unquoted value does not parse")
+    });
+
+    let rendered = error.to_string();
+    for fragment in [KEY, "VERBATIMTESTKEY", "9f3a1c"] {
+        assert!(
+            !rendered.contains(fragment),
+            "the parse error echoed {fragment:?}: {rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("line 2"),
+        "the parse error withheld the position too, so it names nothing findable: {rendered}"
+    );
+    assert!(
+        matches!(error, Error::ConfigParse { .. }),
+        "an unparseable config is still a parse error: {error:?}"
+    );
+}
+
+/// An empty string is not a value, in a config file as in an environment
+/// variable: `api_key = ""` must not outrank a real key in the shared file, and
+/// `base_url = ""` must not become a request against the empty string.
+#[test]
+fn an_empty_provider_string_is_the_same_as_an_absent_one() {
+    let dir = config_dir_holding(&[(
+        CONFIG_FILE_NAME,
+        "[provider]\nenabled = true\nbase_url = \"\"\napi_key = \"\"\nname = \"\"\n",
+    )]);
+    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).unwrap()
+    });
+
+    assert!(config.provider_enabled());
+    assert_eq!(config.provider_base_url(), None);
+    assert_eq!(config.provider_name(), None);
+    assert!(config.provider_api_key().is_none());
 }
