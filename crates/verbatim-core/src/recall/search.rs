@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::Result;
@@ -162,7 +163,10 @@ impl Request {
 /// to say WHICH rule produced a candidate: "matched 2 entities" cannot attribute
 /// a replayed label change to a path rule versus a symbol rule, which is the one
 /// question offline replay exists to answer (phase 6 D-05).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// `serde` is derived here and on nothing else in this module: a matched pair is
+/// the one part of a hit that outlives the query, because FEED-01 writes it into
+/// a decision record on the prompt path and reads it back at ingest.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MatchedEntity {
     /// The `entities.kind`: `path`, `command`, `error`, `symbol`, `tool`.
     pub kind: String,

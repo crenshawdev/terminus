@@ -20,11 +20,12 @@
 //! `create_dir_all`, initialize a fresh database, run the additive column
 //! bring-forward and set two pragmas: a hook must not leave a store behind as
 //! the side effect of a question, and the ingest lock belongs to the pass the
-//! hook already spawned. The one thing injection does write is [`state`], a
-//! per-session scratch file beside the store and never inside it (D-06): a
-//! write on the prompt path is exactly what INJ-06 cannot tolerate, and a
-//! blocked writer behind a 49-second backfill is strictly worse than a blocked
-//! reader.
+//! hook already spawned. What injection does write is two kinds of FILE beside
+//! the store and never inside it: [`state`], one session's disposable scratch
+//! (D-06), and [`decision`], one durable record per prompt that a later ingest
+//! pass drains into the store (phase 6 D-01). A write on the prompt path is
+//! exactly what INJ-06 cannot tolerate, and a blocked writer behind a 49-second
+//! backfill is strictly worse than a blocked reader.
 //!
 //! **The scope comes off the payload (D-12).** [`Scope::Directory`] built from
 //! the payload's `cwd`, never [`Scope::current_directory`]: the working
@@ -34,6 +35,7 @@
 
 pub mod brief;
 pub mod compaction;
+pub mod decision;
 pub mod prompt;
 pub mod state;
 
