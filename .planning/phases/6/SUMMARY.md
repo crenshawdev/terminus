@@ -50,7 +50,8 @@ Every prompt now leaves a decision record that ingest drains into SQLite, labels
 
 ## Open items
 
-- `verbatim stats` and `verbatim replay` against a store ingested before this phase exit 1 with a raw `sqlite: no such table: decisions`. Read commands never migrate by design (D-10/D-18, `cmd/read.rs`), and the tables appear on the next write-mode ingest pass - but this is exactly the "store older than this build" case D-18 says should *say so*, and it does not.
+- ~~`verbatim stats` and `verbatim replay` against a store ingested before this phase exit 1 with a raw `sqlite: no such table: decisions`.~~ Closed at UAT by `00c6b53`: `Store::missing_tables` measures the absence at read-only open, both tables gone is the empty answer with a reason and exit 0, and exactly one gone is a damaged store reported with the envelope written and exit 1. Read commands still never migrate.
+- `read::decision_log` reads the table list captured at open and does not re-check it before the query, so a writer dropping a table in between still reaches the raw sqlite path. Not closable from a read-only connection - the check and the query are two statements whatever their order - and the same window `Store::missing_columns` has always had (cross-model reviewer, medium, adjudicated as an open item rather than a blocker).
 - Replay's `wasted budget` is "the would-inject set is non-empty and none of it is a hit", where ingest reads `chars_injected > 0`. The two agree in practice, but a replay has no rendered text to count and so cannot use the column's own definition.
 - The `decisions` table carries neither `compacted` nor `dropped`, so replay and stats cannot tell a decision taken under a compacted pool from an ordinary one.
 - A `.tmp` left by a hook that exited between write and rename is skipped by `read_all` and deleted by nothing, so the decisions directory accumulates orphans (cross-model reviewer, medium, adjudicated as an open item rather than a blocker).

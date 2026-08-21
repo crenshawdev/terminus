@@ -1,0 +1,90 @@
+{
+  "status": "gaps",
+  "score": "9/9",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "A store built from nothing boots clean under ingest, carries `decisions` and `labels`, and a primary query returns real data with no schema error",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "Live probe with VERBATIM_DATA_DIR/CLAUDE_CONFIG_DIR/VERBATIM_CONFIG_DIR pointed at an empty scratch tree: `verbatim ingest` exit 0, sqlite_master lists decisions and labels alongside the archive/derived tables, `verbatim status --json` returns {sessions:2, turns:14, files_committed:2, bytes_read:8554} with ok:true, `verbatim stats` exit 0 on the same fresh store"
+    },
+    {
+      "n": 2,
+      "truth": "Every UserPromptSubmit leaves a decision record the next ingest drains into a `decisions` row carrying spellings, candidates with matched (kind, value_norm) pairs, suppressions with reasons, thresholds and char counts",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "Live probe: two real `verbatim hook UserPromptSubmit` invocations (one naming stored paths, one naming nothing structural) produced two rows in `decisions`, both carrying the full thresholds document {ranked:10, compacted_ranked:50, entity_rank:3, co_occurring:2, max_turns:3, max_candidates:8, prompt_chars:4000}, spellings on the first and an empty list on the second, chars_injected and a stamped watermark_session_no. crates/verbatim/tests/decisions.rs:248 three_prompt_shapes_each_leave_one_decision_row passes and asserts candidates[0].matched_on = {kind:'path', value:...}, thresholds, per-turn chars, and the drain being idempotent; crates/verbatim-core/tests/feedback.rs a_suppressed_prompt_records_the_refusals_and_why covers the non-empty suppression list. Writer at crates/verbatim-core/src/inject/prompt.rs:199,326 (Decision::opened) and drain at crates/verbatim-core/src/feedback/mod.rs:131 wired from crates/verbatim-core/src/ingest/pass.rs:123"
+    },
+    {
+      "n": 3,
+      "truth": "The phase-4 hook latency budget still holds with the decision-record write on the prompt path",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "`cargo test -p verbatim --test hook` 7 passed / 0 failed, including every_event_exits_zero_with_an_empty_stdout_inside_the_budget; the 10 ms p99 assertion is live at crates/verbatim/tests/hook.rs:345 (BUDGET = 10.0) and :376"
+    },
+    {
+      "n": 4,
+      "truth": "The six-hour idle rule sets is_final and the SQL join labels a referenced injection `hit` and an unreferenced one `false positive`, while a session younger than the threshold stays open and unlabelled",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "crates/verbatim-core/tests/label.rs:310 the_idle_rule_closes_a_quiet_session_and_leaves_a_live_one_open and :347 a_finalized_decision_is_labelled_by_what_the_session_did_next both pass (`cargo test -p verbatim-core --features testkit --test label`, 4 passed): is_final(IDLE)=Some(1), is_final(LIVE)=None, counts hit 1 / false positive 2 / wasted budget 1, labels_of(open) empty, second pass writes nothing. Implementation: crates/verbatim-core/src/feedback/finalize.rs:48 (IDLE_HOURS=6, one incremental UPDATE) and crates/verbatim-core/src/feedback/label.rs:88"
+    },
+    {
+      "n": 5,
+      "truth": "A `recall_search` call for an entity a decision declined to inject labels that decision `miss`, without reading a blob",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "crates/verbatim-core/tests/label.rs:528 a_recall_call_for_something_the_injector_declined_is_a_miss passes, asserting outcomes.count(\"miss\")==1, the label's detail is the withheld path, bytes_read==0 on the labelling pass, and exactly one miss row overall. SQL at crates/verbatim-core/src/feedback/label.rs:197 (miss) / :215 (sought_sql), fed by recall-call entity extraction in crates/verbatim-core/src/index/entity.rs"
+    },
+    {
+      "n": 6,
+      "truth": "`verbatim replay` with a threshold override exits 0, reports a per-label diff, and leaves verbatim.db byte-identical",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "Live probe on the smoke store: `verbatim replay --entity-rank 5` exit 0 printing decisions/hit/false positive/miss/wasted budget old->new plus a changed count; `--json` emits {command:'replay', data:{changed, decisions, labels:[4 entries], thresholds:{entity_rank:5,...}}, ok:true}; md5 of verbatim.db identical before and after both runs. crates/verbatim/tests/replay.rs 4 tests pass (byte-identical store, non-json path, no-store reason, malformed threshold is misuse). Read-only open path: crates/verbatim/src/cmd/replay.rs via cmd/read.rs; registered at crates/verbatim/src/main.rs:119"
+    },
+    {
+      "n": 7,
+      "truth": "`verbatim stats` and `--json` reduce the log to precision, misses and chars injected versus referenced, matching the documented envelope and hand-computed fixture numbers",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "Live probe: human output prints decisions/injected turns/hits/false positives/precision/misses/wasted budget/chars injected/chars referenced, and `--json` emits exactly the nine fields documented at docs/json-shapes.md:180-203 with precision null (not 0.0) on an unlabelled archive. crates/verbatim/tests/cli.rs:625 stats_reports_the_hand_computed_numbers_in_both_modes and crates/verbatim-core/tests/feedback.rs:1105 the_report_adds_up_the_known_mix / :1132 an_unlabelled_archive_has_no_precision_rather_than_a_precision_of_zero all pass. chars_referenced is a real join over hit labels and the injected list (crates/verbatim-core/src/feedback/stats.rs:124), not a constant. Registered at crates/verbatim/src/main.rs:115"
+    },
+    {
+      "n": 8,
+      "truth": "A reindex returns the same `decisions` rows, and a store lacking the two tables gains them on the next write-mode open with no rebuild",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "Live probe: md5 over `SELECT * FROM decisions ORDER BY id` identical before and after `verbatim reindex` (b4c36b9f...), n=2. Second probe: dropped `decisions` and `labels` from a copied store, ran `verbatim ingest` - both tables reappear, turns stays 14 and the run reports files_committed 0 / turns_added 0, so no reindex was triggered; `stats --json` then returns ok:true. Backed by crates/verbatim-core/src/store/schema.rs:295-296 (TABLES) with both absent from DERIVED_TABLES, and crates/verbatim-core/tests/feedback.rs:608 reindex_gives_back_every_logged_decision"
+    },
+    {
+      "n": 9,
+      "truth": "`verbatim search --json` exposes the matched (kind, value_norm) pairs the decision record records",
+      "status": "VERIFIED",
+      "uat_item": 9,
+      "evidence": "Live probe: `verbatim search 'docs/RETRY.md' --project '*' --json` returns hits whose matched_on is [{'kind':'path','value':'docs/RETRY.md'}] on the entity-matched turn and [] on the text-only turn; documented at docs/json-shapes.md:78 and :90"
+    }
+  ],
+  "passes": [
+    { "k": 1, "name": "Cold start from scratch", "evidence": "Fresh data dir: ingest exit 0, decisions and labels created, `status --json` returns sessions 2 / turns 14 / files_committed 2 with ok:true and no schema error" },
+    { "k": 2, "name": "Three prompt shapes each leave a decision row", "evidence": "Two live `hook UserPromptSubmit` runs produced two full decision rows (thresholds, spellings, watermark, chars); crates/verbatim/tests/decisions.rs:248 passes over all three shapes and asserts candidates[].matched_on, suppressions and thresholds" },
+    { "k": 3, "name": "Hook p99 budget still passes", "evidence": "`cargo test -p verbatim --test hook` 7 passed; the 10 ms assertion is live at crates/verbatim/tests/hook.rs:345,376" },
+    { "k": 4, "name": "Idle rule labels hit and false positive", "evidence": "crates/verbatim-core/tests/label.rs:310 and :347 pass - is_final 1 vs None, hit 1 / false positive 2 / wasted budget 1, live session zero labels" },
+    { "k": 5, "name": "A declined entity later searched labels miss", "evidence": "crates/verbatim-core/tests/label.rs:528 passes with miss count 1, detail naming the withheld path, and bytes_read 0" },
+    { "k": 6, "name": "verbatim replay diffs without writing", "evidence": "Live `replay --entity-rank 5` and `--json` exit 0 with the four-label old->new diff; verbatim.db md5 unchanged. crates/verbatim/tests/replay.rs 4 tests pass" },
+    { "k": 7, "name": "verbatim stats reports precision, misses and chars", "evidence": "Live human and --json output match docs/json-shapes.md:180-203 field for field, precision null on an unlabelled archive; cli.rs:625 and feedback.rs:1105/:1132 pass" },
+    { "k": 8, "name": "Reindex preserves decisions; old store gains tables", "evidence": "decisions rows byte-identical across reindex; a store with both tables dropped regains them on ingest with turns preserved and zero files committed" },
+    { "k": 9, "name": "search --json exposes matched_on", "evidence": "Live search returns matched_on [{'kind':'path','value':'docs/RETRY.md'}], documented at docs/json-shapes.md:78,90" }
+  ],
+  "gaps": [
+    {
+      "name": "stats and replay on a store older than this build report a raw sqlite line instead of an answer",
+      "reason": "behavior wrong - on a store that has not yet been opened in write mode by this build, both read-only commands fail on the missing table, and with --json they print a bare stderr line and write no envelope at all",
+      "evidence": "Probe: copied the smoke store, dropped `decisions` and `labels` (standing in for a phase-5-initialized store), then `verbatim stats` -> `verbatim: sqlite: no such table: decisions`, exit 1; `verbatim stats --json` -> same bare line, exit 1, empty stdout; `verbatim replay --entity-rank 5` -> same, exit 1. docs/json-shapes.md:44-50 permits an empty document only for a failure raised BEFORE the command reached its own answer (a store from the future, an unresolvable data dir); here the store opened fine and the query is the failure, so this case is outside the documented exception. Read commands never migrate by design (crates/verbatim/src/cmd/read.rs, D-10/D-15), and the tables do appear on the next write-mode ingest - the same probe's `verbatim ingest` restored them and `stats --json` then returned ok:true. Falsifies no acceptance criterion: AC5 and AC6 are both satisfied on stores this build has ingested into. Already named as open item 1 in .planning/phases/6/SUMMARY.md:53",
+      "severity": "minor",
+      "missing": "In cmd/read.rs (or at the two call sites), detect the missing `decisions`/`labels` tables and return the empty document with reason 'this store predates the decision log; run verbatim ingest once' at exit 0, or at minimum emit the --json envelope with ok:false and that reason rather than a bare sqlite string"
+    }
+  ],
+  "human_checks": []
+}
