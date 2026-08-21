@@ -6,6 +6,10 @@
 //! `paths` are derived and rebuildable from the blobs alone, which is what lets
 //! a format bump rebuild rather than migrate. `watermarks`, `runs` and `meta`
 //! are operational state.
+//!
+//! `decisions` and `labels` join the archive group in phase 6 (D-03): a logged
+//! injection decision is prompt-time state the blobs do not contain, so it is
+//! kept rather than rebuilt, and a `reindex` must never drop it.
 
 /// Bits of a turn id reserved for the per-session turn ordinal.
 ///
@@ -114,6 +118,76 @@ CREATE INDEX IF NOT EXISTS idx_session_meta_path
 CREATE INDEX IF NOT EXISTS idx_session_meta_project
     ON session_meta(project);
 
+-- One `UserPromptSubmit` decision, non-fires included (FEED-01). Archival, and
+-- deliberately NOT in `DERIVED_TABLES`: a decision records prompt-time state -
+-- what the prompt named, what the index answered, which thresholds were in
+-- force, what was suppressed - that no blob replay can reconstruct, so a
+-- `reindex` that dropped it would silently delete the entire history FEED-03's
+-- replay diff and FEED-04's precision are computed over (D-03, a recorded
+-- divergence from `DESIGN-BRIEF.md:92`).
+--
+-- The row is drained out of a per-prompt file by a later ingest pass and never
+-- written by the hook itself (D-01): a SQLite write on the prompt path sits
+-- behind the ingest writer, measured holding the store for 49 s.
+--
+-- Anchored by `session_id` and wall clock, never by `turn_seq` (D-04): the
+-- injector never reads the live transcript, so it cannot know a turn index, and
+-- labelling resolves the anchor to a turn afterwards.
+CREATE TABLE IF NOT EXISTS decisions (
+    id           INTEGER PRIMARY KEY,
+    session_id   TEXT,
+    -- Wall-clock UTC, ISO-8601, read on the prompt path.
+    ts           TEXT,
+    cwd          TEXT,
+    prompt       TEXT,
+    -- Max `sessions.session_no` when the decision was taken, which is what
+    -- bounds a replay to the index as it stood (D-10). Null only until the
+    -- drain stamps it: a prompt naming no candidate spelling never opens the
+    -- store and so has no watermark of its own.
+    watermark_session_no INTEGER,
+    -- The character proxy, never tokens (D-12): 0 for every non-fire.
+    chars_injected INTEGER,
+    -- The list-shaped payload, each column one JSON document. JSON rather than
+    -- five child tables because nothing joins on them - they are read back
+    -- whole by `replay` and `stats` - and a decision must land in one insert.
+    -- The spellings the prompt was asked about, strongest first.
+    spellings    TEXT,
+    -- The scored candidates: turn id, relevance, entity score, entity count and
+    -- the matched `(kind, value)` pairs (D-05).
+    candidates   TEXT,
+    -- The turns injected, with the characters each one spent.
+    injected     TEXT,
+    -- The turns refused, with their reason.
+    suppressed   TEXT,
+    -- The threshold values in force, logged per decision because they are
+    -- compile-time constants a later build may change (D-08).
+    thresholds   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id);
+
+-- What a decision turned out to be worth (FEED-02). Archival for the same
+-- reason `decisions` is: recomputing labels under changed rules is what
+-- `verbatim replay` is for, and dropping them on reindex would leave
+-- `verbatim stats` reporting zero precision until the next pass relabels.
+--
+-- `turn_id` carries NO foreign key on purpose, unlike every other reference in
+-- this schema. `turns` is a derived table `reindex` drops, foreign keys really
+-- are enforced (the bundled SQLite is built with
+-- `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`), and dropping a parent table with live
+-- child rows is a constraint violation - so a declared reference here would
+-- make the first `reindex` after the first label fail outright.
+CREATE TABLE IF NOT EXISTS labels (
+    id          INTEGER PRIMARY KEY,
+    decision_id INTEGER NOT NULL REFERENCES decisions(id),
+    turn_id     INTEGER,
+    label       TEXT    NOT NULL,
+    detail      TEXT,
+    labeled_at  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_labels_decision ON labels(decision_id);
+
 -- DERIVED. Rebuildable from the blobs alone; dropped and recreated by reindex.
 
 -- stream_offset and byte_len address the UNCOMPRESSED session stream, never
@@ -215,6 +289,11 @@ CREATE TABLE IF NOT EXISTS meta (
 pub const TABLES: &[&str] = &[
     "sessions",
     "session_meta",
+    // Both reach an already-initialized store through `bring_forward`'s
+    // missing-table arm on the next `Store::open`, which is what lets phase 6
+    // add two tables with no `DERIVED_SCHEMA` bump and no forced reindex (D-02).
+    "decisions",
+    "labels",
     "turns",
     "compaction_boundaries",
     "turns_fts",
@@ -226,7 +305,9 @@ pub const TABLES: &[&str] = &[
 ];
 
 /// The derived tables `reindex` drops and rebuilds from the blobs (STOR-04).
-/// `sessions` and `session_meta` are absent by design.
+/// `sessions` and `session_meta` are absent by design, and so are `decisions`
+/// and `labels`: nothing in a blob can reconstruct what an injector decided at
+/// prompt time (D-03).
 ///
 /// In creation order, because `reindex` drops in reverse: a boundary row
 /// references `turns(id)`, so `compaction_boundaries` sits **after** `turns`

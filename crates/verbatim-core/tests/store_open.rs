@@ -395,6 +395,61 @@ fn directory_bytes(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
+/// D-02: phase 6's two tables reach a store a phase-5 binary initialized, on the
+/// next ordinary `Store::open`, and nothing is rebuilt to get them there.
+///
+/// The store under test is aged by dropping exactly the two tables, which is
+/// what a store written before they existed looks like. The assertion that
+/// carries the phase is the one about the rest of it: `bring_forward` runs
+/// `CREATE_SQL`, every statement in it is `IF NOT EXISTS`, and the turn rows the
+/// old binary derived are still there afterwards - so an upgraded machine gains
+/// a decision log without paying the measured ~50 s in-lock rebuild that a
+/// `DERIVED_SCHEMA` bump would have forced on its first hook-spawned pass.
+#[cfg(feature = "testkit")]
+#[test]
+fn a_store_written_before_phase_six_gains_decisions_without_a_reindex() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let path = verbatim_core::testkit::copy_fixture_into("session-basic.jsonl", &work);
+    match verbatim_core::ingest::run(&data_dir, &path).unwrap() {
+        verbatim_core::ingest::Outcome::Committed(_) => {}
+        other => panic!("the fixture must archive: {other:?}"),
+    }
+
+    let turns_before = {
+        let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+        let turns = table_count(&conn, "turns");
+        assert!(turns > 0, "the fixture archived no turns");
+        conn.execute_batch("DROP TABLE labels; DROP TABLE decisions;")
+            .expect("the tables this test ages away must exist to be dropped");
+        turns
+    };
+
+    let store = Store::open(&data_dir).expect("an aged store still opens");
+    assert!(
+        store.rebuild_required().is_none(),
+        "a missing table is not a version mismatch, and must not ask for a rebuild"
+    );
+    assert_eq!(table_count(store.conn(), "decisions"), 0);
+    assert_eq!(table_count(store.conn(), "labels"), 0);
+    assert_eq!(
+        table_count(store.conn(), "turns"),
+        turns_before,
+        "the open rebuilt the derived tables instead of adding the missing ones"
+    );
+}
+
+/// `SELECT count(*)`, which is also the assertion that the table is there at
+/// all: a missing one is an `Err` rather than a zero.
+#[cfg(feature = "testkit")]
+fn table_count(conn: &Connection, table: &str) -> i64 {
+    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap_or_else(|e| panic!("counting {table}: {e}"))
+}
+
 fn runs_count(conn: &Connection) -> i64 {
     conn.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
         .unwrap()
