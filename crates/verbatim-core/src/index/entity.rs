@@ -47,6 +47,25 @@ pub struct Entity {
 /// The `tool_use` input keys that name a file outright.
 const PATH_INPUTS: [&str; 3] = ["file_path", "path", "notebook_path"];
 
+/// The recall tool whose input says what the model went looking for.
+const RECALL_SEARCH: &str = "recall_search";
+
+/// Is this the name of a `recall_search` call?
+///
+/// A suffix and not an equality: the harness registers an MCP tool under a
+/// server-prefixed name (`mcp__verbatim__recall_search`), the bare name is what
+/// a direct caller writes, and a build that matched only one of the two would
+/// see none of the calls on a real machine. The separator is still required, so
+/// a tool genuinely called `preflight_recall_search` matches and one called
+/// `xrecall_search` does not.
+pub fn is_recall_search(name: &str) -> bool {
+    match name.strip_suffix(RECALL_SEARCH) {
+        Some("") => true,
+        Some(prefix) => prefix.ends_with('_'),
+        None => false,
+    }
+}
+
 /// How many entities one turn may emit, across every kind (RCL-04, D-15).
 ///
 /// Measured over a 300-file sample of the real corpus: of the turns emitting any
@@ -159,7 +178,41 @@ impl Collector {
                 self.symbols(input.get("old_string"));
                 self.symbols(input.get("new_string"));
             }
+            _ if is_recall_search(name) => self.recall_search(input),
             _ => {}
+        }
+    }
+
+    /// What a `recall_search` call went looking FOR (FEED-02, D-13).
+    ///
+    /// This is the one tool whose inputs are evidence about the injector rather
+    /// than about the project: a model that asked recall for something is a
+    /// model that did not already have it, which is the whole of how a decision
+    /// gets labelled `miss`. The label join is SQL over `entities` and may not
+    /// read the blob (D-07), so if the query never becomes rows there is nothing
+    /// downstream that can say what was searched for.
+    ///
+    /// The `query` is treated exactly as a `Grep` `pattern` is - it is the same
+    /// kind of field, free text that reliably holds identifiers - plus its
+    /// path-shaped words, because a person asking recall about a file types the
+    /// file. Each `paths` filter entry is a path outright.
+    fn recall_search(&mut self, input: &Value) {
+        let query = input.get("query");
+        self.symbols(query);
+        if let Some(text) = query.and_then(Value::as_str) {
+            for word in path_words(text) {
+                self.push(PATH, word);
+            }
+        }
+        for entry in input
+            .get("paths")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(path) = entry.as_str().and_then(normalize_path) {
+                self.push(PATH, path);
+            }
         }
     }
 

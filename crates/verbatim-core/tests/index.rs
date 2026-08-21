@@ -461,12 +461,80 @@ fn only_identifier_shaped_tokens_become_symbols() {
         .all(|(kind, _)| kind != "symbol"));
 }
 
+/// FEED-02: a `recall_search` call is the model saying what it did not already
+/// have, so what it searched FOR has to become rows.
+///
+/// The `miss` label is a SQL join over `entities` and may never read the blob to
+/// find out what a query said (D-07), so a query that leaves no entity is a
+/// decision that can never be labelled a miss. Zero such calls exist across the
+/// 3,217 measured transcripts (D-13), which is why this record is synthesized
+/// rather than found in a fixture.
+#[test]
+fn a_recall_search_call_leaves_what_it_searched_for() {
+    let record = serde_json::json!({
+        "type": "assistant",
+        "message": {"role": "assistant", "content": [{
+            "type": "tool_use",
+            "id": "toolu_01",
+            // The server-prefixed spelling, which is the one a real harness
+            // writes for an MCP tool.
+            "name": "mcp__verbatim__recall_search",
+            "input": {
+                "query": "where did SearchManager touch crates/gizmo/lantern.rs",
+                "paths": ["docs/RETRY.md"],
+            },
+        }]},
+    });
+
+    let entities = verbatim_core::index::entities(&record);
+    let pairs: Vec<(&str, &str)> = entities
+        .iter()
+        .map(|e| (e.kind, e.value.as_str()))
+        .collect();
+    assert!(pairs.contains(&("symbol", "SearchManager")), "{pairs:?}");
+    assert!(
+        pairs.contains(&("path", "crates/gizmo/lantern.rs")),
+        "{pairs:?}"
+    );
+    assert!(pairs.contains(&("path", "docs/RETRY.md")), "{pairs:?}");
+    assert!(
+        pairs.contains(&("tool", "mcp__verbatim__recall_search")),
+        "{pairs:?}"
+    );
+    // The query is free text and the shape test still holds over it: an
+    // ordinary word in it is neither a symbol nor a path.
+    assert!(
+        !pairs.iter().any(|(_, value)| *value == "where"),
+        "{pairs:?}"
+    );
+    assert!(entities.len() <= verbatim_core::index::MAX_ENTITIES_PER_TURN);
+
+    // Deterministic, like every other extraction: a rebuild re-derives the same
+    // list in the same order.
+    assert_eq!(verbatim_core::index::entities(&record), entities);
+
+    // The bare name is the same call. A build that matched only the prefixed
+    // spelling would see none of the direct callers, and one that matched only
+    // the bare name would see none of the real ones.
+    let mut bare = record.clone();
+    bare["message"]["content"][0]["name"] = serde_json::json!("recall_search");
+    let bare = verbatim_core::index::entities(&bare);
+    assert_eq!(bare.len(), entities.len(), "{bare:?}");
+    assert_eq!(bare[0].value, "recall_search");
+}
+
 /// The rules on their own, where the boundary cases are cheap to state.
 #[test]
 fn the_entity_rules_are_functions_with_answers() {
     use verbatim_core::index::entity::{
-        is_identifier_shaped, normalize_path, path_words, program_of,
+        is_identifier_shaped, is_recall_search, normalize_path, path_words, program_of,
     };
+
+    assert!(is_recall_search("recall_search"));
+    assert!(is_recall_search("mcp__verbatim__recall_search"));
+    assert!(!is_recall_search("xrecall_search"));
+    assert!(!is_recall_search("recall_get"));
+    assert!(!is_recall_search("Grep"));
 
     assert_eq!(
         program_of("cargo test -p verbatim-core"),
