@@ -37,6 +37,7 @@
 pub mod egress;
 pub mod mechanical;
 pub mod net;
+pub mod provider;
 
 use std::collections::BTreeMap;
 

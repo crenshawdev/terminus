@@ -315,8 +315,15 @@ fn redact_assignments(text: &str) -> String {
                     None => bytes.len(),
                 }
             }
+            // Whitespace ends an unquoted value, and so does a quote or a
+            // backslash. That second half is load-bearing rather than tidy:
+            // this filter runs over a JSON request body, where an assignment
+            // sits INSIDE a string and the next character after the value is
+            // the string's closing quote. Running to the next space there
+            // would swallow the quote and the comma after it and hand the
+            // endpoint a document that is not JSON.
             _ => text[value_start..]
-                .find(char::is_whitespace)
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\')
                 .map(|offset| value_start + offset)
                 .unwrap_or(bytes.len()),
         };

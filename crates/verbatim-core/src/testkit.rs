@@ -511,3 +511,182 @@ pub fn copy_fixture_into(name: &str, dir: &Path) -> PathBuf {
         .unwrap_or_else(|e| panic!("copy {name} to {}: {e}", dest.display()));
     dest
 }
+
+// ---------------------------------------------------------------------------
+// A real HTTP endpoint on a loopback port (D-20)
+//
+// The project bars mocks - "real SQLite temp databases, never mocks"
+// (DESIGN-BRIEF.md:500) - and a provider test is exactly where a mock would be
+// reached for. So this is a `std::net::TcpListener`, real sockets and real
+// bytes, speaking one canned HTTP/1.1 response per connection and handing back
+// the requests it received so a test can assert over what actually went out.
+//
+// One response per CONNECTION and not per request: `observe::net` builds a
+// fresh client for every call, so one call is one connection, and "exactly one
+// request was made" is answerable by counting what this received.
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Content that is prose where strict JSON was asked for.
+///
+/// OBS-04's arm exists for the model that answers helpfully instead of
+/// answering in the schema, and this is what that looks like.
+pub const UNPARSEABLE_CONTENT: &str =
+    "Sure! Here's a summary of the session: you fixed the ingest lock and then \
+     went to lunch.";
+
+/// A canned HTTP/1.1 response with a JSON body.
+pub fn http_response(status: u16, reason: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    )
+}
+
+/// A canned 200 in the shape an OpenAI-compatible endpoint answers in.
+///
+/// `content` is placed at `choices[0].message.content` and is JSON-escaped on
+/// the way in, so a caller can hand it prose, quotes or a whole JSON document.
+pub fn chat_completion(content: &str, prompt_tokens: u64, completion_tokens: u64) -> String {
+    let body = serde_json::json!({
+        "id": "chatcmpl-testkit",
+        "object": "chat.completion",
+        "model": "testkit",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": { "role": "assistant", "content": content },
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    });
+    http_response(200, "OK", &body.to_string())
+}
+
+/// A loopback HTTP endpoint serving a fixed list of canned responses.
+pub struct HttpStub {
+    base: String,
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    served: Option<std::thread::JoinHandle<Vec<String>>>,
+}
+
+impl HttpStub {
+    /// Serve `responses` in order, one per connection, then stop accepting.
+    ///
+    /// A connection arriving after the list is exhausted gets a 500, so an
+    /// extra request is a visible failure rather than a hang.
+    pub fn serving(responses: &[String]) -> HttpStub {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let responses: Vec<String> = responses.to_vec();
+        let wanted = responses.len();
+        let flag = Arc::clone(&stop);
+        let served = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            while requests.len() < wanted {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                // The wake-up connection [`HttpStub::requests`] makes to
+                // unblock this accept, rather than a client with a request.
+                if flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                requests.push(read_http_request(&mut stream));
+                let response = responses
+                    .get(requests.len() - 1)
+                    .cloned()
+                    .unwrap_or_else(|| http_response(500, "Internal Server Error", "{}"));
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+            requests
+        });
+
+        HttpStub {
+            base: format!("http://{addr}/v1/"),
+            addr,
+            stop,
+            served: Some(served),
+        }
+    }
+
+    /// The base URL to put in `[provider] base_url`, trailing slash included.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    /// Stop serving and hand back every request that arrived, in order.
+    ///
+    /// Each is the request head and its body, as text.
+    pub fn requests(mut self) -> Vec<String> {
+        self.wake();
+        self.served
+            .take()
+            .expect("the stub was already finished")
+            .join()
+            .expect("the stub thread")
+    }
+
+    /// Unblock an `accept` that is still waiting, so a test that made fewer
+    /// requests than the stub was ready for does not hang.
+    fn wake(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.addr);
+    }
+}
+
+impl Drop for HttpStub {
+    fn drop(&mut self) {
+        // A test that panicked mid-assertion never called `requests`, and its
+        // thread would otherwise sit in `accept` for the life of the harness.
+        if self.served.is_some() {
+            self.wake();
+        }
+    }
+}
+
+/// Read one HTTP request: the head, then exactly the declared body.
+///
+/// To the declared length rather than to EOF, because the client holds the
+/// socket open waiting for a response it has not been given yet.
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => head.push(byte[0]),
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    if length > 0 && stream.read_exact(&mut body).is_err() {
+        body.clear();
+    }
+    format!("{head}{}", String::from_utf8_lossy(&body))
+}
