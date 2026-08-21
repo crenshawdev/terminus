@@ -56,6 +56,8 @@ pub struct Summary {
     pub recovery: crate::recover::Recovered,
     /// What the decision log drained into the store before the walk (FEED-01).
     pub feedback: crate::feedback::Drained,
+    /// What the walk's own turns then made of those decisions (FEED-02).
+    pub outcomes: crate::feedback::Labeled,
     pub duration: Duration,
 }
 
@@ -149,6 +151,13 @@ pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
         &mut summary,
         &mut projects,
     );
+
+    // FEED-02, AFTER the walk and before the `runs` row. The turns this pass
+    // just committed are what a session's idleness is measured from and what a
+    // decision's outcome is read off, so running this first would judge every
+    // decision against the archive as it stood before the transcripts that
+    // answer it arrived.
+    summary.outcomes = crate::feedback::outcomes(store.conn_mut());
     summary.duration = started.elapsed();
 
     // One row, whatever happened (D-10, D-14). A pass that died writes it in a
@@ -273,6 +282,7 @@ fn record_pass(
     }
     notes.extend(summary.recovery.lines());
     notes.extend(summary.feedback.lines());
+    notes.extend(summary.outcomes.lines());
     if let Some(e) = fatal {
         notes.push(format!("pass failed: {e}"));
     }

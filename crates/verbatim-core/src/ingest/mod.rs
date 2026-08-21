@@ -955,8 +955,13 @@ fn first_cwd(scan: &Scan) -> Option<String> {
 /// Every column that describes the session as a whole is `coalesce`d onto what
 /// is already there: a tail pass sees only the tail, and `session_id`, `cwd`,
 /// `gitBranch`, the project, the sidecar's parent and the first turn's
-/// timestamp were established by the first pass. `is_final` and `is_evicted`
-/// stay null - retention is phase 8.
+/// timestamp were established by the first pass.
+///
+/// `is_final` is not written here and is not written by any ingest of a file:
+/// it is the idle rule's, evaluated once at the end of a whole pass over
+/// `last_turn_at` (D-06, [`crate::feedback::finalize`]), which is what lets one
+/// mechanism cover a clean exit and a crash alike. `is_evicted` stays null -
+/// retention is phase 8.
 fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
     let scan = row.scan;
     let session_id = scan.records.iter().find_map(|r| r.session_id.clone());

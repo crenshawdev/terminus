@@ -13,6 +13,13 @@
 //! this pass just admitted" (D-10). A record whose prompt never opened the
 //! store has no watermark of its own, and this is the tightest bound anything
 //! can give it.
+//!
+//! The other half is [`outcomes`], and it runs at the far end of the same pass,
+//! **after** the walk: what a decision turned out to be worth is a statement
+//! about the turns that followed it, so it is evaluated once those turns are in
+//! the store rather than once they are not.
+
+pub mod finalize;
 
 use std::path::{Path, PathBuf};
 
@@ -39,6 +46,41 @@ impl Drained {
             .map(|(path, reason)| crate::ingest::pass::note(path, reason))
             .collect()
     }
+}
+
+/// What one pass's outcome step did (FEED-02).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Labeled {
+    /// Sessions the idle rule closed on this pass, never the number that are
+    /// closed: an already-final session is not touched again.
+    pub finalized: usize,
+    /// Whatever could not be done, said rather than raised. There is no log
+    /// file, so these travel into `runs.error` with the pass's other notes.
+    pub notes: Vec<String>,
+}
+
+impl Labeled {
+    /// One reported line per note.
+    pub fn lines(&self) -> Vec<String> {
+        self.notes.clone()
+    }
+}
+
+/// Turn the walk that just finished into outcomes: close the idle sessions.
+///
+/// **Nothing here fails a pass.** The archive is the work; a labelling step that
+/// could not run costs a number in `verbatim stats` and is worth saying, not
+/// worth losing a tree walk over - the same call the drain makes at the other
+/// end of the pass.
+pub fn outcomes(conn: &mut Connection) -> Labeled {
+    let mut labeled = Labeled::default();
+    match finalize::finalize(conn) {
+        Ok(closed) => labeled.finalized = closed,
+        Err(e) => labeled
+            .notes
+            .push(format!("the idle sessions could not be closed: {e}")),
+    }
+    labeled
 }
 
 /// Move every decision file into the `decisions` table.
