@@ -28,7 +28,13 @@
 //! names an HTTP client or opens a socket, and it counts every attempt before
 //! it makes it (PRIV-03, D-21). The mechanical half above reaches it never;
 //! that is an assertion a test reads off the attempt log rather than a promise.
+//!
+//! **One redaction boundary, and it only exists when data leaves.** [`egress`]
+//! filters a request body on the DECLARED destination (D-13) and scrubs every
+//! string on its way to becoming an error whatever the destination is (D-16).
+//! Nothing here redacts at ingest: `.planning/PROJECT.md` bars that outright.
 
+pub mod egress;
 pub mod mechanical;
 pub mod net;
 
