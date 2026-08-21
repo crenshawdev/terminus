@@ -58,6 +58,8 @@ pub struct Summary {
     pub feedback: crate::feedback::Drained,
     /// What the walk's own turns then made of those decisions (FEED-02).
     pub outcomes: crate::feedback::Labeled,
+    /// What the sessions this pass closed had to say for themselves (OBS-01).
+    pub observations: crate::observe::Observed,
     pub duration: Duration,
 }
 
@@ -158,6 +160,18 @@ pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
     // decision against the archive as it stood before the transcripts that
     // answer it arrived.
     summary.outcomes = crate::feedback::outcomes(store.conn_mut());
+
+    // OBS-01, and it has to be here: `feedback::outcomes` is what sets
+    // `session_meta.is_final`, so a session that went quiet before this pass
+    // becomes final and gets its observation on the same pass rather than on
+    // the next one. Before `record_pass`, so whatever it could not do lands in
+    // this pass's `runs.error` rather than the following pass's.
+    //
+    // No model is called here and no network connection is opened. The
+    // judgment half is its own command, outside this lock (D-07): a slow
+    // provider held here would make every hook-spawned pass in that window exit
+    // as `LockHeld` and archive nothing.
+    summary.observations = crate::observe::observe_new(store.conn(), config);
     summary.duration = started.elapsed();
 
     // One row, whatever happened (D-10, D-14). A pass that died writes it in a
@@ -283,6 +297,7 @@ fn record_pass(
     notes.extend(summary.recovery.lines());
     notes.extend(summary.feedback.lines());
     notes.extend(summary.outcomes.lines());
+    notes.extend(summary.observations.lines());
     if let Some(e) = fatal {
         notes.push(format!("pass failed: {e}"));
     }

@@ -245,3 +245,208 @@ fn transcript(commands: &[&str]) -> String {
     }
     body
 }
+
+// ---------------------------------------------------------------------------
+// The pass step: one row per newly finalized session, written once.
+// ---------------------------------------------------------------------------
+
+/// The session that went quiet before the pass, and the one still being typed.
+const IDLE: &str = "11111111-1111-4111-8111-111111111111";
+const LIVE: &str = "22222222-2222-4222-8222-222222222222";
+
+/// A data directory plus the Claude config directory whose `projects` tree a
+/// pass walks. Nothing here resolves a real transcript root.
+struct PassBench {
+    _dir: tempfile::TempDir,
+    data_dir: PathBuf,
+    claude: PathBuf,
+    root: PathBuf,
+}
+
+fn pass_bench() -> PassBench {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let claude = dir.path().join("claude");
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(claude.join("projects")).unwrap();
+    PassBench {
+        _dir: dir,
+        data_dir,
+        claude,
+        root,
+    }
+}
+
+/// A UTC timestamp `offset` from now, in the shape a transcript writes.
+///
+/// SQLite computes it because SQLite is what the idle rule compares against: a
+/// formatter written here could differ from the one under test in exactly the
+/// way that would make the comparison pass for the wrong reason.
+fn ts(offset: &str) -> String {
+    Connection::open_in_memory()
+        .unwrap()
+        .query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+            [offset],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+impl PassBench {
+    fn conn(&self) -> Connection {
+        Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
+    }
+
+    fn pass(&self) -> verbatim_core::ingest::pass::Summary {
+        let config =
+            verbatim_core::config::Config::from_parts(vec![self.claude.clone()], Vec::new());
+        match verbatim_core::ingest::pass::run_with(&self.data_dir, &config).unwrap() {
+            verbatim_core::ingest::pass::PassOutcome::Ran(summary) => summary,
+            verbatim_core::ingest::pass::PassOutcome::LockHeld => {
+                panic!("nothing else holds the lock")
+            }
+        }
+    }
+
+    /// Write one transcript into the tree a pass walks, with a chosen clock.
+    fn transcript(&self, session: &str, at: &str, command: &str) {
+        let cwd = self.root.join("project-alpha");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let dir = self.claude.join("projects").join("project-alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let record = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "cwd": cwd.to_string_lossy(),
+            "sessionId": session,
+            "type": "assistant",
+            "uuid": format!("{session}-0"),
+            "timestamp": at,
+            "gitBranch": "phase-7",
+            "message": {
+                "role": "assistant",
+                "model": "claude-opus-5",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_0",
+                    "name": "Bash",
+                    "input": {"command": command},
+                }],
+            },
+        });
+        std::fs::write(dir.join(format!("{session}.jsonl")), format!("{record}\n")).unwrap();
+    }
+
+    /// Every observation row, as `(session_id, generated_at, mechanical)`.
+    fn rows(&self) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+        self.conn()
+            .prepare(
+                "SELECT o.session_id, o.generated_at, o.mechanical
+                   FROM observations o ORDER BY o.session_key",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn runs(&self) -> i64 {
+        self.conn()
+            .query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
+            .unwrap()
+    }
+}
+
+/// One row per finalized session, none for a session still open, and a second
+/// pass changes nothing.
+///
+/// The insert-only rule is what the second half is about, and it is not
+/// tidiness: `verbatim observations regenerate` is the only rebuild path (D-02)
+/// precisely so a pass cannot discard a judgment half somebody paid for.
+#[test]
+fn a_pass_observes_every_newly_finalized_session_exactly_once() {
+    let bench = pass_bench();
+    bench.transcript(IDLE, &ts("-10 hours"), "cargo test -p verbatim-core");
+    bench.transcript(LIVE, &ts("-1 minutes"), "cargo build --release");
+
+    let first = bench.pass();
+    assert_eq!(first.observations.written, 1, "{:?}", first.observations);
+    assert!(
+        first.observations.notes.is_empty(),
+        "{:?}",
+        first.observations
+    );
+
+    let rows = bench.rows();
+    assert_eq!(rows.len(), 1, "the live session got an observation too");
+    assert_eq!(rows[0].0.as_deref(), Some(IDLE));
+    let facts: serde_json::Value = serde_json::from_str(rows[0].2.as_deref().unwrap()).unwrap();
+    assert_eq!(facts["branch"], "phase-7");
+    assert_eq!(facts["turns"], 1);
+    assert_eq!(facts["commands"][0], "cargo test -p verbatim-core");
+    assert_eq!(bench.runs(), 1, "the pass must write its runs row");
+
+    let second = bench.pass();
+    assert_eq!(second.observations.written, 0, "a pass rewrote a row");
+    assert_eq!(bench.rows(), rows, "a second pass moved an observation");
+    assert_eq!(bench.runs(), 2, "the second pass wrote no runs row");
+}
+
+/// A session that goes quiet between two passes is observed on the pass that
+/// closes it, not on the one after: the step runs after `feedback::outcomes`,
+/// which is what sets `is_final`.
+#[test]
+fn a_session_is_observed_on_the_pass_that_finalizes_it() {
+    let bench = pass_bench();
+    bench.transcript(LIVE, &ts("-1 minutes"), "cargo build --release");
+    assert_eq!(bench.pass().observations.written, 0);
+    assert!(bench.rows().is_empty());
+
+    // The same session, now idle. Rewritten wholesale with an older clock,
+    // which is what makes `finalize` close it on the next pass.
+    bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET last_turn_at = ?1",
+            [ts("-10 hours")],
+        )
+        .unwrap();
+
+    let summary = bench.pass();
+    assert_eq!(summary.outcomes.finalized, 1, "the premise: it closed here");
+    assert_eq!(
+        summary.observations.written, 1,
+        "{:?}",
+        summary.observations
+    );
+    assert_eq!(bench.rows().len(), 1);
+}
+
+/// An excluded project's sessions are never observed, including sessions
+/// archived before the exclusion was configured (ING-08): this step reads a
+/// blob, and "excluded means never read" is the whole of the read half.
+#[test]
+fn an_excluded_project_gets_no_observation() {
+    let bench = pass_bench();
+    bench.transcript(IDLE, &ts("-10 hours"), "cargo test -p verbatim-core");
+    assert_eq!(bench.pass().observations.written, 1);
+
+    bench
+        .conn()
+        .execute("DELETE FROM observations", [])
+        .unwrap();
+    let excluded = verbatim_core::config::Config::from_parts(
+        vec![bench.claude.clone()],
+        vec![bench
+            .root
+            .join("project-alpha")
+            .to_string_lossy()
+            .into_owned()],
+    );
+    let observed = verbatim_core::observe::observe_new(&bench.conn(), &excluded);
+    assert_eq!(observed.written, 0, "{observed:?}");
+    assert!(bench.rows().is_empty());
+}
