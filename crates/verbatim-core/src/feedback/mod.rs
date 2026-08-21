@@ -22,6 +22,7 @@
 pub mod finalize;
 pub mod label;
 pub mod replay;
+pub mod stats;
 
 use std::path::{Path, PathBuf};
 

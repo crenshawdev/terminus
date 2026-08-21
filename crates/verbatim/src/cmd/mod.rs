@@ -47,6 +47,7 @@ pub mod search;
 pub mod sessions;
 pub mod show;
 pub mod spawn;
+pub mod stats;
 pub mod status;
 pub mod uninstall;
 pub mod verify;

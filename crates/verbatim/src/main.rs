@@ -22,6 +22,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        verify                check every blob against its checksum\n  \
                        reindex               rebuild the derived tables from the blobs\n  \
                        status                sizes, counts, watermarks and the last ingest run\n  \
+                       stats                 whether injection is helping: precision, misses, chars\n  \
                        replay                re-score the logged prompts under other thresholds\n  \
                        doctor                report what is wired into Claude Code and what is not\n  \
                        mcp                   serve the three recall tools over stdio (for Claude Code)\n  \
@@ -109,6 +110,9 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         "verify" => cmd::verify::run(cmd::json_flag(parser)?),
         "reindex" => cmd::reindex::run(cmd::json_flag(parser)?),
         "status" => cmd::status::run(cmd::json_flag(parser)?),
+        // FEED-04. A CLI data command and never an MCP tool (D-14): every
+        // tool description sits in every session's context forever.
+        "stats" => cmd::stats::run(cmd::json_flag(parser)?),
         // FEED-03. Read-only by construction (D-15) and the one command whose
         // flags move the injection thresholds - for this report and nothing
         // else: the live path compiles them in (D-08).

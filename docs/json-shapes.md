@@ -177,6 +177,31 @@ in `reason`, not an empty stdout a caller could not tell from a crash.
 Without `--json`, `reindex` writes nothing at all to stdout. That is deliberate
 and unchanged.
 
+### `stats`
+
+```json
+{"decisions": 12, "injected_turns": 9, "hits": 5, "false_positives": 4,
+ "precision": 0.56, "misses": 0, "wasted_budget": 2,
+ "chars_injected": 1840, "chars_referenced": 1020}
+```
+
+- `decisions` counts **every** logged prompt, including the ones that injected
+  nothing and the ones that never opened the store. That is the denominator the
+  whole report is for: a precision computed only over the prompts that fired
+  would be a number about a subset that flatters itself.
+- `precision` is `hits / (hits + false_positives)`, and it is **null**, not
+  zero, when no injected turn has been labelled yet - an archive whose sessions
+  are all still open has no precision, and zero would read as "injection never
+  helps".
+- `misses` counts decisions where the model went to recall for something the
+  prompt had named and the injector declined to hand over. It reads zero on real
+  history today: no `recall_search` call exists in any measured transcript.
+- `chars_injected` is what was spent; `chars_referenced` is the part of it
+  carried by turns that turned out to be hits. **Characters, never tokens** -
+  the same proxy the injection budget is spent in.
+- A label is only ever written for a session the idle rule has closed, so every
+  count here lags the live sessions by that threshold.
+
 ### `replay`
 
 ```json

@@ -20,6 +20,7 @@ use rusqlite::types::Value;
 use rusqlite::Connection;
 use verbatim_core::config::Config;
 use verbatim_core::feedback::replay::{self, Replayed};
+use verbatim_core::feedback::stats;
 use verbatim_core::ingest::pass::{self, PassOutcome, Summary};
 use verbatim_core::inject::decision::{self, Decision};
 use verbatim_core::inject::prompt::Thresholds;
@@ -1023,4 +1024,124 @@ fn a_decision_is_never_scored_against_a_session_archived_after_it() {
         (0, 1),
         "{unbounded:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// FEED-04: what the log adds up to
+// ---------------------------------------------------------------------------
+
+/// A decision and its labels, written straight into both tables.
+///
+/// The aggregation is the subject here, so the mix is placed rather than
+/// produced: a fixture driven through the labeller would make the expected
+/// numbers a second computation of the thing under test, and any drift between
+/// them would cancel out instead of failing.
+fn logged(
+    bench: &Bench,
+    prompt: &str,
+    chars: i64,
+    injected: &[(i64, i64)],
+    labels: &[(&str, i64)],
+) {
+    let conn = bench.conn();
+    let document: Vec<serde_json::Value> = injected
+        .iter()
+        .map(|(turn_id, chars)| serde_json::json!({"turn_id": turn_id, "chars": chars}))
+        .collect();
+    conn.execute(
+        "INSERT INTO decisions (
+            session_id, ts, cwd, prompt, watermark_session_no, chars_injected,
+            spellings, candidates, injected, suppressed, thresholds
+         ) VALUES (?1, '2026-08-14T11:00:00.000Z', '/code', ?2, 1, ?3,
+                   '[]', '[]', ?4, '[]', '{}')",
+        rusqlite::params![
+            FIXTURE_SESSION,
+            prompt,
+            chars,
+            serde_json::to_string(&document).unwrap(),
+        ],
+    )
+    .unwrap();
+    let decision = conn.last_insert_rowid();
+    for (label, turn_id) in labels {
+        conn.execute(
+            "INSERT INTO labels (decision_id, turn_id, label, labeled_at)
+             VALUES (?1, ?2, ?3, '2026-08-14T12:00:00.000Z')",
+            rusqlite::params![decision, (*turn_id >= 0).then_some(*turn_id), label],
+        )
+        .unwrap();
+    }
+}
+
+/// The known outcome mix AC5 asks for, placed in one store.
+///
+/// Three decisions: one that injected two turns and was right about one of
+/// them, one that injected a turn and was right about nothing, and one non-fire
+/// the model then went to recall over.
+fn known_mix(bench: &Bench) {
+    logged(
+        bench,
+        "the mixed one",
+        100,
+        &[(10, 60), (11, 40)],
+        &[("hit", 10), ("false positive", 11)],
+    );
+    logged(
+        bench,
+        "the wasteful one",
+        50,
+        &[(12, 50)],
+        &[("false positive", 12), ("wasted budget", -1)],
+    );
+    logged(bench, "the non-fire", 0, &[], &[("miss", -1)]);
+}
+
+/// FEED-04: the numbers, against a mix a reader can add up by hand.
+///
+/// Every one of them is written out as a literal rather than derived, which is
+/// the whole value of the test: an aggregation asserted against an expression
+/// over the same rows agrees with itself however wrong it is.
+#[test]
+fn the_report_adds_up_the_known_mix() {
+    let bench = bench();
+    known_mix(&bench);
+
+    let counted = stats::stats(&bench.conn()).unwrap();
+
+    // Three prompts, including the one that injected nothing (D-11).
+    assert_eq!(counted.decisions, 3, "{counted:?}");
+    assert_eq!(counted.injected_turns, 3, "{counted:?}");
+    assert_eq!(counted.hits, 1, "{counted:?}");
+    assert_eq!(counted.false_positives, 2, "{counted:?}");
+    assert_eq!(counted.misses, 1, "{counted:?}");
+    assert_eq!(counted.wasted_budget, 1, "{counted:?}");
+    // 1 hit over 1 + 2 judged turns.
+    assert_eq!(counted.precision, Some(1.0 / 3.0), "{counted:?}");
+    // 100 + 50 + 0, the emitted totals - not the sum of the turns' shares.
+    assert_eq!(counted.chars_injected, 150, "{counted:?}");
+    // The one turn that was a hit carried 60 of them.
+    assert_eq!(counted.chars_referenced, 60, "{counted:?}");
+}
+
+/// An archive with no labels yet has no precision, and says so rather than
+/// reporting zero.
+///
+/// Zero is the answer "injection never helps", and a store whose sessions are
+/// all still open has not said that about anything.
+#[test]
+fn an_unlabelled_archive_has_no_precision_rather_than_a_precision_of_zero() {
+    let bench = bench();
+    let counted = stats::stats(&bench.conn()).unwrap();
+
+    assert_eq!(counted.decisions, 0, "{counted:?}");
+    assert_eq!(counted.precision, None, "{counted:?}");
+    assert_eq!(counted.chars_injected, 0, "{counted:?}");
+    assert_eq!(counted.chars_referenced, 0, "{counted:?}");
+
+    // One decision, no label: still nothing to be precise about.
+    logged(&bench, "not judged yet", 40, &[(10, 40)], &[]);
+    let counted = stats::stats(&bench.conn()).unwrap();
+    assert_eq!(counted.decisions, 1, "{counted:?}");
+    assert_eq!(counted.injected_turns, 1, "{counted:?}");
+    assert_eq!(counted.precision, None, "{counted:?}");
 }
