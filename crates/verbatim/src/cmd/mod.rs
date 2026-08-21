@@ -42,6 +42,7 @@ pub mod json;
 pub mod mcp;
 pub mod read;
 pub mod reindex;
+pub mod replay;
 pub mod search;
 pub mod sessions;
 pub mod show;

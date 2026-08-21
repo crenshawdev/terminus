@@ -177,6 +177,39 @@ in `reason`, not an empty stdout a caller could not tell from a crash.
 Without `--json`, `reindex` writes nothing at all to stdout. That is deliberate
 and unchanged.
 
+### `replay`
+
+```json
+{"thresholds": {"ranked": 10, "compacted_ranked": 50, "entity_rank": 5, "co_occurring": 2,
+                "max_turns": 3, "max_candidates": 8},
+ "decisions": 12,
+ "labels": [{"label": "hit", "old": 3, "new": 5},
+            {"label": "false positive", "old": 4, "new": 2},
+            {"label": "miss", "old": 0, "new": 0},
+            {"label": "wasted budget", "old": 2, "new": 1}],
+ "changed": [17, 41]}
+```
+
+- `thresholds` is the six numbers the replay ran under: the compiled-in values
+  with whatever `--ranked`, `--compacted-ranked`, `--entity-rank`,
+  `--co-occurring`, `--max-turns` and `--max-candidates` moved. A diff without
+  them is unreadable, so they are present whether or not a flag was passed.
+  **They reach this report and nothing else** - the live injection path compiles
+  its thresholds in and no config key or flag detunes it.
+- `decisions` counts the rows that were scored: the decisions of sessions the
+  idle rule has closed, which is exactly the set the labeller was allowed to
+  judge. A decision of a live session has no stored label to diff against.
+- `labels` is one entry per label, always all four and always in that order.
+  `old` is what the store holds, `new` is what the replayed rules produce.
+- `changed` names the decision ids whose label set moved, in id order, so a diff
+  can be followed back into the prompts behind it.
+- `replay` never writes: the store is opened read-only, `verbatim.db` is byte
+  for byte what it was, and the WAL carries no frame afterwards. A first
+  read-only open of a WAL database does materialize SQLite's shared-memory
+  index (`verbatim.db-shm`) and an empty `verbatim.db-wal`; those hold no page
+  of the database, every reader needs them, and a read-only connection cannot
+  unlink them on close.
+
 ### `doctor`
 
 ```json
