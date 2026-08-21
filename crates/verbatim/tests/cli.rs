@@ -614,6 +614,125 @@ fn reindex_json_reports_a_held_lock_as_a_document() {
     drop(guard);
 }
 
+/// AC5: `verbatim stats` reports the numbers a reader can add up by hand, in
+/// both modes, off a placed outcome mix (FEED-04).
+///
+/// The mix is written straight into `decisions` and `labels` rather than
+/// produced by an ingest pass: what is under test is the aggregation and the
+/// command, and a mix the labeller derived would make the expected numbers a
+/// second computation of the thing being checked.
+#[test]
+fn stats_reports_the_hand_computed_numbers_in_both_modes() {
+    let bench = bench();
+    bench.ingest("session-basic.jsonl");
+
+    let conn = bench.conn();
+    let place = |prompt: &str, chars: i64, injected: &str, labels: &[(&str, Option<i64>)]| {
+        conn.execute(
+            "INSERT INTO decisions (
+                session_id, ts, cwd, prompt, watermark_session_no, chars_injected,
+                spellings, candidates, injected, suppressed, thresholds
+             ) VALUES ('44444444-4444-4444-8444-444444444444',
+                       '2026-08-14T11:00:00.000Z', '/code', ?1, 1, ?2,
+                       '[]', '[]', ?3, '[]', '{}')",
+            rusqlite::params![prompt, chars, injected],
+        )
+        .unwrap();
+        let decision = conn.last_insert_rowid();
+        for (label, turn_id) in labels {
+            conn.execute(
+                "INSERT INTO labels (decision_id, turn_id, label, labeled_at)
+                 VALUES (?1, ?2, ?3, '2026-08-14T12:00:00.000Z')",
+                rusqlite::params![decision, turn_id, label],
+            )
+            .unwrap();
+        }
+    };
+    place(
+        "the mixed one",
+        100,
+        r#"[{"turn_id":10,"chars":60},{"turn_id":11,"chars":40}]"#,
+        &[("hit", Some(10)), ("false positive", Some(11))],
+    );
+    place(
+        "the wasteful one",
+        50,
+        r#"[{"turn_id":12,"chars":50}]"#,
+        &[("false positive", Some(12)), ("wasted budget", None)],
+    );
+    place("the non-fire", 0, "[]", &[("miss", None)]);
+
+    let out = bench.run(&["stats", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let data = &document(&out)["data"];
+    assert_eq!(data["decisions"], 3, "{data}");
+    assert_eq!(data["injected_turns"], 3, "{data}");
+    assert_eq!(data["hits"], 1, "{data}");
+    assert_eq!(data["false_positives"], 2, "{data}");
+    assert_eq!(data["misses"], 1, "{data}");
+    assert_eq!(data["wasted_budget"], 1, "{data}");
+    assert_eq!(data["chars_injected"], 150, "{data}");
+    assert_eq!(data["chars_referenced"], 60, "{data}");
+    let precision = data["precision"].as_f64().expect("a precision");
+    assert!((precision - 1.0 / 3.0).abs() < 1e-9, "{data}");
+
+    // The same numbers in the human mode, and no others.
+    let out = bench.run(&["stats"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    for line in [
+        "decisions         3",
+        "injected turns    3",
+        "hits              1",
+        "false positives   2",
+        "precision         0.33",
+        "misses            1",
+        "wasted budget     1",
+        "chars injected    150",
+        "chars referenced  60",
+    ] {
+        assert!(text.contains(line), "no {line:?} in:\n{text}");
+    }
+}
+
+/// A machine that has never ingested: exit 0 with a reason, and nothing created
+/// by having been asked.
+#[test]
+fn stats_against_no_store_is_a_reason_and_exits_zero() {
+    let bench = bench();
+
+    let out = bench.run(&["stats"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "", "the reason belongs on stderr");
+    assert!(
+        stderr(&out).contains("no verbatim store"),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = bench.run(&["stats", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let value = document(&out);
+    assert_eq!(value["ok"], true, "{value}");
+    assert!(
+        value["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no verbatim store")),
+        "{value}"
+    );
+    assert_eq!(value["data"]["decisions"], 0, "{value}");
+    assert_eq!(
+        value["data"]["precision"],
+        serde_json::Value::Null,
+        "{value}"
+    );
+
+    assert!(
+        !bench.data_dir.exists(),
+        "a read created the data directory"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // RCL-06: the shapes and the exit codes, swept across every data command
 //
@@ -652,6 +771,29 @@ const DATA_COMMANDS: &[(&str, &[&str], &[&str])] = &[
     ),
     ("verify", &[], &["checked", "failures"]),
     ("reindex", &[], &["sessions", "turns", "skipped"]),
+    (
+        "stats",
+        &[],
+        &[
+            "decisions",
+            "injected_turns",
+            "hits",
+            "false_positives",
+            "precision",
+            "misses",
+            "wasted_budget",
+            "chars_injected",
+            "chars_referenced",
+        ],
+    ),
+    // `replay` joins on the same terms and passes the same five properties: it
+    // is a data command, it emits the envelope, and its `data` is the same shape
+    // whether or not the store holds a decision to score.
+    (
+        "replay",
+        &[],
+        &["thresholds", "decisions", "labels", "changed"],
+    ),
 ];
 
 /// A bench with the whole fixture corpus in it and one known turn id, which is
