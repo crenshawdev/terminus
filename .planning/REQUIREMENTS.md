@@ -183,6 +183,10 @@ Explicit exclusions. The reason prevents scope creep later.
 | INJ-03 | Phase 5 | Complete |
 | INJ-04 | Phase 5 | Complete |
 | INJ-05 | Phase 5 | Complete |
+| FEED-01 | Phase 6 | Pending |
+| FEED-02 | Phase 6 | Pending |
+| FEED-03 | Phase 6 | Pending |
+| FEED-04 | Phase 6 | Pending |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 
