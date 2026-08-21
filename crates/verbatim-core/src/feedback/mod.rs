@@ -20,6 +20,7 @@
 //! the store rather than once they are not.
 
 pub mod finalize;
+pub mod label;
 
 use std::path::{Path, PathBuf};
 
@@ -54,24 +55,47 @@ pub struct Labeled {
     /// Sessions the idle rule closed on this pass, never the number that are
     /// closed: an already-final session is not touched again.
     pub finalized: usize,
+    /// Labels written on this pass, by label, in a stable order. A label with
+    /// no rows is absent rather than zero.
+    pub labels: Vec<(String, usize)>,
     /// Whatever could not be done, said rather than raised. There is no log
     /// file, so these travel into `runs.error` with the pass's other notes.
     pub notes: Vec<String>,
 }
 
 impl Labeled {
-    /// One reported line per note.
+    /// How many labels of one kind this pass wrote.
+    pub fn count(&self, label: &str) -> usize {
+        self.labels
+            .iter()
+            .find(|(name, _)| name == label)
+            .map_or(0, |(_, count)| *count)
+    }
+
+    /// The reported lines: what could not be done, then what was labelled when
+    /// anything was.
     pub fn lines(&self) -> Vec<String> {
-        self.notes.clone()
+        let mut lines = self.notes.clone();
+        if !self.labels.is_empty() {
+            let counts: Vec<String> = self
+                .labels
+                .iter()
+                .map(|(label, count)| format!("{count} {label}"))
+                .collect();
+            lines.push(format!("labelled {}", counts.join(", ")));
+        }
+        lines
     }
 }
 
-/// Turn the walk that just finished into outcomes: close the idle sessions.
+/// Turn the walk that just finished into outcomes: close the idle sessions,
+/// then label the decisions they closed.
 ///
 /// **Nothing here fails a pass.** The archive is the work; a labelling step that
 /// could not run costs a number in `verbatim stats` and is worth saying, not
 /// worth losing a tree walk over - the same call the drain makes at the other
-/// end of the pass.
+/// end of the pass. Labelling still runs when finalizing failed: it operates on
+/// whatever is already marked final, which is a smaller set and not a wrong one.
 pub fn outcomes(conn: &mut Connection) -> Labeled {
     let mut labeled = Labeled::default();
     match finalize::finalize(conn) {
@@ -79,6 +103,12 @@ pub fn outcomes(conn: &mut Connection) -> Labeled {
         Err(e) => labeled
             .notes
             .push(format!("the idle sessions could not be closed: {e}")),
+    }
+    match label::label(conn) {
+        Ok(counts) => labeled.labels = counts,
+        Err(e) => labeled
+            .notes
+            .push(format!("the decisions could not be labelled: {e}")),
     }
     labeled
 }

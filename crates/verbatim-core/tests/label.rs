@@ -69,6 +69,16 @@ fn text(said: &str) -> serde_json::Value {
     serde_json::json!({"type": "text", "text": said})
 }
 
+/// A turn that read a file, which is what leaves a `path` entity behind.
+fn read(path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_use",
+        "id": "toolu_read",
+        "name": "Read",
+        "input": {"file_path": path},
+    })
+}
+
 impl Bench {
     fn conn(&self) -> Connection {
         Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
@@ -120,6 +130,72 @@ impl Bench {
         std::fs::write(dir.join(format!("{session}.jsonl")), body).unwrap();
     }
 
+    /// The id of one archived turn, by the session it is in and its ordinal.
+    fn turn(&self, session: &str, seq: i64) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT t.id FROM turns t
+                   JOIN session_meta m ON m.session_key = t.session_key
+                  WHERE m.session_id = ?1 AND t.turn_seq = ?2",
+                rusqlite::params![session, seq],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("no turn {seq} of {session}: {e}"))
+    }
+
+    /// One logged decision, written straight into the table the drain fills.
+    ///
+    /// Hand-built rather than driven through the prompt path: a decision has to
+    /// name turn ids that already exist and a wall clock the test chooses, and
+    /// the injector reads a real clock and picks its own turns. What the drain
+    /// produces is `feedback.rs`'s subject; what labelling makes of it is this
+    /// file's.
+    fn decide(
+        &self,
+        session: &str,
+        at: &str,
+        injected: &[(i64, usize)],
+        chars: i64,
+        spellings: &[&str],
+    ) -> i64 {
+        let injected: Vec<serde_json::Value> = injected
+            .iter()
+            .map(|(turn_id, chars)| serde_json::json!({"turn_id": turn_id, "chars": chars}))
+            .collect();
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO decisions (
+                session_id, ts, cwd, prompt, watermark_session_no, chars_injected,
+                spellings, candidates, injected, suppressed, thresholds
+             ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, '[]', ?7, '[]', '{}')",
+            rusqlite::params![
+                session,
+                at,
+                self.root.join("project-alpha").to_string_lossy(),
+                "what changed",
+                chars,
+                serde_json::to_string(spellings).unwrap(),
+                serde_json::to_string(&injected).unwrap(),
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Every label one decision carries, in the order they were written.
+    fn labels_of(&self, decision: i64) -> Vec<(String, Option<i64>, Option<String>)> {
+        self.conn()
+            .prepare(
+                "SELECT label, turn_id, detail FROM labels
+                  WHERE decision_id = ?1 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([decision], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     /// The `is_final` flag of one session, as stored: `Some(1)` or `None`.
     fn is_final(&self, session: &str) -> Option<i64> {
         self.conn()
@@ -168,4 +244,88 @@ fn the_idle_rule_closes_a_quiet_session_and_leaves_a_live_one_open() {
     assert_eq!(again.outcomes.finalized, 0, "{again:?}");
     assert_eq!(bench.is_final(IDLE), Some(1));
     assert_eq!(bench.is_final(LIVE), None);
+}
+
+/// D-07: the four labels, off a session whose turns the test wrote and whose
+/// decisions the test placed against a clock it chose.
+///
+/// The two injected turns of the first decision differ in exactly one thing -
+/// whether a later turn of the same session names the file they named - so the
+/// `hit`/`false positive` split is attributable to the rule and to nothing else.
+#[test]
+fn a_finalized_decision_is_labelled_by_what_the_session_did_next() {
+    let bench = bench();
+    bench.transcript(
+        IDLE,
+        "project-alpha",
+        &[
+            // Before the decision: the turn it will inject and be right about,
+            // and the turn it will inject and be wrong about.
+            (ts("-480 minutes"), read("crates/gizmo/lantern.rs")),
+            (ts("-480 minutes"), read("docs/ORPHAN.md")),
+            // After it: the same file again, and never the other one.
+            (ts("-450 minutes"), read("crates/gizmo/lantern.rs")),
+        ],
+    );
+    bench.transcript(
+        LIVE,
+        "project-alpha",
+        &[
+            (ts("-10 minutes"), read("crates/gizmo/lantern.rs")),
+            (ts("-5 minutes"), read("crates/gizmo/lantern.rs")),
+        ],
+    );
+
+    // The turns have to be in the store before a decision can name their ids.
+    let archived = bench.pass();
+    assert_eq!(archived.files_committed, 2, "{archived:?}");
+    assert_eq!(archived.outcomes.finalized, 1, "{archived:?}");
+    assert!(
+        archived.outcomes.labels.is_empty(),
+        "nothing is logged yet: {archived:?}"
+    );
+
+    let used = bench.turn(IDLE, 0);
+    let ignored = bench.turn(IDLE, 1);
+    let at = ts("-465 minutes");
+    let mixed = bench.decide(IDLE, &at, &[(used, 100), (ignored, 50)], 150, &[]);
+    let wasteful = bench.decide(IDLE, &at, &[(ignored, 50)], 50, &[]);
+    // Same shape, on a session that is still being typed into.
+    let open = bench.decide(LIVE, &ts("-8 minutes"), &[(bench.turn(LIVE, 0), 40)], 40, &[]);
+
+    let summary = bench.pass();
+    assert!(summary.outcomes.notes.is_empty(), "{summary:?}");
+    assert_eq!(summary.outcomes.count("hit"), 1, "{summary:?}");
+    assert_eq!(summary.outcomes.count("false positive"), 2, "{summary:?}");
+    assert_eq!(summary.outcomes.count("wasted budget"), 1, "{summary:?}");
+    assert_eq!(summary.outcomes.count("miss"), 0, "{summary:?}");
+
+    assert_eq!(
+        bench.labels_of(mixed),
+        vec![
+            ("hit".to_owned(), Some(used), None),
+            ("false positive".to_owned(), Some(ignored), None),
+        ]
+    );
+    // Every injected turn unreferenced and characters spent all the same: the
+    // decision cost something and bought nothing, and the detail is what it
+    // cost.
+    assert_eq!(
+        bench.labels_of(wasteful),
+        vec![
+            ("false positive".to_owned(), Some(ignored), None),
+            ("wasted budget".to_owned(), None, Some("50".to_owned())),
+        ]
+    );
+    // The live session's decision is not judged: its downstream turns have not
+    // finished arriving, so every label it could be given now is a guess.
+    assert_eq!(bench.labels_of(open), Vec::new());
+
+    // Incremental: the second pass finds every eligible decision already
+    // labelled and writes nothing.
+    let again = bench.pass();
+    assert!(again.outcomes.labels.is_empty(), "{again:?}");
+    assert_eq!(bench.labels_of(mixed).len(), 2);
+    assert_eq!(bench.labels_of(wasteful).len(), 2);
+    assert_eq!(bench.labels_of(open), Vec::new());
 }
