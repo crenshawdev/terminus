@@ -38,6 +38,17 @@ pub fn run(args: Args) -> Result<(), Failure> {
         Opened::Nothing(reason) => return read::empty(empty, &reason, args.json),
     };
 
+    // The same catch `stats` makes, for the same reason: nothing logged is an
+    // empty diff with a reason, never a raw sqlite line escaping the envelope,
+    // and half a log is a failure rather than a diff of nothing.
+    match read::decision_log(&reader) {
+        read::DecisionLog::Present => {}
+        read::DecisionLog::Absent => return read::empty(empty, read::NO_DECISION_LOG, args.json),
+        read::DecisionLog::Damaged(table) => {
+            return Err(read::unusable(empty, read::damaged(table), args.json))
+        }
+    }
+
     let replayed = replay::replay(reader.store(), reader.config(), &args.thresholds)
         .map_err(|e| Failure::Operational(e.to_string()))?;
 

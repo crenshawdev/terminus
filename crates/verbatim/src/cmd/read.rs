@@ -73,6 +73,14 @@ impl Reader {
 const STALE: &str = "this store's derived tables predate this build, so results may be \
                      incomplete; the next `verbatim ingest` rebuilds them";
 
+/// What `stats` and `replay` say on a store that has no decision log.
+///
+/// The same shape as a machine that has never ingested: a reason and exit 0.
+/// Nothing has been recorded, which is an answer to "how is injection doing"
+/// rather than a failure of the question.
+pub const NO_DECISION_LOG: &str = "this store predates the decision log, so nothing has been \
+                                   recorded yet; the next `verbatim ingest` creates it";
+
 /// Open the store every read command reads.
 pub fn open() -> Result<Opened, Failure> {
     let data_dir = super::data_dir()?;
@@ -106,6 +114,63 @@ pub fn open_in(data_dir: &Path, config: Config) -> Result<Opened, Failure> {
     Ok(Opened::Ready(Box::new(Reader { store, config })))
 }
 
+/// What a store missing part of the decision log is: old, or damaged.
+///
+/// The distinction is the whole point of the type. `decisions` and `labels`
+/// arrived together in one `CREATE_SQL` (D-02), so a store that predates them
+/// is missing BOTH - and a store missing exactly one of them was written by a
+/// build that had both and has since lost one. Collapsing the two into "no
+/// decision log" would report a damaged store as a successful empty answer, and
+/// the number a caller then reads as "injection has recorded nothing" would in
+/// fact be "half the log is gone".
+pub enum DecisionLog {
+    /// Both tables are there and can be queried.
+    Present,
+    /// Neither table: a store written before the log existed.
+    Absent,
+    /// One and not the other. Names the one that is gone.
+    Damaged(&'static str),
+}
+
+/// What this store can be asked about the decision log.
+///
+/// Asking here, at the open, is what keeps the ordinary case an answer: left to
+/// the query it surfaces as [`Failure::Operational`] carrying a raw
+/// `no such table: decisions`, which `main` prints on stderr and exits 1 on -
+/// without knowing whether `--json` was asked for, so the envelope the contract
+/// promises is never written at all.
+///
+/// Nothing is repaired either way, because a read never migrates (D-18). For
+/// [`DecisionLog::Absent`] the next write-mode `verbatim ingest` creates both
+/// tables through `bring_forward`'s missing-table arm (D-02); for
+/// [`DecisionLog::Damaged`] it would create the missing one and leave the
+/// surviving one's now-orphaned rows, which is why that case is reported as a
+/// failure a person has to look at rather than repaired by being read.
+///
+/// This is a snapshot taken at open and not re-checked before the query, so a
+/// writer that drops a table in between still reaches the raw sqlite path. That
+/// race is not closable from a read-only connection - the check and the query
+/// are two statements whatever their order - and it is the same one
+/// [`Store::missing_columns`] has always had.
+pub fn decision_log(reader: &Reader) -> DecisionLog {
+    let missing = reader.store().missing_tables();
+    match (missing.contains(&"decisions"), missing.contains(&"labels")) {
+        (false, false) => DecisionLog::Present,
+        (true, true) => DecisionLog::Absent,
+        (true, false) => DecisionLog::Damaged("decisions"),
+        (false, true) => DecisionLog::Damaged("labels"),
+    }
+}
+
+/// The reason a damaged store reports, naming the table that is gone.
+pub fn damaged(table: &str) -> String {
+    format!(
+        "this store is missing the `{table}` table but not the rest of the decision log, so \
+         something removed it; `verbatim doctor` reports on the store, and the rows that are \
+         left cannot be read as a complete record"
+    )
+}
+
 /// The project a read command works in: the one named, or the one the process
 /// is standing in.
 ///
@@ -133,6 +198,23 @@ pub fn empty(document: Document, reason: &str, json: bool) -> Result<(), Failure
         eprintln!("verbatim: {reason}");
     }
     Ok(())
+}
+
+/// Say why this store cannot answer the question, and exit 1.
+///
+/// The counterpart of [`empty`] for a store that is *wrong* rather than empty.
+/// The `--json` arm writes the envelope with `ok: false` and then returns
+/// [`Failure::Silent`], because `main` would otherwise print a second account of
+/// the same thing on stderr after the document already carried it - the shape
+/// `verify` established. Exit 1 either way, so a caller reading the code and a
+/// caller parsing the document agree.
+pub fn unusable(document: Document, reason: String, json: bool) -> Failure {
+    if json {
+        document.failed().because(&reason).emit();
+        Failure::Silent
+    } else {
+        Failure::Operational(reason)
+    }
 }
 
 #[cfg(test)]

@@ -297,3 +297,122 @@ fn a_malformed_threshold_is_misuse() {
         assert_eq!(stdout(&out), "", "`{}` wrote to stdout", argv.join(" "));
     }
 }
+
+/// A store written before phase 6: both reads that live on the decision log
+/// answer, and neither leaks a sqlite line where an envelope was promised.
+///
+/// The tables are dropped rather than a phase-5 binary being kept around,
+/// because the condition under test is exactly "these two tables are absent" -
+/// `decisions` and `labels` went into `schema::TABLES` with no `DERIVED_SCHEMA`
+/// bump (D-02), so an older store is a current store minus these two and
+/// nothing else. That is also why this could ever regress: `rebuild_required`
+/// is `None` and `missing_columns` is empty on such a store, so it reads as
+/// perfectly up to date right up until a query names a table that is not there.
+///
+/// The `--json` half is the half with teeth. The failure this replaces was an
+/// operational error raised from inside the query and printed by `main`, which
+/// never sees the flag - so `--json` exited 1 with an empty stdout and no
+/// document at all, and `docs/json-shapes.md` allows that only for a failure
+/// raised *before* the command reached its own answer.
+#[test]
+fn stats_and_replay_on_a_store_without_the_decision_log_still_answer() {
+    let bench = bench();
+    bench.ingest_fixture();
+
+    let conn = bench.conn();
+    conn.execute_batch("DROP TABLE labels; DROP TABLE decisions;")
+        .unwrap();
+    drop(conn);
+
+    for command in ["stats", "replay"] {
+        let out = bench.run(&[command, "--json"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`{command} --json`: {}",
+            stderr(&out)
+        );
+
+        // One document, and the reason inside it rather than on stderr.
+        let value = document(&out);
+        assert_eq!(value["command"], command, "{value}");
+        assert_eq!(value["ok"], true, "{value}");
+        assert!(
+            value["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("predates the decision log")),
+            "`{command} --json` did not say why it was empty: {value}"
+        );
+        assert!(
+            !stderr(&out).contains("no such table"),
+            "`{command} --json` leaked the sqlite error: {}",
+            stderr(&out)
+        );
+        assert_eq!(value["data"]["decisions"], 0, "{value}");
+
+        // The human mode: the same reason, on stderr, and still exit 0.
+        let out = bench.run(&[command]);
+        assert_eq!(out.status.code(), Some(0), "`{command}`: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("predates the decision log"),
+            "`{command}` did not say why: {}",
+            stderr(&out)
+        );
+    }
+}
+
+/// Half a decision log is damage, not age, and it is reported as such.
+///
+/// The two tables arrived in one `CREATE_SQL` (D-02), so "missing both" is the
+/// only shape age can produce; a store missing exactly one was written by a
+/// build that had both. The failure this guards is the comfortable one: reading
+/// it as "nothing recorded yet" would answer `precision` and a per-label diff
+/// with zeroes and `ok:true`, and a caller cannot tell that from an archive
+/// where injection genuinely never fired.
+#[test]
+fn stats_and_replay_call_half_a_decision_log_a_failure() {
+    for dropped in ["labels", "decisions"] {
+        let bench = bench();
+        bench.ingest_fixture();
+
+        let conn = bench.conn();
+        conn.execute_batch(&format!("DROP TABLE {dropped};"))
+            .unwrap();
+        drop(conn);
+
+        for command in ["stats", "replay"] {
+            let out = bench.run(&[command, "--json"]);
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "`{command} --json` on a store missing `{dropped}` should fail: {}",
+                stderr(&out)
+            );
+
+            // Exit 1 AND the envelope: the contract is that a caller parsing the
+            // document and a caller checking the code agree.
+            let value = document(&out);
+            assert_eq!(value["command"], command, "{value}");
+            assert_eq!(value["ok"], false, "{value}");
+            let reason = value["reason"].as_str().unwrap_or_default();
+            assert!(
+                reason.contains(dropped) && reason.contains("something removed it"),
+                "`{command} --json` did not name the damage: {value}"
+            );
+
+            // The human mode: exit 1 and one line naming the table.
+            let out = bench.run(&[command]);
+            assert_eq!(out.status.code(), Some(1), "`{command}`: {}", stderr(&out));
+            assert!(
+                stderr(&out).contains(dropped),
+                "`{command}` did not name the missing table: {}",
+                stderr(&out)
+            );
+            assert!(
+                !stderr(&out).contains("no such table"),
+                "`{command}` leaked the sqlite error: {}",
+                stderr(&out)
+            );
+        }
+    }
+}

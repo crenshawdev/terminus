@@ -28,6 +28,26 @@ pub fn run(json: bool) -> Result<(), Failure> {
         Opened::Nothing(reason) => return read::empty(document(&Stats::default()), &reason, json),
     };
 
+    // A store older than the decision log is the same answer as a machine that
+    // has never ingested, and it has to be caught here: the query below would
+    // hand `no such table: decisions` to an operational failure that never
+    // learns `--json` was asked for. Half a log is the other thing - zeroes
+    // reported as a clean answer would read as "injection has recorded
+    // nothing", which is exactly what a damaged store must not be able to say.
+    match read::decision_log(&reader) {
+        read::DecisionLog::Present => {}
+        read::DecisionLog::Absent => {
+            return read::empty(document(&Stats::default()), read::NO_DECISION_LOG, json)
+        }
+        read::DecisionLog::Damaged(table) => {
+            return Err(read::unusable(
+                document(&Stats::default()),
+                read::damaged(table),
+                json,
+            ))
+        }
+    }
+
     let stats =
         stats::stats(reader.store().conn()).map_err(|e| Failure::Operational(e.to_string()))?;
 

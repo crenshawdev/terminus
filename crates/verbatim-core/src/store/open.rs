@@ -77,6 +77,7 @@ pub struct Store {
     path: PathBuf,
     rebuild: Option<RebuildRequired>,
     missing: Vec<MissingColumn>,
+    missing_tables: Vec<&'static str>,
 }
 
 impl std::fmt::Debug for Store {
@@ -123,6 +124,11 @@ impl Store {
             // `initialize` writes the whole schema on a fresh one, so a writable
             // open never leaves a declared column absent.
             missing: Vec::new(),
+            // The same sentence, one level up: `bring_forward`'s missing-table
+            // arm creates a table this build declares and the store lacks, which
+            // is how phase 6 landed `decisions` and `labels` with no
+            // `DERIVED_SCHEMA` bump (D-02).
+            missing_tables: Vec::new(),
         };
         if state == StoreState::Fresh {
             store.initialize()?;
@@ -212,6 +218,7 @@ impl Store {
 
         let rebuild = read_versions(&conn, &path)?;
         let missing = missing_columns(&conn)?;
+        let missing_tables = missing_tables(&conn)?;
 
         Ok(Store {
             conn,
@@ -219,6 +226,7 @@ impl Store {
             path,
             rebuild,
             missing,
+            missing_tables,
         })
     }
 
@@ -279,6 +287,28 @@ impl Store {
     /// one, the evidence for [`Store::predates_this_build`].
     pub fn missing_columns(&self) -> &[MissingColumn] {
         &self.missing
+    }
+
+    /// Tables this build declares and the open store does not carry.
+    ///
+    /// The table-level counterpart of [`Store::missing_columns`], and it exists
+    /// because the column list cannot answer for a whole table: phase 6 added
+    /// `decisions` and `labels` to [`crate::store::schema::TABLES`] with no
+    /// `DERIVED_SCHEMA` bump (D-02), so on a store written by an older build
+    /// `rebuild` is `None` and [`Store::missing_columns`] - which walks
+    /// `BRING_FORWARD_COLUMNS` alone - is empty. Both terms of
+    /// [`Store::predates_this_build`] are false and the store reads as current,
+    /// while a query naming either table fails with `no such table`.
+    ///
+    /// Deliberately NOT folded into [`Store::predates_this_build`]. That flag
+    /// makes every read command print the D-18 degraded-results line, and a
+    /// store missing only the decision log answers `search`, `show` and
+    /// `sessions` perfectly well - the absence is a fact about one report, so it
+    /// is reported to the commands whose answer depends on it and to no others.
+    ///
+    /// Always empty for [`Store::open`], which creates them.
+    pub fn missing_tables(&self) -> &[&'static str] {
+        &self.missing_tables
     }
 
     /// Is this store older than the build reading it (D-18)?
@@ -388,6 +418,20 @@ fn missing_columns(conn: &Connection) -> Result<Vec<MissingColumn>> {
         }
     }
     Ok(missing)
+}
+
+/// Which of [`crate::store::schema::TABLES`] the open store does not carry.
+///
+/// The read-only counterpart of [`bring_forward`]'s missing-table arm: same
+/// list, same `sqlite_master` comparison, and no `CREATE`. A read never
+/// migrates (D-18), so this is what its caller must not query.
+fn missing_tables(conn: &Connection) -> Result<Vec<&'static str>> {
+    let present = table_names(conn)?;
+    Ok(crate::store::schema::TABLES
+        .iter()
+        .filter(|table| !present.iter().any(|name| name == *table))
+        .copied()
+        .collect())
 }
 
 /// Every table in the open database, virtual tables included.
