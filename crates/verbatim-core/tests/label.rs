@@ -18,11 +18,18 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use verbatim_core::config::Config;
 use verbatim_core::ingest::pass::{self, PassOutcome, Summary};
+use verbatim_core::inject::decision::{Decision, Injected};
 use verbatim_core::store::DB_FILE_NAME;
 
 /// The session that went quiet before the pass, and the one still being typed.
 const IDLE: &str = "11111111-1111-4111-8111-111111111111";
 const LIVE: &str = "22222222-2222-4222-8222-222222222222";
+
+/// The file a later turn names again, the one nothing ever names again, and the
+/// one an injector hands over while the model goes looking for something else.
+const LANTERN: &str = "crates/gizmo/lantern.rs";
+const ORPHAN: &str = "docs/ORPHAN.md";
+const RETRY: &str = "docs/RETRY.md";
 
 struct Bench {
     _dir: tempfile::TempDir,
@@ -69,6 +76,18 @@ fn text(said: &str) -> serde_json::Value {
     serde_json::json!({"type": "text", "text": said})
 }
 
+/// The same, as unix milliseconds: what the prompt path stamps a record with.
+fn ms(offset: &str) -> i64 {
+    Connection::open_in_memory()
+        .unwrap()
+        .query_row(
+            "SELECT CAST(strftime('%s', 'now', ?1) AS INTEGER) * 1000",
+            [offset],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
 /// A turn that read a file, which is what leaves a `path` entity behind.
 fn read(path: &str) -> serde_json::Value {
     serde_json::json!({
@@ -76,6 +95,21 @@ fn read(path: &str) -> serde_json::Value {
         "id": "toolu_read",
         "name": "Read",
         "input": {"file_path": path},
+    })
+}
+
+/// A turn where the model went to recall for something, under the name a real
+/// harness registers an MCP tool with.
+///
+/// Synthesized because it has to be: zero `recall_search` calls exist across the
+/// 3,217 transcripts measured on 2026-08-20 (D-13), so no fixture taken from
+/// real history can carry one.
+fn recall(query: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_use",
+        "id": "toolu_recall",
+        "name": "mcp__verbatim__recall_search",
+        "input": {"query": query},
     })
 }
 
@@ -182,6 +216,63 @@ impl Bench {
         conn.last_insert_rowid()
     }
 
+    /// One decision written the way a prompt writes it: a file under the data
+    /// directory, for a later pass to drain (D-01).
+    ///
+    /// The wall clock is set rather than read, which is the only liberty taken
+    /// with the record - a decision the injector stamped with `now` would sit
+    /// after every turn the fixture can contain, and the whole join is about
+    /// which side of that clock a turn falls on.
+    fn log(
+        &self,
+        session: &str,
+        prompt: &str,
+        at_ms: i64,
+        injected: &[(i64, usize)],
+        chars: usize,
+        spellings: &[&str],
+    ) {
+        let cwd = self
+            .root
+            .join("project-alpha")
+            .to_string_lossy()
+            .into_owned();
+        let mut record = Decision::opened(Some(session), Some(&cwd), prompt);
+        record.at_ms = at_ms;
+        record.spellings = spellings.iter().map(|s| (*s).to_owned()).collect();
+        record.injected = injected
+            .iter()
+            .map(|(turn_id, chars)| Injected {
+                turn_id: *turn_id,
+                chars: *chars,
+            })
+            .collect();
+        record.chars_injected = chars;
+        assert!(record.save(&self.data_dir), "the record did not land");
+    }
+
+    /// The row one logged prompt became.
+    fn decision_of(&self, prompt: &str) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT id FROM decisions WHERE prompt = ?1",
+                [prompt],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("no decisions row for {prompt:?}: {e}"))
+    }
+
+    /// Every `(kind, value_norm)` one turn left behind.
+    fn entities_of(&self, turn: i64) -> Vec<(String, String)> {
+        self.conn()
+            .prepare("SELECT kind, value_norm FROM entities WHERE turn_id = ?1 ORDER BY rowid")
+            .unwrap()
+            .query_map([turn], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     /// Every label one decision carries, in the order they were written.
     fn labels_of(&self, decision: i64) -> Vec<(String, Option<i64>, Option<String>)> {
         self.conn()
@@ -261,18 +352,18 @@ fn a_finalized_decision_is_labelled_by_what_the_session_did_next() {
         &[
             // Before the decision: the turn it will inject and be right about,
             // and the turn it will inject and be wrong about.
-            (ts("-480 minutes"), read("crates/gizmo/lantern.rs")),
-            (ts("-480 minutes"), read("docs/ORPHAN.md")),
+            (ts("-480 minutes"), read(LANTERN)),
+            (ts("-480 minutes"), read(ORPHAN)),
             // After it: the same file again, and never the other one.
-            (ts("-450 minutes"), read("crates/gizmo/lantern.rs")),
+            (ts("-450 minutes"), read(LANTERN)),
         ],
     );
     bench.transcript(
         LIVE,
         "project-alpha",
         &[
-            (ts("-10 minutes"), read("crates/gizmo/lantern.rs")),
-            (ts("-5 minutes"), read("crates/gizmo/lantern.rs")),
+            (ts("-10 minutes"), read(LANTERN)),
+            (ts("-5 minutes"), read(LANTERN)),
         ],
     );
 
@@ -291,7 +382,13 @@ fn a_finalized_decision_is_labelled_by_what_the_session_did_next() {
     let mixed = bench.decide(IDLE, &at, &[(used, 100), (ignored, 50)], 150, &[]);
     let wasteful = bench.decide(IDLE, &at, &[(ignored, 50)], 50, &[]);
     // Same shape, on a session that is still being typed into.
-    let open = bench.decide(LIVE, &ts("-8 minutes"), &[(bench.turn(LIVE, 0), 40)], 40, &[]);
+    let open = bench.decide(
+        LIVE,
+        &ts("-8 minutes"),
+        &[(bench.turn(LIVE, 0), 40)],
+        40,
+        &[],
+    );
 
     let summary = bench.pass();
     assert!(summary.outcomes.notes.is_empty(), "{summary:?}");
@@ -328,4 +425,167 @@ fn a_finalized_decision_is_labelled_by_what_the_session_did_next() {
     assert_eq!(bench.labels_of(mixed).len(), 2);
     assert_eq!(bench.labels_of(wasteful).len(), 2);
     assert_eq!(bench.labels_of(open), Vec::new());
+}
+
+/// AC2, through every seam at once: a prompt writes a file, a pass drains it
+/// into a row, the idle rule closes the session, and the join labels it.
+///
+/// The labelling pass walks a tree with nothing new in it, and that is the
+/// assertion about D-07 rather than a detail of the setup: it commits no file
+/// and reads no bytes, so the labels it wrote came out of `entities` and
+/// `turns` and out of no blob.
+#[test]
+fn a_logged_decision_is_labelled_end_to_end() {
+    let bench = bench();
+    bench.transcript(
+        IDLE,
+        "project-alpha",
+        &[
+            (ts("-480 minutes"), read(LANTERN)),
+            (ts("-480 minutes"), read(ORPHAN)),
+            (ts("-450 minutes"), read(LANTERN)),
+        ],
+    );
+    bench.transcript(
+        LIVE,
+        "project-alpha",
+        &[
+            (ts("-10 minutes"), read(LANTERN)),
+            (ts("-5 minutes"), read(LANTERN)),
+        ],
+    );
+
+    let archived = bench.pass();
+    assert_eq!(archived.files_committed, 2, "{archived:?}");
+    assert_eq!(bench.is_final(IDLE), Some(1));
+    assert_eq!(bench.is_final(LIVE), None);
+
+    let at = ms("-465 minutes");
+    let referenced = "what did we do to the lantern";
+    let never = "and what about the orphan";
+    let young = "what changed just now";
+    bench.log(
+        IDLE,
+        referenced,
+        at,
+        &[(bench.turn(IDLE, 0), 120)],
+        137,
+        &[LANTERN],
+    );
+    bench.log(
+        IDLE,
+        never,
+        at,
+        &[(bench.turn(IDLE, 1), 90)],
+        104,
+        &[ORPHAN],
+    );
+    bench.log(
+        LIVE,
+        young,
+        ms("-8 minutes"),
+        &[(bench.turn(LIVE, 0), 60)],
+        71,
+        &[LANTERN],
+    );
+
+    let labelled = bench.pass();
+    assert_eq!(labelled.feedback.decisions, 3, "{labelled:?}");
+    assert_eq!(labelled.files_committed, 0, "{labelled:?}");
+    assert_eq!(
+        labelled.bytes_read, 0,
+        "the labelling pass read transcript bytes: {labelled:?}"
+    );
+    assert_eq!(labelled.outcomes.finalized, 0, "{labelled:?}");
+    assert_eq!(labelled.outcomes.count("hit"), 1, "{labelled:?}");
+    assert_eq!(labelled.outcomes.count("false positive"), 1, "{labelled:?}");
+    assert_eq!(labelled.outcomes.count("wasted budget"), 1, "{labelled:?}");
+
+    assert_eq!(
+        bench.labels_of(bench.decision_of(referenced)),
+        vec![("hit".to_owned(), Some(bench.turn(IDLE, 0)), None)]
+    );
+    assert_eq!(
+        bench.labels_of(bench.decision_of(never)),
+        vec![
+            ("false positive".to_owned(), Some(bench.turn(IDLE, 1)), None),
+            ("wasted budget".to_owned(), None, Some("104".to_owned())),
+        ]
+    );
+    // AC2's other half: the session younger than the threshold is not closed and
+    // its decision is not judged.
+    assert_eq!(bench.is_final(LIVE), None);
+    assert_eq!(bench.labels_of(bench.decision_of(young)), Vec::new());
+}
+
+/// AC3: the model went to recall for something this prompt had named and this
+/// decision declined to hand over, which is what a `miss` is.
+///
+/// It is reachable only because a `recall_search` call leaves what it searched
+/// for in `entities` - the join may not open the blob to read the query out of
+/// it (D-07), so the premise is asserted before the label is.
+#[test]
+fn a_recall_call_for_something_the_injector_declined_is_a_miss() {
+    let bench = bench();
+    bench.transcript(
+        IDLE,
+        "project-alpha",
+        &[
+            (ts("-480 minutes"), read(LANTERN)),
+            (ts("-480 minutes"), read(RETRY)),
+            (
+                ts("-450 minutes"),
+                recall(&format!("where did we last touch {LANTERN}")),
+            ),
+        ],
+    );
+
+    let archived = bench.pass();
+    assert_eq!(archived.files_committed, 1, "{archived:?}");
+    assert_eq!(bench.is_final(IDLE), Some(1));
+    assert!(
+        bench
+            .entities_of(bench.turn(IDLE, 2))
+            .contains(&("path".to_owned(), LANTERN.to_owned())),
+        "the recall call left no trace of what it searched for: {:?}",
+        bench.entities_of(bench.turn(IDLE, 2))
+    );
+
+    // The prompt named both files and the injector handed over only one.
+    let prompt = "remind me about the lantern and the retry budget";
+    bench.log(
+        IDLE,
+        prompt,
+        ms("-465 minutes"),
+        &[(bench.turn(IDLE, 1), 90)],
+        104,
+        &[LANTERN, RETRY],
+    );
+
+    let labelled = bench.pass();
+    assert_eq!(labelled.feedback.decisions, 1, "{labelled:?}");
+    assert_eq!(
+        labelled.bytes_read, 0,
+        "the labelling pass read transcript bytes: {labelled:?}"
+    );
+    assert_eq!(labelled.outcomes.count("miss"), 1, "{labelled:?}");
+
+    let labels = bench.labels_of(bench.decision_of(prompt));
+    assert!(
+        labels.contains(&("miss".to_owned(), None, Some(LANTERN.to_owned()))),
+        "{labels:?}"
+    );
+
+    // Attached to that decision and to nothing else, and written once.
+    let total: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM labels WHERE label = 'miss'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total, 1);
+    let again = bench.pass();
+    assert!(again.outcomes.labels.is_empty(), "{again:?}");
 }

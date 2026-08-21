@@ -85,7 +85,8 @@ pub fn label(conn: &mut Connection) -> Result<Vec<(String, usize)>> {
     // The high-water mark, so "what this pass wrote" is a range of ids rather
     // than a sum of `execute` counts - one INSERT below produces two different
     // labels and cannot report them apart.
-    let before: i64 = conn.query_row("SELECT coalesce(max(id), 0) FROM labels", [], |r| r.get(0))?;
+    let before: i64 =
+        conn.query_row("SELECT coalesce(max(id), 0) FROM labels", [], |r| r.get(0))?;
 
     let tx = conn.transaction()?;
     tx.execute(&hit_or_false_positive(), [])?;
@@ -93,8 +94,9 @@ pub fn label(conn: &mut Connection) -> Result<Vec<(String, usize)>> {
     tx.execute(&wasted_budget(), [])?;
     tx.commit()?;
 
-    let mut counted = conn
-        .prepare("SELECT label, count(*) FROM labels WHERE id > ?1 GROUP BY label ORDER BY label")?;
+    let mut counted = conn.prepare(
+        "SELECT label, count(*) FROM labels WHERE id > ?1 GROUP BY label ORDER BY label",
+    )?;
     let counts = counted
         .query_map([before], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
