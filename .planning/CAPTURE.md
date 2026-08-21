@@ -119,6 +119,15 @@
 - [ ] (phase 5) The error entity kind has no candidate spelling of its own in the UserPromptSubmit query: a failure whose text is pure prose and numbers names no candidate and opens no store. Left because a normalized stderr line is not a spelling a user retypes.
 - [ ] (phase 5) inject::state::MAX_SUPPRESSED caps the suppression list at 100 oldest-dropped while injected/brief are uncapped; a very long session's state file forgets its earliest refusals. Nothing in phase 5 reads them back; FEED-01 owns the durable record.
 - [ ] (phase 5) crates/verbatim/src/cmd/hook.rs's inject doc says the abandoned injection thread writes nothing; since plan 4 task 2 it writes the D-06 per-session scratch file (the store still never sees a write). One clause of one comment, outside plan 4's lease.
+- [ ] (phase 6) PLAN-2 Task 3's miss join matches turns.tool_name ending recall_get, but nothing extracts entities from recall_get tool calls (input is a turn-id list, tools.rs:56-64) - the join arm is inert. Either drop recall_get from the join or state why it stays; plan-review finding, downgraded 2026-08-20.
+- [ ] (phase 6) verbatim stats and verbatim replay exit 1 with a raw "sqlite: no such table: decisions" on a store ingested before phase 6 - read commands never migrate by design (D-10/D-18, cmd/read.rs), so give them the "store older than this build" answer D-18 promises instead of the sqlite error.
+- [ ] (phase 6) The decisions table does not persist the record's compacted and dropped fields (feedback/mod.rs insert is eleven columns), so replay and stats cannot tell a decision taken under a compacted pool from an ordinary one.
+- [ ] (phase 6) A .tmp left by a hook that exited between write and rename is skipped by inject::decision::read_all and deleted by nothing, so the decisions directory accumulates orphans forever.
+- [ ] (phase 6) runs.error carries a routine "labelled N hit, N false positive" line whenever an ingest pass labels anything, and verbatim status prints that channel under an error heading, so a correct pass reads as a failed one.
+- [ ] (phase 6) The miss join matches a recall tool by tool_name LIKE '%recall\_search' while index::entity::is_recall_search additionally requires a _ separator, so a tool named xrecall_search is admitted by one rule and extracted from by neither.
+- [ ] (phase 6) Replay computes wasted budget as "the would-inject set is non-empty and none of it is a hit" where ingest reads chars_injected > 0; the two agree today but are two definitions of one label.
+- [ ] (phase 6) MatchedEntity is not re-exported from crate::recall (recall/mod.rs was outside plan 1's lease), so callers name recall::search::MatchedEntity.
+- [ ] (phase 6) Pre-existing cargo fmt drift in crates/verbatim-core/src/ingest/backfill.rs:250 and crates/verbatim/tests/hook.rs:252,681.
 
 
 ## Seeds
