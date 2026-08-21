@@ -23,7 +23,8 @@ use verbatim_core::ingest::pass::{self, PassOutcome, Summary};
 use verbatim_core::inject::decision::{self, Decision};
 use verbatim_core::inject::state::Reason;
 use verbatim_core::inject::{prompt, Payload};
-use verbatim_core::store::{Store, DB_FILE_NAME};
+use verbatim_core::recall::{search, Query, Request, Scope};
+use verbatim_core::store::{schema, Store, DB_FILE_NAME};
 use verbatim_core::{ingest, reindex, testkit};
 
 /// The fixture that stores an absolute path, and the relative spelling of that
@@ -161,6 +162,14 @@ impl Bench {
             .into_iter()
             .map(|found| found.path)
             .collect()
+    }
+
+    /// The highest `sessions.session_no` this store holds: the watermark a
+    /// decision records (D-10).
+    fn watermark(&self) -> i64 {
+        self.conn()
+            .query_row("SELECT max(session_no) FROM sessions", [], |r| r.get(0))
+            .unwrap()
     }
 
     /// Archive one session of hand-written records through the ordinary ingest
@@ -603,4 +612,76 @@ fn reindex_gives_back_every_logged_decision() {
         before,
         "the rebuild changed the decision log"
     );
+}
+
+// ---------------------------------------------------------------------------
+// FEED-03: the index as it stood
+// ---------------------------------------------------------------------------
+
+/// A `Read` tool call, which is what leaves a `path` entity behind.
+fn read_call(path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_use",
+        "id": "toolu_read",
+        "name": "Read",
+        "input": {"file_path": path},
+    })
+}
+
+/// D-10: a search bounded by a watermark answers about the archive as it stood,
+/// and a session ingested afterwards is invisible to it.
+///
+/// Two sessions naming the same file, archived in order. The bound is
+/// `turn_id(watermark + 1, 0)`, which is sound because a turn id is
+/// `session_no << TURN_SEQ_BITS | turn_seq`: every turn of the first session
+/// sits below it and every turn of the second sits above. The unbounded search
+/// is the premise - without it "one hit" could mean the second session simply
+/// did not match.
+#[test]
+fn a_watermark_bound_hides_a_later_ingested_session() {
+    let bench = bench();
+    let project = "project-beta";
+    let file = "/code/beta/src/kettle.rs";
+
+    bench.archive("first.jsonl", project, vec![read_call(file)]);
+    let first = bench.watermark();
+    bench.archive("second2.jsonl", project, vec![read_call(file)]);
+    let second = bench.watermark();
+    assert!(second > first, "the two sessions share a session_no");
+
+    let conn = bench.conn();
+    let cwd = bench.root.join(project);
+    let scope = Scope::Directory(cwd.clone());
+    let request = Request::new(Query::parse(file), scope)
+        .candidates(vec![Query::parse(file)])
+        .excerpts(false)
+        .limit(10);
+
+    let unbounded = search::run(&conn, &Config::default(), &request).unwrap();
+    let sessions: Vec<i64> = unbounded
+        .hits
+        .iter()
+        .map(|hit| schema::split_turn_id(hit.turn_id).0)
+        .collect();
+    // Both hits carry the same relevance and the same timestamp, so the total
+    // order falls through to `t.id ASC` and the first-archived session leads.
+    assert_eq!(sessions, vec![first, second], "{:?}", unbounded.hits);
+
+    let bounded = search::run(
+        &conn,
+        &Config::default(),
+        &request
+            .clone()
+            .before_turn_id(Some(schema::turn_id(first + 1, 0))),
+    )
+    .unwrap();
+    let sessions: Vec<i64> = bounded
+        .hits
+        .iter()
+        .map(|hit| schema::split_turn_id(hit.turn_id).0)
+        .collect();
+    assert_eq!(sessions, vec![first], "{:?}", bounded.hits);
+
+    // The default is no bound at all, so every existing caller is untouched.
+    assert_eq!(request.before_turn_id, None);
 }

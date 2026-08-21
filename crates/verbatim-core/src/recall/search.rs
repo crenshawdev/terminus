@@ -102,6 +102,25 @@ pub struct Request {
     /// attaches them itself, through [`excerpt::attach`], for the at-most-three
     /// turns that fired.
     pub excerpts: bool,
+    /// An exclusive upper bound on `turns.id`: only turns strictly below it may
+    /// come back. `None` for every caller but `verbatim replay`, and then this
+    /// narrows nothing.
+    ///
+    /// **This is how "the index as it stood" is reconstructed (D-10).** A turn
+    /// id is `session_no << TURN_SEQ_BITS | turn_seq`
+    /// (`store::schema::turn_id`), and `sessions.session_no` is assigned in
+    /// ingest order and survives a rebuild - so every turn of every session up
+    /// to and including a watermark sits below `turn_id(watermark + 1, 0)` and
+    /// every later-ingested session sits above it. That makes one integer per
+    /// decision a sound bound on what was archived when the decision was taken,
+    /// with no database snapshot anywhere.
+    ///
+    /// **Not `turns.ts`.** A transcript timestamp says when a turn HAPPENED, not
+    /// when it was indexed: a backfill run today archives turns stamped last
+    /// month, and a replay filtering on `ts` would score a historic prompt
+    /// against rows that did not exist when it was submitted - which is exactly
+    /// the hindsight FEED-03 exists to rule out.
+    pub before_turn_id: Option<i64>,
 }
 
 impl Request {
@@ -121,6 +140,7 @@ impl Request {
             limit: DEFAULT_RESULTS,
             candidates: Vec::new(),
             excerpts: true,
+            before_turn_id: None,
         }
     }
 
@@ -143,6 +163,13 @@ impl Request {
 
     pub fn filters(mut self, filters: Filters) -> Self {
         self.filters = filters;
+        self
+    }
+
+    /// Score only against turns archived before a watermark - see
+    /// [`Request::before_turn_id`].
+    pub fn before_turn_id(mut self, bound: Option<i64>) -> Self {
+        self.before_turn_id = bound;
         self
     }
 
@@ -336,6 +363,14 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
         scoped.excluded_pre_worktree(),
     );
     request.filters.push_onto(&mut sql, &mut params)?;
+    // Conjunctive with everything above and applied inside the ranking query,
+    // not after it: a bound applied to the results would let a later-archived
+    // turn take a slot in the candidate pool and push a turn that WAS indexed
+    // out of the window a replay then judges (D-10).
+    if let Some(bound) = request.before_turn_id {
+        sql.push_str(" AND t.id < ?\n");
+        params.push(Box::new(bound));
+    }
     sql.push_str(TAIL);
     params.push(Box::new(CANDIDATE_POOL as i64));
 
