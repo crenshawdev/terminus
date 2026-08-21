@@ -389,3 +389,67 @@ fn the_project_index_reaches_a_store_that_predates_it() {
     verbatim_core::reindex::reindex(&mut store).unwrap();
     assert_eq!(index_count(store.conn(), "idx_session_meta_project"), 1);
 }
+
+/// D-01: `observations` reaches a store written before it existed through
+/// `bring_forward`'s missing-table arm, and costs no rebuild to get there.
+///
+/// The alternative was a `DERIVED_SCHEMA` bump, which forces a full blob replay
+/// of the whole archive inside the ingest lock on the first hook-spawned pass
+/// after an upgrade - roughly 49 s over the real corpus - for a table nothing
+/// rebuilds anyway. So the assertion is two-part on purpose: the table is back
+/// AND nothing was scheduled to be rebuilt.
+#[test]
+fn the_observations_table_reaches_a_store_that_predates_it() {
+    let (dir, store) = fresh();
+    assert!(names(store.conn(), "table").contains("observations"));
+
+    // A store written by a build that did not declare the table.
+    store
+        .conn()
+        .execute_batch("DROP TABLE observations")
+        .unwrap();
+    assert!(!names(store.conn(), "table").contains("observations"));
+    drop(store);
+
+    let reopened = Store::open(dir.path()).expect("an older store still opens");
+    assert!(
+        names(reopened.conn(), "table").contains("observations"),
+        "the missing-table arm did not create `observations`"
+    );
+    assert!(
+        reopened.rebuild_required().is_none(),
+        "adding `observations` must not force a derived rebuild"
+    );
+}
+
+/// D-02: the table is archival. A `DERIVED_TABLES` entry would make `reindex`
+/// drop it, and the judgment half of a row is a paid model call.
+#[test]
+fn observations_is_not_a_derived_table() {
+    assert!(
+        !schema::DERIVED_TABLES.contains(&"observations"),
+        "reindex would delete every purchased summary in the archive"
+    );
+    assert!(schema::TABLES.contains(&"observations"));
+}
+
+/// D-03: no column of `observations` may reference `turns`, which `reindex`
+/// drops - the bundled SQLite enforces foreign keys, so the first `reindex`
+/// after the first observation would fail outright.
+#[test]
+fn observations_declares_no_reference_to_turns() {
+    let (_dir, store) = fresh();
+    let sql: String = store
+        .conn()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'observations'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !sql.contains("REFERENCES turns"),
+        "a declared reference to a dropped table wedges every later ingest: {sql}"
+    );
+    assert!(sql.contains("REFERENCES sessions"), "{sql}");
+}

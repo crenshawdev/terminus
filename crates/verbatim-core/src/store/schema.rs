@@ -9,7 +9,9 @@
 //!
 //! `decisions` and `labels` join the archive group in phase 6 (D-03): a logged
 //! injection decision is prompt-time state the blobs do not contain, so it is
-//! kept rather than rebuilt, and a `reindex` must never drop it.
+//! kept rather than rebuilt, and a `reindex` must never drop it. `observations`
+//! joins it in phase 7 (D-02): its judgment half is one paid model call, which
+//! no blob replay reproduces either.
 
 /// Bits of a turn id reserved for the per-session turn ordinal.
 ///
@@ -188,6 +190,51 @@ CREATE TABLE IF NOT EXISTS labels (
 
 CREATE INDEX IF NOT EXISTS idx_labels_decision ON labels(decision_id);
 
+-- One session's account of itself (OBS-01..OBS-04). Archival, and deliberately
+-- NOT in `DERIVED_TABLES`, for the reason `decisions` is not (phase 7 D-02).
+-- The mechanical half could in principle be recomputed from the blob, but the
+-- judgment half cannot: it is one paid model call whose answer nothing in the
+-- archive reproduces, so a `reindex` that dropped this table would silently
+-- delete every purchased summary in it. `verbatim observations regenerate`
+-- (OBS-07) is the only rebuild path, and the two halves share one row because
+-- they describe one session and are written and read together.
+--
+-- `mechanical` is one JSON document rather than a column per fact, the way
+-- `decisions` carries its list-shaped fields: nothing joins on them and they
+-- are read back whole.
+--
+-- The claim lists carry NO foreign key to `turns` and cannot (phase 7 D-03,
+-- and the same constraint the `labels` comment above records). Each entry of
+-- `decisions`, `learned` and `unresolved` anchors itself to a `turn_id`
+-- (OBS-03), but the anchor lives INSIDE a JSON document, so there is no column
+-- a reference could be declared on - which is just as well: `turns` is a table
+-- `reindex` drops, and a declared reference would make the first `reindex`
+-- after the first observation fail outright.
+--
+-- `observations.decisions` and the `decisions` TABLE are different objects
+-- with the same name. Every statement naming the column qualifies it.
+CREATE TABLE IF NOT EXISTS observations (
+    session_key    TEXT PRIMARY KEY REFERENCES sessions(session_key),
+    session_id     TEXT,
+    generated_at   TEXT,
+    -- The OBS-01 facts: files, tools, commands with their arguments, errors,
+    -- branch, commits, turn count, duration, compactions.
+    mechanical     TEXT,
+    -- The judgment half. Null until a provider is configured and answers.
+    status         TEXT,
+    model          TEXT,
+    prompt_version TEXT,
+    topic          TEXT,
+    outcome        TEXT,
+    decisions      TEXT,
+    learned        TEXT,
+    unresolved     TEXT,
+    -- The response as it arrived, kept for the OBS-04 `parse_failed` arm: a
+    -- response that would not parse is never dropped silently.
+    raw            TEXT,
+    tokens         INTEGER
+);
+
 -- DERIVED. Rebuildable from the blobs alone; dropped and recreated by reindex.
 
 -- stream_offset and byte_len address the UNCOMPRESSED session stream, never
@@ -294,6 +341,10 @@ pub const TABLES: &[&str] = &[
     // add two tables with no `DERIVED_SCHEMA` bump and no forced reindex (D-02).
     "decisions",
     "labels",
+    // Phase 7 D-01, on the same terms: one more table declared here and absent
+    // from `DERIVED_TABLES`, reaching an already-initialized store through the
+    // same arm, with no `DERIVED_SCHEMA` bump and so no forced reindex.
+    "observations",
     "turns",
     "compaction_boundaries",
     "turns_fts",
@@ -307,7 +358,9 @@ pub const TABLES: &[&str] = &[
 /// The derived tables `reindex` drops and rebuilds from the blobs (STOR-04).
 /// `sessions` and `session_meta` are absent by design, and so are `decisions`
 /// and `labels`: nothing in a blob can reconstruct what an injector decided at
-/// prompt time (D-03).
+/// prompt time (D-03). `observations` is absent for the same reason and one
+/// more (phase 7 D-02): its judgment half is a paid model call, so a `reindex`
+/// that dropped the table would delete summaries that cost money to produce.
 ///
 /// In creation order, because `reindex` drops in reverse: a boundary row
 /// references `turns(id)`, so `compaction_boundaries` sits **after** `turns`

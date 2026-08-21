@@ -398,3 +398,62 @@ fn a_corrupt_blob_is_skipped_and_named_rather_than_stopping_the_rebuild() {
         "every session but the damaged one must have its turns back"
     );
 }
+
+/// D-02, as the failure it prevents: a `reindex` must leave every observation
+/// row exactly where it was.
+///
+/// The judgment half of one of these rows is a paid model call that nothing in
+/// a blob reproduces, so a `reindex` that dropped the table would silently
+/// delete summaries a user bought - and `open_up_to_date` runs on the ingest
+/// path, so it would happen unattended on the first pass after an upgrade.
+///
+/// The comparison is the column VALUES and not a row count: a rebuild that
+/// recreated the table empty and a rebuild that rewrote `mechanical` are both
+/// failures, and a count cannot tell either of them from success.
+#[test]
+fn a_reindex_leaves_every_observation_row_untouched() {
+    let bench = bench();
+    let key: String = bench
+        .conn()
+        .query_row(
+            "SELECT session_key FROM sessions ORDER BY session_no",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let row = |conn: &Connection| -> Vec<Option<String>> {
+        conn.query_row(
+            "SELECT o.session_key, o.session_id, o.generated_at, o.mechanical,
+                    o.status, o.model, o.prompt_version, o.topic, o.outcome,
+                    o.decisions, o.learned, o.unresolved, o.raw,
+                    CAST(o.tokens AS TEXT)
+               FROM observations o WHERE o.session_key = ?1",
+            [&key],
+            |r| (0..14).map(|i| r.get(i)).collect(),
+        )
+        .expect("the observation row must still be there")
+    };
+
+    bench
+        .conn()
+        .execute(
+            "INSERT INTO observations (
+                session_key, session_id, generated_at, mechanical, status, model,
+                prompt_version, topic, outcome, decisions, learned, unresolved,
+                raw, tokens
+             ) VALUES (?1, 'sess-1', '2026-08-21T00:00:00.000Z', '{\"turns\":3}',
+                       'ok', 'qwen3:8b', 'v1', 'the topic', 'the outcome',
+                       '[{\"turn_id\":7,\"claim\":\"a\"}]', '[]', '[]', NULL, 394)",
+            [&key],
+        )
+        .unwrap();
+    let before = row(&bench.conn());
+
+    let mut store = bench.store();
+    reindex::reindex(&mut store).unwrap();
+    drop(store);
+
+    assert_eq!(row(&bench.conn()), before, "the rebuild moved an observation");
+    assert_eq!(count(&bench.conn(), "observations"), 1);
+}
