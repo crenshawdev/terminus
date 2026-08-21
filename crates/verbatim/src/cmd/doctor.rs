@@ -36,6 +36,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use verbatim_core::config::visible;
+use verbatim_core::credentials::{self, Permissions};
 use verbatim_core::Config;
 
 use super::install::binary;
@@ -139,6 +140,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let mut doctor = Doctor::new();
     doctor.wiring();
     doctor.archive();
+    doctor.credentials();
     doctor.claude_settings();
     let checks = doctor.checks;
 
@@ -702,6 +704,75 @@ impl Doctor {
                 self.unknown("last_run", "verbatim's config could not be read");
             }
         }
+    }
+
+    /// The shared credentials file: where it was looked for, whether it is
+    /// there, and what its permissions say (PRIV-02, D-15).
+    ///
+    /// An absent file is the ORDINARY state and not a problem. It does not
+    /// exist on this machine, most machines will never have one, and a provider
+    /// key can also come from `[provider] api_key` or from the environment - so
+    /// reporting its absence as broken would tell every user their machine is
+    /// broken.
+    ///
+    /// Reads a path and a mode. It does not open the file, so no part of a
+    /// credential can reach the report or the `--json` document, and it creates
+    /// nothing - doctor never writes, and a check that created the file it was
+    /// asked about would be reporting on its own work.
+    fn credentials(&mut self) {
+        let Some(path) = credentials::path() else {
+            self.push(Check::new(
+                "credentials",
+                State::Unknown,
+                "no config directory resolved, so there is nowhere to look for a shared \
+                 credentials file",
+            ));
+            return;
+        };
+        let where_it_is = path.display().to_string();
+        let check = match credentials::permissions(&path) {
+            Permissions::Absent => Check::new(
+                "credentials",
+                State::Note,
+                format!(
+                    "nothing at {where_it_is}; a provider key can also come from \
+                     [provider] api_key or from the environment"
+                ),
+            ),
+            Permissions::Owner { mode } => Check::new(
+                "credentials",
+                State::Ok,
+                format!("{where_it_is} is mode {mode:03o}"),
+            ),
+            // Unix only by construction: `credentials::permissions` never
+            // answers this on a build without mode bits, which is why the fix
+            // can be a bare `chmod` with no platform arm.
+            Permissions::TooOpen { mode } => Check::new(
+                "credentials",
+                State::Problem,
+                format!(
+                    "{where_it_is} is mode {mode:03o}, so it is readable beyond its owner \
+                     and verbatim refuses to load a credential from it"
+                ),
+            )
+            .with_fix(format!("chmod 600 '{where_it_is}'")),
+            // D-15's deferral, said in words rather than left as an `ok` this
+            // build did not earn.
+            Permissions::Unchecked => Check::new(
+                "credentials",
+                State::Unknown,
+                format!(
+                    "{where_it_is} is there; this build does not check Windows ACLs, so \
+                     whether anyone else can read it is unverified"
+                ),
+            ),
+            Permissions::Unreadable { detail } => Check::new(
+                "credentials",
+                State::Problem,
+                format!("{where_it_is} could not be read: {detail}"),
+            ),
+        };
+        self.push(check);
     }
 
     /// Which Claude config roots resolved, and how many.

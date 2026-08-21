@@ -100,12 +100,36 @@ impl Fixture {
         self.claude_dir.join("settings.json")
     }
 
+    /// Where the shared credentials file is looked for, for this fixture only.
+    ///
+    /// Pinned like every other directory here, and for a sharper reason: the
+    /// loader falls back to `XDG_CONFIG_HOME` before `HOME`, and this harness
+    /// inherits the developer's `XDG_CONFIG_HOME`. Without this a doctor run
+    /// would report on the real `~/.config/jcrenshaw/credentials.toml`.
+    fn shared_dir(&self) -> PathBuf {
+        self.root.join("shared")
+    }
+
+    fn credentials(&self) -> PathBuf {
+        self.shared_dir().join("credentials.toml")
+    }
+
+    /// Write the shared credentials file at `mode`, creating its directory.
+    fn write_credentials(&self, body: &str, mode: u32) -> PathBuf {
+        let path = self.credentials();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        set_mode(&path, mode);
+        path
+    }
+
     fn env(&self, command: &mut Command) {
         command
             .env("VERBATIM_BIN_DIR", &self.bin_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("VERBATIM_DATA_DIR", self.root.join("data"))
             .env("VERBATIM_CONFIG_DIR", self.root.join("config"))
+            .env("JCRENSHAW_CONFIG_DIR", self.shared_dir())
             .env("HOME", &self.root)
             .env("USERPROFILE", &self.root);
     }
@@ -757,5 +781,151 @@ fn a_missing_binary_makes_the_document_say_so() {
     assert!(
         document["data"]["binary"]["fix"].is_string(),
         "the problem carries no command"
+    );
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) {}
+
+// ---------------------------------------------------------------------------
+// The credentials check (PRIV-02, D-15)
+// ---------------------------------------------------------------------------
+
+/// A value distinctive enough that finding any part of it in a report is
+/// unambiguous evidence of a leak rather than a coincidence.
+const CRED_KEY: &str = "sk-VERBATIMDOCTOR-6e21b4-do-not-log";
+
+fn credentials_file() -> String {
+    format!("[openrouter]\napi_key = \"{CRED_KEY}\"\n")
+}
+
+/// Neither the human report nor the `--json` document may carry a byte of the
+/// key, whatever state the file is in.
+///
+/// Run against both outputs of every case below rather than once, because the
+/// two are built by different code and only one of them is what a script reads.
+fn assert_no_credential_reaches_a_stream(fixture: &Fixture) {
+    let human = fixture.run(&["doctor"]);
+    let json = fixture.run(&["doctor", "--json"]);
+    for out in [&human, &json] {
+        let rendered = text(out);
+        for fragment in [CRED_KEY, "VERBATIMDOCTOR", "6e21b4"] {
+            assert!(
+                !rendered.contains(fragment),
+                "doctor printed {fragment:?}:\n{rendered}"
+            );
+        }
+    }
+    // The falsifying half where there is a file: it really does hold the key,
+    // so the assertions above are about doctor and not about an empty file.
+    if let Ok(written) = std::fs::read_to_string(fixture.credentials()) {
+        assert!(written.contains(CRED_KEY));
+    }
+}
+
+/// An owner-only file is the good state, and it does not make doctor fail.
+#[test]
+fn an_owner_only_credentials_file_is_ok_and_doctor_still_exits_zero() {
+    let fixture = fixture();
+    fixture.install();
+    let path = fixture.write_credentials(&credentials_file(), 0o600);
+
+    let (code, report) = fixture.doctor();
+
+    assert_eq!(report.state("credentials"), "ok", "{}", report.whole);
+    assert!(
+        report
+            .check("credentials")
+            .finding
+            .contains(&path.display().to_string()),
+        "the check does not say where it looked: {}",
+        report.check("credentials").finding
+    );
+    assert_eq!(code, Some(0));
+    assert_no_credential_reaches_a_stream(&fixture);
+}
+
+/// PRIV-02, end to end: a group-readable file is a problem, doctor exits 1, and
+/// the command it prints is a command that fixes it.
+#[cfg(unix)]
+#[test]
+fn a_group_readable_credentials_file_is_a_problem_whose_printed_command_fixes_it() {
+    let fixture = fixture();
+    fixture.install();
+    fixture.write_credentials(&credentials_file(), 0o644);
+
+    let (code, report) = fixture.doctor();
+
+    assert_eq!(report.state("credentials"), "problem", "{}", report.whole);
+    assert_eq!(
+        code,
+        Some(1),
+        "a world-readable credentials file must not exit 0"
+    );
+    assert!(
+        report.check("credentials").finding.contains("644"),
+        "the check does not name the mode: {}",
+        report.check("credentials").finding
+    );
+    assert_no_credential_reaches_a_stream(&fixture);
+
+    let fix = report
+        .check("credentials")
+        .fix
+        .clone()
+        .unwrap_or_else(|| panic!("the problem printed no command:\n{}", report.whole));
+    let out = fixture.shell(&fix);
+    assert!(
+        out.status.success(),
+        "`{fix}` did not succeed: {}",
+        text(&out)
+    );
+
+    let (code, report) = fixture.doctor();
+    assert_eq!(report.state("credentials"), "ok", "{}", report.whole);
+    assert_eq!(code, Some(0));
+}
+
+/// The ordinary state of every machine, including this one: no shared file at
+/// all. It is reported, and it is not a failure.
+#[test]
+fn no_credentials_file_is_reported_without_being_a_problem() {
+    let fixture = fixture();
+    fixture.install();
+
+    let (code, report) = fixture.doctor();
+
+    assert_eq!(report.state("credentials"), "note", "{}", report.whole);
+    assert_eq!(code, Some(0));
+    assert!(
+        !report.problems().contains(&"credentials"),
+        "an absent file was counted as a problem: {}",
+        report.whole
+    );
+    assert_no_credential_reaches_a_stream(&fixture);
+}
+
+/// Doctor never writes, and this check must not be the one that changes that:
+/// asking about a credentials file must not create one, nor the directory it
+/// would live in.
+#[test]
+fn the_credentials_check_creates_nothing() {
+    let fixture = fixture();
+    fixture.install();
+
+    let (_, report) = fixture.doctor();
+    let _ = fixture.run(&["doctor", "--json"]);
+
+    assert_eq!(report.state("credentials"), "note");
+    assert!(
+        !fixture.shared_dir().exists(),
+        "doctor created {}",
+        fixture.shared_dir().display()
     );
 }
