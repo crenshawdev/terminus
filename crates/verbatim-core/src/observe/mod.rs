@@ -35,6 +35,7 @@
 //! Nothing here redacts at ingest: `.planning/PROJECT.md` bars that outright.
 
 pub mod egress;
+pub mod judgment;
 pub mod mechanical;
 pub mod net;
 pub mod provider;
