@@ -52,7 +52,8 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use super::state::{Reason, State};
+use super::decision::{Candidate, Decision, Injected, Thresholds};
+use super::state::{Reason, State, Suppressed};
 use super::{compaction, Payload};
 use crate::config::Config;
 use crate::index::entity::{self, normalize_path};
@@ -115,11 +116,57 @@ pub struct Fired {
 /// Nothing is the ordinary answer and the one this arm exists to protect: the
 /// hook then writes nothing at all and exits 0, which is what every prompt that
 /// names something the archive has not seen gets.
+///
+/// **Every call leaves a decision record (FEED-01, D-11).** Including the ones
+/// that inject nothing, and including the ones that return before the store is
+/// opened at all: non-fires are where the miss data lives, and a precision
+/// computed only over the prompts that fired has no denominator. The record is
+/// completed HERE rather than inside [`selected`] because what one injection
+/// cost is known only after [`render`] has clipped it, and it is written after
+/// the state save, on the same thread the hook abandons - a write that fails
+/// changes nothing about what is emitted.
 pub fn user_prompt_submit(data_dir: &Path, config: &Config, payload: &Payload) -> Option<String> {
-    render(
-        &select(data_dir, config, payload).hits,
-        config.prompt_chars(),
-    )
+    let mut decision = Decision::opened(
+        payload.session_id,
+        payload.cwd,
+        payload.prompt.unwrap_or_default(),
+    );
+    let budget = budget(config);
+    decision.thresholds = in_force(budget);
+
+    let fired = selected(data_dir, config, payload, &mut decision).unwrap_or_default();
+    let text = render(&fired.hits, budget, &mut decision);
+
+    decision.save(data_dir);
+    text
+}
+
+/// The character budget one injection actually gets: what `verbatim.toml`
+/// configures, clamped to the hard ceiling.
+///
+/// One clamp site, because the number is now reported as well as applied: a
+/// decision record claiming a budget the render did not use would make every
+/// replayed comparison against it wrong.
+fn budget(config: &Config) -> usize {
+    config.prompt_chars().min(MAX_PROMPT_CHARS)
+}
+
+/// The threshold values this build applies, as a decision records them (D-08).
+///
+/// They are compile-time constants and stay that way - `DESIGN-BRIEF.md:245`
+/// keeps the precision-first defaults non-detunable by config - so the only way
+/// a later analysis can know which numbers produced a label is if every decision
+/// carries its own copy.
+fn in_force(prompt_chars: usize) -> Thresholds {
+    Thresholds {
+        ranked: RANKED,
+        compacted_ranked: COMPACTED_RANKED,
+        entity_rank: ENTITY_RANK,
+        co_occurring: CO_OCCURRING,
+        max_turns: MAX_TURNS,
+        max_candidates: MAX_CANDIDATES,
+        prompt_chars,
+    }
 }
 
 /// The ceiling on one injection, whatever `verbatim.toml` configures.
@@ -137,11 +184,17 @@ pub const MAX_PROMPT_CHARS: usize = 10_000;
 /// render the same bytes, which is the same property INJ-02 asks of the brief
 /// and is worth as much here - an injection that changes while the archive does
 /// not is one nobody can reason about.
-fn render(hits: &[Hit], budget: usize) -> Option<String> {
+/// `budget` is the effective one - see [`budget`] - and is not clamped again
+/// here.
+///
+/// It also completes `decision`: the per-turn shares and the whole injection's
+/// character count are produced by exactly this arithmetic and nowhere else, so
+/// counting them anywhere but here would be a second, drifting account of what a
+/// prompt spent (D-12).
+fn render(hits: &[Hit], budget: usize, decision: &mut Decision) -> Option<String> {
     if hits.is_empty() {
         return None;
     }
-    let budget = budget.min(MAX_PROMPT_CHARS);
 
     // What the lines cost with no text in them: the ids, the dates and the
     // head. Measured rather than estimated, so the share below is what is
@@ -154,9 +207,24 @@ fn render(hits: &[Hit], budget: usize) -> Option<String> {
         .iter()
         .map(|hit| super::clip(hit.excerpt.trim(), share))
         .collect();
+    // Per turn, the text that turn contributed - not its share of the total.
+    // The head line and the ids are the injection's and belong to no turn.
+    decision.injected = hits
+        .iter()
+        .zip(&texts)
+        .map(|(hit, text)| Injected {
+            turn_id: hit.turn_id,
+            chars: super::chars(text),
+        })
+        .collect();
+
     // The final clip is the backstop and only that: it fires when the ids and
     // dates alone are over budget, which no cut to the quoted turns can fix.
-    Some(super::clip(&assemble(hits, &texts), budget))
+    let text = super::clip(&assemble(hits, &texts), budget);
+    // The whole emitted string, after that backstop: what the model was
+    // actually given, which the per-turn shares do not sum to.
+    decision.chars_injected = super::chars(&text);
+    Some(text)
 }
 
 /// The head line and one line per turn.
@@ -196,28 +264,49 @@ fn day(ts: &str) -> &str {
 /// Every failure is an empty [`Fired`] rather than an error, for the reason the
 /// module doc on [`super`] gives: a missing, unreadable, busy or outdated store
 /// is "no context this time" and not something a prompt can be told about.
+/// The record is filled and then dropped: this seam answers "what would fire",
+/// and only [`user_prompt_submit`] - the arm the hook actually calls - persists
+/// what was decided. One code path either way, so what a test observes here is
+/// what a prompt logs there.
 pub fn select(data_dir: &Path, config: &Config, payload: &Payload) -> Fired {
-    let Some(fired) = selected(data_dir, config, payload) else {
-        return Fired::default();
-    };
-    fired
+    let mut decision = Decision::opened(
+        payload.session_id,
+        payload.cwd,
+        payload.prompt.unwrap_or_default(),
+    );
+    selected(data_dir, config, payload, &mut decision).unwrap_or_default()
 }
 
 /// [`select`]'s body, written in the `?` its every step wants.
-fn selected(data_dir: &Path, config: &Config, payload: &Payload) -> Option<Fired> {
+///
+/// `decision` is filled as the decision is taken rather than reconstructed
+/// afterwards: every `?` below is an exit that injected nothing, and what makes
+/// those exits distinguishable in the log is how much of the record was filled
+/// before one of them fired.
+fn selected(
+    data_dir: &Path,
+    config: &Config,
+    payload: &Payload,
+    decision: &mut Decision,
+) -> Option<Fired> {
     let prompt = payload.prompt.filter(|prompt| !prompt.trim().is_empty())?;
     let cwd = payload.cwd.filter(|cwd| !cwd.is_empty())?;
 
     // Before the store is opened, because a prompt naming nothing the archive
     // could match structurally is the common case, and the cheapest thing this
     // arm can do with it is nothing at all.
-    let candidates = candidates(prompt, Some(cwd));
+    let (spellings, candidates) = candidates(prompt, Some(cwd));
+    decision.spellings = spellings;
     if candidates.is_empty() {
         return None;
     }
 
     let store = super::open(data_dir)?;
     let conn = store.conn();
+    // D-10: the bound a replay needs to score this prompt against the index as
+    // it stood, taken on the connection that is already open. A record whose
+    // prompt never reached here keeps a null watermark for the drain to stamp.
+    decision.watermark_session_no = watermark(conn);
 
     let mut state = State::load(data_dir, payload.session_id);
     let before = state.clone();
@@ -225,6 +314,13 @@ fn selected(data_dir: &Path, config: &Config, payload: &Payload) -> Option<Fired
     // D-08: what a compaction owes this session, or nothing. Derived before the
     // search because it is what decides how wide the search is.
     let dropped = owed(conn, &mut state, current.as_deref());
+    if let Some(dropped) = &dropped {
+        // INJ-05's one prompt per compaction. Recorded because it changes both
+        // the window and the pool, so a decision taken under it is not
+        // comparable to the ordinary ones.
+        decision.compacted = true;
+        decision.dropped = dropped.iter().copied().collect();
+    }
 
     let request = Request::new(query_of(prompt, Some(cwd)), Scope::Directory(cwd.into()))
         .limit(if dropped.is_some() {
@@ -244,9 +340,20 @@ fn selected(data_dir: &Path, config: &Config, payload: &Payload) -> Option<Fired
         Err(_) => Vec::new(),
     };
 
+    // Every hit the ranked window returned, before the threshold judges any of
+    // them: a decision that logged only what fired could never say what was
+    // there to fire on, which is the whole of what a replay re-scores.
+    decision.candidates = response.iter().map(scored).collect();
+
     let threshold = eligible(response);
     let pooled = within(threshold, dropped.as_ref());
-    let mut hits = surviving(&mut state, pooled, current.as_deref(), dropped.as_ref());
+    let mut hits = surviving(
+        &mut state,
+        pooled,
+        current.as_deref(),
+        dropped.as_ref(),
+        &mut decision.suppressed,
+    );
 
     // Now, and only now, is a session worth decompressing - and only for the
     // turns that survived both the threshold and the suppressions, since a
@@ -276,6 +383,35 @@ fn selected(data_dir: &Path, config: &Config, payload: &Payload) -> Option<Fired
         state.save(data_dir, payload.session_id);
     }
     fired
+}
+
+/// One ranked hit, as a decision records it.
+///
+/// Everything the threshold reads and nothing it does not: the excerpt is
+/// deliberately absent, because the search runs with excerpts off until
+/// something has fired (D-13) and a record carrying transcript text would be a
+/// second copy of the archive in the data directory.
+fn scored(hit: &Hit) -> Candidate {
+    Candidate {
+        turn_id: hit.turn_id,
+        relevance: hit.relevance,
+        entity_score: hit.entity_score,
+        entity_count: hit.entity_count,
+        matched_on: hit.matched_on.clone(),
+    }
+}
+
+/// The highest `sessions.session_no` this store holds, or `None`.
+///
+/// D-10's monotone bound. `session_no` is assigned in ingest order and survives
+/// a rebuild, which is what makes it answer "was this row indexed yet" -
+/// `turns.ts` is transcript time and cannot. `None` for an empty archive and for
+/// a query that failed: a bound nothing can state is better left for the drain
+/// to stamp than guessed at.
+fn watermark(conn: &Connection) -> Option<i64> {
+    conn.query_row("SELECT max(session_no) FROM sessions", [], |r| r.get(0))
+        .ok()
+        .flatten()
 }
 
 /// INJ-03's threshold, applied over the ranked order.
@@ -344,16 +480,28 @@ fn within(hits: Vec<Hit>, dropped: Option<&BTreeSet<i64>>) -> Vec<Hit> {
 /// that answers is the one recorded: they can overlap - the brief's own session
 /// can be the one the user is looking at after a resume - and a turn refused
 /// twice for two reasons would say no more than a turn refused once.
+/// `recorded` collects THIS prompt's refusals for the decision record. The
+/// session state file keeps its own list and is not the same thing: that one is
+/// cumulative across the session and capped at a hundred, so reading it back
+/// would attribute another prompt's refusals to this one and silently drop the
+/// oldest.
 fn surviving(
     state: &mut State,
     hits: Vec<Hit>,
     current: Option<&str>,
     dropped: Option<&BTreeSet<i64>>,
+    recorded: &mut Vec<Suppressed>,
 ) -> Vec<Hit> {
     let mut out: Vec<Hit> = Vec::new();
     for hit in hits {
         match refusal(state, &hit, current, dropped) {
-            Some(reason) => state.record_suppressed(hit.turn_id, reason),
+            Some(reason) => {
+                state.record_suppressed(hit.turn_id, reason);
+                recorded.push(Suppressed {
+                    turn_id: hit.turn_id,
+                    reason,
+                });
+            }
             None => out.push(hit),
         }
         if out.len() == MAX_TURNS {
@@ -413,7 +561,8 @@ fn current_session(payload: &Payload) -> Option<String> {
     crate::ingest::path_key(&canonical).ok()
 }
 
-/// The spellings this prompt asks the archive about, strongest first.
+/// The spellings this prompt asks the archive about, strongest first, each with
+/// the query it became.
 ///
 /// A path counts twice: as the absolute spelling the archive almost certainly
 /// stored (D-05) and as the relative one the user typed, because the two are
@@ -421,7 +570,11 @@ fn current_session(payload: &Payload) -> Option<String> {
 /// carries. An identifier-shaped token is `DESIGN-BRIEF.md`'s third signal and
 /// is judged by exactly the rule the extractor judges a `Grep` pattern by, so a
 /// prompt cannot ask about `the` or `should`.
-fn candidates(prompt: &str, cwd: Option<&str>) -> Vec<Query> {
+///
+/// The spellings travel beside the queries because FEED-01 logs them: a `Query`
+/// keeps only its tokens, and "what this prompt was asked about" reads as the
+/// text the extraction produced rather than as a token list.
+fn candidates(prompt: &str, cwd: Option<&str>) -> (Vec<String>, Vec<Query>) {
     let mut spellings: Vec<String> = Vec::new();
     for relative in relative_paths(prompt) {
         if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
@@ -439,6 +592,7 @@ fn candidates(prompt: &str, cwd: Option<&str>) -> Vec<Query> {
     }
 
     let mut seen: BTreeSet<Vec<String>> = BTreeSet::new();
+    let mut asked: Vec<String> = Vec::new();
     let mut out: Vec<Query> = Vec::new();
     for spelling in spellings {
         let query = Query::parse(&spelling);
@@ -449,13 +603,14 @@ fn candidates(prompt: &str, cwd: Option<&str>) -> Vec<Query> {
         // one path differing in a separator are one question to the index, and
         // asking it twice costs a disjunct and returns the same rows.
         if seen.insert(query.tokens().to_vec()) {
+            asked.push(spelling);
             out.push(query);
         }
         if out.len() == MAX_CANDIDATES {
             break;
         }
     }
-    out
+    (asked, out)
 }
 
 /// The query one prompt becomes, with every relative path in it resolved

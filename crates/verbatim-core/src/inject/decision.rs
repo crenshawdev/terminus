@@ -177,11 +177,24 @@ impl Decision {
 
     /// Write this record, reporting whether it landed.
     ///
-    /// `false` covers a refused `session_id`, a data directory that cannot be
-    /// created and a write that failed. None of them is worth failing a prompt
-    /// over, and all of them cost one missing row in a log nothing decides on
-    /// yet.
+    /// `false` covers a refused `session_id`, a data directory that is not there
+    /// yet, a subdirectory that cannot be created and a write that failed. None
+    /// of them is worth failing a prompt over, and all of them cost one missing
+    /// row in a log nothing decides on yet.
+    ///
+    /// **It never creates the data directory itself**, which is the one bound
+    /// D-11's "every prompt writes a record" gives way to. A hook must not leave
+    /// a directory behind on a machine that has installed verbatim and never
+    /// ingested - INJ-06, and `inject`'s own
+    /// `a_data_directory_with_no_store_is_nothing_and_creates_nothing`. Nothing
+    /// is lost that could have been analysed: a decision is only ever read
+    /// beside the archive it was taken against, the hook spawns the ingest that
+    /// creates the directory before it injects anything, and so the unlogged
+    /// prompts are the ones before this machine's first pass.
     pub fn save(&self, data_dir: &Path) -> bool {
+        if !data_dir.is_dir() {
+            return false;
+        }
         write_file(&data_dir.join(DIR_NAME), self).is_some()
     }
 }
@@ -430,7 +443,11 @@ mod tests {
     #[test]
     fn a_hostile_session_id_reaches_no_filesystem_call() {
         let dir = tempfile::tempdir().unwrap();
+        // The data directory EXISTS, so a refusal below is the allow-list's and
+        // not the missing-directory arm's - which would make every assertion
+        // here true for the wrong reason.
         let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
 
         for hostile in [
             "../evil",
@@ -452,9 +469,25 @@ mod tests {
         assert!(!Decision::opened(None, None, "hello").save(&data_dir));
 
         assert!(
-            !data_dir.exists(),
-            "a refused session id still created the data directory"
+            !data_dir.join(DIR_NAME).exists(),
+            "a refused session id still reached a filesystem call"
         );
+        // The control: a plausible id in the same place does write, so what the
+        // assertions above are about is the name and not the directory.
+        assert!(Decision::opened(Some(SESSION), None, "hello").save(&data_dir));
+        assert!(data_dir.join(DIR_NAME).is_dir());
+    }
+
+    /// INJ-06: a machine that has installed verbatim and never ingested is left
+    /// exactly as it was, decision log included.
+    #[test]
+    fn a_data_directory_that_does_not_exist_is_not_created_to_hold_a_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("never-ingested");
+
+        assert!(!Decision::opened(Some(SESSION), Some("/code"), "hello").save(&absent));
+        assert!(!absent.exists(), "the record created the data directory");
+        assert!(read_all(&absent).is_empty());
     }
 
     /// One session submits many prompts, and each is its own record: a name
