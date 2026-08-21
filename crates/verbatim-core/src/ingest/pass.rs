@@ -54,6 +54,8 @@ pub struct Summary {
     pub excluded: Vec<PathBuf>,
     /// What recovery repaired before the walk began (ING-03, D-24).
     pub recovery: crate::recover::Recovered,
+    /// What the decision log drained into the store before the walk (FEED-01).
+    pub feedback: crate::feedback::Drained,
     pub duration: Duration,
 }
 
@@ -65,6 +67,13 @@ impl Summary {
 }
 
 /// What an invocation of [`run_with`] did.
+///
+/// `Ran` is much larger than `LockHeld` and stays unboxed. One of these is
+/// produced per process - a pass is the whole of what `verbatim ingest` does -
+/// so the lint's allocation would buy two hundred bytes once and cost every
+/// caller a deref, on a type `crates/verbatim/src/cmd/ingest.rs` and four test
+/// files already match by value.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PassOutcome {
     /// Another process is mid-pass. Nothing was written, and this is a success:
@@ -101,11 +110,31 @@ pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
     // never appends turn rows in one shape beside rows written in another.
     let (mut store, recovery) = crate::recover::recover(data_dir)?;
 
+    // FEED-01, after recovery and BEFORE the walk. The prompt path cannot write
+    // SQLite (D-01), so this is where its decision files become rows - and the
+    // position is what makes the watermark this stamps the archive as it stood
+    // when the pass began rather than as this pass leaves it (D-10).
+    //
+    // A drain that fails is a note and not a failed pass: the archive is the
+    // work, and a decision log that could not be moved is worth saying and not
+    // worth losing a tree walk over.
+    let feedback = match crate::feedback::drain(store.conn_mut(), data_dir) {
+        Ok(drained) => drained,
+        Err(e) => crate::feedback::Drained {
+            decisions: 0,
+            discarded: vec![(
+                data_dir.join(crate::inject::decision::DIR_NAME),
+                format!("the decision log could not be drained: {e}"),
+            )],
+        },
+    };
+
     let found = discover::discover(config);
     let mut summary = Summary {
         unreadable: found.unreadable,
         excluded: found.excluded,
         recovery,
+        feedback,
         ..Summary::default()
     };
 
@@ -243,6 +272,7 @@ fn record_pass(
         notes.push(note(path, reason));
     }
     notes.extend(summary.recovery.lines());
+    notes.extend(summary.feedback.lines());
     if let Some(e) = fatal {
         notes.push(format!("pass failed: {e}"));
     }

@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use rusqlite::types::Value;
 use rusqlite::Connection;
 use verbatim_core::config::Config;
+use verbatim_core::ingest::pass::{self, PassOutcome, Summary};
 use verbatim_core::inject::decision::{self, Decision};
 use verbatim_core::inject::state::Reason;
 use verbatim_core::inject::{prompt, Payload};
@@ -137,6 +138,29 @@ impl Bench {
             .collect();
         assert_eq!(matching.len(), 1, "{prompt:?}: {matching:?}");
         matching.pop().unwrap()
+    }
+
+    /// One tree pass over a transcript root that holds nothing.
+    ///
+    /// The fixtures are archived through `ingest::run` directly, so the walk has
+    /// nothing to do and every row this pass writes came out of the decision
+    /// log - which is what the assertions are about.
+    fn pass(&self) -> Summary {
+        let claude = self._dir.path().join("claude");
+        std::fs::create_dir_all(claude.join("projects")).unwrap();
+        let config = Config::from_parts(vec![claude], Vec::new());
+        match pass::run_with(&self.data_dir, &config).unwrap() {
+            PassOutcome::Ran(summary) => summary,
+            PassOutcome::LockHeld => panic!("nothing else holds the lock"),
+        }
+    }
+
+    /// Every decision file currently on disk.
+    fn files(&self) -> Vec<PathBuf> {
+        decision::read_all(&self.data_dir)
+            .into_iter()
+            .map(|found| found.path)
+            .collect()
     }
 
     /// Archive one session of hand-written records through the ordinary ingest
@@ -392,6 +416,152 @@ fn insert_decision(conn: &Connection) {
         ],
     )
     .unwrap();
+}
+
+/// One `decisions` row, as the columns a test reads off it.
+fn row_of(conn: &Connection, prompt: &str) -> (String, Option<i64>, i64, String, String, String) {
+    conn.query_row(
+        "SELECT ts, watermark_session_no, chars_injected, spellings, candidates, injected
+         FROM decisions WHERE prompt = ?1",
+        [prompt],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        },
+    )
+    .unwrap_or_else(|e| panic!("no decisions row for {prompt:?}: {e}"))
+}
+
+/// D-01's other half: the files the prompt path wrote become rows on the next
+/// pass, and stop being files.
+///
+/// The pass is the whole entry point under test. `ingest::run`'s single-file
+/// path deliberately does not drain - the hook only ever spawns the pass - so a
+/// test that called the library's drain directly would prove nothing about what
+/// a real machine does.
+#[test]
+fn a_pass_drains_every_decision_file_into_the_table() {
+    let bench = bench();
+    let cwd = bench.project();
+    let fired = format!("what changed in {RELATIVE}");
+    let bare = "what changed";
+
+    let text = bench.submit(&cwd, &fired).expect("the prompt injects");
+    assert_eq!(bench.submit(&cwd, bare), None);
+    assert_eq!(bench.files().len(), 2, "the premise: two records on disk");
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 2, "{summary:?}");
+    assert!(summary.feedback.discarded.is_empty(), "{summary:?}");
+    assert_eq!(summary.files_committed, 0, "the walk had nothing to do");
+    assert!(
+        bench.files().is_empty(),
+        "the drained files are still there: {:?}",
+        bench.files()
+    );
+
+    let conn = bench.conn();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM decisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2);
+
+    let (ts, watermark, chars, spellings, candidates, injected) = row_of(&conn, &fired);
+    // The archive's own timestamp shape, produced by SQLite from the unix
+    // milliseconds the prompt path recorded - so a decision sorts and compares
+    // against `turns.ts` directly.
+    assert_eq!(ts.len(), 24, "{ts}");
+    assert!(ts.starts_with("20") && ts.ends_with('Z'), "{ts}");
+    let sessions: i64 = conn
+        .query_row("SELECT max(session_no) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(watermark, Some(sessions));
+    assert_eq!(chars, text.chars().count() as i64);
+
+    // The list-shaped columns are JSON documents and arrived whole.
+    let spellings: Vec<String> = serde_json::from_str(&spellings).unwrap();
+    assert!(
+        spellings.iter().any(|s| s.ends_with(RELATIVE)),
+        "{spellings:?}"
+    );
+    let candidates: serde_json::Value = serde_json::from_str(&candidates).unwrap();
+    assert!(
+        candidates[0]["matched_on"][0]["kind"] == "path",
+        "the matched pairs did not survive the drain: {candidates}"
+    );
+    let injected: serde_json::Value = serde_json::from_str(&injected).unwrap();
+    assert!(injected[0]["chars"].as_i64().unwrap() > 0, "{injected}");
+
+    // D-10: the prompt that never opened the store had no bound of its own, so
+    // the drain stamped the archive as it stood before this pass walked.
+    let (_, stamped, chars, spellings, _, _) = row_of(&conn, bare);
+    assert_eq!(stamped, Some(sessions));
+    assert_eq!(chars, 0);
+    assert_eq!(spellings, "[]");
+
+    // A second pass has nothing left to move, and moves nothing.
+    let again = bench.pass();
+    assert_eq!(again.feedback.decisions, 0, "{again:?}");
+    let rows: i64 = bench
+        .conn()
+        .query_row("SELECT count(*) FROM decisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 2, "the second pass inserted a decision twice");
+}
+
+/// A file that is not a record this build can read is removed and named, and
+/// the pass commits everything else.
+///
+/// Named because there is no log file: the note has to reach `runs.error`, which
+/// is what `verbatim status` surfaces. Removed because there is no migration -
+/// leaving it would mean re-reading and re-reporting it on every pass forever.
+#[test]
+fn a_file_that_is_not_a_record_is_removed_and_named() {
+    let bench = bench();
+    let cwd = bench.project();
+    let fired = format!("what changed in {RELATIVE}");
+    assert!(bench.submit(&cwd, &fired).is_some());
+
+    let garbage = bench
+        .data_dir
+        .join(decision::DIR_NAME)
+        .join("99999999-9999-4999-8999-999999999999-0-0-0.json");
+    std::fs::write(
+        &garbage,
+        b"{\"format\": 99, \"prompt\": \"from the future\"}",
+    )
+    .unwrap();
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 1, "{summary:?}");
+    assert_eq!(summary.feedback.discarded.len(), 1, "{summary:?}");
+    assert_eq!(summary.feedback.discarded[0].0, garbage);
+    assert!(!garbage.exists(), "the unreadable file is still there");
+    assert!(bench.files().is_empty());
+
+    let conn = bench.conn();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM decisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "the good record did not commit");
+
+    // The one textual channel this product has.
+    let error: Option<String> = conn
+        .query_row("SELECT error FROM runs ORDER BY id DESC LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let error = error.expect("the pass wrote no note about the discarded file");
+    assert!(
+        error.contains(&garbage.display().to_string()),
+        "the note does not name the file: {error}"
+    );
 }
 
 /// D-03: a rebuild returns the decision log exactly as it was.

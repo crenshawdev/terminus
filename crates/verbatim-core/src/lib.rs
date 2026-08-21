@@ -20,6 +20,7 @@ pub mod config;
 pub mod derive;
 pub mod discover;
 pub mod error;
+pub mod feedback;
 pub mod index;
 pub mod ingest;
 pub mod inject;
