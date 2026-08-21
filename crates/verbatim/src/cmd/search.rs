@@ -86,6 +86,17 @@ pub fn run(args: Args) -> Result<(), Failure> {
                     "sidechain": hit.sidechain,
                     "relevance": hit.relevance,
                     "entity_score": hit.entity_score,
+                    // The pairs behind `entity_score`, so a caller can see WHICH
+                    // stored values it came from rather than only how much they
+                    // weighed (D-05).
+                    "matched_on": hit
+                        .matched_on
+                        .iter()
+                        .map(|matched| serde_json::json!({
+                            "kind": matched.kind,
+                            "value": matched.value,
+                        }))
+                        .collect::<Vec<_>>(),
                     "excerpt": hit.excerpt,
                 })
             })

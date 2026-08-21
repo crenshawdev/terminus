@@ -155,6 +155,22 @@ impl Request {
     }
 }
 
+/// One `(kind, value_norm)` pair of the `entities` table that a query matched
+/// on a turn.
+///
+/// The pair itself rather than a count of pairs, because FEED-01 has to be able
+/// to say WHICH rule produced a candidate: "matched 2 entities" cannot attribute
+/// a replayed label change to a path rule versus a symbol rule, which is the one
+/// question offline replay exists to answer (phase 6 D-05).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MatchedEntity {
+    /// The `entities.kind`: `path`, `command`, `error`, `symbol`, `tool`.
+    pub kind: String,
+    /// The `entities.value_norm` as stored - the normalized spelling, never the
+    /// user's.
+    pub value: String,
+}
+
 /// One matching turn.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
@@ -193,6 +209,13 @@ pub struct Hit {
     /// about independent entities co-occurring - so counting rows would let a
     /// single repeated value pass a threshold meant for two different facts.
     pub entity_count: usize,
+    /// The distinct pairs [`Hit::entity_count`] counts, in `(kind, value)`
+    /// order. Empty for a hit the query reached only as free text.
+    ///
+    /// Reported beside the count rather than instead of it: the count is what
+    /// INJ-03's threshold reads on every prompt and the pairs are what FEED-01
+    /// logs, and `entity_count` must always equal `matched_on.len()`.
+    pub matched_on: Vec<MatchedEntity>,
     /// Higher is a better match: the negated bm25 (see [`HEAD`]) plus
     /// [`Hit::entity_score`].
     pub relevance: f64,
@@ -325,6 +348,7 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
                 entity_score: 0.0,
                 entity_match: None,
                 entity_count: 0,
+                matched_on: Vec::new(),
                 relevance: row.get(6)?,
                 excerpt: String::new(),
             })
@@ -520,6 +544,15 @@ fn weight_by_entities(conn: &Connection, query: &Query, hits: &mut [Hit]) -> Res
             hit.entity_score = matched.score;
             hit.entity_match = matched.kind;
             hit.entity_count = matched.values.len();
+            // The same set the count is taken from, so the two cannot disagree.
+            hit.matched_on = matched
+                .values
+                .iter()
+                .map(|(kind, value)| MatchedEntity {
+                    kind: kind.clone(),
+                    value: value.clone(),
+                })
+                .collect();
             hit.relevance += matched.score;
         }
     }

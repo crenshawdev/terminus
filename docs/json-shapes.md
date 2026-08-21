@@ -74,7 +74,9 @@ data on stdout, the counts and the warnings on stderr.
 {"query": "src/worker/S.ts", "truncated": false, "hits": [
   {"turn_id": 42, "session_key": "/abs/path/session.jsonl", "project": "/abs/path/repo",
    "record_type": "assistant", "ts": "2026-08-12T21:00:00.000Z", "sidechain": false,
-   "relevance": 1.83, "entity_score": 0.0, "excerpt": "the retry budget lives in ..."}]}
+   "relevance": 1.83, "entity_score": 0.0,
+   "matched_on": [{"kind": "path", "value": "src/worker/S.ts"}],
+   "excerpt": "the retry budget lives in ..."}]}
 ```
 
 - `query` is the string as typed, not the tokenization of it.
@@ -85,6 +87,12 @@ data on stdout, the counts and the warnings on stderr.
 - `ts` and `project` are null for a turn or a session that has none.
 - `relevance` is higher-is-better. `entity_score` is the part of it that came
   from an exact structural match rather than from free text.
+- `matched_on` names the distinct stored `(kind, value)` entity pairs this query
+  matched on this turn, in sorted order: the facts behind `entity_score`, since
+  a score alone cannot say whether a path, a command or a symbol produced it. It
+  is `[]` for a hit reached only through free text, and its length is the entity
+  count the injection threshold reads. `value` is the normalized stored
+  spelling, not the query's.
 - `excerpt` is cut from the session blob, never from FTS5, and may be empty when
   the archive would not give the bytes up.
 
