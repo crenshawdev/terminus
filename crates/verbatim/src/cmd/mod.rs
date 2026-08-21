@@ -40,6 +40,7 @@ pub mod ingest;
 pub mod install;
 pub mod json;
 pub mod mcp;
+pub mod observations;
 pub mod read;
 pub mod reindex;
 pub mod replay;

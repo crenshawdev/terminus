@@ -235,6 +235,46 @@ and unchanged.
   of the database, every reader needs them, and a read-only connection cannot
   unlink them on close.
 
+### `observations`
+
+```json
+{"observations": [
+  {"session_key": "/home/you/.claude/projects/-code-verbatim/1111....jsonl",
+   "session_id": "1111...", "generated_at": "2026-08-21T18:31:07.412Z",
+   "mechanical": {"files_read": ["..."], "files_modified": ["..."],
+                  "tools": ["Bash", "Edit"],
+                  "commands": ["cargo test -p verbatim-core --features testkit"],
+                  "errors": ["..."], "commits": ["wire the observation step up"],
+                  "branch": "phase-7", "turns": 47,
+                  "first_turn_at": "...", "last_turn_at": "...",
+                  "duration_seconds": 5421, "compactions": 1, "truncated": []},
+   "status": null, "model": null, "prompt_version": null, "topic": null,
+   "outcome": null, "decisions": null, "learned": null, "unresolved": null,
+   "raw": null, "tokens": null}]}
+```
+
+- One entry per **finalized** session that has been observed, in ingest order.
+  A session the idle rule has not closed yet has no row, and neither does an
+  excluded project's session - including one archived before the exclusion was
+  configured.
+- `mechanical` is the OBS-01 fact set, and every one of its values is
+  parser-derived: **no model is called and no network connection is opened** by
+  the ingest step that wrote it or by this command that reads it back.
+  `commands` carries whole command lines with their arguments, which is what the
+  `entities` table cannot answer - it holds basenames.
+- `truncated` names the fact lists a cap cut, by field name. A list that is
+  present and not named there is the whole of what the session did.
+- `duration_seconds` is the wall clock between the first and the last turn, and
+  it is null on a session carrying no timestamp to measure from.
+- The judgment columns - `status`, `model`, `prompt_version`, `topic`,
+  `outcome`, `decisions`, `learned`, `unresolved`, `raw`, `tokens` - are the
+  optional LLM half. They are **present and null** until a provider is
+  configured and answers, so a consumer reads one shape either way.
+  `observations.decisions` here is the column and not the `decisions` table.
+- A store written before this build carries no `observations` table. That is an
+  empty answer with a reason naming the table and exit 0, never a SQLite
+  message: the next `verbatim ingest` creates it.
+
 ### `doctor`
 
 ```json

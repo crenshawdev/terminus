@@ -23,6 +23,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        reindex               rebuild the derived tables from the blobs\n  \
                        status                sizes, counts, watermarks and the last ingest run\n  \
                        stats                 whether injection is helping: precision, misses, chars\n  \
+                       observations          what happened in every session that has closed\n  \
                        replay                re-score the logged prompts under other thresholds\n  \
                        doctor                report what is wired into Claude Code and what is not\n  \
                        mcp                   serve the three recall tools over stdio (for Claude Code)\n  \
@@ -113,6 +114,10 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         // FEED-04. A CLI data command and never an MCP tool (D-14): every
         // tool description sits in every session's context forever.
         "stats" => cmd::stats::run(cmd::json_flag(parser)?),
+        // OBS-01. The facts come off the parser, never off a model: this reads
+        // back a row the ingest pass wrote and opens no network connection on
+        // any path.
+        "observations" => cmd::observations::run(cmd::observations::parse(parser)?),
         // FEED-03. Read-only by construction (D-15) and the one command whose
         // flags move the injection thresholds - for this report and nothing
         // else: the live path compiles them in (D-08).
