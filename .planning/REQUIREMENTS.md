@@ -187,6 +187,17 @@ Explicit exclusions. The reason prevents scope creep later.
 | FEED-02 | Phase 6 | Complete |
 | FEED-03 | Phase 6 | Complete |
 | FEED-04 | Phase 6 | Complete |
+| OBS-01 | Phase 7 | Pending |
+| OBS-07 | Phase 7 | Pending |
+| OBS-05 | Phase 7 | Pending |
+| PRIV-01 | Phase 7 | Pending |
+| PRIV-02 | Phase 7 | Pending |
+| PRIV-03 | Phase 7 | Pending |
+| OBS-02 | Phase 7 | Pending |
+| OBS-03 | Phase 7 | Pending |
+| OBS-04 | Phase 7 | Pending |
+| OBS-06 | Phase 7 | Pending |
+| OBS-08 | Phase 7 | Pending |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 
