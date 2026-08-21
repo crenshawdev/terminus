@@ -3,8 +3,15 @@
 //! The session blob is truth; everything else is derived and rebuildable from
 //! it (`.planning/PROJECT.md`, D-13). This crate owns the store, the
 //! block-framed zstd blob format and the ingest path. It links no async
-//! runtime, no HTTP client and no thread-pool crate: the hook path must not pay
-//! for a runtime it does not use (`DESIGN-BRIEF.md:39`).
+//! runtime and no thread-pool crate: the hook path must not pay for a runtime
+//! it does not use (`DESIGN-BRIEF.md:39`).
+//!
+//! It does link an HTTP client, as of phase 7, and the exception is worth
+//! naming precisely rather than leaving the sentence above to quietly become
+//! false. [`observe::net`] is the one module that names it and the one
+//! constructor that opens a connection (PRIV-03, D-06): a blocking pure-Rust
+//! client with no runtime behind it, reached only by the opt-in provider call
+//! and by nothing on the hook path. The root `Cargo.toml` records what it cost.
 //!
 //! It does start threads, in exactly one place, and the exception is worth
 //! naming precisely rather than leaving the sentence above to quietly become

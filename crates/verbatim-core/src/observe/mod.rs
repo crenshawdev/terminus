@@ -24,7 +24,13 @@
 //! could not be computed is a note folded into `runs.error` - there is no log
 //! file, by design - exactly as the drain's and the labeller's failures are.
 
+//! **One door to the network.** [`net`] is the only module in either crate that
+//! names an HTTP client or opens a socket, and it counts every attempt before
+//! it makes it (PRIV-03, D-21). The mechanical half above reaches it never;
+//! that is an assertion a test reads off the attempt log rather than a promise.
+
 pub mod mechanical;
+pub mod net;
 
 use std::collections::BTreeMap;
 
