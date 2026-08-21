@@ -41,6 +41,18 @@ const FIRST_TURN_SECONDS_AGO: i64 = 36_000;
 /// Wall-clock seconds between the session's first turn and its last.
 const DURATION_SECONDS: i64 = 100;
 
+/// A second session, days older than the first, for the `--since` selector to
+/// leave alone.
+const OLDER_SESSION: &str = "22222222-2222-4222-8222-222222222222";
+const OLDER_FIRST_TURN_SECONDS_AGO: i64 = 200_000;
+
+/// The bound between the two sessions' last turns, in seconds ago.
+const BETWEEN_SECONDS_AGO: i64 = 100_000;
+
+/// Stored facts no recompute could produce, so a row that was rebuilt and a row
+/// that was left alone are distinguishable byte for byte.
+const SPOILED: &str = r#"{"this":"was hand-edited and must not survive a rebuild"}"#;
+
 /// Every directory a spawned `verbatim` may touch, all of them temporary.
 ///
 /// The config directory and the Claude directory are as load-bearing as the
@@ -91,23 +103,60 @@ impl Bench {
         Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
     }
 
-    /// Write the one transcript this file tests, into the tree a pass walks,
-    /// and archive it through the binary's own bare `ingest`.
+    /// Put one transcript into the tree a pass walks, with a chosen clock.
+    fn place(&self, session: &str, first_seconds_ago: i64) {
+        let dir = self.claude_dir.join("projects").join("project-alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{session}.jsonl")),
+            self.transcript(session, first_seconds_ago),
+        )
+        .unwrap();
+    }
+
+    /// Archive whatever is in the tree through the binary's own bare `ingest`.
     ///
     /// Bare and not `ingest <path>`: the pass is what runs `feedback::outcomes`
     /// and therefore what sets `session_meta.is_final`, which is the gate the
     /// observation step reads its sessions through.
-    fn ingest_the_finalized_session(&self) {
-        let dir = self.claude_dir.join("projects").join("project-alpha");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{SESSION}.jsonl")), self.transcript()).unwrap();
-
+    fn ingest(&self) {
         let out = self.run(&["ingest"]);
         assert!(
             out.status.success(),
             "the tree pass failed: {}",
             stderr(&out)
         );
+    }
+
+    /// The one session every fact assertion in this file is about.
+    fn ingest_the_finalized_session(&self) {
+        self.place(SESSION, FIRST_TURN_SECONDS_AGO);
+        self.ingest();
+    }
+
+    /// The `mechanical` column of one session's row, as stored.
+    fn stored(&self, session: &str) -> String {
+        self.conn()
+            .query_row(
+                "SELECT o.mechanical FROM observations o WHERE o.session_id = ?1",
+                [session],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("no observation for {session}: {e}"))
+    }
+
+    /// Overwrite one session's stored facts with something no recompute could
+    /// produce, so "this row was rebuilt" and "this row was left alone" are
+    /// distinguishable afterwards.
+    fn spoil(&self, session: &str) {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE observations SET mechanical = ?2 WHERE session_id = ?1",
+                rusqlite::params![session, SPOILED],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the premise: {session} has a row to spoil");
     }
 
     /// The file the session's `Edit` touched, spelled the way it is stored.
@@ -120,7 +169,7 @@ impl Bench {
 
     /// One session carrying every OBS-01 fact: an edit, two tools, a command
     /// with arguments, a failure, a branch, a commit, six turns and a duration.
-    fn transcript(&self) -> String {
+    fn transcript(&self, session: &str, first_seconds_ago: i64) -> String {
         let cwd = self
             .root
             .join("project-alpha")
@@ -132,10 +181,10 @@ impl Bench {
                 "parentUuid": null,
                 "isSidechain": false,
                 "cwd": cwd.clone(),
-                "sessionId": SESSION,
+                "sessionId": session,
                 "gitBranch": BRANCH,
                 "type": kind,
-                "uuid": format!("{SESSION}-{n}"),
+                "uuid": format!("{session}-{n}"),
                 "timestamp": ts(seconds_ago),
                 "message": {"role": if kind == "user" { "user" } else { "assistant" },
                             "model": "claude-opus-5",
@@ -149,7 +198,7 @@ impl Bench {
             body.push_str(&record.to_string());
             body.push('\n');
         };
-        let first = FIRST_TURN_SECONDS_AGO;
+        let first = first_seconds_ago;
 
         push(
             first,
@@ -399,5 +448,140 @@ fn a_store_older_than_the_table_names_it_rather_than_naming_sqlite() {
         !stdout(&out).contains("no such table"),
         "a SQLite message reached stdout: {}",
         stdout(&out)
+    );
+}
+
+/// AC7: `--since` rebuilds the rows after the bound and leaves every earlier
+/// row byte for byte what it was.
+///
+/// Both rows are spoiled first, so "the earlier row still holds the hand-edited
+/// bytes" is a clause that can fail: a regenerate that ignored its selector
+/// would rewrite both and this would catch it, and one that selected nothing
+/// would leave both spoiled and the first assertion would catch that.
+#[test]
+fn regenerate_rebuilds_the_selected_rows_and_leaves_the_rest_untouched() {
+    let bench = bench();
+    bench.place(SESSION, FIRST_TURN_SECONDS_AGO);
+    bench.place(OLDER_SESSION, OLDER_FIRST_TURN_SECONDS_AGO);
+    bench.ingest();
+
+    bench.spoil(SESSION);
+    bench.spoil(OLDER_SESSION);
+
+    let since = ts(BETWEEN_SECONDS_AGO);
+    let out = bench.run(&["observations", "regenerate", "--since", &since, "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let value = document(&out);
+    assert_eq!(value["command"], "observations regenerate", "{value}");
+    assert_eq!(value["ok"], true, "{value}");
+    let data = &value["data"];
+    assert_eq!(data["since"], since.as_str(), "{data}");
+    assert_eq!(data["prompt_version"], Value::Null, "{data}");
+    assert_eq!(data["selected"], 1, "{data}");
+    assert_eq!(data["regenerated"], 1, "{data}");
+    assert_eq!(data["notes"], serde_json::json!([]), "{data}");
+
+    let rebuilt: Value = serde_json::from_str(&bench.stored(SESSION)).unwrap();
+    assert!(
+        strings(&rebuilt["commands"]).contains(&COMMAND.to_owned()),
+        "the selected row was not recomputed: {rebuilt}"
+    );
+    assert_eq!(
+        bench.stored(OLDER_SESSION),
+        SPOILED,
+        "a row outside the selector was rewritten"
+    );
+}
+
+/// The selector narrows conjunctively, and `--prompt-version` narrows to
+/// nothing while the column is null - which is the honest answer, not an empty
+/// selector that rebuilds everything.
+#[test]
+fn a_prompt_version_no_row_carries_selects_no_row() {
+    let bench = bench();
+    bench.ingest_the_finalized_session();
+    bench.spoil(SESSION);
+
+    let out = bench.run(&[
+        "observations",
+        "regenerate",
+        "--prompt-version",
+        "v1",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let data = &document(&out)["data"];
+    assert_eq!(data["prompt_version"], "v1", "{data}");
+    assert_eq!(data["selected"], 0, "{data}");
+    assert_eq!(data["regenerated"], 0, "{data}");
+    assert_eq!(
+        bench.stored(SESSION),
+        SPOILED,
+        "a selector that matched nothing still rebuilt a row"
+    );
+
+    // And with no selector at all, that same row IS rebuilt: the premise of the
+    // assertion above is that the row was reachable and simply not selected.
+    let out = bench.run(&["observations", "regenerate", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(document(&out)["data"]["regenerated"], 1);
+    assert_ne!(bench.stored(SESSION), SPOILED);
+}
+
+/// D-18's misuse arm: an unknown flag and an unknown second word both exit 2
+/// with nothing on stdout.
+///
+/// The second word matters more than the flag. `dispatch` matches single-word
+/// names, so a `observations` that did not consume its own second word would
+/// answer `no-such-verb` with a full listing and exit 0.
+#[test]
+fn an_unknown_flag_and_an_unknown_verb_are_both_misuse() {
+    let bench = bench();
+    bench.ingest_the_finalized_session();
+
+    for argv in [
+        vec!["observations", "regenerate", "--definitely-not-a-flag"],
+        vec!["observations", "no-such-verb"],
+        vec!["observations", "no-such-verb", "--json"],
+        vec!["observations", "--definitely-not-a-flag"],
+        // The verb comes first or not at all, so this is misuse rather than one
+        // of the two commands chosen silently.
+        vec!["observations", "--json", "regenerate"],
+    ] {
+        let out = bench.run(&argv);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{}` should be misuse: {}",
+            argv.join(" "),
+            stderr(&out)
+        );
+        assert_eq!(
+            stdout(&out),
+            "",
+            "`{}` printed to stdout on misuse",
+            argv.join(" ")
+        );
+    }
+}
+
+/// A malformed `--since` is misuse, not a plausible wrong set rebuilt in
+/// silence: every string orders against every stored timestamp, so an
+/// unvalidated bound would compare cleanly and report success.
+#[test]
+fn a_malformed_since_is_misuse_and_rebuilds_nothing() {
+    let bench = bench();
+    bench.ingest_the_finalized_session();
+    bench.spoil(SESSION);
+
+    let out = bench.run(&["observations", "regenerate", "--since", "last tuesday"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(
+        bench.stored(SESSION),
+        SPOILED,
+        "a refused bound still wrote"
     );
 }

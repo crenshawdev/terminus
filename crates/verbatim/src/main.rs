@@ -24,6 +24,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        status                sizes, counts, watermarks and the last ingest run\n  \
                        stats                 whether injection is helping: precision, misses, chars\n  \
                        observations          what happened in every session that has closed\n  \
+                       observations regenerate   recompute those facts for a selected set\n  \
                        replay                re-score the logged prompts under other thresholds\n  \
                        doctor                report what is wired into Claude Code and what is not\n  \
                        mcp                   serve the three recall tools over stdio (for Claude Code)\n  \

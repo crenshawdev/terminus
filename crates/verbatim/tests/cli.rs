@@ -794,6 +794,22 @@ const DATA_COMMANDS: &[(&str, &[&str], &[&str])] = &[
         &[],
         &["thresholds", "decisions", "labels", "changed"],
     ),
+    // OBS-01 and OBS-07. Both verbs join on the same terms, which is the point
+    // of D-18 naming the sweep: the workspace's first two-word subcommand is
+    // held to the same five properties as every one-word one, rather than
+    // exempted from them for being shaped differently.
+    ("observations", &["--project", "*"], &["observations"]),
+    (
+        "observations regenerate",
+        &[],
+        &[
+            "since",
+            "prompt_version",
+            "selected",
+            "regenerated",
+            "notes",
+        ],
+    ),
 ];
 
 /// A bench with the whole fixture corpus in it and one known turn id, which is
@@ -811,8 +827,14 @@ fn swept() -> (Bench, String) {
 }
 
 /// The command line for one swept command, with `show`'s id appended.
+///
+/// A command NAME may be two words (`observations regenerate`, D-18). The name
+/// is one string because that is what `value["command"]` reports and what
+/// `docs/json-shapes.md` heads its section with; the split into command-line
+/// words lives here, so a second column no one-word command would use never has
+/// to exist.
 fn sweep_args<'a>(command: &'a str, args: &'a [&'a str], id: &'a str) -> Vec<&'a str> {
-    let mut out = vec![command];
+    let mut out: Vec<&str> = command.split_whitespace().collect();
     out.extend_from_slice(args);
     if command == "show" {
         out.push(id);

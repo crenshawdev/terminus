@@ -275,6 +275,35 @@ and unchanged.
   empty answer with a reason naming the table and exit 0, never a SQLite
   message: the next `verbatim ingest` creates it.
 
+### `observations regenerate`
+
+```json
+{"since": "2026-08-14T00:00:00.000Z", "prompt_version": null,
+ "selected": 2, "regenerated": 2, "notes": []}
+```
+
+- The **only** rebuild path for the observations table. `verbatim reindex` never
+  touches it: the judgment half is a paid model call no blob replay reproduces,
+  so a rebuild that ran on a schema bump would delete summaries a user bought.
+- `since` and `prompt_version` are the selector echoed back, each null when it
+  was not given. "Two rows were rebuilt" is unreadable without the bound that
+  chose them.
+- `--since` takes `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS.mmmZ` and selects
+  sessions whose `session_meta.last_turn_at` is at or after it. A session
+  carrying no `last_turn_at` is outside every bound. `--prompt-version` selects
+  rows carrying exactly that value in the `prompt_version` column. Given both,
+  they narrow conjunctively; given neither, every visible session is selected.
+- `selected` counts the rows the selector named **and** the exclusion gate
+  allows; `regenerated` counts the ones actually rewritten, and `notes` names
+  the difference, one line per row that could not be recomputed.
+- Only the `mechanical` column is written, and only on the selected rows.
+  `generated_at` dates the row as a whole - the judgment half included - so a
+  mechanical recompute leaves it alone, and every unselected row stays byte for
+  byte what it was.
+- This command writes, so it opens the store for writing and takes the ingest
+  lock. A run refused because another process holds that lock is `ok: false`
+  with the lock named in `reason`, exit 1 - the same answer `reindex` gives.
+
 ### `doctor`
 
 ```json

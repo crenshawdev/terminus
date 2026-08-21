@@ -158,3 +158,120 @@ fn write_one(conn: &Connection, session_key: &str, session_id: Option<&str>) -> 
     )?;
     Ok(())
 }
+
+/// Which rows a regenerate acts on (OBS-07).
+///
+/// Two independent narrowings that AND together. Neither given selects every
+/// visible session, which is what makes a bare `verbatim observations
+/// regenerate` mean "all of them" rather than "none of them".
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Selector<'a> {
+    /// Sessions whose `session_meta.last_turn_at` is at or after this bound.
+    ///
+    /// A session carrying no `last_turn_at` is outside every bound, for the
+    /// reason `verbatim sessions`'s window says: a session that cannot say when
+    /// it happened cannot be shown as evidence of when something did.
+    pub since: Option<&'a str>,
+    /// Rows carrying exactly this value in `observations.prompt_version`.
+    ///
+    /// The column is null until PLAN-3 fills it, so this narrows to nothing on
+    /// a store no provider has answered for - which is the honest answer, not
+    /// an empty selector that would rebuild everything.
+    pub prompt_version: Option<&'a str>,
+}
+
+/// What one regenerate did (OBS-07).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Regenerated {
+    /// Rows the selector named AND the exclusion gate allows.
+    pub selected: usize,
+    /// Rows whose `mechanical` column was rewritten.
+    pub rewritten: usize,
+    /// Whatever could not be recomputed, named and skipped.
+    pub notes: Vec<String>,
+}
+
+/// Recompute the mechanical half of the selected rows, in place (OBS-07).
+///
+/// **The only rebuild path for this table (D-02).** `observations` is out of
+/// `DERIVED_TABLES`, so `reindex` never touches it and the ingest pass inserts
+/// and never overwrites; this is the one place a stored fact set is replaced.
+///
+/// **`mechanical` and nothing else.** Not `generated_at`, not `session_id`, and
+/// none of the judgment columns: `generated_at` dates the row as a whole -
+/// including a judgment half somebody paid for - so a mechanical recompute that
+/// moved it would misdate the part it did not touch. One column, on exactly the
+/// selected rows, is what makes a run under a narrowed selector provably scoped.
+///
+/// **Through `config::visible::sessions`.** This reads one blob per selected
+/// session, and exclusion is retroactive (ING-08): a project excluded after its
+/// sessions were archived must stop being read, by a rebuild as much as by a
+/// query.
+///
+/// **Unbounded, unlike [`observe_new`].** The pass is bounded because it runs
+/// inside the hook path on every prompt; this is asked for explicitly, the way
+/// `verbatim reindex` is, and a rebuild that silently did a hundred rows of the
+/// set it was handed would be the wrong answer.
+pub fn regenerate(
+    conn: &Connection,
+    config: &Config,
+    selector: &Selector<'_>,
+) -> Result<Regenerated> {
+    let mut out = Regenerated::default();
+
+    let allowed: std::collections::BTreeSet<String> = visible::sessions(conn, config)?
+        .into_iter()
+        .map(|session| session.session_key)
+        .collect();
+
+    // `o.prompt_version` is qualified for the reason the schema comment gives
+    // about `o.decisions`: the column and the table share a name.
+    let selected: Vec<String> = {
+        let mut statement = conn.prepare(
+            "SELECT o.session_key
+               FROM observations o
+               LEFT JOIN session_meta m ON m.session_key = o.session_key
+              WHERE (?1 IS NULL OR m.last_turn_at >= ?1)
+                AND (?2 IS NULL OR o.prompt_version = ?2)
+              ORDER BY o.session_key",
+        )?;
+        let rows = statement.query_map(
+            rusqlite::params![selector.since, selector.prompt_version],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let key = row?;
+            if allowed.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    };
+    out.selected = selected.len();
+
+    for session_key in selected {
+        // Per row and not one transaction over the set: a session whose blob
+        // will not decompress is archive damage `verbatim verify` reports, and
+        // it is not a reason to leave every other selected row un-rebuilt. The
+        // rows that were rewritten were all selected either way, so the scoping
+        // claim holds whichever ones failed.
+        match rewrite_one(conn, &session_key) {
+            Ok(()) => out.rewritten += 1,
+            Err(e) => out
+                .notes
+                .push(format!("{session_key}: not regenerated: {e}")),
+        }
+    }
+    Ok(out)
+}
+
+/// One row's `mechanical` column, recomputed and written over.
+fn rewrite_one(conn: &Connection, session_key: &str) -> Result<()> {
+    let facts = mechanical::observe(conn, session_key)?;
+    conn.execute(
+        "UPDATE observations SET mechanical = ?2 WHERE session_key = ?1",
+        rusqlite::params![session_key, facts.to_json().to_string()],
+    )?;
+    Ok(())
+}
