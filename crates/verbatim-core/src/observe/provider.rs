@@ -112,6 +112,13 @@ pub struct Completion {
 /// Why a call did not produce a [`Completion`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    /// `[provider] enabled` is unset or false, so no request was built.
+    ///
+    /// Its own kind rather than one of [`Kind::NotConfigured`]'s cases,
+    /// because the two mean opposite things to a caller: this is the user
+    /// having said no, which is the default and is silent, and that one is the
+    /// user having said yes and left something out, which is worth a note.
+    Disabled,
     /// There is nothing configured to call.
     NotConfigured,
     /// No bytes were exchanged: a connect failure, a timeout, a dead socket.
@@ -164,6 +171,7 @@ impl Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
+            Kind::Disabled => write!(f, "provider judgment is off: {}", self.detail),
             Kind::NotConfigured => write!(f, "no provider is configured: {}", self.detail),
             Kind::Transport => write!(f, "the provider could not be reached: {}", self.detail),
             Kind::Status(status) => write!(f, "the provider answered {status}: {}", self.detail),
@@ -192,6 +200,17 @@ pub fn complete(
     credential: Option<&Secret>,
     messages: &[Message],
 ) -> Result<Completion, Error> {
+    // OBS-02: judgment is opt-in and off by default, and this is where that is
+    // enforced rather than assumed of the caller. Nothing below runs - no URL
+    // is built, no header is assembled and `net::post` is never reached, so the
+    // attempt log stays empty and a test can read that as a number.
+    if !config.provider_enabled() {
+        return Err(Error::new(
+            Kind::Disabled,
+            credential,
+            "the [provider] table does not set enabled = true",
+        ));
+    }
     let Some(base_url) = config.provider_base_url() else {
         return Err(Error::new(
             Kind::NotConfigured,

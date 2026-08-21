@@ -344,3 +344,54 @@ impl<T: std::fmt::Debug, E> UnwrapErrOr<T, E> for Result<T, E> {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Judgment off means nothing is read (OBS-02)
+
+/// With `enabled` unset, no tier is consulted at all: not the environment, not
+/// the product config, and not the shared file.
+#[test]
+fn a_provider_that_is_not_enabled_resolves_no_credential() {
+    let mut bench = bench();
+    bench.write_shared(OTHER_KEY, 0o600);
+    bench.set(PROVIDER_ENV, Some(std::ffi::OsStr::new(KEY)));
+
+    std::fs::write(
+        bench.config_dir.join(CONFIG_FILE_NAME),
+        format!("[provider]\nname = \"{PROVIDER}\"\napi_key = \"{KEY}\"\n"),
+    )
+    .unwrap();
+    let config = Config::load_from(&bench.config_dir).unwrap();
+
+    // The falsifying half: with `enabled = true` and nothing else changed, all
+    // three tiers are there and the top one answers.
+    assert!(credentials::resolve(&bench.config(None)).unwrap().is_some());
+
+    assert!(
+        credentials::resolve(&config).unwrap().is_none(),
+        "a credential was read while judgment was off"
+    );
+}
+
+/// A file this loader never reads is a file it has nothing to refuse. Doctor
+/// still reports the mode, because that is a report and not a load.
+#[test]
+#[cfg(unix)]
+fn a_group_readable_file_is_not_even_looked_at_while_judgment_is_off() {
+    let bench = bench();
+    let path = bench.write_shared(KEY, 0o644);
+
+    std::fs::write(
+        bench.config_dir.join(CONFIG_FILE_NAME),
+        format!("[provider]\nname = \"{PROVIDER}\"\n"),
+    )
+    .unwrap();
+    let config = Config::load_from(&bench.config_dir).unwrap();
+
+    assert!(credentials::resolve(&config).unwrap().is_none());
+    assert_eq!(
+        credentials::permissions(&path),
+        Permissions::TooOpen { mode: 0o644 },
+        "the mode is still reportable, which is what doctor prints"
+    );
+}

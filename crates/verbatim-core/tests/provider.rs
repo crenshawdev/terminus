@@ -380,7 +380,10 @@ mod call {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(CONFIG_FILE_NAME),
-            format!("[provider]\nbase_url = \"http://{dead}/v1/\"\nmodel = \"{MODEL}\"\n"),
+            format!(
+                "[provider]\nenabled = true\nbase_url = \"http://{dead}/v1/\"\n\
+                 model = \"{MODEL}\"\n"
+            ),
         )
         .unwrap();
         let config = Config::load_from(dir.path()).unwrap();
@@ -393,18 +396,75 @@ mod call {
         assert_eq!(net::attempts::count(), 1);
     }
 
-    /// A config that names no endpoint builds no request: the attempt log stays
-    /// empty, which is the only way "nothing was called" is provable.
+    /// A config that asks for judgment and names no endpoint builds no request:
+    /// the attempt log stays empty, which is the only way "nothing was called"
+    /// is provable.
+    ///
+    /// Enabled deliberately, so this is `NotConfigured` and not `Disabled`: the
+    /// user said yes and left something out, which is the case worth a note.
     #[test]
     fn a_config_naming_no_endpoint_makes_no_request() {
         let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
-        net::attempts::reset();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            "[provider]\nenabled = true\n",
+        )
+        .unwrap();
+        let config = Config::load_from(dir.path()).unwrap();
 
-        let error = provider::complete(&Config::default(), None, &[Message::user("x")])
+        net::attempts::reset();
+        let error = provider::complete(&config, None, &[Message::user("x")])
             .expect_err("there is nothing to call");
 
         assert_eq!(error.kind(), Kind::NotConfigured);
         assert_eq!(net::attempts::count(), 0);
+
+        // And the default config, which asks for nothing at all, is the other
+        // kind: silence rather than a note.
+        assert_eq!(
+            provider::complete(&Config::default(), None, &[Message::user("x")])
+                .expect_err("there is nothing to call")
+                .kind(),
+            Kind::Disabled
+        );
+        assert_eq!(net::attempts::count(), 0);
+    }
+
+    /// OBS-02: with judgment off, this plan's code builds no request. Proven
+    /// off the attempt log and off a live stub that received nothing, rather
+    /// than off the absence of a caller.
+    #[test]
+    fn a_provider_that_is_not_enabled_builds_no_request() {
+        let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+        let stub = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
+        // Everything a call needs except the one key that asks for it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            format!(
+                "[provider]\nbase_url = \"{}\"\nmodel = \"{MODEL}\"\n",
+                stub.base_url()
+            ),
+        )
+        .unwrap();
+        let config = Config::load_from(dir.path()).unwrap();
+
+        net::attempts::reset();
+        let error = provider::complete(&config, Some(&Secret::new(KEY)), &[Message::user("x")])
+            .expect_err("judgment is off");
+
+        assert_eq!(error.kind(), Kind::Disabled);
+        assert_eq!(
+            net::attempts::count(),
+            0,
+            "a disabled provider reached the network: {:?}",
+            net::attempts::destinations()
+        );
+        assert!(
+            stub.requests().is_empty(),
+            "a disabled provider sent something to the endpoint"
+        );
     }
 
     // -----------------------------------------------------------------------

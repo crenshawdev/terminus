@@ -239,7 +239,23 @@ pub fn permissions(path: &Path) -> Permissions {
 /// The file is only opened when the two tiers above it came up empty, so a key
 /// supplied in the environment is not held hostage by the mode of a file
 /// nothing read.
+///
+/// **Nothing is looked at while judgment is off (OBS-02).** A config whose
+/// `[provider]` table is absent, or present with `enabled` unset, resolves
+/// nothing: no environment variable is read, no shared file is opened and no
+/// permission is examined. The gate is here as well as in the caller that
+/// decides WHEN to ask a model, because "with judgment off, verbatim reads no
+/// credential" should be a property of this function rather than a promise
+/// about everything that ever calls it.
+///
+/// A `0644` file therefore yields `None` and not [`Error::TooOpen`] while
+/// judgment is off - there is nothing to refuse when nothing was read.
+/// `verbatim doctor` reports the mode either way, because that is a report and
+/// not a load.
 pub fn resolve(config: &Config) -> Result<Option<Secret>, Error> {
+    if !config.provider_enabled() {
+        return Ok(None);
+    }
     if let Some(provider) = config.provider_name() {
         if let Some(value) = non_empty_var(&env_var_for(provider)) {
             // Lossy rather than refused: a credential arriving through the
