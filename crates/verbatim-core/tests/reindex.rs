@@ -454,6 +454,10 @@ fn a_reindex_leaves_every_observation_row_untouched() {
     reindex::reindex(&mut store).unwrap();
     drop(store);
 
-    assert_eq!(row(&bench.conn()), before, "the rebuild moved an observation");
+    assert_eq!(
+        row(&bench.conn()),
+        before,
+        "the rebuild moved an observation"
+    );
     assert_eq!(count(&bench.conn(), "observations"), 1);
 }
