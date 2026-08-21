@@ -21,6 +21,7 @@
 
 pub mod finalize;
 pub mod label;
+pub mod replay;
 
 use std::path::{Path, PathBuf};
 

@@ -49,12 +49,17 @@ const REFERENCE_KINDS: &str = "('path', 'symbol', 'error', 'command')";
 
 /// The decisions this step may consider at all.
 ///
+/// Public because `verbatim replay` has to consider exactly this set and no
+/// other: a decision of a session that is not final carries no stored label, so
+/// replaying it would diff a recomputed label against an absence and report
+/// movement on every open session in the archive.
+///
 /// A decision belongs to a session only through `session_id`, never a session
 /// key (D-04) - the injector cannot know which transcript file it is inside.
 /// Joining that way also, deliberately, admits a sidecar's turns as downstream
 /// evidence: 812 sidecar files report their parent's `sessionId`, and work an
 /// agent did after an injection is still work that followed it.
-const ELIGIBLE: &str = "\
+pub const ELIGIBLE: &str = "\
     d.session_id IS NOT NULL
     AND d.ts IS NOT NULL
     AND EXISTS (
@@ -116,23 +121,12 @@ pub fn label(conn: &mut Connection) -> Result<Vec<(String, usize)>> {
 /// `(kind, value_norm)` (by `idx_entities_lookup`), rather than scanning the
 /// downstream turns and asking about each.
 fn hit_or_false_positive() -> String {
+    let referenced = referenced_sql("json_extract(i.value, '$.turn_id')");
     format!(
         "INSERT INTO labels (decision_id, turn_id, label, labeled_at)
          SELECT d.id,
                 json_extract(i.value, '$.turn_id'),
-                CASE WHEN EXISTS (
-                    SELECT 1
-                      FROM entities gave
-                      JOIN entities used
-                        ON used.kind = gave.kind
-                       AND used.value_norm = gave.value_norm
-                      JOIN turns t        ON t.id = used.turn_id
-                      JOIN session_meta m ON m.session_key = t.session_key
-                     WHERE gave.turn_id = json_extract(i.value, '$.turn_id')
-                       AND gave.kind IN {REFERENCE_KINDS}
-                       AND m.session_id = d.session_id
-                       AND t.ts > d.ts
-                ) THEN '{HIT}' ELSE '{FALSE_POSITIVE}' END,
+                CASE WHEN {referenced} THEN '{HIT}' ELSE '{FALSE_POSITIVE}' END,
                 {NOW}
            FROM decisions d, json_each({INJECTED}) i
           WHERE {ELIGIBLE}
@@ -142,6 +136,49 @@ fn hit_or_false_positive() -> String {
                    AND l.turn_id = json_extract(i.value, '$.turn_id')
             )"
     )
+}
+
+/// The whole of what separates a [`HIT`] from a [`FALSE_POSITIVE`], as an SQL
+/// predicate over an outer `decisions d`: did any later turn of this decision's
+/// session name something the turn `turn` named?
+///
+/// One definition, two callers. Ingest substitutes the injected list's own
+/// `json_extract`; [`referenced`] substitutes a bound parameter, so a replay
+/// asking the question about a turn the injector did NOT choose gets the same
+/// answer the labeller would have written. Two copies of this join would make a
+/// replayed diff a statement about which copy drifted.
+fn referenced_sql(turn: &str) -> String {
+    format!(
+        "EXISTS (
+             SELECT 1
+               FROM entities gave
+               JOIN entities used
+                 ON used.kind = gave.kind
+                AND used.value_norm = gave.value_norm
+               JOIN turns t        ON t.id = used.turn_id
+               JOIN session_meta m ON m.session_key = t.session_key
+              WHERE gave.turn_id = {turn}
+                AND gave.kind IN {REFERENCE_KINDS}
+                AND m.session_id = d.session_id
+                AND t.ts > d.ts
+         )"
+    )
+}
+
+/// Would this decision's injection of `turn_id` be a [`HIT`]?
+///
+/// The same join [`hit_or_false_positive`] writes its labels from, asked one
+/// turn at a time - which is what `verbatim replay` needs, since the turns it is
+/// asking about are the ones a different threshold WOULD have injected and are
+/// in no `decisions` row.
+pub fn referenced(conn: &Connection, decision_id: i64, turn_id: i64) -> Result<bool> {
+    let sql = format!(
+        "SELECT {} FROM decisions d WHERE d.id = ?1",
+        referenced_sql("?2")
+    );
+    let answer: i64 =
+        conn.query_row(&sql, rusqlite::params![decision_id, turn_id], |r| r.get(0))?;
+    Ok(answer != 0)
 }
 
 /// One row per decision: the model asked recall for something this prompt had
@@ -159,31 +196,12 @@ fn hit_or_false_positive() -> String {
 /// cannot say different things. `min` because a decision may have missed several
 /// and a label has one detail; the choice is arbitrary but it is stable.
 fn miss() -> String {
+    let sought = sought_sql(SPELLINGS, INJECTED);
     format!(
         "INSERT INTO labels (decision_id, turn_id, label, detail, labeled_at)
          SELECT decision_id, NULL, '{MISS}', sought, {NOW}
            FROM (
-             SELECT d.id AS decision_id,
-                    (SELECT min(sought.value_norm)
-                       FROM entities sought
-                       JOIN turns t        ON t.id = sought.turn_id
-                       JOIN session_meta m ON m.session_key = t.session_key
-                      WHERE m.session_id = d.session_id
-                        AND t.ts > d.ts
-                        AND (t.tool_name LIKE '%recall\\_search' ESCAPE '\\'
-                          OR t.tool_name LIKE '%recall\\_get' ESCAPE '\\')
-                        AND EXISTS (
-                            SELECT 1 FROM json_each({SPELLINGS}) s
-                             WHERE s.value = sought.value_norm
-                        )
-                        AND NOT EXISTS (
-                            SELECT 1
-                              FROM json_each({INJECTED}) i
-                              JOIN entities gave
-                                ON gave.turn_id = json_extract(i.value, '$.turn_id')
-                             WHERE gave.value_norm = sought.value_norm
-                        )
-                    ) AS sought
+             SELECT d.id AS decision_id, {sought} AS sought
                FROM decisions d
               WHERE {ELIGIBLE}
                 AND NOT EXISTS (
@@ -193,6 +211,69 @@ fn miss() -> String {
            )
           WHERE sought IS NOT NULL"
     )
+}
+
+/// What this decision withheld and the model then went to recall for, as a
+/// scalar subquery over an outer `decisions d` - or NULL when there was no such
+/// thing.
+///
+/// `spellings` and `injected` are the JSON documents to read those two lists
+/// out of. Ingest passes the decision's own columns; [`sought`] passes bound
+/// parameters, because a replay's spellings come from re-running the extraction
+/// under a different candidate cap and its injected list is the one a different
+/// threshold would have produced. Neither list is a join key, which is why they
+/// can be substituted at all.
+///
+/// `min` because a decision may have withheld several and a label carries one
+/// detail; arbitrary, but stable.
+fn sought_sql(spellings: &str, injected: &str) -> String {
+    format!(
+        "(SELECT min(sought.value_norm)
+            FROM entities sought
+            JOIN turns t        ON t.id = sought.turn_id
+            JOIN session_meta m ON m.session_key = t.session_key
+           WHERE m.session_id = d.session_id
+             AND t.ts > d.ts
+             AND (t.tool_name LIKE '%recall\\_search' ESCAPE '\\'
+               OR t.tool_name LIKE '%recall\\_get' ESCAPE '\\')
+             AND EXISTS (
+                 SELECT 1 FROM json_each({spellings}) s
+                  WHERE s.value = sought.value_norm
+             )
+             AND NOT EXISTS (
+                 SELECT 1
+                   FROM json_each({injected}) i
+                   JOIN entities gave
+                     ON gave.turn_id = json_extract(i.value, '$.turn_id')
+                  WHERE gave.value_norm = sought.value_norm
+             )
+         )"
+    )
+}
+
+/// What this decision would have missed, had it asked about `spellings` and
+/// handed over `injected`.
+///
+/// The same subquery [`miss`] labels from, with the two list-shaped inputs bound
+/// rather than read off the row - see [`sought_sql`]. `Ok(None)` is "nothing was
+/// withheld that the model then went looking for", which is what real history
+/// reads today (D-13).
+pub fn sought(
+    conn: &Connection,
+    decision_id: i64,
+    spellings: &str,
+    injected: &str,
+) -> Result<Option<String>> {
+    let sql = format!(
+        "SELECT {} FROM decisions d WHERE d.id = ?1",
+        sought_sql("?2", "?3")
+    );
+    let found = conn.query_row(
+        &sql,
+        rusqlite::params![decision_id, spellings, injected],
+        |r| r.get::<_, Option<String>>(0),
+    )?;
+    Ok(found)
 }
 
 /// One row per decision: characters were spent and nothing came of them.

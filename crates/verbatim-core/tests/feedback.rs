@@ -19,8 +19,10 @@ use std::path::PathBuf;
 use rusqlite::types::Value;
 use rusqlite::Connection;
 use verbatim_core::config::Config;
+use verbatim_core::feedback::replay::{self, Replayed};
 use verbatim_core::ingest::pass::{self, PassOutcome, Summary};
 use verbatim_core::inject::decision::{self, Decision};
+use verbatim_core::inject::prompt::Thresholds;
 use verbatim_core::inject::state::Reason;
 use verbatim_core::inject::{prompt, Payload};
 use verbatim_core::recall::{search, Query, Request, Scope};
@@ -35,6 +37,14 @@ const RELATIVE: &str = "crates/gizmo/lantern.rs";
 
 /// The `session_id` a payload carries unless the test names another.
 const SESSION: &str = "0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55";
+
+/// The session id the edits fixture's own records carry.
+///
+/// A decision is only ever labelled - and so only ever replayed - against a
+/// session the archive holds and has closed (`label::ELIGIBLE`), and a decision
+/// belongs to a session by `session_id` alone (D-04). So a test about labels
+/// submits under this id and not under [`SESSION`].
+const FIXTURE_SESSION: &str = "44444444-4444-4444-8444-444444444444";
 
 struct Bench {
     _dir: tempfile::TempDir,
@@ -111,6 +121,21 @@ impl Bench {
             &self.data_dir,
             &Config::default(),
             &self.payload(cwd, prompt),
+        )
+    }
+
+    /// The same, under a session id the archive actually holds.
+    fn submit_as(&self, session_id: &str, cwd: &str, prompt: &str) -> Option<String> {
+        prompt::user_prompt_submit(
+            &self.data_dir,
+            &Config::default(),
+            &Payload {
+                session_id: Some(session_id),
+                transcript_path: None,
+                cwd: Some(cwd),
+                prompt: Some(prompt),
+                source: None,
+            },
         )
     }
 
@@ -684,4 +709,318 @@ fn a_watermark_bound_hides_a_later_ingested_session() {
 
     // The default is no bound at all, so every existing caller is untouched.
     assert_eq!(request.before_turn_id, None);
+}
+
+/// One session of hand-written records with the timestamps the test chose.
+///
+/// [`Bench::archive`] stamps its own clock a second apart, and every replay
+/// assertion here is about which side of a decision's wall clock a turn falls
+/// on - so the times have to be the test's to set.
+fn archive_at(
+    bench: &Bench,
+    name: &str,
+    project: &str,
+    session: &str,
+    turns: &[(&str, serde_json::Value)],
+) {
+    let cwd = bench.root.join(project);
+    let mut body = String::new();
+    for (n, (at, content)) in turns.iter().enumerate() {
+        let record = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "cwd": cwd.to_string_lossy(),
+            "sessionId": session,
+            "type": "assistant",
+            "uuid": format!("{session}-{n}"),
+            "timestamp": at,
+            "requestId": format!("req_{n}"),
+            "message": {"role": "assistant", "model": "claude-opus-5", "content": [content]},
+        });
+        body.push_str(&record.to_string());
+        body.push('\n');
+    }
+    let path = bench.work.join(name);
+    std::fs::write(&path, body).unwrap();
+    match ingest::run(&bench.data_dir, &path).unwrap() {
+        ingest::Outcome::Committed(_) => {}
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
+/// One logged decision, written straight into the table the drain fills.
+///
+/// Hand-built because these tests choose the wall clock, the watermark and the
+/// refusals - three things the injector reads off a real machine.
+#[allow(clippy::too_many_arguments)]
+fn decide(
+    bench: &Bench,
+    session: &str,
+    at: &str,
+    cwd: &str,
+    prompt: &str,
+    watermark: i64,
+    injected: &[(i64, usize)],
+    chars: i64,
+    suppressed: &[i64],
+) -> i64 {
+    let injected: Vec<serde_json::Value> = injected
+        .iter()
+        .map(|(turn_id, chars)| serde_json::json!({"turn_id": turn_id, "chars": chars}))
+        .collect();
+    let suppressed: Vec<serde_json::Value> = suppressed
+        .iter()
+        .map(|turn_id| serde_json::json!({"turn_id": turn_id, "reason": "already_injected"}))
+        .collect();
+    let conn = bench.conn();
+    conn.execute(
+        "INSERT INTO decisions (
+            session_id, ts, cwd, prompt, watermark_session_no, chars_injected,
+            spellings, candidates, injected, suppressed, thresholds
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', '[]', ?7, ?8, '{}')",
+        rusqlite::params![
+            session,
+            at,
+            cwd,
+            prompt,
+            watermark,
+            chars,
+            serde_json::to_string(&injected).unwrap(),
+            serde_json::to_string(&suppressed).unwrap(),
+        ],
+    )
+    .unwrap();
+    conn.last_insert_rowid()
+}
+
+/// One label's `(old, new)` out of a replay.
+fn movement(replayed: &Replayed, label: &str) -> (usize, usize) {
+    let found = replayed
+        .labels
+        .iter()
+        .find(|movement| movement.label == label)
+        .unwrap_or_else(|| panic!("{label} is not in the diff: {replayed:?}"));
+    (found.old, found.new)
+}
+
+/// Replay this store under `thresholds`, through the read-only open the command
+/// uses (D-15).
+fn replayed(bench: &Bench, thresholds: &Thresholds) -> Replayed {
+    let store = Store::open_read_only(&bench.data_dir).unwrap();
+    replay::replay(&store, &Config::default(), thresholds).unwrap()
+}
+
+/// FEED-03: replaying the shipped thresholds over freshly-written labels moves
+/// nothing.
+///
+/// The zero diff is the whole assertion and it is not vacuous: the counts it
+/// compares are non-zero, so a replay that re-extracted a different spelling,
+/// searched a different pool or judged by a different rule would show up as
+/// movement rather than as an empty answer. This is what makes any diff a
+/// later run reports attributable to the change under test.
+#[test]
+fn replaying_the_shipped_thresholds_moves_nothing() {
+    let bench = bench();
+    let cwd = bench.project();
+    let raw = format!("what changed in {RELATIVE}");
+
+    assert!(
+        bench.submit_as(FIXTURE_SESSION, &cwd, &raw).is_some(),
+        "the prompt has to inject for there to be a label to reproduce"
+    );
+
+    let labelled = bench.pass();
+    assert_eq!(labelled.feedback.decisions, 1, "{labelled:?}");
+    assert_eq!(labelled.outcomes.count("false positive"), 1, "{labelled:?}");
+    assert_eq!(labelled.outcomes.count("wasted budget"), 1, "{labelled:?}");
+
+    let diff = replayed(&bench, &Thresholds::default());
+    assert_eq!(diff.decisions, 1, "{diff:?}");
+    assert_eq!(diff.changed, Vec::<i64>::new(), "{diff:?}");
+    assert_eq!(movement(&diff, "false positive"), (1, 1), "{diff:?}");
+    assert_eq!(movement(&diff, "wasted budget"), (1, 1), "{diff:?}");
+    assert_eq!(movement(&diff, "hit"), (0, 0), "{diff:?}");
+    assert_eq!(movement(&diff, "miss"), (0, 0), "{diff:?}");
+
+    // Determinism: the same store and the same thresholds, twice.
+    assert_eq!(replayed(&bench, &Thresholds::default()), diff);
+}
+
+/// FEED-03: a turn that sat one place below the rank threshold is injected under
+/// a widened one, and the label that would have earned is what the diff reports.
+///
+/// The decision under test refused everything the default admits - the three
+/// suppressions are read off the ranked order the store actually produces, not
+/// guessed - so under the shipped numbers it injects nothing and carries no
+/// label. Widening the rank by one admits exactly one more turn, and a later
+/// turn of the same session names the same file, so that turn is a `hit`.
+#[test]
+fn a_widened_rank_threshold_moves_a_decision_from_silence_to_a_hit() {
+    let bench = bench();
+    let session = "55555555-5555-4555-8555-555555555555";
+    let project = "project-beta";
+    let file = "/code/beta/src/kettle.rs";
+    let cwd = bench.root.join(project).to_string_lossy().into_owned();
+
+    archive_at(
+        &bench,
+        "beta.jsonl",
+        project,
+        session,
+        &[
+            ("2026-08-14T10:00:00.000Z", read_call(file)),
+            ("2026-08-14T10:01:00.000Z", read_call(file)),
+            ("2026-08-14T10:02:00.000Z", read_call(file)),
+            ("2026-08-14T10:03:00.000Z", read_call(file)),
+            // After the decision below, and what makes an injected turn a hit:
+            // the session went back to the same file.
+            ("2026-08-14T12:00:00.000Z", read_call(file)),
+        ],
+    );
+    let closed = bench.pass();
+    assert_eq!(closed.outcomes.finalized, 2, "{closed:?}");
+
+    // The ranked order this store actually produces, through the same
+    // extraction and the same request shape the injector builds.
+    let raw = format!("what happened in {file}");
+    let (_, candidates) = prompt::candidates(&raw, Some(&cwd), prompt::MAX_CANDIDATES);
+    let request = Request::new(
+        prompt::query_of(&raw, Some(&cwd)),
+        Scope::Directory(bench.root.join(project)),
+    )
+    .candidates(candidates)
+    .excerpts(false)
+    .limit(prompt::RANKED);
+    let hits = search::run(&bench.conn(), &Config::default(), &request)
+        .unwrap()
+        .hits;
+    assert!(hits.len() >= 4, "{hits:?}");
+    for hit in &hits[..4] {
+        assert!(
+            hit.entity_match.is_some() && hit.entity_count < prompt::CO_OCCURRING,
+            "the rank is what admits this hit, so it has to be the only thing \
+             that does: {hit:?}"
+        );
+    }
+    let suppressed: Vec<i64> = hits[..prompt::ENTITY_RANK]
+        .iter()
+        .map(|hit| hit.turn_id)
+        .collect();
+
+    let id = decide(
+        &bench,
+        session,
+        "2026-08-14T11:00:00.000Z",
+        &cwd,
+        &raw,
+        bench.watermark(),
+        &[],
+        0,
+        &suppressed,
+    );
+    let labelled = bench.pass();
+    assert!(
+        labelled.outcomes.labels.is_empty(),
+        "the decision injected nothing, so it carries no label: {labelled:?}"
+    );
+
+    // Under the shipped numbers: every eligible turn was refused, so nothing.
+    let same = replayed(&bench, &Thresholds::default());
+    assert_eq!(same.decisions, 1, "{same:?}");
+    assert_eq!(same.changed, Vec::<i64>::new(), "{same:?}");
+    assert_eq!(movement(&same, "hit"), (0, 0), "{same:?}");
+
+    // One rank wider, and the turn below the cut is injected and earns a hit.
+    let widened = Thresholds {
+        entity_rank: prompt::ENTITY_RANK + 1,
+        ..Thresholds::default()
+    };
+    let diff = replayed(&bench, &widened);
+    assert_eq!(diff.changed, vec![id], "{diff:?}");
+    assert_eq!(movement(&diff, "hit"), (0, 1), "{diff:?}");
+    assert_eq!(movement(&diff, "false positive"), (0, 0), "{diff:?}");
+    assert_eq!(movement(&diff, "wasted budget"), (0, 0), "{diff:?}");
+}
+
+/// D-10: a decision is scored against the archive as it stood, so a session
+/// ingested after it cannot be offered to it however well it matches.
+///
+/// The two halves are one test on purpose. Raising the stored watermark and
+/// replaying again is what makes the first half a statement about the bound
+/// rather than about a prompt that simply matched nothing.
+#[test]
+fn a_decision_is_never_scored_against_a_session_archived_after_it() {
+    let bench = bench();
+    let project = "project-gamma";
+    let cwd = bench.root.join(project).to_string_lossy().into_owned();
+    let earlier = "66666666-6666-4666-8666-666666666666";
+    let later = "77777777-7777-4777-8777-777777777777";
+    let file = "/code/gamma/src/beacon.rs";
+
+    // The session the decision belongs to, holding nothing that matches.
+    archive_at(
+        &bench,
+        "gamma-one.jsonl",
+        project,
+        earlier,
+        &[(
+            "2026-08-14T10:00:00.000Z",
+            read_call("/code/gamma/src/other.rs"),
+        )],
+    );
+    let watermark = bench.watermark();
+    // Archived afterwards, and the only thing in the store that names the file
+    // the prompt asks about.
+    archive_at(
+        &bench,
+        "gamma-two.jsonl",
+        project,
+        later,
+        &[("2026-08-14T10:30:00.000Z", read_call(file))],
+    );
+    assert!(bench.watermark() > watermark, "one session, not two");
+    bench.pass();
+
+    let raw = format!("what happened in {file}");
+    let id = decide(
+        &bench,
+        earlier,
+        "2026-08-14T11:00:00.000Z",
+        &cwd,
+        &raw,
+        watermark,
+        &[],
+        0,
+        &[],
+    );
+
+    let bounded = replayed(&bench, &Thresholds::default());
+    assert_eq!(bounded.decisions, 1, "{bounded:?}");
+    assert_eq!(
+        bounded.changed,
+        Vec::<i64>::new(),
+        "a turn archived after the decision was offered to it: {bounded:?}"
+    );
+    assert_eq!(movement(&bounded, "false positive"), (0, 0), "{bounded:?}");
+
+    // The falsifying half: the same prompt, the same store, one integer moved.
+    bench
+        .conn()
+        .execute(
+            "UPDATE decisions SET watermark_session_no = ?1 WHERE id = ?2",
+            rusqlite::params![bench.watermark(), id],
+        )
+        .unwrap();
+    let unbounded = replayed(&bench, &Thresholds::default());
+    assert_eq!(unbounded.changed, vec![id], "{unbounded:?}");
+    assert_eq!(
+        movement(&unbounded, "false positive"),
+        (0, 1),
+        "{unbounded:?}"
+    );
+    assert_eq!(
+        movement(&unbounded, "wasted budget"),
+        (0, 1),
+        "{unbounded:?}"
+    );
 }
