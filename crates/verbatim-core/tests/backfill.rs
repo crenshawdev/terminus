@@ -3,9 +3,10 @@
 //!
 //! The whole value of a second implementation of the walk is that it is not a
 //! second implementation of the ingest, so the assertion that matters is
-//! equality with `pass::run_with` over the same tree: every table's row count,
-//! every session's blob checksum, every watermark, and the archive digest that
-//! covers the blobs themselves.
+//! equality with `pass::run_with` over the same tree: every table's row count
+//! (bar the post-walk set - see [`POST_WALK_TABLES`]), every session's blob
+//! checksum, every watermark, and the archive digest that covers the blobs
+//! themselves.
 //!
 //! `#![cfg(feature = "testkit")]` gates the file, which is load-bearing and also
 //! a hazard `.planning/CAPTURE.md` records: `cargo test -p verbatim-core`
@@ -14,8 +15,8 @@
 //! `cargo test -p verbatim-core --features testkit --test backfill`, and the
 //! only thing that tells a real run from a vacuous one is the count in its
 //! output - a self-test cannot say it, because a file that compiled to nothing
-//! has no test left to run. Two live here, so `running 2 tests` is the line to
-//! read, and it was read.
+//! has no test left to run. Three live here, so `running 3 tests` is the line
+//! to read, and it was read.
 
 #![cfg(feature = "testkit")]
 
@@ -31,6 +32,24 @@ use verbatim_core::{discover, testkit};
 
 /// The worker count the plan's `Verify` names, and enough to be more than one.
 const WORKERS: usize = 4;
+
+/// The tables the post-walk half of a pass writes, which a backfill never runs.
+///
+/// `backfill::run_with` IS the walk and nothing more. `pass::run_with` runs the
+/// same walk and then `feedback::drain` and `feedback::outcomes` after it - and
+/// `outcomes` is what sets `session_meta.is_final`, which is the gate
+/// `observe::observe_new` gets its sessions through. So these three tables are
+/// written by a step backfill deliberately does not take, and comparing their
+/// row counts compares that deliberate asymmetry rather than the walk the two
+/// implementations share.
+///
+/// All three, not just the one that fired. `decisions` and `labels` both read 0
+/// against this fixture tree today, which is the only reason they never sprang
+/// the trap `observations` just sprang; excluding `observations` alone would
+/// move the trap to whichever of them a fixture change populates first. Every
+/// other table, the checksums, the watermarks and the archive digest stay in
+/// the comparison unchanged.
+const POST_WALK_TABLES: &[&str] = &["observations", "decisions", "labels"];
 
 /// How many copies of the fixture set the tree holds.
 ///
@@ -98,7 +117,8 @@ impl Tree {
 /// Everything two passes over one tree must agree on.
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
-    /// One count per table in `store::TABLES`, in that order.
+    /// One count per table in `store::TABLES`, in that order, minus
+    /// [`POST_WALK_TABLES`].
     counts: Vec<(String, i64)>,
     /// The per-session blob checksum, keyed by session.
     checksums: BTreeMap<String, String>,
@@ -112,6 +132,7 @@ fn snapshot(data_dir: &Path) -> Snapshot {
     Snapshot {
         counts: TABLES
             .iter()
+            .filter(|table| !POST_WALK_TABLES.contains(*table))
             .map(|table| {
                 let count: i64 = conn
                     .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
@@ -174,6 +195,16 @@ fn the_pipeline_lands_on_the_same_store_as_the_sequential_pass() {
     assert_eq!(summary.bytes_read, reference.bytes_read);
     assert_eq!(summary.turns_added, reference.turns_added);
     assert_eq!(summary.failures, reference.failures);
+
+    // A name in POST_WALK_TABLES that no longer names a table would exclude
+    // nothing and read as if it did, so the exclusion has to be checked against
+    // the same list the counts are built from.
+    for table in POST_WALK_TABLES {
+        assert!(
+            TABLES.contains(table),
+            "POST_WALK_TABLES names {table}, which is not a table in store::TABLES"
+        );
+    }
 
     let expected = snapshot(&sequential_dir);
     let actual = snapshot(&parallel_dir);
