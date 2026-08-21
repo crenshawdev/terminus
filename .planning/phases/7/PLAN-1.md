@@ -11,6 +11,7 @@ files:
   - crates/verbatim-core/tests/schema.rs
   - crates/verbatim-core/tests/reindex.rs
   - crates/verbatim-core/tests/observe.rs
+  - crates/verbatim-core/tests/backfill.rs
   - crates/verbatim/src/main.rs
   - crates/verbatim/src/cmd/mod.rs
   - crates/verbatim/src/cmd/observations.rs

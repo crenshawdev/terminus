@@ -1,0 +1,57 @@
+{
+  "phase": "7",
+  "trigger": "risk_surface",
+  "discriminator": "plan-2",
+  "round": 1,
+  "base": "a9f0fc6",
+  "head": "37b5834",
+  "base_id": "a9f0fc6914ca1db138522e13c347a5b4745a5b3b",
+  "head_id": "37b58348cdb6761d8d285a68bbc20f00cc5ae842",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/observe/egress.rs",
+      "line": 67,
+      "severity": "high",
+      "claim": "`replace_credential` skips exact redaction for any credential shorter than 4 characters, so a short API key can survive unchanged in a scrubbed error or log line.",
+      "failure_scenario": "Configure `api_key = \"abc\"`, then get a provider error like `Incorrect API key provided: abc`. `egress::scrub(Some(&Secret::new(\"abc\")), ...)` returns the text unchanged for the credential itself, so `provider::Error::detail`, `runs.error`, or stderr can store and print the secret.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/observe/egress.rs",
+        "line": 100,
+        "note": "The mechanism is real and the reviewer is right that the shape rules do not save it: redact_assignments requires a literal = and redact_json_pairs requires a JSON name/value pair, so the prose form Incorrect API key provided: abc is caught by neither, and the MIN_CREDENTIAL_CHARS doc comment at line 74-79 promises a backstop that does not exist for prose. That comment is wrong and is filed as an open item. But high overstates the exposure on two independent grounds. First, scrub() carries no destination argument by design and its own doc says why: an error travels to runs.error and to stderr, which are LOCAL destinations. Nothing on this path egresses, so this is not a breach of the phase-7 boundary the fire is gating. Second, it requires a user-configured credential of one to three characters, which no provider issues; the realistic occupant of that slot is a placeholder for a local endpoint that ignores auth. Real hygiene gap in the user own store, not a high-severity secret disclosure."
+      },
+      "base_id": "a9f0fc6914ca1db138522e13c347a5b4745a5b3b",
+      "head_id": "37b58348cdb6761d8d285a68bbc20f00cc5ae842"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/credentials.rs",
+      "line": 177,
+      "severity": "high",
+      "claim": "The Unix permission gate only inspects `metadata().permissions().mode()` and ignores ACLs or other write grants, so an attacker-writable credentials file can still be accepted.",
+      "failure_scenario": "Create `~/.config/jcrenshaw/credentials.toml` with mode `0600`, then grant another user write access through a POSIX ACL or equivalent filesystem mechanism. `permissions(&path)` returns `Owner` because the mode bits still look private, `resolve()` loads the key, and the intended refusal for an attacker-writable file never happens.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/credentials.rs",
+        "line": 196,
+        "note": "Factually correct and already the documented scope of the check: the comment here says any group or world bit, and mode() is by definition blind to POSIX ACLs. Not reachable as written, though. Reading an ACL needs acl_get_file through libc or a new crate; std exposes no such thing, so this is not an oversight in the range but a dependency decision outside plan 2. It is also the same bound every comparable tool accepts - OpenSSH StrictModes and gpg both gate on mode bits alone. The scenario needs the user to deliberately grant another account an ACL on their own credentials file. Defense-in-depth gap worth recording, filed as an open item; not a defect in this committed range."
+      },
+      "base_id": "a9f0fc6914ca1db138522e13c347a5b4745a5b3b",
+      "head_id": "37b58348cdb6761d8d285a68bbc20f00cc5ae842"
+    }
+  ]
+}

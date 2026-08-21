@@ -1,0 +1,59 @@
+{
+  "phase": "7",
+  "trigger": "plan",
+  "discriminator": "plan-396c063",
+  "round": 1,
+  "base": "396c063",
+  "head": "396c063",
+  "base_id": "396c063a4e81d4086793b0358820c66cb4570279",
+  "head_id": "396c063a4e81d4086793b0358820c66cb4570279",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": ".planning/phases/7/PLAN-1.md",
+      "line": 162,
+      "severity": "medium",
+      "claim": "Task 5's verification only exercises `regenerate --since <date>`; it never checks `--prompt-version`, even though the task action says the selector is part of the rebuild path and `OBS-07` requires it.",
+      "failure_scenario": "An implementation could ignore `--prompt-version` entirely, or accept the flag without filtering on it, and both planned tests would still pass because they only prove the `--since` branch works.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/7/PLAN-1.md",
+        "line": 140,
+        "note": "Grounded and not overstated: the Action does specify --prompt-version as a selector that narrows conjunctively with --since, and the Verify exercises only the --since branch plus two exit-2 misuse cases, so an accepted-but-ignored --prompt-version passes. Downgraded rather than survived because it is a verification-coverage gap on one flag of one read/rebuild command, below the blocker/high bar this blocking gate acts on, and no fix commit exists: carried to open items for phase 7 execution."
+      },
+      "citation_missing": true,
+      "base_id": "396c063a4e81d4086793b0358820c66cb4570279",
+      "head_id": "396c063a4e81d4086793b0358820c66cb4570279"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": ".planning/phases/7/PLAN-3.md",
+      "line": 71,
+      "severity": "medium",
+      "claim": "Task 1's invalid-anchor check is too weak: it only asserts that no success-status row is written, not that the bad response is rejected through the parse-failure path or even stored at all as the task action requires.",
+      "failure_scenario": "A bad `turn_id` response could be silently discarded or turned into a generic error without writing the required `parse_failed` row, and the verification would still pass because it never checks for the stored failure record.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/7/PLAN-3.md",
+        "line": 152,
+        "note": "Partially overstated in its attribution. Task 3 Action already states the required behavior verbatim - \"a response whose claims do not anchor - is retried exactly once and then stored with status = parse_failed\" - so the plan does not permit a silent discard. The real residue is narrower: Task 3 Verify exercises only the unparseable arm and Task 1 Verify asserts only the absence of a success row, so no task falsifies the non-anchoring branch reaching parse_failed. A verification gap across two tasks, not an unspecified behavior; medium, below the gate bar, carried to open items."
+      },
+      "citation_missing": true,
+      "base_id": "396c063a4e81d4086793b0358820c66cb4570279",
+      "head_id": "396c063a4e81d4086793b0358820c66cb4570279"
+    }
+  ]
+}
