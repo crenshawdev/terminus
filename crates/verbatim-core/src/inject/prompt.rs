@@ -52,7 +52,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use super::decision::{Candidate, Decision, Injected, Thresholds};
+use super::decision::{self, Candidate, Decision, Injected};
 use super::state::{Reason, State, Suppressed};
 use super::{compaction, Payload};
 use crate::config::Config;
@@ -65,7 +65,7 @@ use crate::recall::{excerpt, Hit, Query, Scope};
 /// Wider than the cap of three, so a hit that two entities corroborate can be
 /// seen below the top three, and far narrower than `CANDIDATE_POOL`, which the
 /// re-rank already fixes: ten rows of seven small columns, no blob touched.
-const RANKED: usize = 10;
+pub const RANKED: usize = 10;
 
 /// How many ranked hits the one prompt after a compaction looks through
 /// (INJ-05).
@@ -77,16 +77,16 @@ const RANKED: usize = 10;
 /// these are small columns and no blob is touched. It is [`search::MAX_RESULTS`]
 /// because that is the ceiling `search::run` clamps to anyway, and asking for
 /// more would be a number that reads as a decision and is not one.
-const COMPACTED_RANKED: usize = search::MAX_RESULTS;
+pub const COMPACTED_RANKED: usize = search::MAX_RESULTS;
 
 /// The rank within which one matched entity is enough (INJ-03).
-const ENTITY_RANK: usize = 3;
+pub const ENTITY_RANK: usize = 3;
 
 /// How many distinct entities make a hit eligible wherever it ranks (INJ-03).
 ///
 /// Not a subset of the rank condition: corroboration by two independent facts
 /// is evidence that bm25's ordering may have got this one wrong.
-const CO_OCCURRING: usize = 2;
+pub const CO_OCCURRING: usize = 2;
 
 /// The most turns one prompt may ever be given (INJ-03).
 pub const MAX_TURNS: usize = 3;
@@ -97,7 +97,77 @@ pub const MAX_TURNS: usize = 3;
 /// of them is another disjunct fts5 evaluates under a hard deadline. The
 /// strongest signals are first - paths before symbols, in the order they were
 /// typed - so the cut falls on the weakest.
-const MAX_CANDIDATES: usize = 8;
+pub const MAX_CANDIDATES: usize = 8;
+
+/// The six numbers INJ-03's decision is taken under.
+///
+/// **The live path constructs [`Thresholds::default`] and nothing else**, which
+/// is exactly the six constants above: no [`Config`] field reaches it, no flag
+/// detunes it and no `verbatim.toml` key names it, because
+/// `DESIGN-BRIEF.md:245` keeps the precision-first defaults non-detunable
+/// (D-08). Three near-misses are worse than silence, and a threshold a user can
+/// lower is a threshold a user lowers once and never raises.
+///
+/// What the type buys is `verbatim replay`: one build can score the whole
+/// logged history under a variant of these numbers and diff the labels it would
+/// have produced, so a retrieval change is tested against history rather than
+/// rebuilt and eyeballed. The values a decision was actually taken under travel
+/// in the record ([`Thresholds::recorded`]), so a later analysis reads them off
+/// the row rather than off whatever the constants say by then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Thresholds {
+    /// How many ranked hits the threshold is applied over - [`RANKED`].
+    pub ranked: usize,
+    /// The wider window the one prompt after a compaction looks through -
+    /// [`COMPACTED_RANKED`].
+    pub compacted_ranked: usize,
+    /// The rank within which one matched entity is enough - [`ENTITY_RANK`].
+    pub entity_rank: usize,
+    /// How many distinct entities make a hit eligible at any rank -
+    /// [`CO_OCCURRING`].
+    pub co_occurring: usize,
+    /// The most turns one prompt may ever be given - [`MAX_TURNS`].
+    pub max_turns: usize,
+    /// How many spellings one prompt may ask the archive about -
+    /// [`MAX_CANDIDATES`].
+    pub max_candidates: usize,
+}
+
+impl Default for Thresholds {
+    /// The compiled-in values, and the only ones the live path ever uses.
+    fn default() -> Self {
+        Thresholds {
+            ranked: RANKED,
+            compacted_ranked: COMPACTED_RANKED,
+            entity_rank: ENTITY_RANK,
+            co_occurring: CO_OCCURRING,
+            max_turns: MAX_TURNS,
+            max_candidates: MAX_CANDIDATES,
+        }
+    }
+}
+
+impl Thresholds {
+    /// These values as a decision records them, with the character budget that
+    /// was actually applied.
+    ///
+    /// Off the value in force rather than off the constants, which is the whole
+    /// reason the type exists: a record that re-read [`RANKED`] would claim the
+    /// build's default even on a run that used something else, and every
+    /// comparison against it afterwards would be wrong about which numbers
+    /// produced which label.
+    pub fn recorded(&self, prompt_chars: usize) -> decision::Thresholds {
+        decision::Thresholds {
+            ranked: self.ranked,
+            compacted_ranked: self.compacted_ranked,
+            entity_rank: self.entity_rank,
+            co_occurring: self.co_occurring,
+            max_turns: self.max_turns,
+            max_candidates: self.max_candidates,
+            prompt_chars,
+        }
+    }
+}
 
 /// The turns one prompt fired on, and what reading them cost.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -132,9 +202,11 @@ pub fn user_prompt_submit(data_dir: &Path, config: &Config, payload: &Payload) -
         payload.prompt.unwrap_or_default(),
     );
     let budget = budget(config);
-    decision.thresholds = in_force(budget);
+    // D-08: the compiled-in values, constructed here and configurable nowhere.
+    let thresholds = Thresholds::default();
+    decision.thresholds = thresholds.recorded(budget);
 
-    let fired = selected(data_dir, config, payload, &mut decision).unwrap_or_default();
+    let fired = selected(data_dir, config, payload, &thresholds, &mut decision).unwrap_or_default();
     let text = render(&fired.hits, budget, &mut decision);
 
     decision.save(data_dir);
@@ -149,24 +221,6 @@ pub fn user_prompt_submit(data_dir: &Path, config: &Config, payload: &Payload) -
 /// replayed comparison against it wrong.
 fn budget(config: &Config) -> usize {
     config.prompt_chars().min(MAX_PROMPT_CHARS)
-}
-
-/// The threshold values this build applies, as a decision records them (D-08).
-///
-/// They are compile-time constants and stay that way - `DESIGN-BRIEF.md:245`
-/// keeps the precision-first defaults non-detunable by config - so the only way
-/// a later analysis can know which numbers produced a label is if every decision
-/// carries its own copy.
-fn in_force(prompt_chars: usize) -> Thresholds {
-    Thresholds {
-        ranked: RANKED,
-        compacted_ranked: COMPACTED_RANKED,
-        entity_rank: ENTITY_RANK,
-        co_occurring: CO_OCCURRING,
-        max_turns: MAX_TURNS,
-        max_candidates: MAX_CANDIDATES,
-        prompt_chars,
-    }
 }
 
 /// The ceiling on one injection, whatever `verbatim.toml` configures.
@@ -274,7 +328,14 @@ pub fn select(data_dir: &Path, config: &Config, payload: &Payload) -> Fired {
         payload.cwd,
         payload.prompt.unwrap_or_default(),
     );
-    selected(data_dir, config, payload, &mut decision).unwrap_or_default()
+    selected(
+        data_dir,
+        config,
+        payload,
+        &Thresholds::default(),
+        &mut decision,
+    )
+    .unwrap_or_default()
 }
 
 /// [`select`]'s body, written in the `?` its every step wants.
@@ -287,6 +348,7 @@ fn selected(
     data_dir: &Path,
     config: &Config,
     payload: &Payload,
+    thresholds: &Thresholds,
     decision: &mut Decision,
 ) -> Option<Fired> {
     let prompt = payload.prompt.filter(|prompt| !prompt.trim().is_empty())?;
@@ -295,7 +357,7 @@ fn selected(
     // Before the store is opened, because a prompt naming nothing the archive
     // could match structurally is the common case, and the cheapest thing this
     // arm can do with it is nothing at all.
-    let (spellings, candidates) = candidates(prompt, Some(cwd));
+    let (spellings, candidates) = candidates(prompt, Some(cwd), thresholds.max_candidates);
     decision.spellings = spellings;
     if candidates.is_empty() {
         return None;
@@ -324,9 +386,9 @@ fn selected(
 
     let request = Request::new(query_of(prompt, Some(cwd)), Scope::Directory(cwd.into()))
         .limit(if dropped.is_some() {
-            COMPACTED_RANKED
+            thresholds.compacted_ranked
         } else {
-            RANKED
+            thresholds.ranked
         })
         .candidates(candidates)
         .excerpts(false);
@@ -345,7 +407,7 @@ fn selected(
     // there to fire on, which is the whole of what a replay re-scores.
     decision.candidates = response.iter().map(scored).collect();
 
-    let threshold = eligible(response);
+    let threshold = eligible(response, thresholds);
     let pooled = within(threshold, dropped.as_ref());
     let mut hits = surviving(
         &mut state,
@@ -353,6 +415,7 @@ fn selected(
         current.as_deref(),
         dropped.as_ref(),
         &mut decision.suppressed,
+        thresholds.max_turns,
     );
 
     // Now, and only now, is a session worth decompressing - and only for the
@@ -423,14 +486,39 @@ fn watermark(conn: &Connection) -> Option<i64> {
 /// **The cap is not applied here.** INJ-04's suppressions run between the two
 /// (see [`surviving`]), so that a turn this session has already been given does
 /// not consume one of the three slots on its way to being refused.
-fn eligible(hits: Vec<Hit>) -> Vec<Hit> {
+///
+/// Public because `verbatim replay` applies exactly this judgement to the hits
+/// a logged prompt would get back today under a different [`Thresholds`]: two
+/// definitions of "eligible" would make a replayed diff a statement about the
+/// replay engine rather than about the change under test.
+pub fn eligible(hits: Vec<Hit>, thresholds: &Thresholds) -> Vec<Hit> {
     hits.into_iter()
         .enumerate()
         .filter(|(rank, hit)| {
             // A free-text-only hit is never eligible, whatever its relevance.
-            hit.entity_match.is_some() && (*rank < ENTITY_RANK || hit.entity_count >= CO_OCCURRING)
+            hit.entity_match.is_some()
+                && (*rank < thresholds.entity_rank || hit.entity_count >= thresholds.co_occurring)
         })
         .map(|(_, hit)| hit)
+        .collect()
+}
+
+/// The eligible turns that are actually injected, once `refused` is taken out
+/// and the cap applied.
+///
+/// The live path reaches the same answer through [`surviving`], which derives
+/// its refusals from the session's [`State`] file as it goes. `verbatim replay`
+/// cannot: those files are one session's disposable scratch, deleted or stale
+/// long before a replay runs, and re-deriving a refusal would attribute
+/// unreproducible session state to the rule change under test. So it re-applies
+/// the refusals the decision itself recorded and calls this.
+///
+/// The cap falls AFTER the refusals here for the reason it does there: a turn
+/// that was refused must not have spent one of the slots on its way out.
+pub fn capped(hits: Vec<Hit>, refused: &BTreeSet<i64>, max_turns: usize) -> Vec<Hit> {
+    hits.into_iter()
+        .filter(|hit| !refused.contains(&hit.turn_id))
+        .take(max_turns)
         .collect()
 }
 
@@ -491,6 +579,7 @@ fn surviving(
     current: Option<&str>,
     dropped: Option<&BTreeSet<i64>>,
     recorded: &mut Vec<Suppressed>,
+    max_turns: usize,
 ) -> Vec<Hit> {
     let mut out: Vec<Hit> = Vec::new();
     for hit in hits {
@@ -504,7 +593,7 @@ fn surviving(
             }
             None => out.push(hit),
         }
-        if out.len() == MAX_TURNS {
+        if out.len() == max_turns {
             break;
         }
     }
@@ -574,7 +663,16 @@ fn current_session(payload: &Payload) -> Option<String> {
 /// The spellings travel beside the queries because FEED-01 logs them: a `Query`
 /// keeps only its tokens, and "what this prompt was asked about" reads as the
 /// text the extraction produced rather than as a token list.
-fn candidates(prompt: &str, cwd: Option<&str>) -> (Vec<String>, Vec<Query>) {
+///
+/// Public because `verbatim replay` re-runs exactly this extraction over a
+/// stored prompt and `cwd` (FEED-03). `max_candidates` is
+/// [`Thresholds::max_candidates`], which is [`MAX_CANDIDATES`] on the live path
+/// and whatever a replay was asked for on that one.
+pub fn candidates(
+    prompt: &str,
+    cwd: Option<&str>,
+    max_candidates: usize,
+) -> (Vec<String>, Vec<Query>) {
     let mut spellings: Vec<String> = Vec::new();
     for relative in relative_paths(prompt) {
         if let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) {
@@ -606,7 +704,7 @@ fn candidates(prompt: &str, cwd: Option<&str>) -> (Vec<String>, Vec<Query>) {
             asked.push(spelling);
             out.push(query);
         }
-        if out.len() == MAX_CANDIDATES {
+        if out.len() == max_candidates {
             break;
         }
     }
@@ -720,4 +818,112 @@ fn join(cwd: &str, relative: &str) -> String {
     let base = cwd.trim_end_matches(['/', '\\']);
     let relative = relative.trim_start_matches("./").trim_start_matches(".\\");
     format!("{base}/{relative}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::recall::EntityMatch;
+
+    /// One ranked hit that matched a stored entity.
+    ///
+    /// Everything [`eligible`] reads and nothing it does not: a hit's rank is
+    /// its index in the slice, so what decides are `entity_match` and
+    /// `entity_count`.
+    fn hit(turn_id: i64, entity_count: usize) -> Hit {
+        Hit {
+            turn_id,
+            session_key: "/s.jsonl".into(),
+            record_type: "assistant".into(),
+            ts: Some("2026-08-13T09:00:00.000Z".into()),
+            project: Some("/code/verbatim".into()),
+            sidechain: false,
+            entity_score: 1.0,
+            entity_match: Some(EntityMatch::Exact),
+            entity_count,
+            matched_on: Vec::new(),
+            relevance: 1.0,
+            excerpt: String::new(),
+        }
+    }
+
+    fn ids(hits: &[Hit]) -> Vec<i64> {
+        hits.iter().map(|hit| hit.turn_id).collect()
+    }
+
+    /// D-08's whole point: the same ranked input fires differently under an
+    /// overridden rank threshold, and exactly as before under the default.
+    ///
+    /// The default arm is the load-bearing half. It is what says the live path
+    /// did not move when the six constants became a value type, and it fails the
+    /// moment [`Thresholds::default`] stops being the compiled-in numbers.
+    #[test]
+    fn a_widened_rank_threshold_admits_a_hit_the_default_refuses() {
+        let ranked: Vec<Hit> = (1..=5).map(|n| hit(n, 1)).collect();
+
+        // Ranks 4 and 5 are out: one matched entity is enough only inside the
+        // top three, and one entity is fewer than CO_OCCURRING.
+        assert_eq!(
+            ids(&eligible(ranked.clone(), &Thresholds::default())),
+            vec![1, 2, 3]
+        );
+
+        let widened = Thresholds {
+            entity_rank: 5,
+            ..Thresholds::default()
+        };
+        assert_eq!(
+            ids(&eligible(ranked.clone(), &widened)),
+            vec![1, 2, 3, 4, 5]
+        );
+
+        // The other condition is not a subset of the rank one: two co-occurring
+        // entities admit a hit wherever it sits, which is why rank 4 here is
+        // eligible under the DEFAULT.
+        let mut corroborated = ranked.clone();
+        corroborated[3].entity_count = 2;
+        assert_eq!(
+            ids(&eligible(corroborated, &Thresholds::default())),
+            vec![1, 2, 3, 4]
+        );
+
+        // A free-text-only hit is never eligible, whatever the thresholds say.
+        let mut prose = ranked;
+        prose[0].entity_match = None;
+        assert_eq!(ids(&eligible(prose, &widened)), vec![2, 3, 4, 5]);
+    }
+
+    /// The cap falls after the refusals, so a refused turn does not spend a
+    /// slot - the property [`surviving`] holds on the live path.
+    #[test]
+    fn a_refused_turn_does_not_spend_one_of_the_slots() {
+        let admitted: Vec<Hit> = (1..=5).map(|n| hit(n, 1)).collect();
+        let refused: BTreeSet<i64> = [1, 2].into_iter().collect();
+
+        assert_eq!(
+            ids(&capped(admitted.clone(), &refused, MAX_TURNS)),
+            vec![3, 4, 5]
+        );
+        assert_eq!(
+            ids(&capped(admitted, &BTreeSet::new(), MAX_TURNS)),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// The record's copy comes off the value in force, never off the constants.
+    #[test]
+    fn a_record_carries_the_values_that_were_actually_applied() {
+        let overridden = Thresholds {
+            entity_rank: 5,
+            max_candidates: 2,
+            ..Thresholds::default()
+        };
+        let recorded = overridden.recorded(4_000);
+
+        assert_eq!(recorded.entity_rank, 5);
+        assert_eq!(recorded.max_candidates, 2);
+        assert_eq!(recorded.ranked, RANKED);
+        assert_eq!(recorded.prompt_chars, 4_000);
+    }
 }
