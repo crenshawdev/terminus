@@ -216,7 +216,20 @@ pub struct Regenerated {
     pub selected: usize,
     /// Rows whose `mechanical` column was rewritten.
     pub rewritten: usize,
-    /// Whatever could not be recomputed, named and skipped.
+    /// Rows whose judgment columns [`rejudge`] replaced. Zero without a
+    /// provider, which is the default and is not a failure.
+    pub judged: usize,
+    /// Selected rows [`rejudge`] stopped short of asking about, because the
+    /// daily token budget ran out part way through the set.
+    pub unasked: usize,
+    /// The keys the selector chose, in the order they were rebuilt.
+    ///
+    /// Carried so [`rejudge`] asks about exactly this set rather than running
+    /// the selection a second time: it runs after the ingest lock has dropped,
+    /// and a pass in between could have changed what the selector would choose.
+    pub sessions: Vec<String>,
+    /// Whatever could not be recomputed or could not be judged, named and
+    /// skipped - already scrubbed (D-16).
     pub notes: Vec<String>,
 }
 
@@ -227,7 +240,9 @@ pub struct Regenerated {
 /// and never overwrites; this is the one place a stored fact set is replaced.
 ///
 /// **`mechanical` and nothing else.** Not `generated_at`, not `session_id`, and
-/// none of the judgment columns: `generated_at` dates the row as a whole -
+/// none of the judgment columns - those are [`rejudge`]'s, and it runs after
+/// this does and after the caller's ingest lock has dropped (D-07).
+/// `generated_at` dates the row as a whole -
 /// including a judgment half somebody paid for - so a mechanical recompute that
 /// moved it would misdate the part it did not touch. One column, on exactly the
 /// selected rows, is what makes a run under a narrowed selector provably scoped.
@@ -291,8 +306,94 @@ pub fn regenerate(
                 .notes
                 .push(format!("{session_key}: not regenerated: {e}")),
         }
+        out.sessions.push(session_key);
     }
     Ok(out)
+}
+
+/// Buy a second judgment for exactly the rows [`regenerate`] chose (OBS-07).
+///
+/// **The one path allowed to ask twice.** Every other caller is stopped by
+/// [`cost::admits`]'s already-judged gate; this one waives it through
+/// [`judgment::judge_again`], because the reason to pay for a session again is
+/// that the prompt changed and `--prompt-version` is how a user says which ones.
+/// Every OTHER cost control still applies: a session under [`cost::MIN_TURNS`]
+/// is still not bought, and the daily token budget still stops the run.
+///
+/// **Nothing happens without a provider, and that is the default.** With
+/// `[provider] enabled` unset or false this returns before it resolves a
+/// credential or opens anything, and the stored judgment columns are left
+/// exactly as they were - so a user with no provider can still rebuild facts.
+///
+/// **Outside the caller's ingest lock (D-07).** It opens its own store handle
+/// for the same reason [`judge_new`] does: `verbatim observations regenerate`
+/// takes the ingest lock for the mechanical rewrite, and holding it across a
+/// run of HTTP calls would make every hook-spawned pass in that window exit
+/// `LockHeld` and archive nothing.
+pub fn rejudge(data_dir: &Path, config: &Config, done: &mut Regenerated) {
+    if !config.provider_enabled() {
+        return;
+    }
+    let credential = match crate::credentials::resolve(config) {
+        Ok(credential) => credential,
+        Err(e) => {
+            done.notes
+                .push(egress::scrub(None, &format!("nothing was re-judged: {e}")));
+            return;
+        }
+    };
+    let store = match crate::store::Store::open(data_dir) {
+        Ok(store) => store,
+        Err(e) => {
+            done.notes.push(egress::scrub(
+                credential.as_ref(),
+                &format!("nothing was re-judged: {e}"),
+            ));
+            return;
+        }
+    };
+    let conn = store.conn();
+
+    let sessions = done.sessions.clone();
+    for (asked, session_key) in sessions.iter().enumerate() {
+        let verdict = judgment::judge_again(conn, config, credential.as_ref(), session_key);
+        let note = match verdict {
+            Verdict::Stored { .. } => {
+                done.judged += 1;
+                continue;
+            }
+            // The one verdict that ends the run rather than skipping a row: the
+            // budget is spent for the day, so every session after this one
+            // would refuse identically. Reported as a count, because "it
+            // stopped" and "there was nothing left to do" are different answers.
+            Verdict::Skipped(skip @ cost::Skip::BudgetSpent { .. }) => {
+                done.unasked = sessions.len() - asked;
+                done.notes.push(format!(
+                    "{skip}; {} selected session(s) were left unasked",
+                    done.unasked
+                ));
+                break;
+            }
+            Verdict::Skipped(skip) => skip.to_string(),
+            Verdict::ParseFailed { reason, .. } => {
+                format!("the answer could not be used and was stored raw: {reason}")
+            }
+            Verdict::Failed { reason } => reason,
+        };
+        done.notes.push(egress::scrub(
+            credential.as_ref(),
+            &format!("{session_key}: {note}"),
+        ));
+    }
+
+    // Said even when it is all good news: without it, a `--json` run that
+    // re-judged every selected row is indistinguishable from one that never
+    // had a provider to ask.
+    done.notes.push(format!(
+        "re-judged {} of {} selected session(s)",
+        done.judged,
+        sessions.len()
+    ));
 }
 
 /// What one pass's judgment step did (OBS-02, D-07).

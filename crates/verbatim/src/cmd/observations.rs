@@ -159,39 +159,52 @@ fn regenerate(args: Regenerate) -> Result<(), Failure> {
     let data_dir = super::data_dir()?;
     let config = verbatim_core::Config::load()?;
 
-    let _guard = match lock::try_acquire(&data_dir)? {
-        // Non-zero, the way `reindex`'s contention is: a rebuild is asked for
-        // explicitly, so silently not doing it would be the wrong answer.
-        Attempt::Held => {
-            let held = format!(
-                "another verbatim process holds {}; try again when it finishes",
-                data_dir.join(lock::LOCK_FILE_NAME).display()
-            );
-            if args.json {
-                regenerated_document(&args, &Regenerated::default())
-                    .failed()
-                    .because(&held)
-                    .emit();
-                return Err(Failure::Silent);
+    // The lock covers the mechanical rewrite and nothing more. Scoped to this
+    // block on purpose: the judgment half below makes HTTP calls, and D-07 bars
+    // one from being made while the ingest lock is held - a rebuild that sat on
+    // it through a run of provider calls would make every hook-spawned pass in
+    // that window exit `LockHeld` and archive nothing.
+    let mut done = {
+        let _guard = match lock::try_acquire(&data_dir)? {
+            // Non-zero, the way `reindex`'s contention is: a rebuild is asked
+            // for explicitly, so silently not doing it would be the wrong
+            // answer.
+            Attempt::Held => {
+                let held = format!(
+                    "another verbatim process holds {}; try again when it finishes",
+                    data_dir.join(lock::LOCK_FILE_NAME).display()
+                );
+                if args.json {
+                    regenerated_document(&args, &Regenerated::default())
+                        .failed()
+                        .because(&held)
+                        .emit();
+                    return Err(Failure::Silent);
+                }
+                return Err(Failure::Operational(held));
             }
-            return Err(Failure::Operational(held));
-        }
-        Attempt::Acquired(guard) => guard,
+            Attempt::Acquired(guard) => guard,
+        };
+
+        // `Store::open` and not the read path: this is the write-mode open that
+        // brings a store older than this build forward through `bring_forward`'s
+        // missing-table arm, which is how a store that predates `observations`
+        // acquires it (D-01).
+        let store = Store::open(&data_dir)?;
+        observe::regenerate(
+            store.conn(),
+            &config,
+            &observe::Selector {
+                since: args.since.as_deref(),
+                prompt_version: args.prompt_version.as_deref(),
+            },
+        )?
     };
 
-    // `Store::open` and not the read path: this is the write-mode open that
-    // brings a store older than this build forward through `bring_forward`'s
-    // missing-table arm, which is how a store that predates `observations`
-    // acquires it (D-01).
-    let store = Store::open(&data_dir)?;
-    let done = observe::regenerate(
-        store.conn(),
-        &config,
-        &observe::Selector {
-            since: args.since.as_deref(),
-            prompt_version: args.prompt_version.as_deref(),
-        },
-    )?;
+    // Outside the lock, and a no-op without a provider - which is the default,
+    // and is what lets a user with no provider rebuild facts and keep whatever
+    // judgment the rows already carry.
+    observe::rejudge(&data_dir, &config, &mut done);
 
     if args.json {
         regenerated_document(&args, &done).emit();
@@ -204,6 +217,12 @@ fn regenerate(args: Regenerate) -> Result<(), Failure> {
         "regenerated {} of {} selected observation(s)",
         done.rewritten, done.selected
     );
+    if config.provider_enabled() {
+        eprintln!(
+            "re-judged {} of {} selected observation(s)",
+            done.judged, done.selected
+        );
+    }
     for note in &done.notes {
         eprintln!("{note}");
     }

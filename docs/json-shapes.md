@@ -296,13 +296,30 @@ and unchanged.
 - `selected` counts the rows the selector named **and** the exclusion gate
   allows; `regenerated` counts the ones actually rewritten, and `notes` names
   the difference, one line per row that could not be recomputed.
-- Only the `mechanical` column is written, and only on the selected rows.
-  `generated_at` dates the row as a whole - the judgment half included - so a
-  mechanical recompute leaves it alone, and every unselected row stays byte for
-  byte what it was.
+- The mechanical half writes the `mechanical` column and only that, on the
+  selected rows. `generated_at` dates the row as a whole - the judgment half
+  included - so a mechanical recompute leaves it alone, and every unselected row
+  stays byte for byte what it was.
+- With `[provider] enabled = true`, the same selected rows are then re-asked of
+  the model, which is what makes `--prompt-version` mean anything: the reason to
+  pay for a session twice is that the prompt changed. This is the **only** path
+  allowed to ask about a session that already carries a judgment status; every
+  other cost control still applies, so a session under the minimum turn count is
+  still not bought. With no provider, the stored judgment columns are left
+  exactly as they were and no request is made at all - a user without a model can
+  still rebuild facts.
+- `notes` carries the judgment half's report too: one `re-judged N of M selected
+  session(s)` line whenever a provider was asked, one line per session whose
+  answer could not be used, and - when the daily token budget runs out part way
+  through the set - one line naming how many selected sessions were left
+  unasked. A run that exhausts the budget stops asking, keeps every row it
+  already rebuilt, and still exits 0.
 - This command writes, so it opens the store for writing and takes the ingest
   lock. A run refused because another process holds that lock is `ok: false`
-  with the lock named in `reason`, exit 1 - the same answer `reindex` gives.
+  with the lock named in `reason`, exit 1 - the same answer `reindex` gives. The
+  lock covers the mechanical rewrite only: provider calls are made after it is
+  released, because an HTTP call held inside the ingest lock would make every
+  hook-spawned pass in that window archive nothing.
 
 ### `doctor`
 
