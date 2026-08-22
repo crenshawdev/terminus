@@ -420,6 +420,13 @@ pub struct Judged {
 /// observations concurrently is the price, and SQLite's busy timeout is what
 /// pays it: the writes are one UPDATE per session.
 ///
+/// **Two passes never buy the same session twice.** Running outside the lock
+/// means a second pass can be in this function while the first is inside its
+/// HTTP call, so the candidate list below is not a claim on anything:
+/// `judgment::reserve` writes the row before the request goes out and the pass
+/// that loses says [`cost::Skip::InFlight`] and asks nothing. The list only
+/// keeps this pass from spending its one slot on a session already in flight.
+///
 /// **At most [`cost::JUDGED_PER_PASS`] sessions.** See that constant: a pass is
 /// a detached background process and a provider may take the full network
 /// timeout to answer.
@@ -495,20 +502,41 @@ pub fn judge_new(data_dir: &Path, config: &Config) -> Judged {
 /// in this list would make every pass forever pick it, refuse it and write a
 /// note about it. The gate in `admits` is what enforces the rule; this is what
 /// keeps the rule from being noise.
+///
+/// **A row another pass is asking about right now is not a candidate.** Its
+/// status is a [`judgment::STATUS_JUDGING`] reservation, `judgment::reserve`
+/// would refuse it, and with `cost::JUDGED_PER_PASS` at one, leaving it in the
+/// list would spend this pass's single slot on a session that is already being
+/// judged. A reservation older than
+/// [`judgment::RESERVATION_LEASE_SECONDS`] IS a candidate: the run that took it
+/// is gone, and a token nothing will ever release must not make a session
+/// permanently unjudgeable.
 fn unjudged(conn: &Connection, config: &Config) -> Result<Vec<String>> {
+    let lapsed_before = judgment::lapsed_before(conn)?;
     let mut pending: std::collections::BTreeSet<String> = {
         let mut statement = conn.prepare(
-            "SELECT o.session_key
+            "SELECT o.session_key, o.status
                FROM observations o
                JOIN session_meta m ON m.session_key = o.session_key
-              WHERE o.status IS NULL
+              WHERE (o.status IS NULL OR o.status LIKE ?2)
                 AND m.is_final = 1
                 AND (SELECT COUNT(*) FROM turns t WHERE t.session_key = o.session_key) >= ?1",
         )?;
-        let rows = statement.query_map([cost::MIN_TURNS as i64], |r| r.get::<_, String>(0))?;
+        let rows = statement.query_map(
+            rusqlite::params![cost::MIN_TURNS as i64, judgment::RESERVED_LIKE],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )?;
         let mut out = std::collections::BTreeSet::new();
         for row in rows {
-            out.insert(row?);
+            // The lease is compared in one place rather than in the SQL of
+            // every query that wants it: the token's ordering is the token's
+            // business, and `lapsed_before` is where it is spelled.
+            let (session_key, status) = row?;
+            match status {
+                None => out.insert(session_key),
+                Some(status) if status < lapsed_before => out.insert(session_key),
+                Some(_) => false,
+            };
         }
         out
     };

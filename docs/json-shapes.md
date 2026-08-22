@@ -281,6 +281,17 @@ and unchanged.
   optional LLM half. They are **present and null** until a provider is
   configured and answers, so a consumer reads one shape either way.
   `observations.decisions` here is the column and not the `decisions` table.
+- `status` has three shapes and only two of them are answers. `"ok"` is a
+  validated judgment; `"parse_failed"` is the OBS-04 arm, with the raw response
+  in `raw` and the claim columns null; and `"judging <timestamp>"` is a
+  **reservation**, written before the request goes out so that two overlapping
+  runs cannot both pay for the same session - the second reads it, skips, and
+  asks nothing. A reservation is transient: the run that took it replaces it
+  with one of the two answers, or puts the column back to what it was if the
+  provider never answered. One left standing by a killed process is treated as
+  abandoned 15 minutes after its timestamp and the next ingest takes the
+  session, so a crash mid-request costs a delay and never a permanently
+  unjudgeable session.
 - A store written before this build carries no `observations` table. That is an
   empty answer with a reason naming the table and exit 0, never a SQLite
   message: the next `verbatim ingest` creates it.
@@ -315,7 +326,8 @@ and unchanged.
   pay for a session twice is that the prompt changed. This is the **only** path
   allowed to ask about a session that already carries a judgment status; every
   other cost control still applies, so a session under the minimum turn count is
-  still not bought. With no provider, the stored judgment columns are left
+  still not bought, and a session an ingest pass is asking about right now is
+  skipped with a note rather than asked a second time in parallel. With no provider, the stored judgment columns are left
   exactly as they were and no request is made at all - a user without a model can
   still rebuild facts.
 - `notes` carries the judgment half's report too: one `re-judged N of M selected

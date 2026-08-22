@@ -10,9 +10,11 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use verbatim_core::config::{Config, Secret, CONFIG_FILE_NAME};
+use verbatim_core::observe::cost::Skip;
 use verbatim_core::observe::judgment::{self, Verdict};
 use verbatim_core::observe::net;
 use verbatim_core::store::DB_FILE_NAME;
@@ -526,5 +528,161 @@ fn the_request_shows_the_model_each_turn_beside_its_real_turn_id() {
     assert!(
         system.contains("turn_id"),
         "the instructions never mention the anchor: {system}"
+    );
+}
+
+/// The race D-07 makes reachable: a provider call in flight does not stop a
+/// second `verbatim ingest`, so two runs really can be over the same unjudged
+/// session at once. Between them they cost ONE request, and the loser skips.
+///
+/// The whole assertion is on the attempt log while the first call is still in
+/// flight: reserving after the answer comes back would leave both requests
+/// made, and the request is the charge.
+#[test]
+fn two_runs_over_one_unjudged_session_make_one_request_between_them() {
+    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let bench = bench();
+    let (judged, _other) = bench.observed();
+    assert_eq!(bench.row(&judged).status, None, "the premise: unjudged");
+
+    // Held long enough that the second run happens provably inside the first
+    // run's request, then answered - a stalled thread that never returns would
+    // leak into the rest of the file.
+    let stub = HttpStub::stalling(Duration::from_secs(3));
+    let config = bench.config(&stub);
+
+    net::attempts::reset();
+    let db = bench.data_dir.join(DB_FILE_NAME);
+    let running = config.clone();
+    let asked = judged.clone();
+    let first = std::thread::spawn(move || {
+        let conn = Connection::open(&db).expect("a second handle on the same store");
+        judgment::judge(&conn, &running, None, &asked)
+    });
+
+    // The request has been read and the stub is sitting on it, so the first run
+    // is inside the HTTP call for the length of the hold.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while stub.arrived() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the first run never reached the provider"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let held = bench.row(&judged).status.expect("the row is reserved");
+    assert!(
+        judgment::is_reservation(&held),
+        "the row was not claimed before the request went out: {held:?}"
+    );
+
+    let second = judgment::judge(&bench.conn(), &config, None, &judged);
+    match &second {
+        Verdict::Skipped(Skip::InFlight { since }) => assert!(
+            held.contains(since.as_str()),
+            "the skip names {since}, the reservation says {held}"
+        ),
+        other => panic!("the second run did not skip a session in flight: {other:?}"),
+    }
+    assert_eq!(
+        net::attempts::count(),
+        1,
+        "one session was paid for twice: {:?}",
+        net::attempts::destinations()
+    );
+
+    // The stall answers 503, which is not an answer this build could not read -
+    // it is one that never arrived. The reservation is released rather than
+    // left standing, so the session is not unjudgeable until the lease lapses.
+    let first = first.join().expect("the first thread");
+    assert!(
+        matches!(first, Verdict::Failed { .. }),
+        "a 503 stored something: {first:?}"
+    );
+    assert_eq!(
+        bench.row(&judged).status,
+        None,
+        "a provider that was down left the session permanently unjudgeable"
+    );
+    assert_eq!(stub.requests().len(), 1);
+
+    // The falsifier: the same bench, the same session, a provider that answers.
+    // One request, and the row is judged - so the two zero-request assertions
+    // above are about the reservation and not about a bench that could never
+    // buy anything.
+    let ids = bench.turn_ids(&judged);
+    let stub = HttpStub::serving(&[testkit::chat_completion(&answer(&ids), 325, 69)]);
+    let config = bench.config(&stub);
+    net::attempts::reset();
+    assert_eq!(
+        judgment::judge(&bench.conn(), &config, None, &judged),
+        Verdict::Stored { tokens: 394 }
+    );
+    assert_eq!(net::attempts::count(), 1);
+    assert_eq!(
+        bench.row(&judged).status.as_deref(),
+        Some(judgment::STATUS_OK)
+    );
+}
+
+/// A reservation whose run died is not a life sentence: past the lease the next
+/// run takes the session, and inside it nobody does.
+#[test]
+fn an_abandoned_reservation_is_taken_only_once_the_lease_has_lapsed() {
+    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let bench = bench();
+    let (judged, _other) = bench.observed();
+    let ids = bench.turn_ids(&judged);
+
+    // What a killed process leaves behind: a token nothing will ever release.
+    // Written straight into the column, because the only way to produce one
+    // honestly is to kill a run mid-request.
+    let stamp = |seconds: i64| -> String {
+        bench
+            .conn()
+            .query_row(
+                "SELECT ?1 || ' ' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)",
+                rusqlite::params![judgment::STATUS_JUDGING, format!("{seconds} seconds")],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let abandon = |token: &str| {
+        bench
+            .conn()
+            .execute(
+                "UPDATE observations SET status = ?2 WHERE session_key = ?1",
+                rusqlite::params![judged, token],
+            )
+            .unwrap();
+    };
+
+    // Inside the lease: somebody may still be asking, so nothing is bought.
+    abandon(&stamp(-(judgment::RESERVATION_LEASE_SECONDS / 2)));
+    let stub = HttpStub::serving(&[testkit::chat_completion(&answer(&ids), 1, 1)]);
+    let config = bench.config(&stub);
+    net::attempts::reset();
+    let verdict = judgment::judge(&bench.conn(), &config, None, &judged);
+    assert!(
+        matches!(verdict, Verdict::Skipped(Skip::InFlight { .. })),
+        "a live reservation was taken: {verdict:?}"
+    );
+    assert_eq!(net::attempts::count(), 0);
+    assert!(
+        observe::judge_new(&bench.data_dir, &config).judged == 0,
+        "a pass spent its one slot on a session already in flight"
+    );
+    assert_eq!(net::attempts::count(), 0);
+
+    // Past it: the run that held it is gone, and the session is judged rather
+    // than left unjudgeable forever.
+    abandon(&stamp(-(judgment::RESERVATION_LEASE_SECONDS + 60)));
+    let judged_now = observe::judge_new(&bench.data_dir, &config);
+    assert_eq!(judged_now.judged, 1, "{judged_now:?}");
+    assert_eq!(net::attempts::count(), 1);
+    assert_eq!(
+        bench.row(&judged).status.as_deref(),
+        Some(judgment::STATUS_OK)
     );
 }

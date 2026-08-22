@@ -17,6 +17,15 @@
 //! pass. `verbatim observations regenerate` is the one caller that may, and it
 //! says so by passing `again`.
 //!
+//! That fourth gate is only half enforced here. [`admits`] reads the stored
+//! status, and a read cannot stop the second of two overlapping runs from
+//! reading the same `NULL` and paying for the same session:
+//! [`super::judgment::reserve`] is the atomic half, and this gate is about a
+//! stored ANSWER rather than about who is asking right now. A row carrying a
+//! reservation is therefore passed straight through to it - the refusal for
+//! that case is [`Skip::InFlight`], written by the one statement that can tell
+//! the winner from the loser.
+//!
 //! # The spend is in the store, because there is no process to hold it (D-12)
 //!
 //! Every generation is a separate short-lived process - there is no daemon, the
@@ -112,6 +121,13 @@ pub enum Skip {
     TooShort { turns: usize },
     /// The row already carries a judgment status, and this caller is a pass.
     AlreadyJudged { status: String },
+    /// Another run reserved this session first and its request is in flight.
+    ///
+    /// The losing half of a race two runs both entered, and a skip rather than
+    /// a failure for the same reason every other variant is one: nothing went
+    /// wrong, the session is being judged, and the only thing this run must not
+    /// do is pay for a second answer to the same question.
+    InFlight { since: String },
     /// Today's spend has reached the configured budget.
     BudgetSpent { spent: u64, budget: u64 },
 }
@@ -128,6 +144,10 @@ impl fmt::Display for Skip {
                 "not judged: this session already has a judgment ({status}); \
                  `verbatim observations regenerate` is what asks again"
             ),
+            Skip::InFlight { since } => write!(
+                f,
+                "not judged: another run holds this session (reserved {since}) and is asking now"
+            ),
             Skip::BudgetSpent { spent, budget } => write!(
                 f,
                 "not judged: {spent} of today's {budget}-token provider budget is spent"
@@ -143,6 +163,10 @@ impl fmt::Display for Skip {
 /// the one path allowed to buy a second answer for a session, and it still pays
 /// the minimum-turn and daily-budget gates like every other caller.
 ///
+/// Permission here is not the reservation. Every gate below is a READ, so two
+/// runs can pass all of them for the same session in the same instant;
+/// [`super::judgment::reserve`] is what one of them then loses.
+///
 /// The budget is read here, BEFORE the call, and moved by [`spend`] after it.
 /// Two invocations racing could each pass this gate and overshoot by one call;
 /// that is accepted, because the alternative is holding a transaction across an
@@ -157,7 +181,14 @@ pub fn admits(
 ) -> Result<Option<Skip>> {
     if !again {
         if let Some(status) = status(conn, session_key)? {
-            return Ok(Some(Skip::AlreadyJudged { status }));
+            // A reservation is not an answer: it says a run is asking right
+            // now, or died while asking. Which of those it is, and what may be
+            // done about it, is `judgment::reserve`'s to decide in one
+            // statement - refusing here would report a request in flight as a
+            // judgment that exists.
+            if !super::judgment::is_reservation(&status) {
+                return Ok(Some(Skip::AlreadyJudged { status }));
+            }
         }
     }
     if turns < MIN_TURNS {
@@ -173,7 +204,11 @@ pub fn admits(
 }
 
 /// The judgment status one row carries, if it carries one.
-fn status(conn: &Connection, session_key: &str) -> Result<Option<String>> {
+///
+/// Shared with [`super::judgment`], which reads the same column to decide
+/// whether the row is free to reserve: two spellings of "what does this row
+/// say" is how the two halves of one gate drift apart.
+pub(crate) fn status(conn: &Connection, session_key: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
             "SELECT status FROM observations WHERE session_key = ?1",
