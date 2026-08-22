@@ -40,6 +40,7 @@ use serde_json::{json, Value};
 use crate::config::{Config, Secret};
 use crate::error::Result;
 use crate::index::text;
+use crate::observe::cost::{self, Skip};
 use crate::observe::provider::{self, Message};
 
 /// Which prompt produced a row, stored in `observations.prompt_version`.
@@ -96,6 +97,12 @@ pub struct Judgment {
 pub enum Verdict {
     /// A validated judgment replaced the row's judgment columns.
     Stored { tokens: u64 },
+    /// No request was made, because a cost control said not to (OBS-06).
+    ///
+    /// Distinct from [`Verdict::Failed`] because nothing went wrong: a session
+    /// under the minimum turn count, one already judged, or a day whose budget
+    /// is spent are all the controls working.
+    Skipped(Skip),
     /// Nothing was stored. `reason` has already been through
     /// [`crate::observe::egress::scrub`] on its way out of the provider, so it
     /// is safe for `runs.error` and for stderr (D-16).
@@ -118,7 +125,34 @@ pub fn judge(
     credential: Option<&Secret>,
     session_key: &str,
 ) -> Verdict {
-    match attempt(conn, config, credential, session_key) {
+    run(conn, config, credential, session_key, false)
+}
+
+/// Ask again for a session that already carries a judgment status.
+///
+/// The one waiver of [`cost`]'s fourth gate, and it exists for exactly one
+/// caller: `verbatim observations regenerate`, whose whole point is that the
+/// prompt changed. Every other control still applies - a session under
+/// [`cost::MIN_TURNS`] is still not bought, and a spent daily budget still
+/// stops the run.
+pub fn judge_again(
+    conn: &Connection,
+    config: &Config,
+    credential: Option<&Secret>,
+    session_key: &str,
+) -> Verdict {
+    run(conn, config, credential, session_key, true)
+}
+
+/// Both entry points, with the store's own failures folded into a verdict.
+fn run(
+    conn: &Connection,
+    config: &Config,
+    credential: Option<&Secret>,
+    session_key: &str,
+    again: bool,
+) -> Verdict {
+    match attempt(conn, config, credential, session_key, again) {
         Ok(verdict) => verdict,
         Err(reason) => Verdict::Failed { reason },
     }
@@ -130,12 +164,16 @@ fn attempt(
     config: &Config,
     credential: Option<&Secret>,
     session_key: &str,
+    again: bool,
 ) -> std::result::Result<Verdict, String> {
     let anchors = anchors(conn, session_key).map_err(|e| note(credential, e))?;
-    if anchors.is_empty() {
-        return Ok(Verdict::Failed {
-            reason: "the session has no indexed turns to anchor a claim to".to_owned(),
-        });
+    // Every gate, before a URL is built or a credential is read: OBS-06's
+    // controls are only worth anything if nothing was already sent by the time
+    // they are consulted, and `net`'s attempt log is what a test reads that off.
+    if let Some(skip) = cost::admits(conn, config, session_key, anchors.len(), again)
+        .map_err(|e| note(credential, e))?
+    {
+        return Ok(Verdict::Skipped(skip));
     }
     let shown = transcript(conn, session_key).map_err(|e| note(credential, e))?;
 
@@ -151,6 +189,10 @@ fn attempt(
         }
     };
     let tokens = completion.usage.map(|u| u.total_tokens).unwrap_or(0);
+    // Charged for whatever the answer turns out to be: the provider billed this
+    // request the moment it answered, so the budget moves before the content is
+    // even looked at (D-12).
+    cost::spend(conn, tokens).map_err(|e| note(credential, e))?;
 
     match read(&completion.content, &anchors) {
         Ok(judgment) => {
@@ -235,7 +277,9 @@ fn transcript(conn: &Connection, session_key: &str) -> Result<String> {
         }
         lines.push(format!("turn_id={turn_id} {record_type}: {said}"));
     }
-    Ok(lines.join("\n"))
+    // Cut to the budget with markers naming what went (OBS-06): a session shown
+    // short and silently would be summarized as if it were whole.
+    Ok(cost::truncate(&lines))
 }
 
 /// Runs of whitespace as single spaces, so one turn is one line.

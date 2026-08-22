@@ -29,11 +29,17 @@
 //! it makes it (PRIV-03, D-21). The mechanical half above reaches it never;
 //! that is an assertion a test reads off the attempt log rather than a promise.
 //!
+//! **Nothing is asked for twice, and nothing is asked for free.** [`cost`] holds
+//! OBS-06's four gates - the minimum turn count, the truncation budget, the
+//! daily token budget and "one call per session" - and it is the only place a
+//! judgment run learns it may not make a request.
+//!
 //! **One redaction boundary, and it only exists when data leaves.** [`egress`]
 //! filters a request body on the DECLARED destination (D-13) and scrubs every
 //! string on its way to becoming an error whatever the destination is (D-16).
 //! Nothing here redacts at ingest: `.planning/PROJECT.md` bars that outright.
 
+pub mod cost;
 pub mod egress;
 pub mod judgment;
 pub mod mechanical;
