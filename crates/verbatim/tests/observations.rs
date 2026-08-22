@@ -14,10 +14,25 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde_json::Value;
+use verbatim_core::config::{Config, CONFIG_FILE_NAME};
+use verbatim_core::ingest::lock::{self, Attempt};
+use verbatim_core::ingest::pass::{self, PassOutcome};
+use verbatim_core::observe::net;
 use verbatim_core::store::DB_FILE_NAME;
+use verbatim_core::testkit::{self, HttpStub};
+
+/// Held by every test that runs a pass IN PROCESS: `observe::net`'s attempt log
+/// is process global, so a test counting zero connections and a test making one
+/// cannot run at the same time.
+static NET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How long a test waits for a detached spawn or a stalled call, before it
+/// calls the thing it is waiting for broken.
+const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The session the transcript below belongs to, and the branch it ran on.
 const SESSION: &str = "11111111-1111-4111-8111-111111111111";
@@ -165,6 +180,58 @@ impl Bench {
             .join("project-alpha/crates/gizmo/lantern.rs")
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// Write a `verbatim.toml` naming the transcript root, plus whatever
+    /// provider block the caller wants.
+    ///
+    /// The root has to be spelled in the file rather than left to
+    /// `CLAUDE_CONFIG_DIR`, because the in-process tests below load this config
+    /// in a process that never set that variable.
+    fn write_config(&self, provider: &str) {
+        let root = self.claude_dir.to_string_lossy().replace('\\', "\\\\");
+        std::fs::write(
+            self.config_dir.join(CONFIG_FILE_NAME),
+            format!("roots = [\"{root}\"]\n{provider}"),
+        )
+        .unwrap();
+    }
+
+    fn config(&self) -> Config {
+        Config::load_from(&self.config_dir).unwrap()
+    }
+
+    /// How many passes this store has recorded.
+    fn runs(&self) -> i64 {
+        self.conn()
+            .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Block until a pass beyond `before` has recorded itself.
+    ///
+    /// The hook's ingest is detached by design, so there is nothing to wait on
+    /// but the row it writes - and it writes one whatever it found.
+    fn wait_for_a_pass_after(&self, before: i64) {
+        let deadline = Instant::now() + DEADLINE;
+        while self.runs() <= before {
+            assert!(
+                Instant::now() < deadline,
+                "the hook's detached ingest never recorded a pass"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// One session's judgment status, null until a provider has answered.
+    fn status(&self, session: &str) -> Option<String> {
+        self.conn()
+            .query_row(
+                "SELECT o.status FROM observations o WHERE o.session_id = ?1",
+                [session],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("no observation for {session}: {e}"))
     }
 
     /// One session carrying every OBS-01 fact: an edit, two tools, a command
@@ -584,4 +651,150 @@ fn a_malformed_since_is_misuse_and_rebuilds_nothing() {
         SPOILED,
         "a refused bound still wrote"
     );
+}
+
+/// A `[provider]` block pointing at `stub`, on or off.
+///
+/// `local = true` throughout: the egress filter has its own tests, and what is
+/// being measured here is whether anything is reached for at all.
+fn provider(stub: &HttpStub, enabled: bool) -> String {
+    format!(
+        "[provider]\nenabled = {enabled}\nbase_url = \"{}\"\n\
+         model = \"qwen3:8b\"\nlocal = true\n",
+        stub.base_url()
+    )
+}
+
+/// AC6's ingest half: with judgment off - the default - a full tree pass and a
+/// hook run reach for nothing at all.
+///
+/// Two instruments, because one process cannot see the other's log (D-21). In
+/// process, `observe::net`'s attempt log is the count. Across the process
+/// boundary, a real endpoint is: it is named in the config, it is listening,
+/// and nothing ever knocks on it.
+#[test]
+fn with_judgment_off_a_pass_and_a_hook_run_reach_for_nothing() {
+    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let bench = bench();
+    bench.place(SESSION, FIRST_TURN_SECONDS_AGO);
+
+    let stub = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
+    bench.write_config(&provider(&stub, false));
+
+    net::attempts::reset();
+    let outcome = pass::run_with(&bench.data_dir, &bench.config()).unwrap();
+    assert!(matches!(outcome, PassOutcome::Ran(_)), "{outcome:?}");
+    assert_eq!(
+        net::attempts::count(),
+        0,
+        "a pass with judgment off opened a connection: {:?}",
+        net::attempts::destinations()
+    );
+
+    // The spawned tree pass, and then the hook that spawns one of its own.
+    let out = bench.run(&["ingest"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let before = bench.runs();
+    let hook = bench.run(&["hook", "SessionStart"]);
+    assert_eq!(hook.status.code(), Some(0), "{}", stderr(&hook));
+    bench.wait_for_a_pass_after(before);
+
+    assert_eq!(
+        stub.requests(),
+        Vec::<String>::new(),
+        "something knocked on the configured endpoint with judgment off"
+    );
+}
+
+/// D-07: the provider call is outside the ingest lock, and that is asserted by
+/// taking the lock while a call is provably in flight.
+#[test]
+fn a_provider_call_in_flight_does_not_hold_the_ingest_lock() {
+    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let bench = bench();
+    bench.place(SESSION, FIRST_TURN_SECONDS_AGO);
+    // Archive and close the session first, so the pass under test has exactly
+    // one thing left to do and gets to the provider immediately.
+    bench.ingest();
+
+    let stub = HttpStub::stalling(Duration::from_secs(5));
+    bench.write_config(&provider(&stub, true));
+    let config = bench.config();
+
+    // The falsifier, before anything else: this lock really does refuse a
+    // second holder inside one process, so `Acquired` below means the pass had
+    // let go rather than that the instrument cannot see itself.
+    {
+        let held = lock::try_acquire(&bench.data_dir).unwrap();
+        assert!(matches!(held, Attempt::Acquired(_)), "{held:?}");
+        assert_eq!(
+            pass::run_with(&bench.data_dir, &config).unwrap(),
+            PassOutcome::LockHeld
+        );
+    }
+
+    let data_dir = bench.data_dir.clone();
+    let running = config.clone();
+    let passing = std::thread::spawn(move || pass::run_with(&data_dir, &running).unwrap());
+
+    // The request has been read and the stub is sitting on it, so the pass is
+    // inside the HTTP call for the length of the hold.
+    let deadline = Instant::now() + DEADLINE;
+    while stub.arrived() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the pass never reached the provider"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    match lock::try_acquire(&bench.data_dir).unwrap() {
+        Attempt::Acquired(_) => {}
+        Attempt::Held => panic!("a provider call is holding the ingest lock (D-07)"),
+    }
+
+    let outcome = passing.join().expect("the pass thread");
+    assert!(matches!(outcome, PassOutcome::Ran(_)), "{outcome:?}");
+}
+
+/// OBS-04's promise at the process boundary: judgment never blocks ingest. The
+/// pass completes, records itself, exits 0, and says on stderr what happened.
+#[test]
+fn a_pass_whose_answer_cannot_be_used_still_records_itself_and_exits_zero() {
+    let bench = bench();
+    bench.place(SESSION, FIRST_TURN_SECONDS_AGO);
+    bench.ingest();
+    let before = bench.runs();
+    assert_eq!(
+        bench.status(SESSION),
+        None,
+        "the premise: nothing judged yet"
+    );
+
+    // Two, because an unusable answer is asked for again exactly once.
+    let stub = HttpStub::serving(&[
+        testkit::chat_completion(testkit::UNPARSEABLE_CONTENT, 10, 5),
+        testkit::chat_completion(testkit::UNPARSEABLE_CONTENT, 10, 5),
+    ]);
+    bench.write_config(&provider(&stub, true));
+
+    let out = bench.run(&["ingest"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(bench.runs(), before + 1, "the pass recorded no run");
+    assert_eq!(stub.requests().len(), 2);
+    assert_eq!(
+        bench.status(SESSION).as_deref(),
+        Some("parse_failed"),
+        "the failure was dropped instead of stored"
+    );
+
+    // Said rather than swallowed. This step runs after the `runs` row commits,
+    // so stderr is the only channel it has.
+    let said = stderr(&out);
+    assert!(
+        said.contains("could not be used"),
+        "the pass was silent about a provider answer it threw away: {said:?}"
+    );
+    assert_eq!(stdout(&out), "", "a tree pass printed to stdout");
 }

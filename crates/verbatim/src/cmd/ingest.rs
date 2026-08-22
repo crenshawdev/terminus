@@ -55,6 +55,15 @@ fn tree(data_dir: &std::path::Path) -> Result<(), Failure> {
     if !summary.failures.is_empty() {
         eprintln!("{} file(s) skipped", summary.failures.len());
     }
+
+    // The judgment step's notes, on stderr and not in `runs.error`: it runs
+    // after the lock drops and after that row commits (D-07), so this is the
+    // only channel it has - there is no log file, by design. Already scrubbed
+    // where they were built (D-16); a provider message or a credentials failure
+    // must never reach a stream carrying a key.
+    for note in &summary.judgment.notes {
+        eprintln!("{note}");
+    }
     Ok(())
 }
 

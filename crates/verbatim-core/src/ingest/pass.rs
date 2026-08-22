@@ -60,6 +60,12 @@ pub struct Summary {
     pub outcomes: crate::feedback::Labeled,
     /// What the sessions this pass closed had to say for themselves (OBS-01).
     pub observations: crate::observe::Observed,
+    /// What the provider was asked, after the lock dropped (OBS-02, D-07).
+    ///
+    /// Empty and free while judgment is off, which is the default. Its notes do
+    /// NOT reach `runs.error`: this step runs after that row is written, so the
+    /// caller prints them on stderr instead.
+    pub judgment: crate::observe::Judged,
     pub duration: Duration,
 }
 
@@ -97,7 +103,30 @@ pub fn run(data_dir: &Path) -> Result<PassOutcome> {
 /// The pass, against a config the caller already has.
 ///
 /// The seam tests use, so a test never has to resolve a real transcript root.
+///
+/// Two halves, and the boundary between them is D-07. [`locked`] is everything
+/// that touches the archive, under the ingest lock, ending with the `runs` row.
+/// The judgment call comes after it returns - which is after the guard and the
+/// store have been dropped - because a slow or hanging provider held inside the
+/// lock would make every hook-spawned pass in that window exit [`LockHeld`] and
+/// archive nothing.
+///
+/// [`LockHeld`]: PassOutcome::LockHeld
 pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
+    let mut summary = match locked(data_dir, config)? {
+        PassOutcome::LockHeld => return Ok(PassOutcome::LockHeld),
+        PassOutcome::Ran(summary) => summary,
+    };
+
+    // Outside the lock, outside the store handle, and after the row that says
+    // the pass happened. Nothing below can fail the pass: the archive is
+    // already committed and this step only ever returns notes (OBS-04).
+    summary.judgment = crate::observe::judge_new(data_dir, config);
+    Ok(PassOutcome::Ran(summary))
+}
+
+/// Everything the ingest lock covers, from taking it to the `runs` row.
+fn locked(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
     let started = Instant::now();
 
     // Once, for the whole walk. A per-file lock would be two thousand syscalls

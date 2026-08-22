@@ -527,7 +527,7 @@ pub fn copy_fixture_into(name: &str, dir: &Path) -> PathBuf {
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Content that is prose where strict JSON was asked for.
@@ -579,6 +579,7 @@ pub struct HttpStub {
     base: String,
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
+    arrived: Arc<AtomicUsize>,
     served: Option<std::thread::JoinHandle<Vec<String>>>,
 }
 
@@ -588,13 +589,32 @@ impl HttpStub {
     /// A connection arriving after the list is exhausted gets a 500, so an
     /// extra request is a visible failure rather than a hang.
     pub fn serving(responses: &[String]) -> HttpStub {
+        HttpStub::new(responses, std::time::Duration::ZERO)
+    }
+
+    /// Accept one request, hold it for `hold`, and only then answer.
+    ///
+    /// The arm D-07 is asserted with: a provider that is slow rather than
+    /// broken. A test watches [`HttpStub::arrived`] until the request lands,
+    /// which is a window in which the caller is provably inside the HTTP call,
+    /// and then checks that the ingest lock is free anyway.
+    ///
+    /// It answers eventually rather than never, so the pass under test finishes
+    /// and its thread can be joined instead of leaking into the next test.
+    pub fn stalling(hold: std::time::Duration) -> HttpStub {
+        HttpStub::new(&[http_response(503, "Service Unavailable", "{}")], hold)
+    }
+
+    fn new(responses: &[String], hold: std::time::Duration) -> HttpStub {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let addr = listener.local_addr().expect("the bound address");
         let stop = Arc::new(AtomicBool::new(false));
+        let arrived = Arc::new(AtomicUsize::new(0));
 
         let responses: Vec<String> = responses.to_vec();
         let wanted = responses.len();
         let flag = Arc::clone(&stop);
+        let counter = Arc::clone(&arrived);
         let served = std::thread::spawn(move || {
             let mut requests = Vec::new();
             while requests.len() < wanted {
@@ -607,6 +627,13 @@ impl HttpStub {
                     break;
                 }
                 requests.push(read_http_request(&mut stream));
+                // Counted after the request is fully read and BEFORE the hold,
+                // so a test waiting on this knows the caller is inside the
+                // exchange rather than still opening a socket.
+                counter.fetch_add(1, Ordering::SeqCst);
+                if !hold.is_zero() {
+                    std::thread::sleep(hold);
+                }
                 let response = responses
                     .get(requests.len() - 1)
                     .cloned()
@@ -622,6 +649,7 @@ impl HttpStub {
             base: format!("http://{addr}/v1/"),
             addr,
             stop,
+            arrived,
             served: Some(served),
         }
     }
@@ -629,6 +657,15 @@ impl HttpStub {
     /// The base URL to put in `[provider] base_url`, trailing slash included.
     pub fn base_url(&self) -> &str {
         &self.base
+    }
+
+    /// How many requests have been fully read so far.
+    ///
+    /// Readable while the stub is still serving, unlike [`HttpStub::requests`]
+    /// which consumes it: a test asserting something about a call IN FLIGHT has
+    /// no other way to know the call is in flight.
+    pub fn arrived(&self) -> usize {
+        self.arrived.load(Ordering::SeqCst)
     }
 
     /// Stop serving and hand back every request that arrived, in order.

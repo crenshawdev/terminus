@@ -20,6 +20,13 @@
 //! on the same pass. It INSERTS and never overwrites: a pass that recomputed
 //! would silently discard a judgment half somebody paid for.
 //!
+//! **The judgment half runs LATER, and outside the lock (D-07).**
+//! [`judge_new`] is the pass's last step, past the point where the `runs` row
+//! has committed and the ingest guard has dropped. It is never a fourth step
+//! beside the drain, the walk and `outcomes`: an HTTP call held inside the lock
+//! would make every hook-spawned pass in that window exit `LockHeld` and
+//! archive nothing, and the archive is the work.
+//!
 //! **Nothing here fails a pass.** The archive is the work. An observation that
 //! could not be computed is a note folded into `runs.error` - there is no log
 //! file, by design - exactly as the drain's and the labeller's failures are.
@@ -47,11 +54,13 @@ pub mod net;
 pub mod provider;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use rusqlite::Connection;
 
 use crate::config::{visible, Config};
 use crate::error::Result;
+use crate::observe::judgment::Verdict;
 
 pub use mechanical::{observe, Mechanical};
 
@@ -281,6 +290,138 @@ pub fn regenerate(
             Err(e) => out
                 .notes
                 .push(format!("{session_key}: not regenerated: {e}")),
+        }
+    }
+    Ok(out)
+}
+
+/// What one pass's judgment step did (OBS-02, D-07).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Judged {
+    /// Sessions whose judgment columns this pass filled.
+    pub judged: usize,
+    /// Whatever could not be done, said rather than raised - and already
+    /// scrubbed (D-16). These reach stderr and not `runs.error`: this step runs
+    /// AFTER the `runs` row commits, so stderr is the channel it has.
+    pub notes: Vec<String>,
+}
+
+/// Ask the configured provider to judge the sessions this pass just closed.
+///
+/// **Nothing happens while judgment is off, and that is the default (OBS-02).**
+/// With `[provider] enabled` unset or false this returns before it resolves a
+/// credential, before it opens the store and before it builds a request, so the
+/// attempt log stays empty and a test reads that as a number (PRIV-03, D-21).
+///
+/// **Its own store handle, because the pass's is gone.** The caller has dropped
+/// the ingest guard and the [`crate::store::Store`] by the time this runs, and
+/// that ordering is the whole point of D-07. Two invocations writing
+/// observations concurrently is the price, and SQLite's busy timeout is what
+/// pays it: the writes are one UPDATE per session.
+///
+/// **At most [`cost::JUDGED_PER_PASS`] sessions.** See that constant: a pass is
+/// a detached background process and a provider may take the full network
+/// timeout to answer.
+pub fn judge_new(data_dir: &Path, config: &Config) -> Judged {
+    let mut out = Judged::default();
+    if !config.provider_enabled() {
+        return out;
+    }
+
+    // PRIV-02's refusal, and it is deliberately not a provider failure: a
+    // credentials file the user must fix reads nothing like an endpoint that
+    // would not answer. Scrubbed on the way out like everything else (D-16).
+    let credential = match crate::credentials::resolve(config) {
+        Ok(credential) => credential,
+        Err(e) => {
+            out.notes
+                .push(egress::scrub(None, &format!("no session was judged: {e}")));
+            return out;
+        }
+    };
+
+    let store = match crate::store::Store::open(data_dir) {
+        Ok(store) => store,
+        Err(e) => {
+            out.notes.push(egress::scrub(
+                credential.as_ref(),
+                &format!("no session was judged: {e}"),
+            ));
+            return out;
+        }
+    };
+    let conn = store.conn();
+
+    let candidates = match unjudged(conn, config) {
+        Ok(candidates) => candidates,
+        Err(e) => {
+            out.notes.push(egress::scrub(
+                credential.as_ref(),
+                &format!("the sessions to judge could not be listed: {e}"),
+            ));
+            return out;
+        }
+    };
+
+    for session_key in candidates.into_iter().take(cost::JUDGED_PER_PASS) {
+        let verdict = judgment::judge(conn, config, credential.as_ref(), &session_key);
+        // Nothing here is an `Err` and nothing here fails the pass (OBS-04).
+        // The pass has already committed its `runs` row; the archive is done.
+        let note = match verdict {
+            Verdict::Stored { .. } => {
+                out.judged += 1;
+                continue;
+            }
+            Verdict::Skipped(skip) => skip.to_string(),
+            Verdict::ParseFailed { reason, .. } => {
+                format!("the answer could not be used and was stored raw: {reason}")
+            }
+            Verdict::Failed { reason } => reason,
+        };
+        out.notes.push(egress::scrub(
+            credential.as_ref(),
+            &format!("{session_key}: {note}"),
+        ));
+    }
+    out
+}
+
+/// Visible finalized sessions with an observation row, no judgment status yet,
+/// and enough turns to be worth paying for - in ingest order.
+///
+/// The turn-count test is here as well as in [`cost::admits`] on purpose. A
+/// session under the minimum is never judged and never will be, so leaving it
+/// in this list would make every pass forever pick it, refuse it and write a
+/// note about it. The gate in `admits` is what enforces the rule; this is what
+/// keeps the rule from being noise.
+fn unjudged(conn: &Connection, config: &Config) -> Result<Vec<String>> {
+    let mut pending: std::collections::BTreeSet<String> = {
+        let mut statement = conn.prepare(
+            "SELECT o.session_key
+               FROM observations o
+               JOIN session_meta m ON m.session_key = o.session_key
+              WHERE o.status IS NULL
+                AND m.is_final = 1
+                AND (SELECT COUNT(*) FROM turns t WHERE t.session_key = o.session_key) >= ?1",
+        )?;
+        let rows = statement.query_map([cost::MIN_TURNS as i64], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::BTreeSet::new();
+        for row in rows {
+            out.insert(row?);
+        }
+        out
+    };
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Through `visible::sessions` for the reason `observe_new` gives: exclusion
+    // is retroactive (ING-08), and this step reads a blob and sends its text to
+    // a provider - which is the read that matters most.
+    let mut out = Vec::new();
+    for session in visible::sessions(conn, config)? {
+        if pending.remove(&session.session_key) {
+            out.push(session.session_key);
         }
     }
     Ok(out)

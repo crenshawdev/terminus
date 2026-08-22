@@ -71,6 +71,21 @@ pub const MIN_TURNS: usize = 6;
 /// local models D-05's one code path is meant to serve.
 pub const TRUNCATION_BUDGET: usize = 60_000;
 
+/// How many sessions one ingest pass may buy a judgment for.
+///
+/// One. A pass is a DETACHED background process, a provider may take the whole
+/// of `net`'s network timeout to answer, and a pass that judged a hundred
+/// sessions would sit on the machine for hours - which is the long-lived
+/// process `.planning/PROJECT.md` rules out as a design invariant, arrived at
+/// sideways.
+///
+/// The backlog is not lost: the hook spawn is the scheduler, so "the next pass"
+/// is the next prompt, and `verbatim observations regenerate` is the explicit
+/// bulk path for a history somebody wants judged now. One call per pass is also
+/// what keeps a first run against a remote provider from being a surprise bill
+/// before [`crate::config::Config::provider_daily_token_budget`] is ever set.
+pub const JUDGED_PER_PASS: usize = 1;
+
 /// The most of the budget any one turn may take.
 ///
 /// A single tool result can be megabytes, and without this the whole budget is
