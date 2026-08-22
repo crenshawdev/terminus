@@ -1,0 +1,49 @@
+{
+  "phase": "7",
+  "trigger": "risk_surface",
+  "discriminator": "plan-3",
+  "round": 2,
+  "base": "5ae63b4",
+  "head": "89098d5",
+  "base_id": "5ae63b4130bad6f1497759153f606710c4f6d345",
+  "head_id": "89098d5fa4cc52200d87f005edc4f62198d43e96",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/observe/judgment.rs",
+      "line": 123,
+      "severity": "high",
+      "claim": "The lease is only a fixed timestamp comparison, and nothing refreshes it while the HTTP request is in flight. If a legitimate provider call or a suspended process runs longer than 900 seconds, a second ingest can retake the row while the first is still working, so two runs can still pay for the same session.",
+      "failure_scenario": "A provider stalls or the machine is paused for >15 minutes after reservation but before the first run finishes. A later ingest sees the token as abandoned, steals it, and sends a second request. The original run then returns with a stale reservation and cannot store, but the duplicate request has already been paid for.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": "The blocker this round exists to confirm IS closed, and the finding does not dispute the part that mattered. The overwrite - the loss the reservation was added to stop - is provably gone: judgment.rs:388 lapsed() drops a late answer rather than writing it (\"the answer is dropped rather than written over the run that owns the row now: an overwrite here is the exact loss the reservation exists to stop, and it would be the paid one\"), and every write is conditioned on the token plus the session key. What the reviewer describes as remaining is one duplicate PAID REQUEST in a window that judgment.rs:124-138 already names and prices: net exchange timeout 120s times RETRIES=1 bounds a live run at 240s against a 900s lease, so the window opens only when the machine is suspended mid-call - not under any provider latency. That is the defining property of a lease rather than a defect in this one, and the alternative direction is the stranded-forever row the fix was explicitly required to avoid. Downgraded to low: bounded, documented at the constant with its reasoning, and reachable only by suspending the host mid-request.",
+      "base_id": "5ae63b4130bad6f1497759153f606710c4f6d345",
+      "head_id": "89098d5fa4cc52200d87f005edc4f62198d43e96"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/observe/cost.rs",
+      "line": 181,
+      "severity": "low",
+      "claim": "Live reservations are not short-circuited here; the code skips only the AlreadyJudged path and still runs the minimum-turn and budget gates first. That means a concurrent caller on an in-flight session can be reported as TooShort or BudgetSpent instead of the new InFlight skip.",
+      "failure_scenario": "One run has already reserved a row, but the row also has too few turns or the daily budget is exhausted. A second overlapping call passes the reservation check, hits the earlier gate, and returns a non-InFlight skip even though the session is actively being judged.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": "Already low, and half of it is unreachable as written. A TooShort row can never be holding a reservation: cost::admits runs the minimum-turn gate BEFORE permission is granted and reserve() is only reached after admits returns None, so no under-MIN_TURNS session is ever reserved and the TooShort arm of the scenario cannot occur. The BudgetSpent arm is real but is a reporting nicety only - it changes which Skip string a concurrent caller puts in its notes, not whether a request is made, not what is stored, and not what is charged. No behavior changes on either arm. Recorded as an open item rather than fixed.",
+      "base_id": "5ae63b4130bad6f1497759153f606710c4f6d345",
+      "head_id": "89098d5fa4cc52200d87f005edc4f62198d43e96"
+    }
+  ]
+}

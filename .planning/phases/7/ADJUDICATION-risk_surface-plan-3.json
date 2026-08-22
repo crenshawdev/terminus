@@ -1,0 +1,49 @@
+{
+  "phase": "7",
+  "trigger": "risk_surface",
+  "discriminator": "plan-3",
+  "round": 1,
+  "base": "37b5834",
+  "head": "5ae63b4",
+  "base_id": "37b58348cdb6761d8d285a68bbc20f00cc5ae842",
+  "head_id": "5ae63b4130bad6f1497759153f606710c4f6d345",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/observe/mod.rs",
+      "line": 317,
+      "severity": "high",
+      "claim": "`judge_new` selects unjudged sessions and then calls the provider without first reserving the row or writing any in-progress marker. Two concurrent ingest/regenerate passes can therefore select the same freshly-finalized session, both send the same prompt, and both write back to the same `observations` row, with the later response overwriting the earlier one and the run being charged twice.",
+      "failure_scenario": "Start two hook-spawned passes against a store that has one newly-finalized session and provider judgment enabled. Both pass the `unjudged(...)` query before either has updated `observations.status`, so both invoke `provider::complete`, both increment spend, and whichever update lands last wins the stored judgment. The archive now contains one row that was produced by two paid requests, and the earlier answer is lost.",
+      "ruling": "survived",
+      "convergent": false,
+      "fix_commit": "89098d5",
+      "base_id": "37b58348cdb6761d8d285a68bbc20f00cc5ae842",
+      "head_id": "5ae63b4130bad6f1497759153f606710c4f6d345"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/observe/cost.rs",
+      "line": 151,
+      "severity": "high",
+      "claim": "The daily-budget gate is a non-atomic read-then-check against the `meta` row, so concurrent judgment calls can all observe the same pre-spend balance and all proceed. The budget can be overshot and the accumulator can lose one of the increments because `spend()` rewrites the whole row with a stale total rather than doing an atomic compare-and-add.",
+      "failure_scenario": "With a daily budget of 100 and an already-spent total of 80, launch two passes at the same time, each about to buy a 30-token judgment. Both calls read `spent_today == 80` before either writes, both pass `admits`, both hit the provider, and both call `spend()`. One or both writes will store 110 instead of enforcing the cap, so the configured budget is exceeded and the persisted spend no longer reflects the true total.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": "Split claim, and the load-bearing half is refuted. The OVERSHOOT half is not a defect: crates/verbatim-core/src/observe/cost.rs:145-150 documents it in the code being reviewed - \"Two invocations racing could each pass this gate and overshoot by one call; that is accepted, because the alternative is holding a transaction across an HTTP request and D-07 puts this whole step outside the ingest lock precisely so a provider cannot hold anything.\" A stated and reasoned trade-off is an approach difference, not a finding. What survives is the narrower and undocumented half the reviewer names second: cost.rs:217 spend() is spent_today() + saturating_add + INSERT ... ON CONFLICT DO UPDATE SET value = excluded.value, a read-then-write, so two concurrent increments store one and the accumulator permanently under-reports the day. That is not the bounded one-call overshoot the comment accepts. Downgraded to medium: it costs accounting accuracy on a budget counter, not a corrupted archive and not an unbounded spend, and it is recorded as a phase open item.",
+      "base_id": "37b58348cdb6761d8d285a68bbc20f00cc5ae842",
+      "head_id": "5ae63b4130bad6f1497759153f606710c4f6d345"
+    }
+  ]
+}
