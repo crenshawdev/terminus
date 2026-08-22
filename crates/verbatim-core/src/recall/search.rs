@@ -26,6 +26,15 @@ use crate::recall::Query;
 /// I/O stays out of scope (D-20).
 pub const MAX_RESULTS: usize = 50;
 
+/// The one [`Filters::kind`] value that is not a `turns.record_type` (OBS-08).
+///
+/// `turns_fts` is contentless with `rowid IS turns.id`, so an observation has
+/// no natural row in it and no clause added to the ranking query could ever
+/// return one. The filter therefore switches [`run`] to a second query over the
+/// `observations` table instead - which is the whole of what D-17 buys over a
+/// fourth MCP tool, and `DESIGN-BRIEF.md:184` bars a fourth outright.
+pub const OBSERVATION_KIND: &str = "observation";
+
 /// What a caller gets when it does not say.
 ///
 /// Injection is precision-first and a terminal page is short; a caller that
@@ -44,6 +53,9 @@ pub struct Filters {
     /// tool filter and not a first guess at one.
     pub tool: Option<String>,
     /// `turns.record_type`: `user`, `assistant`, `system`, `attachment`.
+    ///
+    /// Or [`OBSERVATION_KIND`], which is not a record type at all: it switches
+    /// [`run`] to a second query over the `observations` table (OBS-08, D-17).
     pub kind: Option<String>,
     /// Turns carrying any of these in the `paths` table. Structural, not
     /// textual: a turn that merely names a path in prose has no `paths` row and
@@ -335,6 +347,13 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
         });
     }
 
+    // OBS-08's branch, and it has to be a branch rather than a clause - see
+    // [`OBSERVATION_KIND`]. Taken after the scope resolves, so an excluded or
+    // unknown project answers with the same reason it would for a turn search.
+    if request.filters.kind.as_deref() == Some(OBSERVATION_KIND) {
+        return observations(conn, request, &scoped);
+    }
+
     let Some(expression) = expression(request) else {
         return Ok(Response::default());
     };
@@ -435,6 +454,164 @@ fn expression(request: &Request) -> Option<String> {
         .collect();
     (!parts.is_empty()).then(|| parts.join(" OR "))
 }
+
+/// One hit per CLAIM of every stored observation whose text matches (OBS-08).
+///
+/// **Claims and not rows.** The three claim columns are walked with `json_each`
+/// the way `feedback::label` walks a decision's injected list, so a hit carries
+/// the anchoring `turn_id` of the one claim it is about. An observation-shaped
+/// hit whose `turn_id` was the whole row's would be unanchorable, which is the
+/// only thing that makes any of this auditable.
+///
+/// **Scoped and excluded like every other hit.** The join to `session_meta` and
+/// the two exclusion clauses are the turn branch's, reused: a branch that
+/// queried `observations` directly is exactly how a project excluded after its
+/// sessions were archived becomes visible again (ING-08).
+///
+/// **No excerpt read.** [`excerpt::attach`] is deliberately not called: the text
+/// IS the claim, it is already in hand, and attaching would decompress a whole
+/// session for a hit whose `turn_id` points at a different turn from the one the
+/// claim text came out of.
+///
+/// **No `before_turn_id`.** That bound is `verbatim replay`'s alone and replay
+/// never sets a `kind`, so there is nothing here to implement it for. It also
+/// could not mean the same thing: an observation is written long after the turns
+/// it anchors to.
+fn observations(conn: &Connection, request: &Request, scoped: &scope::Scoped) -> Result<Response> {
+    // The table, not the row count: a store written before phase 7 has no
+    // `observations` at all, and left to the query that is `no such table`
+    // inside an error rather than an answer.
+    let present: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'observations'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !present {
+        return Ok(Response {
+            reason: Some(Reason::NoObservations),
+            ..Response::default()
+        });
+    }
+
+    let tokens: Vec<String> = request
+        .query
+        .tokens()
+        .iter()
+        .map(|token| token.to_lowercase())
+        .collect();
+    if tokens.is_empty() {
+        return Ok(Response::default());
+    }
+
+    let mut sql = String::from(CLAIMS);
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(project) = scoped.project() {
+        sql.push_str(" AND m.project = ?\n");
+        params.push(Box::new(project.to_owned()));
+    }
+    push_exclusion(
+        &mut sql,
+        &mut params,
+        "m.project",
+        scoped.excluded_projects(),
+    );
+    push_exclusion(
+        &mut sql,
+        &mut params,
+        "m.project_pre_worktree",
+        scoped.excluded_pre_worktree(),
+    );
+    // Conjunctive, like the turn branch's tokens. `instr` over the folded text
+    // and not `LIKE`: a token carrying `%` or `_` would be a wildcard the user
+    // never typed, and a query is untrusted text.
+    for token in &tokens {
+        sql.push_str(" AND instr(lower(c.text), ?) > 0\n");
+        params.push(Box::new(token.clone()));
+    }
+    sql.push_str(CLAIMS_TAIL);
+    params.push(Box::new(request.effective_limit() as i64));
+
+    let mut statement = conn.prepare(&sql)?;
+    let hits = statement
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(Hit {
+                turn_id: row.get(0)?,
+                session_key: row.get(1)?,
+                record_type: OBSERVATION_KIND.to_owned(),
+                // The observation's own timestamp, because a claim has no other
+                // one: `generated_at` says when this was written, and the turn
+                // the claim anchors to is reachable through `turn_id`.
+                ts: row.get(2)?,
+                project: row.get(3)?,
+                sidechain: row.get::<_, i64>(4)? != 0,
+                entity_score: 0.0,
+                entity_match: None,
+                entity_count: 0,
+                matched_on: Vec::new(),
+                // Flat, and honestly so. There is no bm25 to read here - a
+                // contentless FTS index cannot score a row that is not in it -
+                // and every hit matched every token, so nothing distinguishes
+                // them. The ORDER BY below is what makes the result stable.
+                relevance: 1.0,
+                excerpt: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<Hit>>>()?;
+
+    Ok(Response {
+        hits,
+        reason: None,
+        reads: excerpt::Reads::default(),
+    })
+}
+
+/// Every claim of every observation, flattened, with the row it came from.
+///
+/// `coalesce(..., '[]')` because a row whose status is `parse_failed` carries
+/// null claim columns and `json_each(NULL)` is not a table this can join.
+const CLAIMS: &str = "
+    WITH claims AS (
+        SELECT o.session_key AS session_key, 0 AS list, e.key AS pos,
+               json_extract(e.value, '$.turn_id') AS turn_id,
+               json_extract(e.value, '$.text') AS text,
+               o.generated_at AS generated_at
+          FROM observations o, json_each(coalesce(o.decisions, '[]')) e
+        UNION ALL
+        SELECT o.session_key, 1, e.key,
+               json_extract(e.value, '$.turn_id'),
+               json_extract(e.value, '$.text'),
+               o.generated_at
+          FROM observations o, json_each(coalesce(o.learned, '[]')) e
+        UNION ALL
+        SELECT o.session_key, 2, e.key,
+               json_extract(e.value, '$.turn_id'),
+               json_extract(e.value, '$.text'),
+               o.generated_at
+          FROM observations o, json_each(coalesce(o.unresolved, '[]')) e
+    )
+    SELECT c.turn_id,
+           c.session_key,
+           c.generated_at,
+           m.project,
+           m.parent_session_key IS NOT NULL AS sidechain,
+           c.text
+    FROM claims c
+    LEFT JOIN session_meta m ON m.session_key = c.session_key
+    WHERE c.turn_id IS NOT NULL AND c.text IS NOT NULL
+";
+
+/// A total order, so two runs over an unchanged store agree.
+///
+/// Newest observation first, then the session key, then which of the three
+/// lists the claim came from, then its position in that list - and the last two
+/// together are unique within one observation, so there is no tie left to break
+/// nondeterministically.
+const CLAIMS_TAIL: &str = "
+    ORDER BY c.generated_at DESC, c.session_key ASC, c.list ASC, c.pos ASC
+    LIMIT ?
+";
 
 /// The same total order [`TAIL`] applies, over scores SQL could not compute.
 fn rank(a: &Hit, b: &Hit) -> std::cmp::Ordering {

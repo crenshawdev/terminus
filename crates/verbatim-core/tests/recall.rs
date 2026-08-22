@@ -12,7 +12,7 @@ use rusqlite::Connection;
 use verbatim_core::config::Config;
 use verbatim_core::recall::{
     context, get, search, EntityMatch, Filters, Hit, Query, Reason, Request, Response, Scope,
-    Window, MAX_CONTEXT_SIDE, MAX_QUERY_TOKENS, MAX_RESULTS,
+    Window, MAX_CONTEXT_SIDE, MAX_QUERY_TOKENS, MAX_RESULTS, OBSERVATION_KIND,
 };
 use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::{ingest, testkit};
@@ -1877,4 +1877,198 @@ fn a_get_of_an_excluded_projects_turn_is_absent_with_a_reason() {
         "{fetched:?}"
     );
     assert_eq!(fetched.reads.blobs, 0, "an excluded turn read a blob");
+}
+
+// ---------------------------------------------------------------------------
+// OBS-08: observations reached through the search the model already has
+//
+// One new value on `kind`, a second query branch, and no fourth MCP tool
+// (D-17, `DESIGN-BRIEF.md:184`). The rows are written straight into the table
+// here rather than bought from a model: what is under test is the query, and
+// how a judgment gets stored is `tests/judgment.rs`'s subject.
+
+/// A word that is really in the corpus exactly once as a turn, so a query for
+/// it has turn hits AND an observation claim to tell apart.
+const SHARED: &str = "brillig";
+
+/// One session's key, found by the fixture file its transcript came from.
+fn key_of(conn: &Connection, fixture: &str) -> String {
+    conn.query_row(
+        "SELECT session_key FROM session_meta WHERE session_key LIKE '%' || ?1",
+        [fixture],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|e| panic!("no session for {fixture}: {e}"))
+}
+
+/// Store one observation carrying one claim, anchored at a real turn of that
+/// session, and answer with the session key and the anchor.
+fn observe(conn: &Connection, fixture: &str, generated_at: &str, text: &str) -> (String, i64) {
+    let key = key_of(conn, fixture);
+    let anchor: i64 = conn
+        .query_row(
+            "SELECT min(id) FROM turns WHERE session_key = ?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let claims = serde_json::json!([{"turn_id": anchor, "text": text}]).to_string();
+    conn.execute(
+        "INSERT INTO observations (
+            session_key, generated_at, status, model, prompt_version, topic, outcome,
+            decisions, learned, unresolved, tokens
+         ) VALUES (?1, ?2, 'ok', 'stub', 'obs-judgment-1', 'a topic', 'completed',
+                   ?3, '[]', '[]', 1)",
+        rusqlite::params![key, generated_at, claims],
+    )
+    .unwrap();
+    (key, anchor)
+}
+
+/// One search under the observation kind.
+fn claims(conn: &Connection, exclusions: &[&str], scope: Scope, raw: &str) -> Response {
+    search::run(
+        conn,
+        &config(exclusions),
+        &Request::new(Query::parse(raw), scope)
+            .limit(MAX_RESULTS)
+            .filters(Filters {
+                kind: Some(OBSERVATION_KIND.to_owned()),
+                ..Filters::default()
+            }),
+    )
+    .unwrap()
+}
+
+/// OBS-08: the same tool, one new `kind`, and every hit still carries a
+/// `turn_id` that selects a real turn.
+#[test]
+fn the_observation_kind_returns_claims_anchored_to_real_turns() {
+    let bench = bench();
+    let conn = bench.conn();
+    let claim = format!("the {SHARED} helper was replaced by the steady one");
+    let (key, anchor) = observe(
+        &conn,
+        "session-recall.jsonl",
+        "2026-08-21T10:00:00.000Z",
+        &claim,
+    );
+
+    let response = claims(&conn, &[], Scope::Everything, SHARED);
+    assert_eq!(response.reason, None, "{response:?}");
+    assert_eq!(response.hits.len(), 1, "{:?}", response.hits);
+
+    let hit = &response.hits[0];
+    assert_eq!(hit.record_type, OBSERVATION_KIND);
+    assert_eq!(hit.session_key, key);
+    assert_eq!(hit.turn_id, anchor);
+    assert_eq!(hit.excerpt, claim, "the claim text is the excerpt");
+    // The whole of OBS-03 at the read end: the anchor is asked of the database
+    // rather than trusted from the row.
+    let of_session: String = conn
+        .query_row(
+            "SELECT session_key FROM turns WHERE id = ?1",
+            [hit.turn_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("turn {} is not archived: {e}", hit.turn_id));
+    assert_eq!(of_session, key);
+    // Nothing was decompressed to produce it: the text was already in hand.
+    assert_eq!(response.reads.blobs, 0, "{:?}", response.reads);
+
+    // The control: the SAME query without the kind is a turn search, and no
+    // observation is in it.
+    let turns = answer(&conn, &[], Scope::Everything, SHARED);
+    assert!(!turns.hits.is_empty(), "the corpus must carry {SHARED}");
+    assert!(
+        turns
+            .hits
+            .iter()
+            .all(|hit| hit.record_type != OBSERVATION_KIND),
+        "an observation came back from a turn search: {:?}",
+        turns.hits
+    );
+}
+
+/// A query no claim matches is zero hits and no reason - the ordinary empty
+/// answer, not an error and not a silence that means something else.
+#[test]
+fn a_query_matching_no_claim_is_an_empty_result() {
+    let bench = bench();
+    let conn = bench.conn();
+    observe(
+        &conn,
+        "session-recall.jsonl",
+        "2026-08-21T10:00:00.000Z",
+        "a claim about something else entirely",
+    );
+
+    let response = claims(&conn, &[], Scope::Everything, "zzzznotinanyclaim");
+    assert!(response.hits.is_empty(), "{:?}", response.hits);
+    assert_eq!(response.reason, None);
+}
+
+/// Exclusion reaches this branch too. A branch that queried `observations`
+/// directly is exactly how a project excluded after its sessions were archived
+/// becomes visible again (ING-08).
+#[test]
+fn an_excluded_projects_observation_is_hidden_and_a_siblings_is_not() {
+    let bench = bench();
+    let conn = bench.conn();
+    let text = format!("a claim naming {SHARED}");
+    let (alpha_key, _) = observe(
+        &conn,
+        "session-recall.jsonl",
+        "2026-08-21T10:00:00.000Z",
+        &text,
+    );
+    let (beta_key, _) = observe(
+        &conn,
+        "session-errors-a.jsonl",
+        "2026-08-21T09:00:00.000Z",
+        &text,
+    );
+
+    // The falsifier: both are reachable when nothing is excluded, so the
+    // absence below is the exclusion and not a query that only ever finds one.
+    let both = claims(&conn, &[], Scope::Everything, SHARED);
+    let keys: Vec<&str> = both.hits.iter().map(|h| h.session_key.as_str()).collect();
+    assert!(keys.contains(&alpha_key.as_str()), "{keys:?}");
+    assert!(keys.contains(&beta_key.as_str()), "{keys:?}");
+
+    let alpha_project = testkit::fixture_project("session-recall.jsonl", &bench.root)
+        .to_string_lossy()
+        .into_owned();
+    let response = claims(&conn, &[&alpha_project], Scope::Everything, SHARED);
+    let keys: Vec<&str> = response
+        .hits
+        .iter()
+        .map(|h| h.session_key.as_str())
+        .collect();
+    assert!(
+        !keys.contains(&alpha_key.as_str()),
+        "an excluded project's observation came back: {keys:?}"
+    );
+    assert!(
+        keys.contains(&beta_key.as_str()),
+        "the sibling project's observation went missing too: {keys:?}"
+    );
+}
+
+/// D-17's worst failure mode, ruled out: a store with no table says so rather
+/// than answering zero hits, which reads as "nothing was found".
+#[test]
+fn a_store_with_no_observations_table_says_so_rather_than_nothing() {
+    let bench = bench();
+    let conn = bench.conn();
+    conn.execute("DROP TABLE observations", []).unwrap();
+
+    let response = claims(&conn, &[], Scope::Everything, SHARED);
+    assert!(response.hits.is_empty());
+    assert_eq!(response.reason, Some(Reason::NoObservations));
+    assert!(response
+        .reason
+        .unwrap()
+        .to_string()
+        .contains("observations"));
 }

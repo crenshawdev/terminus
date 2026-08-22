@@ -1569,3 +1569,100 @@ fn an_excluded_project_is_never_named_to_a_client_at_the_default_scope() {
         "an excluded id and an unarchived id answer differently"
     );
 }
+
+/// OBS-08 at the tool boundary: the model reaches observations through the
+/// search tool it already has, and there is still no fourth tool.
+#[test]
+fn recall_search_reaches_observations_through_the_kind_it_already_has() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    // A claim naming a word the corpus really carries, so the two kinds have
+    // something to be told apart by.
+    let key: String = bench
+        .conn()
+        .query_row(
+            "SELECT session_key FROM session_meta WHERE session_key LIKE '%session-recall.jsonl'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let anchor: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT min(id) FROM turns WHERE session_key = ?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    bench
+        .conn()
+        .execute(
+            "INSERT INTO observations (
+                session_key, generated_at, status, model, prompt_version, topic, outcome,
+                decisions, learned, unresolved, tokens
+             ) VALUES (?1, '2026-08-21T10:00:00.000Z', 'ok', 'stub', 'obs-judgment-1',
+                       'a topic', 'completed', ?2, '[]', '[]', 1)",
+            rusqlite::params![
+                key,
+                json!([{"turn_id": anchor, "text": "the brillig helper was replaced"}]).to_string()
+            ],
+        )
+        .unwrap();
+
+    let document = bench.call(
+        &bench.work,
+        "recall_search",
+        json!({"query": "brillig", "project": "*", "kind": "observation"}),
+    );
+    let hits = document["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 1, "{document}");
+    assert_eq!(hits[0]["record_type"], "observation", "{document}");
+    assert_eq!(hits[0]["turn_id"], anchor, "{document}");
+    assert!(
+        hits[0]["excerpt"]
+            .as_str()
+            .is_some_and(|text| text.contains("brillig")),
+        "the claim text is not the excerpt: {document}"
+    );
+
+    // The same query under the default kind is a turn search, and no
+    // observation is in it.
+    let turns = bench.call(
+        &bench.work,
+        "recall_search",
+        json!({"query": "brillig", "project": "*"}),
+    );
+    let hits = turns["hits"].as_array().expect("hits");
+    assert!(!hits.is_empty(), "{turns}");
+    assert!(
+        hits.iter().all(|hit| hit["record_type"] != "observation"),
+        "{turns}"
+    );
+
+    // And the schema told the model the value exists at all - a filter it is
+    // never shown is a filter it never sends.
+    let listed = bench.talk(
+        &bench.work,
+        &[
+            initialize(),
+            initialized(),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        ],
+    );
+    listed.expect_ok();
+    let tools = listed.responses[1]["result"]["tools"]
+        .as_array()
+        .expect("a tool list");
+    assert_eq!(tools.len(), 3, "OBS-08 must not add a fourth tool");
+    let kind = tools
+        .iter()
+        .find(|tool| tool["name"] == "recall_search")
+        .expect("recall_search")["inputSchema"]["properties"]["kind"]["description"]
+        .as_str()
+        .expect("a kind description");
+    assert!(
+        kind.contains("observation"),
+        "the model is never told the value exists: {kind}"
+    );
+}

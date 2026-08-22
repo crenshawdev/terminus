@@ -24,4 +24,4 @@ pub use excerpt::{Reads, EXCERPT_CHARS};
 pub use get::{Absent, Fetched, Record};
 pub use query::{EntityMatch, Query, MAX_QUERY_TOKENS};
 pub use scope::{Reason, Scope};
-pub use search::{Filters, Hit, Request, Response, DEFAULT_RESULTS, MAX_RESULTS};
+pub use search::{Filters, Hit, Request, Response, DEFAULT_RESULTS, MAX_RESULTS, OBSERVATION_KIND};

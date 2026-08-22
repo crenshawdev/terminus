@@ -95,6 +95,16 @@ data on stdout, the counts and the warnings on stderr.
   spelling, not the query's.
 - `excerpt` is cut from the session blob, never from FTS5, and may be empty when
   the archive would not give the bytes up.
+- `--kind observation` searches stored session summaries instead of turns, and
+  is the whole of how observations are reachable from the model - there is no
+  fourth MCP tool. Each hit is one CLAIM: `turn_id` is the turn that claim is
+  anchored to, `excerpt` is the claim's own text, `record_type` is
+  `observation`, and `ts` is when the observation was written rather than when
+  the turn happened. `relevance` is flat at 1.0, because there is no FTS index
+  over these to score against and every hit matched every token; the order is
+  newest observation first and is total. Scope and exclusion apply exactly as
+  they do to turns. On a store written before the observations table exists, the
+  answer is empty with that named in `reason` - never zero hits in silence.
 
 ### `show`
 

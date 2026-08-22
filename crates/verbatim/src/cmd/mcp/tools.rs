@@ -135,7 +135,12 @@ pub fn descriptors() -> Vec<Value> {
                     },
                     "kind": {
                         "type": "string",
-                        "description": "Only turns of this record type: user, assistant, system or attachment."
+                        "description": format!(
+                            "Only turns of this record type: user, assistant, system or \
+                             attachment; or \"{}\" to search stored session summaries \
+                             instead, each hit being one claim and its anchoring turn id.",
+                            verbatim_core::recall::OBSERVATION_KIND
+                        )
                     },
                     "since": {
                         "type": "string",

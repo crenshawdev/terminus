@@ -1009,3 +1009,96 @@ fn sessions_scopes_and_bounds_the_listing() {
     assert_eq!(stdout(&out), "");
     assert!(stderr(&out).contains("0 session(s)"), "{}", stderr(&out));
 }
+
+/// `verbatim search --kind observation` reaches the same branch `recall_search`
+/// does, and renders a claim as an ordinary hit.
+#[test]
+fn the_terminal_search_reaches_observations_through_the_same_kind() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let key: String = bench
+        .conn()
+        .query_row(
+            "SELECT session_key FROM session_meta WHERE session_key LIKE '%session-recall.jsonl'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let anchor: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT min(id) FROM turns WHERE session_key = ?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let claim = "the brillig helper was replaced by the steady one";
+    bench
+        .conn()
+        .execute(
+            "INSERT INTO observations (
+                session_key, generated_at, status, model, prompt_version, topic, outcome,
+                decisions, learned, unresolved, tokens
+             ) VALUES (?1, '2026-08-21T10:00:00.000Z', 'ok', 'stub', 'obs-judgment-1',
+                       'a topic', 'completed', ?2, '[]', '[]', 1)",
+            rusqlite::params![
+                key,
+                serde_json::json!([{"turn_id": anchor, "text": claim}]).to_string()
+            ],
+        )
+        .unwrap();
+
+    let out = bench.run(&[
+        "search",
+        "brillig",
+        "--project",
+        "*",
+        "--kind",
+        "observation",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let value = document(&out);
+    let hits = value["data"]["hits"].as_array().expect("hits");
+    assert_eq!(hits.len(), 1, "{value}");
+    assert_eq!(hits[0]["record_type"], "observation", "{value}");
+    assert_eq!(hits[0]["turn_id"], anchor, "{value}");
+    assert_eq!(hits[0]["excerpt"], claim, "{value}");
+
+    // And a person sees it too, with the same fields the human renderer gives
+    // every other hit.
+    let human = bench.run(&[
+        "search",
+        "brillig",
+        "--project",
+        "*",
+        "--kind",
+        "observation",
+    ]);
+    assert_eq!(human.status.code(), Some(0), "{}", stderr(&human));
+    let text = stdout(&human);
+    assert!(text.contains(claim), "the claim never printed: {text}");
+    assert!(
+        text.contains(&anchor.to_string()),
+        "the anchor never printed: {text}"
+    );
+
+    // A query no claim matches is zero hits and exit 0, not a failure.
+    let empty = bench.run(&[
+        "search",
+        "zzzznotinanyclaim",
+        "--project",
+        "*",
+        "--kind",
+        "observation",
+        "--json",
+    ]);
+    assert_eq!(empty.status.code(), Some(0), "{}", stderr(&empty));
+    assert_eq!(
+        document(&empty)["data"]["hits"],
+        serde_json::json!([]),
+        "{}",
+        stdout(&empty)
+    );
+}
