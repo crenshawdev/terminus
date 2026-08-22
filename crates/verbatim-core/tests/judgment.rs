@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use rusqlite::Connection;
-use verbatim_core::config::{Config, CONFIG_FILE_NAME};
+use verbatim_core::config::{Config, Secret, CONFIG_FILE_NAME};
 use verbatim_core::observe::judgment::{self, Verdict};
 use verbatim_core::observe::net;
 use verbatim_core::store::DB_FILE_NAME;
@@ -259,16 +259,21 @@ fn one_call_stores_claims_whose_turn_ids_are_real_turns_of_that_session() {
 /// than no claim.
 #[test]
 fn a_claim_anchored_outside_the_session_stores_no_successful_row() {
-    let bench = bench();
-    let (judged, other) = bench.observed();
-    let strangers = bench.turn_ids(&other);
-    assert!(!strangers.is_empty(), "the second fixture carries no turns");
-    let mine = bench.turn_ids(&judged);
-
-    // A real turn id of another session first, then an id belonging to nothing.
-    let nowhere = mine.iter().chain(&strangers).max().copied().unwrap() + 10_000;
-    for bad in [strangers[0], nowhere] {
+    // A bench each, because a refused answer leaves a `parse_failed` status
+    // behind and a pass never asks the same session twice (OBS-06's fourth
+    // gate). Two benches is what asking the question twice actually costs.
+    for case in ["another session", "no session at all"] {
         let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+        let bench = bench();
+        let (judged, other) = bench.observed();
+        let strangers = bench.turn_ids(&other);
+        assert!(!strangers.is_empty(), "the second fixture carries no turns");
+        let mine = bench.turn_ids(&judged);
+        let bad = match case {
+            "another session" => strangers[0],
+            _ => mine.iter().chain(&strangers).max().copied().unwrap() + 10_000,
+        };
+
         let canned = serde_json::json!({
             "topic": "a plausible summary of somebody else's work",
             "outcome": "completed",
@@ -277,24 +282,32 @@ fn a_claim_anchored_outside_the_session_stores_no_successful_row() {
             "unresolved": [],
         })
         .to_string();
-        let stub = HttpStub::serving(&[testkit::chat_completion(&canned, 10, 10)]);
+        let stub = HttpStub::serving(&[
+            testkit::chat_completion(&canned, 10, 10),
+            testkit::chat_completion(&canned, 10, 10),
+        ]);
         let config = bench.config(&stub);
 
         net::attempts::reset();
         let verdict = judgment::judge(&bench.conn(), &config, None, &judged);
 
         match &verdict {
-            Verdict::Failed { reason } => assert!(
+            Verdict::ParseFailed { reason, .. } => assert!(
                 reason.contains(&bad.to_string()),
                 "the refusal does not name the anchor it refused: {reason}"
             ),
-            other => panic!("turn {bad} was accepted as an anchor: {other:?}"),
+            other => panic!("turn {bad} ({case}) was accepted as an anchor: {other:?}"),
         }
-        assert_eq!(net::attempts::count(), 1);
+        assert_eq!(
+            net::attempts::count(),
+            2,
+            "an unanchored answer was not retried"
+        );
 
         let row = bench.row(&judged);
         assert_eq!(
-            row.status, None,
+            row.status.as_deref(),
+            Some(judgment::STATUS_PARSE_FAILED),
             "a row was written with a success status for an unanchored answer"
         );
         assert_eq!(row.topic, None);
@@ -306,10 +319,6 @@ fn a_claim_anchored_outside_the_session_stores_no_successful_row() {
 /// a success status either.
 #[test]
 fn an_answer_that_is_not_the_schema_stores_no_successful_row() {
-    let bench = bench();
-    let (judged, _other) = bench.observed();
-    let ids = bench.turn_ids(&judged);
-
     let unusable = [
         testkit::UNPARSEABLE_CONTENT.to_owned(),
         serde_json::json!({
@@ -334,28 +343,149 @@ fn an_answer_that_is_not_the_schema_stores_no_successful_row() {
 
     for content in unusable {
         let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
-        let stub = HttpStub::serving(&[testkit::chat_completion(&content, 1, 1)]);
+        let bench = bench();
+        let (judged, _other) = bench.observed();
+        let stub = HttpStub::serving(&[
+            testkit::chat_completion(&content, 1, 1),
+            testkit::chat_completion(&content, 1, 1),
+        ]);
         let config = bench.config(&stub);
 
         let verdict = judgment::judge(&bench.conn(), &config, None, &judged);
 
         assert!(
-            matches!(verdict, Verdict::Failed { .. }),
+            matches!(verdict, Verdict::ParseFailed { .. }),
             "{content:?} was accepted: {verdict:?}"
         );
-        assert_eq!(bench.row(&judged).status, None);
+        assert_eq!(
+            bench.row(&judged).status.as_deref(),
+            Some(judgment::STATUS_PARSE_FAILED)
+        );
     }
 
-    // The falsifying half: the same store, the same session, an answer that IS
-    // the schema - so the refusals above are about the answers and not about a
-    // bench that could never store anything.
+    // The falsifying half: the same fixtures, an answer that IS the schema - so
+    // the refusals above are about the answers and not about a bench that could
+    // never store anything.
     let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let bench = bench();
+    let (judged, _other) = bench.observed();
+    let ids = bench.turn_ids(&judged);
     let stub = HttpStub::serving(&[testkit::chat_completion(&answer(&ids), 1, 1)]);
     let config = bench.config(&stub);
     assert_eq!(
         judgment::judge(&bench.conn(), &config, None, &judged),
         Verdict::Stored { tokens: 2 }
     );
+}
+
+/// OBS-04: two requests, then the raw answer is KEPT rather than dropped - and
+/// kept scrubbed, because it is text this build did not author and `verbatim
+/// observations` prints the column (D-16).
+#[test]
+fn an_unusable_answer_is_asked_twice_and_then_stored_raw() {
+    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let bench = bench();
+    let (judged, _other) = bench.observed();
+    let before = bench.row(&judged);
+
+    // A provider echoing the caller's own key back inside its answer is the
+    // case that makes the scrub load-bearing: `raw` is durable and printed.
+    const KEY: &str = "sk-observations-should-never-store-this";
+    let leaky = format!("{} (api_key: {KEY})", testkit::UNPARSEABLE_CONTENT);
+    let stub = HttpStub::serving(&[
+        testkit::chat_completion(&leaky, 10, 5),
+        testkit::chat_completion(&leaky, 10, 5),
+    ]);
+    let config = bench.config(&stub);
+    let secret = Secret::new(KEY);
+
+    net::attempts::reset();
+    let verdict = judgment::judge(&bench.conn(), &config, Some(&secret), &judged);
+
+    match &verdict {
+        Verdict::ParseFailed { tokens, reason } => {
+            assert_eq!(*tokens, 30, "both requests must be charged for");
+            assert!(
+                !reason.contains(KEY),
+                "the reason carries the key: {reason}"
+            );
+        }
+        other => panic!("an unparseable answer was not stored as a failure: {other:?}"),
+    }
+    assert_eq!(
+        net::attempts::count(),
+        2,
+        "exactly one retry: {:?}",
+        net::attempts::destinations()
+    );
+    assert_eq!(stub.requests().len(), 2);
+
+    let row = bench.row(&judged);
+    assert_eq!(
+        row.status.as_deref(),
+        Some(judgment::STATUS_PARSE_FAILED),
+        "the failure was dropped instead of stored"
+    );
+    let raw = row.raw.as_deref().expect("the raw answer");
+    assert!(
+        raw.contains(testkit::UNPARSEABLE_CONTENT),
+        "the stored raw answer is not what came back: {raw}"
+    );
+    assert!(
+        !raw.contains(KEY),
+        "the credential is durably stored: {raw}"
+    );
+    assert_eq!(row.topic, None, "a failed row must carry no claims");
+    assert_eq!(row.decisions, None);
+    assert_eq!(row.tokens, Some(30));
+    assert_eq!(
+        row.mechanical, before.mechanical,
+        "the failure arm disturbed the mechanical half"
+    );
+
+    // And a later run of the same session makes no third request: the status is
+    // what stops a pass asking again (OBS-06's fourth gate).
+    let again = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
+    let config = bench.config(&again);
+    net::attempts::reset();
+    let verdict = judgment::judge(&bench.conn(), &config, None, &judged);
+    assert!(
+        matches!(verdict, Verdict::Skipped(_)),
+        "a stored failure was asked again: {verdict:?}"
+    );
+    assert_eq!(net::attempts::count(), 0);
+}
+
+/// The transient case the retry exists for: the second answer parses, and the
+/// row is a success carrying what both requests cost.
+#[test]
+fn a_retry_that_parses_is_stored_as_a_success() {
+    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let bench = bench();
+    let (judged, _other) = bench.observed();
+    let ids = bench.turn_ids(&judged);
+
+    let stub = HttpStub::serving(&[
+        testkit::chat_completion(testkit::UNPARSEABLE_CONTENT, 10, 5),
+        testkit::chat_completion(&answer(&ids), 325, 69),
+    ]);
+    let config = bench.config(&stub);
+
+    net::attempts::reset();
+    let verdict = judgment::judge(&bench.conn(), &config, None, &judged);
+
+    assert_eq!(verdict, Verdict::Stored { tokens: 409 }, "{verdict:?}");
+    assert_eq!(net::attempts::count(), 2);
+
+    let row = bench.row(&judged);
+    assert_eq!(row.status.as_deref(), Some(judgment::STATUS_OK));
+    assert_eq!(row.raw, None, "a successful row kept the failed text");
+    assert_eq!(
+        row.tokens,
+        Some(409),
+        "the row must say what the session cost, both requests included"
+    );
+    assert_eq!(row.anchors().len(), 3);
 }
 
 /// The model cannot anchor a claim to an id it was never shown, so the ids go

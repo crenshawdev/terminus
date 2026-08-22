@@ -26,6 +26,16 @@
 //! twice is that the prompt changed, and a row that cannot say which prompt
 //! produced it cannot be re-asked selectively.
 //!
+//! # An answer that will not do is asked for once more, then kept (OBS-04)
+//!
+//! A response whose content is not the document the schema asked for, and a
+//! response whose claims do not anchor, take the same path: asked again exactly
+//! [`RETRIES`] times, then stored with [`STATUS_PARSE_FAILED`] and the raw text.
+//! Never dropped - the session is still in the archive and regeneration is
+//! always available, and a silently discarded failure is how the incumbent's
+//! schema drift became permanent invisible loss. Never a failed pass either:
+//! every way this can go is a [`Verdict`] the caller turns into a note.
+//!
 //! # `mechanical` is not touched
 //!
 //! Every write here names the judgment columns and no other. PLAN-1 owns
@@ -53,6 +63,18 @@ pub const PROMPT_VERSION: &str = "obs-judgment-1";
 
 /// `observations.status` for a row whose claims were validated and stored.
 pub const STATUS_OK: &str = "ok";
+
+/// `observations.status` for a row whose two answers could not be used.
+pub const STATUS_PARSE_FAILED: &str = "parse_failed";
+
+/// How many times an unusable answer is asked for again.
+///
+/// Exactly one. Not zero, which loses the transient case the retry exists for -
+/// a thinking model that wrapped its JSON in a fence once will usually not do
+/// it twice. Not more, which doubles the bill on a model that will never comply
+/// and turns OBS-02's bounded "one call per session" into an unbounded loop
+/// against a paid endpoint.
+pub const RETRIES: usize = 1;
 
 /// The most entries one claim list may carry.
 ///
@@ -103,6 +125,12 @@ pub enum Verdict {
     /// under the minimum turn count, one already judged, or a day whose budget
     /// is spent are all the controls working.
     Skipped(Skip),
+    /// Both answers were unusable; the row carries `parse_failed` and the raw
+    /// text of the second one (OBS-04).
+    ///
+    /// Not a [`Verdict::Failed`]: something WAS stored, the provider was paid
+    /// for it, and the session must not be asked a third time by a pass.
+    ParseFailed { tokens: u64, reason: String },
     /// Nothing was stored. `reason` has already been through
     /// [`crate::observe::egress::scrub`] on its way out of the provider, so it
     /// is safe for `runs.error` and for stderr (D-16).
@@ -176,34 +204,55 @@ fn attempt(
         return Ok(Verdict::Skipped(skip));
     }
     let shown = transcript(conn, session_key).map_err(|e| note(credential, e))?;
-
     let messages = [Message::system(instructions()), Message::user(shown)];
-    let completion = match provider::complete(config, credential, &messages) {
-        Ok(completion) => completion,
-        // Already scrubbed: `provider::Error`'s text is written by one
-        // constructor and that constructor runs the scrubber.
-        Err(e) => {
-            return Ok(Verdict::Failed {
-                reason: e.to_string(),
-            })
-        }
-    };
-    let tokens = completion.usage.map(|u| u.total_tokens).unwrap_or(0);
-    // Charged for whatever the answer turns out to be: the provider billed this
-    // request the moment it answered, so the budget moves before the content is
-    // even looked at (D-12).
-    cost::spend(conn, tokens).map_err(|e| note(credential, e))?;
 
-    match read(&completion.content, &anchors) {
-        Ok(judgment) => {
-            store(conn, session_key, config, &judgment, tokens).map_err(|e| note(credential, e))?;
-            Ok(Verdict::Stored { tokens })
+    // What the last unusable answer was, and why. Kept rather than discarded:
+    // the row that gets written carries it, because a silently dropped failure
+    // is how the incumbent's schema drift became permanent invisible loss.
+    let mut unusable: Option<(String, String)> = None;
+    let mut tokens = 0u64;
+
+    for _ in 0..=RETRIES {
+        let completion = match provider::complete(config, credential, &messages) {
+            Ok(completion) => completion,
+            // Already scrubbed: `provider::Error`'s text is written by one
+            // constructor and that constructor runs the scrubber.
+            //
+            // No retry and no `parse_failed` row: a dead socket or a 429 is not
+            // an answer this build could not read, it is an answer that never
+            // arrived, and writing a status for it would stop the next pass from
+            // ever trying again.
+            Err(e) => {
+                return Ok(Verdict::Failed {
+                    reason: e.to_string(),
+                })
+            }
+        };
+        // Charged for whatever the answer turns out to be, and charged per
+        // request rather than once at the end: the provider billed the moment it
+        // answered, and both requests of a retried session count (D-12).
+        let charge = completion.usage.map(|u| u.total_tokens).unwrap_or(0);
+        tokens = tokens.saturating_add(charge);
+        cost::spend(conn, charge).map_err(|e| note(credential, e))?;
+
+        match read(&completion.content, &anchors) {
+            Ok(judgment) => {
+                store(conn, session_key, config, &judgment, tokens)
+                    .map_err(|e| note(credential, e))?;
+                return Ok(Verdict::Stored { tokens });
+            }
+            Err(reason) => unusable = Some((completion.content, reason)),
         }
-        // No row is written and no success status is set. PLAN-3's task 3 is
-        // what turns this into the retry and the `parse_failed` row; until
-        // then an answer that cannot be verified is an answer that is not kept.
-        Err(reason) => Ok(Verdict::Failed { reason }),
     }
+
+    // Stored, never dropped (OBS-04). The session is still in the archive and
+    // `verbatim observations regenerate` is always available, so what this row
+    // buys is that a reader can see the model was asked and see what came back.
+    let (raw, reason) = unusable.expect("the loop runs at least once");
+    let raw = crate::observe::egress::scrub(credential, &raw);
+    let reason = crate::observe::egress::scrub(credential, &reason);
+    store_failure(conn, session_key, config, &raw, tokens).map_err(|e| note(credential, e))?;
+    Ok(Verdict::ParseFailed { tokens, reason })
 }
 
 /// A store failure as a line safe to print, scrubbed like every other (D-16).
@@ -473,6 +522,41 @@ fn store(
             list(&judgment.decisions),
             list(&judgment.learned),
             list(&judgment.unresolved),
+            tokens as i64,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Write the failure columns of one row, and only those (OBS-04).
+///
+/// `raw` has already been through [`crate::observe::egress::scrub`]: it is a
+/// provider response this build did not author, `verbatim observations` prints
+/// the column, and `runs.error` keeps whatever travels with it (D-16).
+///
+/// The claim columns are CLEARED rather than left standing. A row whose status
+/// says `parse_failed` while it still carries `topic`, `outcome` and three
+/// claim lists is a row that lies about where its contents came from - the
+/// claims would be an older prompt version's, presented under this run's
+/// status. `mechanical` is untouched, like everywhere else in this module.
+fn store_failure(
+    conn: &Connection,
+    session_key: &str,
+    config: &Config,
+    raw: &str,
+    tokens: u64,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE observations
+            SET status = ?2, model = ?3, prompt_version = ?4, topic = NULL, outcome = NULL,
+                decisions = NULL, learned = NULL, unresolved = NULL, raw = ?5, tokens = ?6
+          WHERE session_key = ?1",
+        rusqlite::params![
+            session_key,
+            STATUS_PARSE_FAILED,
+            config.provider_model(),
+            PROMPT_VERSION,
+            raw,
             tokens as i64,
         ],
     )?;

@@ -156,7 +156,12 @@ fn a_session_under_the_minimum_turn_count_costs_nothing() {
     assert_eq!(bench.turn_ids(&too_short).len(), 3);
     assert_eq!(bench.turn_ids(&long_enough).len(), cost::MIN_TURNS);
 
-    let stub = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
+    // Two canned answers, because an unusable one is asked for again (OBS-04):
+    // the falsifying half below spends both.
+    let stub = HttpStub::serving(&[
+        testkit::chat_completion("{}", 1, 1),
+        testkit::chat_completion("{}", 1, 1),
+    ]);
     let config = bench.config(&stub, None);
 
     net::attempts::reset();
@@ -177,10 +182,10 @@ fn a_session_under_the_minimum_turn_count_costs_nothing() {
     let ids = bench.turn_ids(&long_enough);
     let verdict = judgment::judge(&bench.conn(), &config, None, &long_enough);
     assert!(
-        matches!(verdict, Verdict::Failed { .. }),
+        matches!(verdict, Verdict::ParseFailed { .. }),
         "the stub's `{{}}` is not the schema: {verdict:?}"
     );
-    assert_eq!(net::attempts::count(), 1);
+    assert_eq!(net::attempts::count(), 2);
     assert!(!ids.is_empty());
 }
 
