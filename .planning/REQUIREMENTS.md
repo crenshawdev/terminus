@@ -81,6 +81,13 @@ Committed scope. Each maps to exactly one roadmap phase.
 - **OBS-03**: Every generated claim carries a `turn_id` anchoring it to a verbatim turn in the archive.
 - **OBS-04**: A parse failure retries once and then stores the raw response with `status = parse_failed`; it is never dropped silently and never blocks ingest.
 - **OBS-05**: One provider block of base URL, model and key serves local, OpenRouter and any OpenAI-compatible endpoint through a single code path, with Anthropic subscription auth as a separate branch.
+  - Phase 7 note (2026-08-22): the OpenAI-compatible half is delivered and the single code path is
+    intact. Anthropic subscription OAuth - the "separate branch" - is DEFERRED out of phase 7
+    (CONTEXT D-05): no OAuth flow, refresh or storage is described anywhere in the repo and there is
+    no Anthropic key on this machine to prove it against. Add it as its own phase via /cad-phase.
+    A fourth key, `response_format`, exists for an endpoint whose structured-output support is
+    narrower than `json_schema` (measured against `deepseek-chat`); it selects one field's value,
+    not a second request shape, so "single code path" holds. See phase 7 AC4 as amended.
 - **OBS-06**: Cost controls hold: sessions under N turns are skipped, input is truncated with explicit elision markers, a daily token budget applies, and there is never more than one call per session.
 - **OBS-07**: `verbatim observations regenerate` rebuilds derived observations selected by `--since` or `--prompt-version`.
 - **OBS-08**: Observations are reachable through the existing recall tools as a `kind` filter rather than through a fourth tool.
@@ -89,6 +96,9 @@ Committed scope. Each maps to exactly one roadmap phase.
 
 - **PRIV-01**: Redaction happens at egress and is keyed on destination — a remote provider is filtered, a local provider is not egress at all — and never at ingest.
 - **PRIV-02**: Credentials load from the shared per-provider file with permissions enforced and load refused when they are too open, following precedence process env, then product config, then shared file, and their values never reach logs, errors or output.
+  - Phase 7 note (2026-08-22): the permission check is a Unix mode-bit test via `PermissionsExt`.
+    Windows ACL enforcement is DEFERRED (CONTEXT D-15); the Windows arm accepts with a caveat
+    surfaced in `doctor`. Complete on Unix only.
 - **PRIV-03**: The binary opens no network connection except to the configured model provider, and emits no telemetry of any kind.
 - **PRIV-04**: `verbatim export` produces portable output for backup or migration and states what that output contains.
 
@@ -187,17 +197,17 @@ Explicit exclusions. The reason prevents scope creep later.
 | FEED-02 | Phase 6 | Complete |
 | FEED-03 | Phase 6 | Complete |
 | FEED-04 | Phase 6 | Complete |
-| OBS-01 | Phase 7 | Pending |
-| OBS-07 | Phase 7 | Pending |
-| OBS-05 | Phase 7 | Pending |
-| PRIV-01 | Phase 7 | Pending |
-| PRIV-02 | Phase 7 | Pending |
-| PRIV-03 | Phase 7 | Pending |
-| OBS-02 | Phase 7 | Pending |
-| OBS-03 | Phase 7 | Pending |
-| OBS-04 | Phase 7 | Pending |
-| OBS-06 | Phase 7 | Pending |
-| OBS-08 | Phase 7 | Pending |
+| OBS-01 | Phase 7 | Complete |
+| OBS-07 | Phase 7 | Complete |
+| OBS-05 | Phase 7 | Complete |
+| PRIV-01 | Phase 7 | Complete |
+| PRIV-02 | Phase 7 | Complete |
+| PRIV-03 | Phase 7 | Complete |
+| OBS-02 | Phase 7 | Complete |
+| OBS-03 | Phase 7 | Complete |
+| OBS-04 | Phase 7 | Complete |
+| OBS-06 | Phase 7 | Complete |
+| OBS-08 | Phase 7 | Complete |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 

@@ -1,0 +1,107 @@
+{
+  "status": "needs_human",
+  "score": "7/8",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "The `observations` table is archival, declared in CREATE_SQL and TABLES, absent from DERIVED_TABLES, reaches an already-initialized store through `bring_forward` with no derived rebuild, and a fresh store lists real data through `verbatim observations`.",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "crates/verbatim-core/src/store/schema.rs:216 (CREATE TABLE observations), :347 (TABLES entry), :361 (excluded from DERIVED_TABLES); `cargo test -p verbatim-core --features testkit --test schema` -> the_observations_table_reaches_a_store_that_predates_it, observations_is_not_a_derived_table, observations_declares_no_reference_to_turns all ok (15 passed); `cargo test -p verbatim --features testkit --test observations` -> a_finalized_session_is_listed_with_every_obs_01_fact ok; the missing-table test drops the table, reopens and asserts both that it came back and that no derived rebuild fired (schema.rs:409-421)."
+    },
+    {
+      "n": 2,
+      "truth": "Mechanical observations for a finalized session carry every OBS-01 fact by name - files, tools, commands WITH arguments, errors, branch, commits, turn count, duration, compactions - and no connection is attempted on that path.",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "crates/verbatim-core/src/observe/mechanical.rs (520 lines, SQL over turns/entities/paths plus one blob read for commands and commits per D-04); crates/verbatim/tests/observations.rs:435-514 asserts the JSON envelope carries files_modified, tools, commands (full argument string, not the basename), errors, commits, branch, turns=6, duration_seconds, compactions=0, AND the same facts on the human stdout listing; the judgment columns are asserted null. crates/verbatim-core/tests/observe.rs a_command_comes_back_with_its_arguments_and_not_merely_its_basename and a_commit_subject_comes_off_the_session_stream both ok (7 passed). Zero-attempt half: crates/verbatim/tests/observations.rs:733 with_judgment_off_a_pass_and_a_hook_run_reach_for_nothing asserts net::attempts::count()==0 in-process AND that a real listening stub endpoint named in the config received no request across the spawned pass and the hook."
+    },
+    {
+      "n": 3,
+      "truth": "With judgment enabled, one finalized session above MIN_TURNS costs exactly one HTTP request, stores schema-valid JSON, and every stored decisions/learned/unresolved anchor resolves to a real `turns` row OF THAT SESSION; a short session and an exhausted daily budget each make zero requests.",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "crates/verbatim-core/src/observe/judgment.rs:371 and the anchor validation before any write; crates/verbatim-core/tests/judgment.rs:193 one_call_stores_claims_whose_turn_ids_are_real_turns_of_that_session asserts net::attempts::count()==1, stub.requests().len()==1, status/model/prompt_version/topic/outcome/tokens, and then re-queries `SELECT session_key FROM turns WHERE id = ?` for every anchor; :263 a_claim_anchored_outside_the_session_stores_no_successful_row refuses whole rather than dropping bad anchors. Gates: crates/verbatim-core/tests/cost.rs:152 (TooShort, count==0, spend row untouched, with the falsifying at-the-minimum call proving the bench can call) and :194 (BudgetSpent, count==0, counter unmoved). All 8 judgment and 6 cost tests ok."
+    },
+    {
+      "n": 4,
+      "truth": "An unparseable answer is asked exactly twice, stored under `status = parse_failed` with the raw response scrubbed and the claim columns cleared, both requests charged, and the ingest pass over the same session still exits 0 and writes its `runs` row.",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "crates/verbatim-core/tests/judgment.rs:387 an_unusable_answer_is_asked_twice_and_then_stored_raw asserts attempts==2, stub.requests().len()==2, tokens==30 (both charged), status STATUS_PARSE_FAILED, raw holds UNPARSEABLE_CONTENT but not the injected key, topic/decisions None, and a later run makes no third request; :464 a_retry_that_parses_is_stored_as_a_success is the falsifying arm. Process boundary: crates/verbatim/tests/observations.rs:822 a_pass_whose_answer_cannot_be_used_still_records_itself_and_exits_zero ok. Judgment is a post-lock step (crates/verbatim-core/src/ingest/pass.rs:124 calls observe::judge_new after the runs row commits), and crates/verbatim/tests/observations.rs:771 a_provider_call_in_flight_does_not_hold_the_ingest_lock proves D-07 with a stalling stub plus a falsifier that the lock really refuses a second holder."
+    },
+    {
+      "n": 5,
+      "truth": "The same code path serves a remote OpenAI-compatible endpoint with only base URL, model and key changed, storing an observation both times.",
+      "status": "UNCERTAIN",
+      "uat_item": 5,
+      "evidence": "Local half and stub half are exercised (crates/verbatim-core/tests/provider.rs call::* , 13 tests ok) and there is only one request builder (observe/provider.rs, 317 lines). The remote half cannot be run here: no remote OpenAI-compatible key exists on this machine, per CONTEXT AC4's own human-verify tag. SUMMARY open item also flags that the response schema travels in the system message while `response_format` carries `{\"type\":\"json_schema\",\"strict\":true}` with no `json_schema` object beside it, which is exactly what a strict remote endpoint could reject."
+    },
+    {
+      "n": 6,
+      "truth": "A credentials file with any group or world bit is refused with a message naming the file and its mode, no judgment run proceeds, and no rendering of the secret anywhere reproduces its value.",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "crates/verbatim-core/src/credentials.rs:287 returns Error::TooOpen before reading the file; crates/verbatim-core/tests/credentials.rs:140 asserts the rendered error names the path and `644` and withholds the key in both Display and Debug, :170 loops 0o640/0o604/0o660/0o606/0o610/0o601 and then proves 0o600 loads (the falsifying half), :189 proves the loaded Secret renders REDACTED in both formatters. No observation is generated on that path: crates/verbatim-core/src/observe/mod.rs:441-449 pushes a scrubbed note and returns from `judge_new` before the store is opened or any request built. The error scrubber is unconditional and destination-independent (crates/verbatim-core/tests/egress.rs:108, :133). All 12 credentials and 11 egress tests ok."
+    },
+    {
+      "n": 7,
+      "truth": "Exactly one module names the HTTP client, a judgment-off ingest and hook run open nothing, and the request body is filtered for an undeclared/remote destination and byte-identical for `local = true`.",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "crates/verbatim-core/tests/provider.rs:29 the_http_client_is_named_in_exactly_one_source_file walks both crates' sources and asserts observe/net.rs is the sole namer; crates/verbatim-core/src/observe/net.rs records the attempt before the socket opens (testkit-gated log with reset/count/destinations, D-21). crates/verbatim/tests/observations.rs:733 covers the ingest+hook zero-attempt half with two independent instruments (in-process log and a real listening stub). Destination filtering: crates/verbatim-core/tests/provider.rs:476 the_body_on_the_wire_is_filtered_for_remote_and_whole_for_local drives both `local = true` and `local = false` with two secrets in one line, asserts presence/absence on the wire in both directions and that the filtered body still parses as JSON; crates/verbatim-core/src/observe/egress.rs returns Cow::Borrowed on the local path so identity is provable. crates/verbatim-core/tests/egress.rs:231 asserts nothing in the ingest path names the filter."
+    },
+    {
+      "n": 8,
+      "truth": "`observations regenerate --since` rebuilds only the selected rows and leaves earlier rows byte-for-byte unchanged, and `verbatim reindex` leaves every observation row present and unmoved.",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "crates/verbatim/src/cmd/observations.rs (527 lines) is dispatched at crates/verbatim/src/main.rs:121 with the two-word verb; crates/verbatim/tests/observations.rs:587 regenerate_rebuilds_the_selected_rows_and_leaves_the_rest_untouched spoils BOTH rows first so the untouched clause can actually fail, :626 a_prompt_version_no_row_carries_selects_no_row and :699 a_malformed_since_is_misuse_and_rebuilds_nothing are the negative arms, :882/:931/:977 cover the provider-backed, provider-less and spent-budget regenerate arms - 13 ok. Reindex: crates/verbatim-core/tests/reindex.rs:414 a_reindex_leaves_every_observation_row_untouched asserts the row survives with its bytes and count==1, ok. crates/verbatim/tests/cli.rs:801-803 holds both `observations` and `observations regenerate` to the envelope contract (24 ok)."
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "Cold start from scratch",
+      "evidence": "schema.rs::the_observations_table_reaches_a_store_that_predates_it (drop, reopen, table back, no derived rebuild) plus observations.rs::a_finalized_session_is_listed_with_every_obs_01_fact returning a populated document; the store-older-than-the-table arm returns a reason and exit 0 rather than leaking `no such table` (crates/verbatim/tests/observations.rs:549)."
+    },
+    {
+      "k": 2,
+      "name": "Mechanical observations with judgment off",
+      "evidence": "crates/verbatim/tests/observations.rs:435 asserts every OBS-01 fact by name in --json and on the human listing (command keeps its arguments, commit subject, branch, 6 turn(s), 1m 40s); :733 asserts net::attempts::count()==0 for a pass and that a live configured stub endpoint got zero requests across a spawned pass and a hook run."
+    },
+    {
+      "k": 3,
+      "name": "One judgment call, anchored claims, gates hold",
+      "evidence": "judgment.rs:193 (attempts==1, one stub request, every anchor re-queried against `turns` and confirmed to belong to that session); cost.rs:152 and :194 (attempts==0 for TooShort and BudgetSpent, spend row unmoved, each with a falsifying positive half)."
+    },
+    {
+      "k": 4,
+      "name": "Parse failure arm retries once and does not block ingest",
+      "evidence": "judgment.rs:387 (attempts==2, status parse_failed, raw stored and scrubbed, claim columns null, both requests charged, no third request later); crates/verbatim/tests/observations.rs:822 the pass records itself and exits 0; pass.rs:124 runs judgment after the runs row commits and observations.rs:771 proves the lock is free during the call."
+    },
+    {
+      "k": 6,
+      "name": "Loose credentials file is refused and the key never leaks",
+      "evidence": "credentials.rs:140/:170/:189 (message names path and 644, every group/world bit refused, 0600 loads as the falsifier, both formatters render REDACTED); observe/mod.rs:441-449 returns from judge_new before the store opens so no observation row is written; egress.rs:108/:133 the scrubber is unconditional and destination-independent."
+    },
+    {
+      "k": 7,
+      "name": "No connection with judgment off; egress filtered by destination",
+      "evidence": "provider.rs:29 source-level single-namer test; observations.rs:733 two-instrument zero-attempt proof; provider.rs:476 drives local=true and local=false over the same body and asserts the secrets are present in one and absent in the other, with the filtered body still valid JSON."
+    },
+    {
+      "k": 8,
+      "name": "regenerate --since is scoped and reindex preserves observations",
+      "evidence": "observations.rs:587 (both rows spoiled first, only the selected one rebuilt); reindex.rs:414 (the observation row survives a rebuild unmoved); cli.rs:801-803 holds the two-word command to the envelope contract."
+    }
+  ],
+  "gaps": [],
+  "human_checks": [
+    {
+      "name": "Switch the [provider] block from the local endpoint to a remote OpenAI-compatible one, changing only base_url, model and the key, and run one judgment",
+      "expected": "A stored observation both times with no other configuration changed; watch for a strict endpoint rejecting `response_format: {\"type\":\"json_schema\",\"strict\":true}` sent with no `json_schema` object beside it (SUMMARY open item, one-line change in provider.rs).",
+      "why_human": "Out-of-reach resource: it needs a remote OpenAI-compatible API key, and no such key exists on this machine. CONTEXT tags AC4 human-verify for exactly this reason; no probe here can reach a remote endpoint without one, and the network is off limits to this pass."
+    }
+  ]
+}
