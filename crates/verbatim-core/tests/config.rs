@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use verbatim_core::config::{
-    Config, Secret, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME, DEFAULT_BRIEF_CHARS,
+    Config, ResponseFormat, Secret, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME, DEFAULT_BRIEF_CHARS,
     DEFAULT_CLAUDE_DIR, DEFAULT_PROMPT_CHARS, PROJECTS_SUBDIR, REDACTED,
 };
 use verbatim_core::Error;
@@ -575,6 +575,44 @@ fn a_full_provider_table_resolves_to_the_values_it_names() {
         Some(KEY),
         "the one accessor that reaches the value has to reach it"
     );
+    assert_eq!(
+        config.provider_response_format(),
+        ResponseFormat::JsonSchema,
+        "a table naming no response_format asks for the default mode"
+    );
+}
+
+/// D-09's mode key, and why it exists: `deepseek-chat` answers 400 `This
+/// response_format type is unavailable now` to `json_schema` however
+/// well-formed, and takes `json_object`. Measured 2026-08-22.
+#[test]
+fn the_response_format_key_selects_the_mode_and_defaults_to_json_schema() {
+    for (written, expected) in [
+        ("json_schema", ResponseFormat::JsonSchema),
+        ("json_object", ResponseFormat::JsonObject),
+        ("JSON_OBJECT", ResponseFormat::JsonObject),
+        ("  json_object  ", ResponseFormat::JsonObject),
+        ("none", ResponseFormat::None),
+        // An unrecognized VALUE falls back the way an unrecognized KEY is
+        // ignored: this file grows every phase and a typo must not stop a
+        // store from opening.
+        ("tool_calling", ResponseFormat::JsonSchema),
+        ("", ResponseFormat::JsonSchema),
+    ] {
+        let dir = config_dir_holding(&[(
+            CONFIG_FILE_NAME,
+            &format!("[provider]\nenabled = true\nresponse_format = \"{written}\"\n"),
+        )]);
+        let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+            Config::load_from(dir.path()).unwrap()
+        });
+
+        assert_eq!(
+            config.provider_response_format(),
+            expected,
+            "response_format = {written:?}"
+        );
+    }
 }
 
 /// The documented rule holds one level down: this file grows every phase, and a

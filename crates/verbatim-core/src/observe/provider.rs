@@ -39,22 +39,41 @@ use std::fmt;
 
 use serde_json::{json, Value};
 
-use crate::config::{Config, Secret};
+use crate::config::{Config, ResponseFormat, Secret};
 use crate::observe::{egress, net};
 
 /// What is appended to the configured base URL.
 pub const COMPLETIONS_PATH: &str = "chat/completions";
 
-/// D-09's strict-JSON request, verbatim.
+/// D-09's strict-JSON request, carrying the caller's schema.
 ///
-/// The 2026-08-21 probe honored it and came back with `finish_reason` `stop`.
-/// A constant rather than a parameter because nothing in this phase asks for a
-/// second shape; `DESIGN-BRIEF.md:326`'s tool-calling alternative is the
-/// documented fallback if an endpoint rejects this, and it would be a second
-/// request-shaping branch inside the one code path OBS-05 promises - so it gets
-/// reported rather than added speculatively.
-fn response_format() -> Value {
-    json!({ "type": "json_schema", "strict": true })
+/// `json_schema` mode is a two-part shape: `type` names the mode and a SIBLING
+/// `json_schema` object carries the `name` and `schema` the answer is held to.
+/// `strict` lives inside that object, not beside `type`.
+///
+/// It was a bare constant until AC4 was first run against a real remote
+/// endpoint. The 2026-08-21 probe (ollama) accepted
+/// `{"type":"json_schema","strict":true}` with no `json_schema` beside it, and
+/// so does the loopback stub, because neither validates the field it is not
+/// going to enforce. DeepSeek does: it answers 400 `missing field json_schema`.
+/// A permissive local endpoint cannot tell you this request is malformed, which
+/// is why the parameter arrived from a live remote run rather than from a test.
+///
+/// The schema is the CALLER's - `crate::observe::judgment::schema` already
+/// returns the `{name, schema}` payload this wraps - so `provider` stays the one
+/// request shape OBS-05 promises and learns nothing about observations.
+fn response_format(mode: ResponseFormat, schema: Option<&Value>) -> Option<Value> {
+    match mode {
+        ResponseFormat::None => None,
+        ResponseFormat::JsonObject => Some(json!({ "type": "json_object" })),
+        ResponseFormat::JsonSchema => schema.map(|schema| {
+            let mut payload = schema.clone();
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("strict".to_owned(), Value::Bool(true));
+            }
+            json!({ "type": "json_schema", "json_schema": payload })
+        }),
+    }
 }
 
 /// One message in the request.
@@ -193,12 +212,18 @@ impl std::error::Error for Error {}
 /// PRIV-02's refusal is a different failure from a provider failure and the two
 /// must not be reported as one.
 ///
+/// `schema` is the `{name, schema}` payload the answer is held to. `None` sends
+/// no `response_format` at all rather than a half of one: an endpoint that
+/// enforces the field refuses a request naming the mode without the schema, so
+/// there is no shape to fall back to that is better than asking for nothing.
+///
 /// Makes exactly one request. Retries are OBS-04's and belong to the caller
 /// that knows whether the content parsed.
 pub fn complete(
     config: &Config,
     credential: Option<&Secret>,
     messages: &[Message],
+    schema: Option<&Value>,
 ) -> Result<Completion, Error> {
     // OBS-02: judgment is opt-in and off by default, and this is where that is
     // enforced rather than assumed of the caller. Nothing below runs - no URL
@@ -227,15 +252,20 @@ pub fn complete(
     };
 
     let url = endpoint(base_url);
-    let body = json!({
+    let mut request = json!({
         "model": model,
         "messages": messages
             .iter()
             .map(|m| json!({ "role": m.role, "content": m.content }))
             .collect::<Vec<_>>(),
-        "response_format": response_format(),
-    })
-    .to_string();
+    });
+    if let (Some(format), Some(object)) = (
+        response_format(config.provider_response_format(), schema),
+        request.as_object_mut(),
+    ) {
+        object.insert("response_format".to_owned(), format);
+    }
+    let body = request.to_string();
     // D-13: the declaration decides, not the address. `local` absent or false
     // filters, so a user who forgot the key pays the filter rather than sending
     // unfiltered session text offsite.

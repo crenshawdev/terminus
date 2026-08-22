@@ -169,12 +169,21 @@ mod call {
 
     /// A config pointing at `stub`, with the destination declared as `local`.
     fn config(stub: &HttpStub, local: bool) -> (tempfile::TempDir, Config) {
+        config_with_format(stub, local, "json_schema")
+    }
+
+    fn config_with_format(
+        stub: &HttpStub,
+        local: bool,
+        response_format: &str,
+    ) -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(CONFIG_FILE_NAME),
             format!(
                 "[provider]\nenabled = true\nbase_url = \"{}\"\n\
-                 model = \"{MODEL}\"\nlocal = {local}\n",
+                 model = \"{MODEL}\"\nlocal = {local}\n\
+                 response_format = \"{response_format}\"\n",
                 stub.base_url()
             ),
         )
@@ -205,11 +214,14 @@ mod call {
         let stub = HttpStub::serving(&[testkit::chat_completion("{\"ok\":true}", 325, 69)]);
         let (_dir, config) = config(&stub, true);
 
+        let held_to = serde_json::json!({ "name": "session_observation", "schema": {} });
+
         net::attempts::reset();
         let completion = provider::complete(
             &config,
             Some(&Secret::new(KEY)),
             &[Message::user("summarise this session")],
+            Some(&held_to),
         )
         .expect("the stub answered");
 
@@ -241,7 +253,11 @@ mod call {
         let body: serde_json::Value = serde_json::from_str(body_of(request)).unwrap();
         assert_eq!(body["model"], MODEL);
         assert_eq!(body["response_format"]["type"], "json_schema");
-        assert_eq!(body["response_format"]["strict"], true);
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "session_observation"
+        );
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "summarise this session");
     }
@@ -271,8 +287,8 @@ mod call {
         let stub = HttpStub::serving(&[testkit::http_response(200, "OK", &canned)]);
         let (_dir, config) = config(&stub, true);
 
-        let completion =
-            provider::complete(&config, None, &[Message::user("x")]).expect("the stub answered");
+        let completion = provider::complete(&config, None, &[Message::user("x")], None)
+            .expect("the stub answered");
 
         assert_eq!(completion.content, "{\"decisions\":[]}");
         assert!(
@@ -290,7 +306,7 @@ mod call {
         let stub = HttpStub::serving(&[testkit::chat_completion("{}", 325, 69)]);
         let (_dir, config) = config(&stub, true);
 
-        let completion = provider::complete(&config, None, &[Message::user("x")]).unwrap();
+        let completion = provider::complete(&config, None, &[Message::user("x")], None).unwrap();
 
         assert_eq!(
             completion.usage,
@@ -300,6 +316,103 @@ mod call {
                 total_tokens: 394,
             })
         );
+    }
+
+    /// AC4's regression guard, and the one a permissive endpoint cannot be.
+    ///
+    /// `json_schema` mode is refused by a strict remote endpoint - DeepSeek
+    /// answers 400 `missing field json_schema` - when `type` names the mode and
+    /// no sibling `json_schema` object carries the schema. ollama and this stub
+    /// both accept the truncated form, so nothing that only asserts "the stub
+    /// answered" can see the defect. This asserts the BYTES instead.
+    #[test]
+    fn the_schema_rides_the_request_in_the_field_a_strict_endpoint_reads() {
+        let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+        let stub = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
+        let (_dir, config) = config(&stub, true);
+        let held_to = serde_json::json!({
+            "name": "session_observation",
+            "schema": { "type": "object", "additionalProperties": false },
+        });
+
+        provider::complete(&config, None, &[Message::user("x")], Some(&held_to))
+            .expect("the stub answered");
+
+        let sent = stub.requests().remove(0);
+        let body: serde_json::Value =
+            serde_json::from_str(body_of(&sent)).expect("the request body is JSON");
+        let format = &body["response_format"];
+
+        assert_eq!(format["type"], "json_schema");
+        assert_eq!(format["json_schema"]["name"], "session_observation");
+        assert_eq!(format["json_schema"]["schema"], held_to["schema"]);
+        // `strict` belongs INSIDE `json_schema`, not beside `type`, which is
+        // where it sat while the schema was travelling in the prompt alone.
+        assert_eq!(format["json_schema"]["strict"], true);
+        assert!(format.get("strict").is_none());
+    }
+
+    /// The DeepSeek case: `response_format = "json_object"` asks for the mode
+    /// that endpoint implements, over the same code path and the same body.
+    /// The schema is not sent - `json_object` has nowhere to put one - and the
+    /// instruction turn stays the thing that names the shape.
+    #[test]
+    fn the_json_object_mode_sends_the_shape_deepseek_accepts() {
+        let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+        let stub = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
+        let (_dir, config) = config_with_format(&stub, true, "json_object");
+        let held_to = serde_json::json!({ "name": "session_observation", "schema": {} });
+
+        provider::complete(&config, None, &[Message::user("x")], Some(&held_to))
+            .expect("the stub answered");
+
+        let sent = stub.requests().remove(0);
+        let body: serde_json::Value =
+            serde_json::from_str(body_of(&sent)).expect("the request body is JSON");
+
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert!(
+            body["response_format"].get("json_schema").is_none(),
+            "json_object mode carries no schema: {}",
+            body["response_format"]
+        );
+    }
+
+    /// `response_format = "none"` sends the key at all, for an endpoint that
+    /// rejects it outright. A schema in hand does not override the setting.
+    #[test]
+    fn the_none_mode_sends_no_response_format_even_with_a_schema() {
+        let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+        let stub = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
+        let (_dir, config) = config_with_format(&stub, true, "none");
+        let held_to = serde_json::json!({ "name": "session_observation", "schema": {} });
+
+        provider::complete(&config, None, &[Message::user("x")], Some(&held_to))
+            .expect("the stub answered");
+
+        let sent = stub.requests().remove(0);
+        let body: serde_json::Value =
+            serde_json::from_str(body_of(&sent)).expect("the request body is JSON");
+
+        assert!(body.get("response_format").is_none());
+    }
+
+    /// The other half: no schema means no `response_format` at all, rather than
+    /// the half of one that got AC4 refused. An endpoint that enforces the field
+    /// has nothing to reject when the mode is never named.
+    #[test]
+    fn a_request_with_no_schema_names_no_response_format() {
+        let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+        let stub = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
+        let (_dir, config) = config(&stub, true);
+
+        provider::complete(&config, None, &[Message::user("x")], None).expect("the stub answered");
+
+        let sent = stub.requests().remove(0);
+        let body: serde_json::Value =
+            serde_json::from_str(body_of(&sent)).expect("the request body is JSON");
+
+        assert!(body.get("response_format").is_none());
     }
 
     /// A `usage` object the provider left out entirely is `None` and not zeros:
@@ -314,7 +427,7 @@ mod call {
         let stub = HttpStub::serving(&[testkit::http_response(200, "OK", &canned)]);
         let (_dir, config) = config(&stub, true);
 
-        let completion = provider::complete(&config, None, &[Message::user("x")]).unwrap();
+        let completion = provider::complete(&config, None, &[Message::user("x")], None).unwrap();
 
         assert_eq!(completion.usage, None);
     }
@@ -337,8 +450,13 @@ mod call {
         let stub = HttpStub::serving(&[testkit::http_response(401, "Unauthorized", &canned)]);
         let (_dir, config) = config(&stub, false);
 
-        let error = provider::complete(&config, Some(&Secret::new(KEY)), &[Message::user("x")])
-            .expect_err("a 401 is not a completion");
+        let error = provider::complete(
+            &config,
+            Some(&Secret::new(KEY)),
+            &[Message::user("x")],
+            None,
+        )
+        .expect_err("a 401 is not a completion");
 
         assert_eq!(error.kind(), Kind::Status(401));
         assert_eq!(error.status(), Some(401));
@@ -363,7 +481,7 @@ mod call {
         let (_dir, config) = config(&stub, true);
 
         for _ in 0..2 {
-            let error = provider::complete(&config, None, &[Message::user("x")])
+            let error = provider::complete(&config, None, &[Message::user("x")], None)
                 .expect_err("neither body is a chat completion");
             assert_eq!(error.kind(), Kind::Malformed);
         }
@@ -389,7 +507,7 @@ mod call {
         let config = Config::load_from(dir.path()).unwrap();
 
         net::attempts::reset();
-        let error = provider::complete(&config, None, &[Message::user("x")])
+        let error = provider::complete(&config, None, &[Message::user("x")], None)
             .expect_err("nothing is listening there");
 
         assert_eq!(error.kind(), Kind::Transport);
@@ -414,7 +532,7 @@ mod call {
         let config = Config::load_from(dir.path()).unwrap();
 
         net::attempts::reset();
-        let error = provider::complete(&config, None, &[Message::user("x")])
+        let error = provider::complete(&config, None, &[Message::user("x")], None)
             .expect_err("there is nothing to call");
 
         assert_eq!(error.kind(), Kind::NotConfigured);
@@ -423,7 +541,7 @@ mod call {
         // And the default config, which asks for nothing at all, is the other
         // kind: silence rather than a note.
         assert_eq!(
-            provider::complete(&Config::default(), None, &[Message::user("x")])
+            provider::complete(&Config::default(), None, &[Message::user("x")], None)
                 .expect_err("there is nothing to call")
                 .kind(),
             Kind::Disabled
@@ -451,8 +569,13 @@ mod call {
         let config = Config::load_from(dir.path()).unwrap();
 
         net::attempts::reset();
-        let error = provider::complete(&config, Some(&Secret::new(KEY)), &[Message::user("x")])
-            .expect_err("judgment is off");
+        let error = provider::complete(
+            &config,
+            Some(&Secret::new(KEY)),
+            &[Message::user("x")],
+            None,
+        )
+        .expect_err("judgment is off");
 
         assert_eq!(error.kind(), Kind::Disabled);
         assert_eq!(
@@ -490,6 +613,7 @@ mod call {
                 &config,
                 Some(&Secret::new(KEY)),
                 &[Message::user(leaky.clone())],
+                None,
             )
             .expect("the stub answered");
             let sent = stub.requests().remove(0);

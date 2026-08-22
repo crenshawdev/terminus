@@ -94,7 +94,7 @@ use crate::observe::provider::{self, Message};
 /// make an old row's claims mean something different. It is the selector
 /// `verbatim observations regenerate --prompt-version` narrows on, so a bump
 /// that is not made is a re-run that cannot be targeted.
-pub const PROMPT_VERSION: &str = "obs-judgment-1";
+pub const PROMPT_VERSION: &str = "obs-judgment-2";
 
 /// `observations.status` for a row whose claims were validated and stored.
 pub const STATUS_OK: &str = "ok";
@@ -321,6 +321,11 @@ fn ask(
 ) -> std::result::Result<Verdict, String> {
     let shown = transcript(conn, session_key).map_err(|e| note(credential, e))?;
     let messages = [Message::system(instructions()), Message::user(shown)];
+    // The same schema twice, on purpose: in the instruction turn for an endpoint
+    // that only reads prose, and in `response_format` for one that enforces it.
+    // A local endpoint honors the first and ignores the second; a strict remote
+    // one refuses a request that names the mode without the second.
+    let held_to = schema();
 
     // What the last unusable answer was, and why. Kept rather than discarded:
     // the row that gets written carries it, because a silently dropped failure
@@ -329,7 +334,7 @@ fn ask(
     let mut tokens = 0u64;
 
     for _ in 0..=RETRIES {
-        let completion = match provider::complete(config, credential, &messages) {
+        let completion = match provider::complete(config, credential, &messages, Some(&held_to)) {
             Ok(completion) => completion,
             // Already scrubbed: `provider::Error`'s text is written by one
             // constructor and that constructor runs the scrubber.
@@ -693,9 +698,15 @@ fn claim_list(description: &str) -> Value {
 fn instructions() -> String {
     format!(
         "You are summarising one archived coding session for an audit log.\n\
-         Answer with exactly one JSON object matching this schema, and nothing \
-         else - no prose before it, no markdown fence around it:\n\
+         Answer with exactly one JSON object and nothing else - no prose before \
+         it, no markdown fence around it.\n\
+         Its top-level keys are exactly `topic`, `outcome`, `decisions`, \
+         `learned` and `unresolved`, holding real values read off the session \
+         below.\n\
+         The JSON Schema those values must satisfy is:\n\
          {}\n\
+         Answer with an INSTANCE of that schema, never the schema itself: your \
+         reply must contain no `properties`, `type`, `required` or `items` key.\n\
          Every line of the session below begins with `turn_id=<id>`. Every entry \
          of `decisions`, `learned` and `unresolved` must carry the turn_id of the \
          line the claim is read off, copied exactly. A claim you cannot point at a \

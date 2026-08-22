@@ -120,6 +120,7 @@ struct FileProvider {
     api_key: Option<String>,
     local: Option<bool>,
     daily_token_budget: Option<u64>,
+    response_format: Option<String>,
 }
 
 /// The `[injection]` table of `verbatim.toml`.
@@ -210,11 +211,54 @@ impl std::fmt::Display for Secret {
     }
 }
 
+/// Which structured-output mode the endpoint is asked for (D-09).
+///
+/// Not a second request SHAPE and not a branch on who the provider is - it is
+/// one field of one body, set by one key, and every mode goes down the same
+/// code path. What forced it into the config was an endpoint that cannot do the
+/// default: `deepseek-chat` answers 400 `This response_format type is
+/// unavailable now` to `json_schema` however well-formed it is, while accepting
+/// `json_object`. D-09 named tool-calling as the fallback and deferred it as
+/// speculative; this is the non-speculative half, measured 2026-08-22.
+///
+/// The schema reaches the model either way: it is written into the instruction
+/// turn (`crate::observe::judgment`), and every claim's `turn_id` is validated
+/// against `turns` before a row is stored. What the stricter modes add is
+/// enforcement at the endpoint, not the anchoring guarantee.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResponseFormat {
+    /// `{"type":"json_schema","json_schema":{name,strict,schema}}` - the
+    /// endpoint holds the answer to the schema. The default, and what OpenAI,
+    /// OpenRouter and vLLM implement.
+    #[default]
+    JsonSchema,
+    /// `{"type":"json_object"}` - the endpoint guarantees parseable JSON and
+    /// nothing about its shape. DeepSeek's only structured mode.
+    JsonObject,
+    /// No `response_format` field at all, for an endpoint that rejects the key
+    /// itself. The instruction turn is then the only thing asking for JSON.
+    None,
+}
+
+impl ResponseFormat {
+    /// Parse the config value. An unrecognized one is the default, under the
+    /// same rule that ignores an unrecognized KEY: this file grows across
+    /// phases and a typo must not stop a store from opening.
+    fn parse(value: &str) -> ResponseFormat {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "json_object" => ResponseFormat::JsonObject,
+            "none" => ResponseFormat::None,
+            _ => ResponseFormat::JsonSchema,
+        }
+    }
+}
+
 /// The resolved `[provider]` block (OBS-05, D-05, D-10).
 ///
-/// Base URL, model and key are the only things that differ between a local
-/// ollama and a remote OpenAI-compatible endpoint; there is no second request
-/// shape behind any of these fields.
+/// Base URL, model and key are what differ between a local ollama and a remote
+/// OpenAI-compatible endpoint; there is no second request shape behind any of
+/// these fields. `response_format` is the one exception AC4 forced, and it
+/// selects a field's value rather than a code path.
 ///
 /// Nothing here is parsed as a URL, resolved as a host or looked up in DNS.
 /// There is no `url` crate in this workspace on purpose (D-13): a name
@@ -229,6 +273,7 @@ struct Provider {
     api_key: Option<Secret>,
     local: bool,
     daily_token_budget: Option<u64>,
+    response_format: ResponseFormat,
 }
 
 /// The resolved config.
@@ -336,6 +381,10 @@ impl Config {
             api_key: non_empty(file.provider.api_key).map(Secret::new),
             local: file.provider.local.unwrap_or(false),
             daily_token_budget: file.provider.daily_token_budget,
+            response_format: non_empty(file.provider.response_format)
+                .as_deref()
+                .map(ResponseFormat::parse)
+                .unwrap_or_default(),
         };
         Ok(config)
     }
@@ -406,6 +455,16 @@ impl Config {
     /// [`Config::provider_enabled`] says otherwise.
     pub fn provider_daily_token_budget(&self) -> Option<u64> {
         self.provider.daily_token_budget
+    }
+
+    /// Which structured-output mode to ask the endpoint for (D-09).
+    ///
+    /// [`ResponseFormat::JsonSchema`] unless the config says otherwise, so an
+    /// endpoint that implements the default needs no key and AC4's "only base
+    /// URL, model and key" holds for every provider that does. A provider that
+    /// does not - DeepSeek - is the reason the key exists.
+    pub fn provider_response_format(&self) -> ResponseFormat {
+        self.provider.response_format
     }
 
     /// How many characters the SessionStart resume brief may carry (INJ-01).
