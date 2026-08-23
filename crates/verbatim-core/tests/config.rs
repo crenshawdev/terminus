@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use verbatim_core::config::{
-    Config, ResponseFormat, Secret, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME, DEFAULT_BRIEF_CHARS,
-    DEFAULT_CLAUDE_DIR, DEFAULT_PROMPT_CHARS, PROJECTS_SUBDIR, REDACTED,
+    Config, ResponseFormat, RetentionAction, Secret, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME,
+    DEFAULT_BRIEF_CHARS, DEFAULT_CLAUDE_DIR, DEFAULT_PROMPT_CHARS, PROJECTS_SUBDIR, REDACTED,
 };
 use verbatim_core::Error;
 
@@ -711,4 +711,158 @@ fn an_empty_provider_string_is_the_same_as_an_absent_one() {
     assert_eq!(config.provider_base_url(), None);
     assert_eq!(config.provider_name(), None);
     assert!(config.provider_api_key().is_none());
+}
+
+// RET-01 and D-01: retention is off unless `verbatim.toml` says otherwise, and
+// a per-project rule is matched through the same subtree test the exclusions
+// use rather than by string equality against `session_meta.project`.
+
+/// Load a config out of a directory holding just this `verbatim.toml` body.
+fn retention_config(body: &str) -> Config {
+    let dir = config_dir_holding(&[(CONFIG_FILE_NAME, body)]);
+    with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).expect("a retention table is not a parse failure")
+    })
+}
+
+/// RET-01's off state, from both directions it can be reached: no file at all,
+/// and a file that configures something else entirely. Neither may select a
+/// session, and a store whose every session predates any plausible default has
+/// to come out of a pass unchanged because of this.
+#[test]
+fn a_config_with_no_retention_table_selects_nothing() {
+    let missing = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(config_dir_holding(&[]).path()).unwrap()
+    });
+    let unrelated = retention_config("[injection]\nbrief_chars = 500\n");
+
+    for (name, config) in [("no file", &missing), ("no table", &unrelated)] {
+        assert!(
+            config.retention_selects_nothing(),
+            "{name}: retention is on with nothing configuring it"
+        );
+        let policy = config.retention_for(Some("/data/code/scratch"));
+        assert_eq!(policy.action, RetentionAction::Keep, "{name}");
+        assert_eq!(policy.age_days, 0, "{name}");
+        assert!(policy.selects_nothing(), "{name}");
+    }
+}
+
+/// D-01: the per-project key is a subtree, matched through `covers`. The
+/// hyphenated sibling is the case a string prefix would get wrong, and it is
+/// the same one D-07 proved the encoded exclusion test cannot decide.
+#[test]
+fn a_project_rule_covers_the_subtree_and_stops_at_a_segment_boundary() {
+    let config = retention_config(
+        "[retention.project.\"/data/code/scratch\"]\naction = \"evict\"\nage_days = 30\n",
+    );
+
+    assert!(!config.retention_selects_nothing());
+
+    let inside = config.retention_for(Some("/data/code/scratch/sub"));
+    assert_eq!(inside.action, RetentionAction::Evict);
+    assert_eq!(inside.age_days, 30);
+
+    let itself = config.retention_for(Some("/data/code/scratch"));
+    assert_eq!(
+        itself.action,
+        RetentionAction::Evict,
+        "the key covers itself"
+    );
+
+    for elsewhere in ["/data/code/scratch-other", "/data/code", "/elsewhere"] {
+        let policy = config.retention_for(Some(elsewhere));
+        assert_eq!(
+            policy.action,
+            RetentionAction::Keep,
+            "{elsewhere} took a rule written for /data/code/scratch"
+        );
+        assert!(policy.selects_nothing(), "{elsewhere}");
+    }
+
+    assert!(
+        config.retention_for(None).selects_nothing(),
+        "a session with no project key falls back to the global table, which is off here"
+    );
+}
+
+/// Two keys cover the same session and the deeper one decides, which is the
+/// rule `recall::scope` already applies to project keys. A user who names a
+/// tree and then carves one project out of it means the carve-out.
+#[test]
+fn the_deepest_configured_project_key_wins() {
+    let config = retention_config(
+        "[retention]\naction = \"evict\"\nage_days = 400\n\n         [retention.project.\"/data/code\"]\naction = \"evict\"\nage_days = 90\n\n         [retention.project.\"/data/code/scratch\"]\naction = \"delete\"\nage_days = 7\n",
+    );
+
+    let deep = config.retention_for(Some("/data/code/scratch/sub"));
+    assert_eq!(deep.action, RetentionAction::Delete);
+    assert_eq!(deep.age_days, 7);
+
+    let shallow = config.retention_for(Some("/data/code/other"));
+    assert_eq!(shallow.action, RetentionAction::Evict);
+    assert_eq!(shallow.age_days, 90);
+
+    let global = config.retention_for(Some("/elsewhere"));
+    assert_eq!(global.age_days, 400, "nothing covers this one");
+}
+
+/// A typo in `action` resolves to keep rather than failing the load, under the
+/// same rule `ResponseFormat::parse` states - and here the alternative is worse
+/// than a wrong mode: an action nobody meant must never be a deletion.
+#[test]
+fn an_unrecognized_action_resolves_to_keep_rather_than_failing_the_load() {
+    let config = retention_config("[retention]\naction = \"nonsense\"\nage_days = 30\n");
+
+    let policy = config.retention_for(Some("/data/code/scratch"));
+    assert_eq!(policy.action, RetentionAction::Keep);
+    assert_eq!(policy.age_days, 30, "the age it did understand is kept");
+    assert!(
+        policy.selects_nothing(),
+        "keep names no session however old it is"
+    );
+    assert!(config.retention_selects_nothing());
+}
+
+/// Both halves have to be set. An action with no age names every session ever
+/// archived, so an absent, zero or negative `age_days` is the off state - and a
+/// negative one is clamped rather than rejected, because a config that refuses
+/// to load stops every command including the ones that would show the mistake.
+#[test]
+fn an_action_without_a_positive_age_selects_nothing() {
+    for body in [
+        "[retention]\naction = \"delete\"\n",
+        "[retention]\naction = \"delete\"\nage_days = 0\n",
+        "[retention]\naction = \"delete\"\nage_days = -30\n",
+    ] {
+        let config = retention_config(body);
+        let policy = config.retention_for(Some("/data/code/scratch"));
+        assert_eq!(policy.action, RetentionAction::Delete, "{body:?}");
+        assert_eq!(policy.age_days, 0, "{body:?}");
+        assert!(policy.selects_nothing(), "{body:?}");
+        assert!(config.retention_selects_nothing(), "{body:?}");
+    }
+}
+
+/// D-01: a project key is spelled by a human and normalized by the same
+/// function the exclusions go through, so a trailing separator, a `..` or a
+/// `~` still names its project - and a key that names nothing at all is
+/// dropped rather than kept as a prefix of every path there is.
+#[test]
+fn a_project_key_is_normalized_the_way_an_exclusion_is() {
+    let config = retention_config(
+        "[retention.project.\"/data/code/../code/scratch/\"]\naction = \"evict\"\nage_days = 5\n\n         [retention.project.\"code/relative\"]\naction = \"delete\"\nage_days = 5\n",
+    );
+
+    assert_eq!(
+        config.retention_for(Some("/data/code/scratch/sub")).action,
+        RetentionAction::Evict,
+        "a key spelled with a parent component and a trailing separator names its project"
+    );
+    assert!(
+        config
+            .retention_for(Some("/anything/at/all"))
+            .selects_nothing(),
+        "a relative key matches no absolute project key and must not become one that matches all"
+    );
 }

@@ -33,6 +33,7 @@
 //! disagree about which projects are excluded is precisely the read-then-filter
 //! ING-08 forbids.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -98,6 +99,45 @@ struct FileConfig {
     /// The model provider observations may ask for judgment (OBS-05, D-10).
     #[serde(default)]
     provider: FileProvider,
+    /// How much of each project's history to keep (RET-01, D-01).
+    #[serde(default)]
+    retention: FileRetention,
+}
+
+/// The `[retention]` table of `verbatim.toml` (RET-01, D-01).
+///
+/// **Read and never written.** No command in this workspace writes this file
+/// and none can: the `toml` dependency is `default-features = false` with the
+/// serializer half deliberately absent (root `Cargo.toml`), so "retention is
+/// configured by hand-editing the file" is a property of what is linked rather
+/// than a convention a later command could quietly break.
+///
+/// Every key is optional and a missing table means the defaults, under the same
+/// rule `[injection]` and `[provider]` follow. Here the defaults are the OFF
+/// state, which is RET-01 itself: a store keeps everything unless this table
+/// says otherwise.
+///
+/// The per-project keys are project paths **as the user writes them** -
+/// `[retention.project."/data/code/scratch"]` - and they are put through the
+/// same [`normalize`] the exclusions go through before anything compares them
+/// (D-01). The design brief's own example writes a bare `scratch` while every
+/// stored project key is a canonical git toplevel, so a rule that matched by
+/// string equality against `session_meta.project` would silently match nothing
+/// forever and read as broken rather than as misconfigured.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FileRetention {
+    action: Option<String>,
+    age_days: Option<i64>,
+    #[serde(default)]
+    project: BTreeMap<String, FileRetentionTable>,
+}
+
+/// One `[retention.project."<path>"]` table: the same two keys as the global
+/// one, so a project overrides the whole rule rather than half of it.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FileRetentionTable {
+    action: Option<String>,
+    age_days: Option<i64>,
 }
 
 /// The `[provider]` table of `verbatim.toml` (D-10).
@@ -276,6 +316,69 @@ struct Provider {
     response_format: ResponseFormat,
 }
 
+/// What retention does to a session that has aged past its policy (RET-01).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RetentionAction {
+    /// Keep it. The default, the whole product's posture, and what an
+    /// unrecognized `action` resolves to.
+    #[default]
+    Keep,
+    /// Empty the blob and mark the session evicted, leaving the row, its
+    /// metadata and every derived row in place (RET-02).
+    Evict,
+    /// Remove the session entirely - and only once Claude Code's own
+    /// `cleanupPeriodDays` has already removed its transcript (D-02).
+    Delete,
+}
+
+impl RetentionAction {
+    /// Parse the config value. An unrecognized one is [`RetentionAction::Keep`],
+    /// under the same rule [`ResponseFormat::parse`] states for an unrecognized
+    /// value and for the same reason plus a sharper one: this file grows across
+    /// phases, and a typo here must not make a store start deleting.
+    fn parse(value: &str) -> RetentionAction {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "evict" => RetentionAction::Evict,
+            "delete" => RetentionAction::Delete,
+            _ => RetentionAction::Keep,
+        }
+    }
+}
+
+/// One resolved retention rule: what to do, and how old a session has to be
+/// before it is done.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub action: RetentionAction,
+    /// How many days a session's last turn must predate before the action
+    /// applies. Zero is off, and it is what an absent, zero or negative
+    /// `age_days` all resolve to.
+    pub age_days: u32,
+}
+
+impl RetentionPolicy {
+    /// Can this policy ever name a session?
+    ///
+    /// "Off by default" is a property of the resolved VALUE rather than of a
+    /// caller remembering to check two fields (RET-01). Both halves have to be
+    /// set for anything to happen: an `action` with no age names every session
+    /// that ever existed, and an age with no action names them for no purpose.
+    pub fn selects_nothing(&self) -> bool {
+        self.age_days == 0 || self.action == RetentionAction::Keep
+    }
+}
+
+/// The resolved `[retention]` block (RET-01, D-01).
+///
+/// The project keys are [`normalize`]d, exactly as the exclusions are, and a
+/// key that normalizes to nothing is dropped exactly as an exclusion is - an
+/// empty string here would be an ancestor of every path there is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Retention {
+    global: RetentionPolicy,
+    projects: Vec<(String, RetentionPolicy)>,
+}
+
 /// The resolved config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -288,6 +391,7 @@ pub struct Config {
     brief_chars: usize,
     prompt_chars: usize,
     provider: Provider,
+    retention: Retention,
 }
 
 /// The defaults, spelled once. Derived `Default` would give both budgets zero,
@@ -306,6 +410,10 @@ impl Default for Config {
             // opt-in and off (OBS-02), and `local` absent means remote and
             // therefore filtered (D-13).
             provider: Provider::default(),
+            // Every field at its zero, and here that IS the specified state:
+            // `Keep` with no age selects nothing, so a user who never wrote a
+            // `[retention]` table has retention off (RET-01).
+            retention: Retention::default(),
         }
     }
 }
@@ -386,6 +494,7 @@ impl Config {
                 .map(ResponseFormat::parse)
                 .unwrap_or_default(),
         };
+        config.retention = resolve_retention(file.retention);
         Ok(config)
     }
 
@@ -477,6 +586,54 @@ impl Config {
         self.prompt_chars
     }
 
+    /// The retention policy in force for a session stored under this project
+    /// key (RET-01, D-01).
+    ///
+    /// **The deepest configured key that COVERS the session's project wins**,
+    /// through [`covers`] - the same component-wise ancestor test
+    /// [`Config::excludes_path`] and `recall::scope` share, and the same
+    /// deepest-wins rule `recall::scope` already applies to project keys. So
+    /// `[retention.project."/data/code/scratch"]` governs a session archived
+    /// under `/data/code/scratch/sub` and does not govern one under
+    /// `/data/code/scratch-other`, and where both `/data/code` and
+    /// `/data/code/scratch` are configured the more specific one decides.
+    ///
+    /// A session no configured key covers - including one carrying no project
+    /// key at all, which one real transcript per 3,416 does - gets the global
+    /// table. That is the widest rule and it is still off unless the global
+    /// table says otherwise.
+    pub fn retention_for(&self, project: Option<&str>) -> RetentionPolicy {
+        let Some(project) = project else {
+            return self.retention.global;
+        };
+        let project = Path::new(project);
+        let mut best: Option<(usize, RetentionPolicy)> = None;
+        for (key, policy) in &self.retention.projects {
+            let Some(depth) = covers(Path::new(key), project) else {
+                continue;
+            };
+            if best.is_none_or(|(deepest, _)| depth > deepest) {
+                best = Some((depth, *policy));
+            }
+        }
+        best.map_or(self.retention.global, |(_, policy)| policy)
+    }
+
+    /// Is there any session, anywhere, this config's retention could name?
+    ///
+    /// Asked once so the retention step can issue no query at all in the state
+    /// every user starts in. It is deliberately answered from the config alone
+    /// and never from the store: "retention is off" must be a fact about what
+    /// was configured, not about what happens to be archived today.
+    pub fn retention_selects_nothing(&self) -> bool {
+        self.retention.global.selects_nothing()
+            && self
+                .retention
+                .projects
+                .iter()
+                .all(|(_, policy)| policy.selects_nothing())
+    }
+
     /// The Claude config directories, in the order they were configured.
     pub fn roots(&self) -> &[PathBuf] {
         &self.roots
@@ -562,6 +719,40 @@ impl Config {
         self.exclusions
             .iter()
             .any(|excluded| covers(Path::new(excluded), path).is_some())
+    }
+}
+
+/// Turn the `[retention]` table into the value every caller reads (D-01).
+///
+/// Two things happen here and nowhere else. Every per-project key goes through
+/// [`normalize`], so a rule written `~/code/scratch/` or `/data/code/../code`
+/// names the same subtree the exclusions would - and a key that normalizes to
+/// nothing is dropped rather than kept as an empty string that covers every
+/// path there is. And `age_days` is CLAMPED rather than rejected: deserializing
+/// it into an unsigned integer instead would make a negative number fail the
+/// whole config load, which is a typo in a key that only ever turns something
+/// on stopping `verbatim status` from running at all. Clamping sends it to
+/// zero, which is off.
+fn resolve_retention(file: FileRetention) -> Retention {
+    fn rule(action: Option<String>, age_days: Option<i64>) -> RetentionPolicy {
+        RetentionPolicy {
+            action: non_empty(action)
+                .as_deref()
+                .map(RetentionAction::parse)
+                .unwrap_or_default(),
+            age_days: age_days.unwrap_or(0).clamp(0, i64::from(u32::MAX)) as u32,
+        }
+    }
+
+    Retention {
+        global: rule(file.action, file.age_days),
+        projects: file
+            .project
+            .into_iter()
+            .filter_map(|(key, table)| {
+                normalize(&key).map(|key| (key, rule(table.action, table.age_days)))
+            })
+            .collect(),
     }
 }
 
