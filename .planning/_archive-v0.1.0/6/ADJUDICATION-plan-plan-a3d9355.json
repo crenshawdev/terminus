@@ -1,0 +1,78 @@
+{
+  "phase": "6",
+  "trigger": "plan",
+  "discriminator": "plan-a3d9355",
+  "round": 1,
+  "base": "a3d9355",
+  "head": "a3d9355",
+  "base_id": "a3d93552aa2b50ee6dc753f9c0fe530323e9a339",
+  "head_id": "a3d93552aa2b50ee6dc753f9c0fe530323e9a339",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": ".planning/phases/6/PLAN-2.md",
+      "line": 34,
+      "severity": "medium",
+      "claim": "Task 1 only extracts entities from `tool_use` blocks whose name ends with `recall_search`; it never covers `recall_get`, even though FEED-02/D-13 define `miss` against both tool-call types.",
+      "failure_scenario": "A finalized decision is later followed by a `recall_get` call for an entity it declined to inject, but no entities are extracted from that turn, so the labeler never emits the required `miss` row.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim/src/cmd/mcp/tools.rs",
+        "line": 64,
+        "note": "recall_get input is a bounded turn-id list, never a query or entity name, so the stated scenario - a recall_get call FOR AN ENTITY the decision declined to inject - cannot occur; the miss signal rides recall_search, which PLAN-2 Task 1 covers. The residual (Task 3 joins on recall_get turns nothing populates entities for) is an inert join arm, recorded as an open item in CAPTURE.md."
+      },
+      "citation_missing": true,
+      "base_id": "a3d93552aa2b50ee6dc753f9c0fe530323e9a339",
+      "head_id": "a3d93552aa2b50ee6dc753f9c0fe530323e9a339"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": ".planning/phases/6/PLAN-1.md",
+      "line": 57,
+      "severity": "medium",
+      "claim": "The reindex-survival test only checks that `decisions`/`labels` exist again and that the `turns` row count is unchanged, so it cannot distinguish the intended missing-table arm from an accidental reindex/rebuild that recreates the tables.",
+      "failure_scenario": "Opening an upgraded store with dropped feedback tables mistakenly triggers a rebuild; the test still passes because the tables reappear and the `turns` count stays the same, hiding the regression and its performance cost.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/6/PLAN-1.md",
+        "line": 110,
+        "note": "the test also asserts rebuild_required() is None, which discriminates the flagged-rebuild arm; Store::open has no silent-rebuild path, and reindex would not recreate decisions since Task 2 keeps it out of DERIVED_TABLES. Test-hardening nicety, not a plan defect."
+      },
+      "citation_missing": true,
+      "base_id": "a3d93552aa2b50ee6dc753f9c0fe530323e9a339",
+      "head_id": "a3d93552aa2b50ee6dc753f9c0fe530323e9a339"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": ".planning/phases/6/PLAN-1.md",
+      "line": 68,
+      "severity": "medium",
+      "claim": "The decision-record shape persists candidate spellings and scored candidates, but it never explicitly stores the raw entities extracted from the prompt, which FEED-01 says must be logged.",
+      "failure_scenario": "A prompt extracts several entities that are later filtered or re-ranked away; the saved record no longer contains the original extraction set, so replay/debugging cannot explain why the decision changed and the logged decision is incomplete.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/6/PLAN-1.md",
+        "line": 124,
+        "note": "Task 3 record shape stores the extracted candidate spellings - the raw pre-filter extraction set - and Task 4 writes them on every exit arm including non-fires; AC1 names entities and the spellings are that field."
+      },
+      "citation_missing": true,
+      "base_id": "a3d93552aa2b50ee6dc753f9c0fe530323e9a339",
+      "head_id": "a3d93552aa2b50ee6dc753f9c0fe530323e9a339"
+    }
+  ]
+}

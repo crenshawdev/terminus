@@ -11,6 +11,8 @@ files:
   - crates/verbatim/src/cmd/uninstall.rs
   - crates/verbatim/src/cmd/json.rs
   - crates/verbatim/src/cmd/install/targets.rs
+  - crates/verbatim/src/cmd/install/json_file.rs
+  - crates/verbatim/src/cmd/install/mod.rs
   - crates/verbatim/tests/doctor.rs
   - crates/verbatim/tests/uninstall.rs
   - docs/json-shapes.md

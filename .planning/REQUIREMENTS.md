@@ -11,104 +11,104 @@ Committed scope. Each maps to exactly one roadmap phase.
 
 ### Archive (STOR)
 
-- **STOR-01**: A session's turns are stored as one block-framed zstd blob, and reading a single turn decompresses only the 64 KB blocks that turn occupies.
-- **STOR-02**: An ingest commits blob, turn rows, FTS rows, entity rows and the watermark in a single transaction, so a killed process leaves no partially indexed session.
-- **STOR-03**: `verbatim verify` walks every blob, checks its per-blob checksum, and names the session ids that fail rather than declaring the store bad.
-- **STOR-04**: `verbatim reindex` rebuilds every derived table from blobs alone and produces the same query results as before the rebuild.
-- **STOR-05**: The binary refuses to open a store whose format version is newer than it knows, and rebuilds derived tables — never the archive table — when the format is older.
-- **STOR-06**: Rolling snapshots run by default and produce a consistent copy of the store without stopping ingest.
-- **STOR-07**: `verbatim data move <path>` relocates the store and updates the location pointer, so no component holds a hardcoded store path.
 
 ### Ingest (ING)
 
-- **ING-01**: `verbatim ingest` tails each transcript from its stored byte offset to the last complete record, and resumes correctly when the previous run stopped mid-line.
-- **ING-02**: A second ingest launched while one is running exits 0 within milliseconds instead of waiting, and exactly one process does the work.
-- **ING-03**: Ingest performs its recovery at the top of every run, with no repair command and no external supervisor, and a rerun after a kill at any point converges to a consistent store.
-- **ING-04**: Ingest discovers nested subagent sidecar transcripts and links sessions that continue across files into one thread.
-- **ING-05**: A session's project is the canonical git toplevel derived from the record's `cwd`, with worktrees mapped to the parent repo and both keys stored; the encoded directory name and `basename()` are never used for identity.
-- **ING-06**: A compaction appended to a live transcript is ingested as a boundary carrying the record's compaction metadata verbatim. The set of turns that fell out of the model's context is derived from that metadata at query time (INJ-05, Phase 5) - the metadata describes the preserved segment, so the complement is a query and not a stored column (Phase 2 D-08).
-- **ING-07**: Capture mode (`full`, `lean`, `minimal`) controls how much of each record is stored, and every elision is marked in the stored record.
-- **ING-08**: An excluded project is never read rather than read-then-filtered, and the exclusion is honored on the ingest path and every read path alike.
-- **ING-09**: `verbatim status` reports sizes, counts, watermarks and the last ingest run with its error, sourced from the `runs` table rather than a log file.
-- **ING-10**: Each of the four hooks spawns a fully detached ingest process and returns 0 immediately, invoking the binary by absolute path with no shell and no inherited handles.
-- **ING-11**: Backfill estimates sessions, size and time up front, then runs detached, chunked, resumable and with bounded parallelism.
 
 ### Recall (RCL)
 
-- **RCL-01**: Turn text is expanded in Rust at ingest into its camel, snake, kebab and path components, so a search for `SearchManager` and a search for `manager` both find the same turn through plain `unicode61` FTS5.
-- **RCL-02**: Entities of kind path, command, error, symbol and tool are extracted from structured tool records, with per-kind normalization, rather than from prose.
-- **RCL-03**: Error entities are normalized by stripping line numbers, addresses, timestamps and UUIDs, so the same error recurring in a later session matches the earlier one.
-- **RCL-04**: No entity is rejected at index time; commonness is handled by IDF weighting at query time, and the number of entities emitted per turn is capped.
-- **RCL-05**: `verbatim search`, `verbatim show` and `verbatim sessions` give terminal recall over the archive with project scoping and filters.
-- **RCL-06**: Every data command accepts `--json` and emits a stable shape, sends data to stdout and errors to stderr, and exits 0 on success, 1 on operational failure and 2 on misuse, never non-zero for an empty result.
-- **RCL-07**: `recall_search` returns ranked turns filtered by project, paths, tool, kind and time window, with id, session, timestamp, project and excerpt per hit.
-- **RCL-08**: `recall_context` returns the chronological turns around a given hit.
-- **RCL-09**: `recall_get` returns full verbatim text for a list of ids and flags any body that was evicted.
-- **RCL-10**: All three MCP tools are marked read-only, auto-scope to the current project with `project: "*"` opting into cross-project, enforce a server-side result budget, and return empty results with a reason instead of throwing.
-- **RCL-11**: The MCP server is a short-lived stdio process reading through WAL, with no port, no daemon, no HTTP and no SSE.
 
 ### Install (INST)
 
-- **INST-01**: `npx verbatim install` runs from a thin npm package with per-platform optional dependencies and no postinstall script.
-- **INST-02**: Install copies the platform binary to the canonical stable path and points both hook entries and MCP registration at that copy, without modifying PATH.
-- **INST-03**: Install shows the exact diff for each file it changes (`~/.claude/settings.json` and `~/.claude.json`), backs each one up, confirms once, merges into the existing objects atomically, and produces no second entry when rerun.
-- **INST-04**: Install offers to raise `cleanupPeriodDays` when it is low and prints the auto-compact recommendation, without changing either setting itself.
-- **INST-05**: An upgrade replaces the binary and re-copies it to the stable path without rewriting a single hook entry.
-- **INST-06**: `verbatim doctor` is read-only, never repairs, and prints the exact command that fixes each problem it reports.
-- **INST-07**: Uninstall removes only what install added, restores the settings backup when the file is otherwise unchanged, leaves the data and prints where it is, and deletes it under `--purge` only after showing its size and confirming.
-- **INST-08**: `--yes` accepts every default so install runs unattended in a script.
 
 ### Injection (INJ)
 
-- **INJ-01**: SessionStart emits a resume brief covering the last session in this project, the branch that session ended on, the index pointer and observations when enabled, inside its token budget and a single-digit-millisecond wall budget. The working-state delta is branch-only because `session_meta.branch` is the sole git fact the archive holds and a `git` subprocess costs 10-30 ms against a single-digit-millisecond budget (Phase 5 D-10).
-- **INJ-02**: The resume brief contains no volatile text — stable ordering, dates rounded to the day — so unchanged state produces byte-identical output across runs and does not bust the prefix cache.
-- **INJ-03**: UserPromptSubmit injects between 0 and 3 turns, firing only on a structural threshold (a rank 1–3 exact entity match, or two or more independent entities co-occurring in one turn), and never on a free-text-only match.
-- **INJ-04**: A turn already injected this session, already visible in the session, or already carried by the resume brief is suppressed rather than injected again.
-- **INJ-05**: After a compaction, the next prompt draws its candidates from the turns that fell out of context, scoped and capped, rather than bulk re-injecting them.
-- **INJ-06**: Any injection failure emits nothing and exits 0 inside the deadline, so a missing, locked or corrupt store never blocks a prompt.
 
 ### Feedback (FEED)
 
-- **FEED-01**: Every injection decision is logged, non-fires included, with the entities extracted, candidates scored, turns injected, turns suppressed with reasons, thresholds used and tokens spent.
-- **FEED-02**: Ingest labels decisions from finalized sessions as hit, false positive, miss or wasted budget by joining them against the transcript that followed.
-- **FEED-03**: A replay harness re-runs every logged prompt against the index as it stood, so a change to extraction or thresholds is diffed against history offline instead of tuned by feel.
-- **FEED-04**: `verbatim stats` reports injection precision, misses, and tokens injected versus tokens referenced.
 
 ### Observations (OBS)
 
-- **OBS-01**: Mechanical observations — files read and modified, tools used, commands run, errors seen, branch, commits, turn count, duration, compactions — are parser-derived and always available.
-- **OBS-02**: LLM judgment is opt-in and off by default, costs one call per finalized session, and returns strict JSON against a fixed schema.
-- **OBS-03**: Every generated claim carries a `turn_id` anchoring it to a verbatim turn in the archive.
-- **OBS-04**: A parse failure retries once and then stores the raw response with `status = parse_failed`; it is never dropped silently and never blocks ingest.
-- **OBS-05**: One provider block of base URL, model and key serves local, OpenRouter and any OpenAI-compatible endpoint through a single code path, with Anthropic subscription auth as a separate branch.
-  - Phase 7 note (2026-08-22): the OpenAI-compatible half is delivered and the single code path is
-    intact. Anthropic subscription OAuth - the "separate branch" - is DEFERRED out of phase 7
-    (CONTEXT D-05): no OAuth flow, refresh or storage is described anywhere in the repo and there is
-    no Anthropic key on this machine to prove it against. Add it as its own phase via /cad-phase.
-    A fourth key, `response_format`, exists for an endpoint whose structured-output support is
-    narrower than `json_schema` (measured against `deepseek-chat`); it selects one field's value,
-    not a second request shape, so "single code path" holds. See phase 7 AC4 as amended.
-- **OBS-06**: Cost controls hold: sessions under N turns are skipped, input is truncated with explicit elision markers, a daily token budget applies, and there is never more than one call per session.
-- **OBS-07**: `verbatim observations regenerate` rebuilds derived observations selected by `--since` or `--prompt-version`.
-- **OBS-08**: Observations are reachable through the existing recall tools as a `kind` filter rather than through a fourth tool.
 
 ### Privacy (PRIV)
 
-- **PRIV-01**: Redaction happens at egress and is keyed on destination — a remote provider is filtered, a local provider is not egress at all — and never at ingest.
-- **PRIV-02**: Credentials load from the shared per-provider file with permissions enforced and load refused when they are too open, following precedence process env, then product config, then shared file, and their values never reach logs, errors or output.
-  - Phase 7 note (2026-08-22): the permission check is a Unix mode-bit test via `PermissionsExt`.
-    Windows ACL enforcement is DEFERRED (CONTEXT D-15); the Windows arm accepts with a caveat
-    surfaced in `doctor`. Complete on Unix only.
-- **PRIV-03**: The binary opens no network connection except to the configured model provider, and emits no telemetry of any kind.
-- **PRIV-04**: `verbatim export` produces portable output for backup or migration and states what that output contains.
 
 ### Retention (RET)
 
-- **RET-01**: Retention is off by default, and `keep`, `evict` and `delete` can be set globally or per project.
-- **RET-02**: An evicted session stays searchable and listed with its body flagged as evicted, while a deleted one is gone from both blob and index.
-- **RET-03**: Retention runs at the end of an ingest pass under the lock already held, does bounded work per pass, and `--dry-run` reports what it would do before anything is applied.
-- **RET-04**: `verbatim compact` reclaims freed space so the store actually shrinks after retention.
-- **RET-05**: `verbatim usage` reports bytes per project and per month.
+
+## Shipped
+
+Delivered and verified. Kept as rows for shipped-scope trace; git history
+holds the full requirement text. Archived out of `## Traceability` so a new
+milestone's audit starts clean (the audit seam parses only the Traceability
+table).
+
+| Requirement | Phase | Status | Milestone |
+|-------------|-------|--------|-----------|
+| STOR-01 (A session's turns are stored as one block-framed zstd blob, and reading a single turn decompresses only the 64 KB blocks that turn occupies.) | 1 | Complete | v0.1.0 |
+| STOR-05 (The binary refuses to open a store whose format version is newer than it knows, and rebuilds derived tables — never the archive table — when the format is older.) | 1 | Complete | v0.1.0 |
+| STOR-02 (An ingest commits blob, turn rows, FTS rows, entity rows and the watermark in a single transaction, so a killed process leaves no partially indexed session.) | 1 | Complete | v0.1.0 |
+| STOR-03 (`verbatim verify` walks every blob, checks its per-blob checksum, and names the session ids that fail rather than declaring the store bad.) | 1 | Complete | v0.1.0 |
+| STOR-04 (`verbatim reindex` rebuilds every derived table from blobs alone and produces the same query results as before the rebuild.) | 1 | Complete | v0.1.0 |
+| ING-01 (`verbatim ingest` tails each transcript from its stored byte offset to the last complete record, and resumes correctly when the previous run stopped mid-line.) | 1 | Complete | v0.1.0 |
+| ING-02 (A second ingest launched while one is running exits 0 within milliseconds instead of waiting, and exactly one process does the work.) | 1 | Complete | v0.1.0 |
+| ING-03 (Ingest performs its recovery at the top of every run, with no repair command and no external supervisor, and a rerun after a kill at any point converges to a consistent store.) | 2 | Complete | v0.1.0 |
+| ING-04 (Ingest discovers nested subagent sidecar transcripts and links sessions that continue across files into one thread.) | 2 | Complete | v0.1.0 |
+| ING-08 (An excluded project is never read rather than read-then-filtered, and the exclusion is honored on the ingest path and every read path alike.) | 2 | Complete | v0.1.0 |
+| ING-09 (`verbatim status` reports sizes, counts, watermarks and the last ingest run with its error, sourced from the `runs` table rather than a log file.) | 2 | Complete | v0.1.0 |
+| ING-05 (A session's project is the canonical git toplevel derived from the record's `cwd`, with worktrees mapped to the parent repo and both keys stored; the encoded directory name and `basename()` are never used for identity.) | 2 | Complete | v0.1.0 |
+| ING-06 (A compaction appended to a live transcript is ingested as a boundary carrying the record's compaction metadata verbatim. The set of turns that fell out of the model's context is derived from that metadata at query time (INJ-05, Phase 5) - the metadata describes the preserved segment, so the complement is a query and not a stored column (Phase 2 D-08).) | 2 | Complete | v0.1.0 |
+| RCL-01 (Turn text is expanded in Rust at ingest into its camel, snake, kebab and path components, so a search for `SearchManager` and a search for `manager` both find the same turn through plain `unicode61` FTS5.) | 3 | Complete | v0.1.0 |
+| RCL-02 (Entities of kind path, command, error, symbol and tool are extracted from structured tool records, with per-kind normalization, rather than from prose.) | 3 | Complete | v0.1.0 |
+| RCL-03 (Error entities are normalized by stripping line numbers, addresses, timestamps and UUIDs, so the same error recurring in a later session matches the earlier one.) | 3 | Complete | v0.1.0 |
+| RCL-04 (No entity is rejected at index time; commonness is handled by IDF weighting at query time, and the number of entities emitted per turn is capped.) | 3 | Complete | v0.1.0 |
+| RCL-05 (`verbatim search`, `verbatim show` and `verbatim sessions` give terminal recall over the archive with project scoping and filters.) | 3 | Complete | v0.1.0 |
+| RCL-07 (`recall_search` returns ranked turns filtered by project, paths, tool, kind and time window, with id, session, timestamp, project and excerpt per hit.) | 3 | Complete | v0.1.0 |
+| RCL-08 (`recall_context` returns the chronological turns around a given hit.) | 3 | Complete | v0.1.0 |
+| RCL-06 (Every data command accepts `--json` and emits a stable shape, sends data to stdout and errors to stderr, and exits 0 on success, 1 on operational failure and 2 on misuse, never non-zero for an empty result.) | 3 | Complete | v0.1.0 |
+| RCL-09 (`recall_get` returns full verbatim text for a list of ids and flags any body that was evicted.) | 3 | Complete | v0.1.0 |
+| RCL-10 (All three MCP tools are marked read-only, auto-scope to the current project with `project: "*"` opting into cross-project, enforce a server-side result budget, and return empty results with a reason instead of throwing.) | 3 | Complete | v0.1.0 |
+| RCL-11 (The MCP server is a short-lived stdio process reading through WAL, with no port, no daemon, no HTTP and no SSE.) | 3 | Complete | v0.1.0 |
+| ING-10 (Each of the four hooks spawns a fully detached ingest process and returns 0 immediately, invoking the binary by absolute path with no shell and no inherited handles.) | 4 | Complete | v0.1.0 |
+| INST-02 (Install copies the platform binary to the canonical stable path and points both hook entries and MCP registration at that copy, without modifying PATH.) | 4 | Complete | v0.1.0 |
+| INST-03 (Install shows the exact diff for each file it changes (`~/.claude/settings.json` and `~/.claude.json`), backs each one up, confirms once, merges into the existing objects atomically, and produces no second entry when rerun.) | 4 | Complete | v0.1.0 |
+| INST-04 (Install offers to raise `cleanupPeriodDays` when it is low and prints the auto-compact recommendation, without changing either setting itself.) | 4 | Complete | v0.1.0 |
+| INST-05 (An upgrade replaces the binary and re-copies it to the stable path without rewriting a single hook entry.) | 4 | Complete | v0.1.0 |
+| INST-08 (`--yes` accepts every default so install runs unattended in a script.) | 4 | Complete | v0.1.0 |
+| INST-06 (`verbatim doctor` is read-only, never repairs, and prints the exact command that fixes each problem it reports.) | 4 | Complete | v0.1.0 |
+| INST-07 (Uninstall removes only what install added, restores the settings backup when the file is otherwise unchanged, leaves the data and prints where it is, and deletes it under `--purge` only after showing its size and confirming.) | 4 | Complete | v0.1.0 |
+| ING-11 (Backfill estimates sessions, size and time up front, then runs detached, chunked, resumable and with bounded parallelism.) | 4 | Complete | v0.1.0 |
+| INST-01 (`npx verbatim install` runs from a thin npm package with per-platform optional dependencies and no postinstall script.) | 4 | Complete | v0.1.0 |
+| INJ-01 (SessionStart emits a resume brief covering the last session in this project, the branch that session ended on, the index pointer and observations when enabled, inside its token budget and a single-digit-millisecond wall budget. The working-state delta is branch-only because `session_meta.branch` is the sole git fact the archive holds and a `git` subprocess costs 10-30 ms against a single-digit-millisecond budget (Phase 5 D-10).) | 5 | Complete | v0.1.0 |
+| INJ-06 (Any injection failure emits nothing and exits 0 inside the deadline, so a missing, locked or corrupt store never blocks a prompt.) | 5 | Complete | v0.1.0 |
+| INJ-02 (The resume brief contains no volatile text — stable ordering, dates rounded to the day — so unchanged state produces byte-identical output across runs and does not bust the prefix cache.) | 5 | Complete | v0.1.0 |
+| INJ-03 (UserPromptSubmit injects between 0 and 3 turns, firing only on a structural threshold (a rank 1–3 exact entity match, or two or more independent entities co-occurring in one turn), and never on a free-text-only match.) | 5 | Complete | v0.1.0 |
+| INJ-04 (A turn already injected this session, already visible in the session, or already carried by the resume brief is suppressed rather than injected again.) | 5 | Complete | v0.1.0 |
+| INJ-05 (After a compaction, the next prompt draws its candidates from the turns that fell out of context, scoped and capped, rather than bulk re-injecting them.) | 5 | Complete | v0.1.0 |
+| FEED-01 (Every injection decision is logged, non-fires included, with the entities extracted, candidates scored, turns injected, turns suppressed with reasons, thresholds used and tokens spent.) | 6 | Complete | v0.1.0 |
+| FEED-02 (Ingest labels decisions from finalized sessions as hit, false positive, miss or wasted budget by joining them against the transcript that followed.) | 6 | Complete | v0.1.0 |
+| FEED-03 (A replay harness re-runs every logged prompt against the index as it stood, so a change to extraction or thresholds is diffed against history offline instead of tuned by feel.) | 6 | Complete | v0.1.0 |
+| FEED-04 (`verbatim stats` reports injection precision, misses, and tokens injected versus tokens referenced.) | 6 | Complete | v0.1.0 |
+| OBS-01 (Mechanical observations — files read and modified, tools used, commands run, errors seen, branch, commits, turn count, duration, compactions — are parser-derived and always available.) | 7 | Complete | v0.1.0 |
+| OBS-07 (`verbatim observations regenerate` rebuilds derived observations selected by `--since` or `--prompt-version`.) | 7 | Complete | v0.1.0 |
+| OBS-05 (One provider block of base URL, model and key serves local, OpenRouter and any OpenAI-compatible endpoint through a single code path, with Anthropic subscription auth as a separate branch. - Phase 7 note (2026-08-22): the OpenAI-compatible half is delivered and the single code path is intact. Anthropic subscription OAuth - the "separate branch" - is DEFERRED out of phase 7 (CONTEXT D-05): no OAuth flow, refresh or storage is described anywhere in the repo and there is no Anthropic key on this machine to prove it against. Add it as its own phase via /cad-phase. A fourth key, `response_format`, exists for an endpoint whose structured-output support is narrower than `json_schema` (measured against `deepseek-chat`); it selects one field's value, not a second request shape, so "single code path" holds. See phase 7 AC4 as amended.) | 7 | Complete | v0.1.0 |
+| PRIV-01 (Redaction happens at egress and is keyed on destination — a remote provider is filtered, a local provider is not egress at all — and never at ingest.) | 7 | Complete | v0.1.0 |
+| PRIV-02 (Credentials load from the shared per-provider file with permissions enforced and load refused when they are too open, following precedence process env, then product config, then shared file, and their values never reach logs, errors or output. - Phase 7 note (2026-08-22): the permission check is a Unix mode-bit test via `PermissionsExt`. Windows ACL enforcement is DEFERRED (CONTEXT D-15); the Windows arm accepts with a caveat surfaced in `doctor`. Complete on Unix only.) | 7 | Complete | v0.1.0 |
+| PRIV-03 (The binary opens no network connection except to the configured model provider, and emits no telemetry of any kind.) | 7 | Complete | v0.1.0 |
+| OBS-02 (LLM judgment is opt-in and off by default, costs one call per finalized session, and returns strict JSON against a fixed schema.) | 7 | Complete | v0.1.0 |
+| OBS-03 (Every generated claim carries a `turn_id` anchoring it to a verbatim turn in the archive.) | 7 | Complete | v0.1.0 |
+| OBS-04 (A parse failure retries once and then stores the raw response with `status = parse_failed`; it is never dropped silently and never blocks ingest.) | 7 | Complete | v0.1.0 |
+| OBS-06 (Cost controls hold: sessions under N turns are skipped, input is truncated with explicit elision markers, a daily token budget applies, and there is never more than one call per session.) | 7 | Complete | v0.1.0 |
+| OBS-08 (Observations are reachable through the existing recall tools as a `kind` filter rather than through a fourth tool.) | 7 | Complete | v0.1.0 |
+| RET-01 (Retention is off by default, and `keep`, `evict` and `delete` can be set globally or per project.) | 8 | Complete | v0.1.0 |
+| RET-03 (Retention runs at the end of an ingest pass under the lock already held, does bounded work per pass, and `--dry-run` reports what it would do before anything is applied.) | 8 | Complete | v0.1.0 |
+| RET-02 (An evicted session stays searchable and listed with its body flagged as evicted, while a deleted one is gone from both blob and index.) | 8 | Complete | v0.1.0 |
+| RET-04 (`verbatim compact` reclaims freed space so the store actually shrinks after retention.) | 8 | Complete | v0.1.0 |
+| RET-05 (`verbatim usage` reports bytes per project and per month.) | 8 | Complete | v0.1.0 |
+| PRIV-04 (`verbatim export` produces portable output for backup or migration and states what that output contains.) | 8 | Complete | v0.1.0 |
+| STOR-06 (Rolling snapshots run by default and produce a consistent copy of the store without stopping ingest.) | 8 | Complete | v0.1.0 |
+| STOR-07 (`verbatim data move <path>` relocates the store and updates the location pointer, so no component holds a hardcoded store path.) | 8 | Complete | v0.1.0 |
+| ING-07 (Capture mode (`full`, `lean`, `minimal`) controls how much of each record is stored, and every elision is marked in the stored record.) | 8 | Complete | v0.1.0 |
 
 ## v2 Requirements
 
@@ -153,70 +153,6 @@ Explicit exclusions. The reason prevents scope creep later.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| STOR-01 | Phase 1 | Complete |
-| STOR-05 | Phase 1 | Complete |
-| STOR-02 | Phase 1 | Complete |
-| STOR-03 | Phase 1 | Complete |
-| STOR-04 | Phase 1 | Complete |
-| ING-01 | Phase 1 | Complete |
-| ING-02 | Phase 1 | Complete |
-| ING-03 | Phase 2 | Complete |
-| ING-04 | Phase 2 | Complete |
-| ING-08 | Phase 2 | Complete |
-| ING-09 | Phase 2 | Complete |
-| ING-05 | Phase 2 | Complete |
-| ING-06 | Phase 2 | Complete |
-| RCL-01 | Phase 3 | Complete |
-| RCL-02 | Phase 3 | Complete |
-| RCL-03 | Phase 3 | Complete |
-| RCL-04 | Phase 3 | Complete |
-| RCL-05 | Phase 3 | Complete |
-| RCL-07 | Phase 3 | Complete |
-| RCL-08 | Phase 3 | Complete |
-| RCL-06 | Phase 3 | Complete |
-| RCL-09 | Phase 3 | Complete |
-| RCL-10 | Phase 3 | Complete |
-| RCL-11 | Phase 3 | Complete |
-| ING-10 | Phase 4 | Complete |
-| INST-02 | Phase 4 | Complete |
-| INST-03 | Phase 4 | Complete |
-| INST-04 | Phase 4 | Complete |
-| INST-05 | Phase 4 | Complete |
-| INST-08 | Phase 4 | Complete |
-| INST-06 | Phase 4 | Complete |
-| INST-07 | Phase 4 | Complete |
-| ING-11 | Phase 4 | Complete |
-| INST-01 | Phase 4 | Complete |
-| INJ-01 | Phase 5 | Complete |
-| INJ-06 | Phase 5 | Complete |
-| INJ-02 | Phase 5 | Complete |
-| INJ-03 | Phase 5 | Complete |
-| INJ-04 | Phase 5 | Complete |
-| INJ-05 | Phase 5 | Complete |
-| FEED-01 | Phase 6 | Complete |
-| FEED-02 | Phase 6 | Complete |
-| FEED-03 | Phase 6 | Complete |
-| FEED-04 | Phase 6 | Complete |
-| OBS-01 | Phase 7 | Complete |
-| OBS-07 | Phase 7 | Complete |
-| OBS-05 | Phase 7 | Complete |
-| PRIV-01 | Phase 7 | Complete |
-| PRIV-02 | Phase 7 | Complete |
-| PRIV-03 | Phase 7 | Complete |
-| OBS-02 | Phase 7 | Complete |
-| OBS-03 | Phase 7 | Complete |
-| OBS-04 | Phase 7 | Complete |
-| OBS-06 | Phase 7 | Complete |
-| OBS-08 | Phase 7 | Complete |
-| RET-01 | Phase 8 | Complete |
-| RET-03 | Phase 8 | Complete |
-| RET-02 | Phase 8 | Complete |
-| RET-04 | Phase 8 | Complete |
-| RET-05 | Phase 8 | Complete |
-| PRIV-04 | Phase 8 | Complete |
-| STOR-06 | Phase 8 | Complete |
-| STOR-07 | Phase 8 | Complete |
-| ING-07 | Phase 8 | Complete |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 

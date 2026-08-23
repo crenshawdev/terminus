@@ -1,0 +1,58 @@
+{
+  "phase": "8",
+  "trigger": "plan",
+  "discriminator": "plan-86b34ad",
+  "round": 1,
+  "base": "a519d78",
+  "head": "86b34ad",
+  "base_id": "a519d785f73b1cc45b968185075ac8144db632cb",
+  "head_id": "86b34adffefd5730a831e83f12dfb40594936466",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": ".planning/phases/8/PLAN-2.md",
+      "line": 31,
+      "severity": "medium",
+      "claim": "The dry-run path is still evaluated against wall-clock `now`, but the plan gives no shared cutoff or persisted evaluation time between `verbatim retention --dry-run` and the later ingest pass. That means the command can report a different eviction/delete set than the pass that follows, especially near an age boundary.",
+      "failure_scenario": "A session sits right on the retention threshold. `--dry-run` runs at 23:59 and includes it; the ingest pass starts after midnight and excludes it. AC3's requirement that the subsequent real pass act on exactly the dry-run set fails.",
+      "ruling": "survived",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/8/PLAN-1.md",
+        "line": 117,
+        "note": "Confirmed. PLAN-1 task 2 does route both callers through one evaluation function, but its own prose claimed that this means the two 'can never disagree about a now-relative predicate evaluated at two instants' - false, because strftime('now', ?) re-evaluates per call, so the shared function pins the RULE and not the INSTANT. Fixed in the plan text, not deferred: PLAN-1 task 2 now takes an explicit cutoff argument computed once by the caller and states the boundary case plainly; PLAN-2 task 3 reports that cutoff in its --json document and its Verify (a) pins the fixture at least a day clear of the boundary on either side so AC3 cannot flake. Severity held at medium: it degrades AC3 into a flaky assertion at an age boundary rather than producing a wrong retention action."
+      },
+      "fix_commit": "86b34ad",
+      "base_id": "a519d785f73b1cc45b968185075ac8144db632cb",
+      "head_id": "86b34adffefd5730a831e83f12dfb40594936466"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": ".planning/phases/8/PLAN-4.md",
+      "line": 61,
+      "severity": "medium",
+      "claim": "`data move` is planned to be human-only with no `--json`, no `DATA_COMMANDS` entry, and no `docs/json-shapes.md` section, but D-17 explicitly locks the two-word command into the same envelope/shape contract as other phase-8 data commands. The plan only notes that deviation instead of preserving or re-justifying the locked interface.",
+      "failure_scenario": "Any tooling or tests that rely on the locked `data move` command behaving like the other phase-8 command surfaces will fail: it will not emit the expected JSON envelope, and the CLI/docs contract will diverge from the locked decision without a supported migration path.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/8/CONTEXT.md",
+        "line": 49,
+        "note": "D-17 says the opposite of what this finding attributes to it. Its first clause puts retention, compact, usage and export in DATA_COMMANDS and then states that 'data move is human-only like install and uninstall', citing crates/verbatim/src/main.rs:135-143, which explains why install and uninstall are deliberately NOT data commands ('it shows a diff and asks once, and a single JSON document on stdout cannot be both of those things'). The finding's own quoted evidence contains the human-only clause it claims is contradicted. The trailing 'with its own envelope command string' phrase was carried over from the observations regenerate precedent D-17 draws its nested-dispatch half from, and contradicts the human-only clause in the same sentence; the planner flagged that contradiction and recorded its reading at PLAN-4.md:75-76 rather than diverging silently. No locked interface is dropped and no migration path is owed."
+      },
+      "base_id": "a519d785f73b1cc45b968185075ac8144db632cb",
+      "head_id": "86b34adffefd5730a831e83f12dfb40594936466"
+    }
+  ]
+}

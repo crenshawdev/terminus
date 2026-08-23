@@ -1,0 +1,57 @@
+{
+  "phase": "8",
+  "trigger": "risk_surface",
+  "discriminator": "plan-5",
+  "round": 1,
+  "base": "058eacd",
+  "head": "f0397dd",
+  "base_id": "058eacd0c8abbfb8603915ab13f2a17200216a9e",
+  "head_id": "f0397dd4a21fed485f1cb06b735c98a7298c9403",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/capture.rs",
+      "line": 149,
+      "severity": "medium",
+      "claim": "The elision mark records `serde_json::to_vec(value).len()`, i.e. the canonical reserialization of the parsed subtree, not the bytes actually removed from the archived JSONL line. That makes `verbatimElided` lie whenever the source subtree used escape sequences, different number spellings, or any other non-canonical JSON encoding.",
+      "failure_scenario": "A `toolUseResult` containing a string like `\"\\u0041\"` is stored as if only 3 bytes were removed because the parsed value reserializes to `\"A\"`; the source line actually shed many more bytes, so the accounting disagrees with the archive delta and any later audit that trusts the mark gets the wrong size.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/capture.rs",
+        "line": 148,
+        "note": "The mechanism is stated correctly and the divergence is real, but the consequence the scenario rests on does not exist. Nothing in production reads the mark: grep for elided_bytes and ELISION_MARK across crates/ finds capture.rs itself and crates/verbatim-core/tests/capture.rs and nowhere else, so there is no accounting, no archive-delta comparison and no audit for the figure to disagree with - it is documentary. The measurement basis is also chosen rather than accidental: the Lean arm two lines above says so in as many words, measured on the compact serialization, which is what a transcript writes, and it is the same serialized value the threshold compares. Reaching the divergence needs a source line that is not compact JSON, which the Claude Code writer does not emit. Downgraded from medium to low and queued as an open item: the honest fix is to say in the doc comment that the figure is the canonical size of what was dropped, not the source bytes."
+      },
+      "base_id": "058eacd0c8abbfb8603915ab13f2a17200216a9e",
+      "head_id": "f0397dd4a21fed485f1cb06b735c98a7298c9403"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/capture.rs",
+      "line": 141,
+      "severity": "low",
+      "claim": "`CaptureMode::Minimal` elides unconditionally, even when the replacement mark is larger than the subtree it replaces. That means the \"minimal\" mode can grow some records instead of shrinking them.",
+      "failure_scenario": "A tiny `toolUseResult` or `attachment` such as `{\"stdout\":\"ok\"}` is replaced by `{\"verbatimElided\":...}`; for small enough payloads the replacement is larger than the original, so a \"minimal\" ingest can store more bytes than `full` for that record and break the intended size-reduction guarantee.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/capture.rs",
+        "line": 151,
+        "note": "The scenario asserts a guarantee the mode does not make. Minimal is the mode that drops the large bodies unconditionally - the choice of how much of each record to keep, not a per-record size bound - and the measured effect on the plan fixture is 28,785 bytes at full against 2,436 at minimal (reports/plan-5.md, task 3). The growth case is bounded at the mark object itself, about twenty bytes, and only for a payload smaller than that; it does not compound, because elide_fields skips a value is_mark already accepts (capture.rs:137-140), so a second pass over an elided record rewrites nothing. There is no state in which minimal stores more than full for a transcript, and no code that depends on per-record shrinkage."
+      },
+      "base_id": "058eacd0c8abbfb8603915ab13f2a17200216a9e",
+      "head_id": "f0397dd4a21fed485f1cb06b735c98a7298c9403"
+    }
+  ]
+}
