@@ -7,34 +7,11 @@ Scope comes from `DESIGN-BRIEF.md`, where every decision is settled unless marke
 
 ## Active
 
-Committed scope. Each maps to exactly one roadmap phase.
+No cycle open.
 
-### Archive (STOR)
+Every requirement this project has committed to has shipped and been verified — see `## Shipped` below for all 64 ids with the phase that delivered each. Nothing is deferred and nothing is carried forward.
 
-
-### Ingest (ING)
-
-
-### Recall (RCL)
-
-
-### Install (INST)
-
-
-### Injection (INJ)
-
-
-### Feedback (FEED)
-
-
-### Observations (OBS)
-
-
-### Privacy (PRIV)
-
-
-### Retention (RET)
-
+`/cad-phase add` opens the next cycle's first phase; `/cad-plan` seeds new rows here from that phase's requirements.
 
 ## Shipped
 

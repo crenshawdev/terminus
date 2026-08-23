@@ -1,6 +1,6 @@
 # State
 
-Phase: 8 of 8 (Retention And Lifecycle)
-Status: phase complete
-Next: /cad-milestone - phase 8 was the last phase; the audit gate precedes any ship
+Phase: 1 of 0 (no active cycle)
+Status: ready to plan
+Next: /cad-phase add
 Updated: 2026-08-23

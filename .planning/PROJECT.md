@@ -16,20 +16,25 @@ The verbatim transcript is the record: every session archived losslessly and per
 
 ### Active
 
-All hypotheses until shipped and validated. Detailed, phase-mapped requirements live in REQUIREMENTS.md; this is the capability-level scope.
+No cycle open.
 
-- [ ] Ingest: hook-triggered detached ingest tails transcripts by byte watermark, commits blob + index in one transaction, survives crashes and concurrent invocation, discovers subagent sidecars, links continued sessions
-- [ ] Storage: SQLite single store; block-framed zstd session blobs with per-blob checksums; derived tables rebuildable from blobs alone; archive table never migrates
-- [ ] Search: FTS5 over Rust-expanded turn text plus exact-match entities (paths, commands, errors, symbols, tools) extracted from structured tool records
-- [ ] Recall: exactly three MCP tools (`recall_search`, `recall_context`, `recall_get`) over short-lived stdio, plus terminal recall (`search`/`show`/`sessions`)
-- [ ] Injection: SessionStart resume brief (continuity, cache-stable, single-digit ms) and UserPromptSubmit relevance injection (0–3 turns, structural thresholds, silent by default), PostCompact-aware
-- [ ] Feedback loop: every injection decision logged including non-fires; outcome labels; offline replay of retrieval changes against history; `stats` that prove whether injection helps
-- [ ] Observations: mechanical facts always (parser, exact); LLM judgment opt-in, strict JSON, every claim anchored to a `turn_id`; provider = base URL + model + key, one code path
-- [ ] Retention and exclusion: off by default; keep / evict / delete; excluded projects never read, enforced on ingest and read paths both
-- [ ] Durability ops: `verify`, rolling snapshots, `compact`, `usage`, `data move`, `export`
-- [ ] CLI contract: `--json` stable shapes, stderr/stdout split, exit 0/1/2, no log file (a `runs` table surfaced by `status`)
-- [ ] Install: npm primary (thin package, per-platform `optionalDependencies`, no postinstall), canonical stable binary path, hooks written once and never rewritten, read-only `doctor`, clean uninstall
-- [ ] Privacy contract: redaction at egress keyed on destination, never at ingest; no telemetry; no network except the configured model provider
+**Shipped: v0.1.0 — closed 2026-08-23.**
+
+The full feature set landed in one cycle. Every capability bullet that stood here is delivered and verified:
+
+| | |
+|---|---|
+| Phases | 8 (Archive Core, Ingest At Scale, Recall, Hooks And Install, Context Injection, Feedback Loop, Observations, Retention And Lifecycle) |
+| Requirements | 64, all Complete — STOR-01..07, ING-01..11, RCL-01..11, INST-01..08, INJ-01..06, FEED-01..04, OBS-01..08, PRIV-01..04, RET-01..05 |
+| Commits | 237 on `phase-2-ingest-at-scale` |
+| Audit | PASS — 64/64 traced requirement -> phase -> plan -> verified, 0 broken, 0 deferred; 57/57 acceptance criteria covered by a UAT item, 0 breaks |
+| Manifest | 0.1.0 (`Cargo.toml` workspace, `npm/verbatim/package.json`) — unbumped, since nothing has been published yet |
+
+Where it lives now: the requirement rows under `## Shipped` in REQUIREMENTS.md; the per-phase narrative, deviations, UAT results and context decisions in `.planning/ARCHIVE.md` (292 rows); the full phase directories, plans, reviews and adjudications under `.planning/_archive-v0.1.0/`.
+
+Still outstanding: the merge to base and the release tag. Both are `/cad-land`'s — the tag is cut there on the pulled base after the merge confirms, never at close.
+
+`/cad-phase add` opens the next cycle.
 
 ### Out of Scope
 
