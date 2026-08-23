@@ -226,6 +226,17 @@ later milestone. Nothing below is planned work yet.
   It should - mirror pushes authenticate with a PAT, and only pushes made by a
   workflow's own `GITHUB_TOKEN` are suppressed - but it is load-bearing and
   unverified. Fallback is `workflow_dispatch`.
+  Checked 2026-08-23: no existing repo answers this. `crenshawdev/verbatim` does
+  not exist on GitHub yet. `tempest` has six tag-triggered runs but its local
+  `origin` points straight at `git@github.com:crenshawdev/tempest.git`, so those
+  tags were pushed to GitHub directly and prove nothing about mirror pushes.
+  `cadence` carries both remotes and has zero tag-triggered runs. No Forgejo
+  push mirror has ever fired Actions in this account.
+  Decided 2026-08-23: do not build a throwaway repo pair to test this. Verify it
+  on verbatim's own mirror once that mirror exists, with the real release
+  workflow, at the point where the answer is load-bearing. First tag pushed to
+  Forgejo is the test; if no run appears within a couple of minutes, switch the
+  workflow to `workflow_dispatch` and move on.
 - Release CI does not exist at all: neither `.github/workflows` nor
   `.forgejo/workflows` is present in the tree.
 - The version bump. Workspace `Cargo.toml` and `npm/verbatim/package.json` both
