@@ -166,8 +166,15 @@ are separable leases over different files.
 - [ ] AC3: A session whose last `user` record is a task-notification envelope or
       an `isMeta: true` record quotes the preceding typed prompt, not the
       envelope.
-- [ ] AC4: `crates/verbatim/tests/hook.rs`'s existing p99 assertion passes over
-      100 runs of every event with `VERBATIM_TEST_CORPUS` set.
+- [ ] AC4: The same 10 ms p99 that `crates/verbatim/tests/hook.rs` already
+      asserts holds over 100 runs of every event against a store built from the
+      real corpus, with `VERBATIM_TEST_CORPUS` set. It is asserted in
+      `crates/verbatim/tests/corpus.rs`, not in `hook.rs`: `hook.rs`'s `hook()`
+      harness (`hook.rs:63`) builds the temporary data and Claude directories
+      that the kill, detach and stdin tests all run against, so re-pointing it
+      at the real tree would change what those measure too. D-14's
+      `VERBATIM_TEST_CORPUS` gate and its loud-skip convention already live in
+      `corpus.rs`, which is why the measurement goes there.
 - [ ] AC5: A store written by the previous build gains the column on open, is
       populated from `sessions.blob` with no transcript read, then completes a
       further `verbatim ingest` without error when it contains an `is_evicted`

@@ -104,13 +104,17 @@ five-record fixture.
 
 ## Notes
 
-- AC4 names `crates/verbatim/tests/hook.rs`'s existing p99 assertion. The
-  measurement is placed in `corpus.rs` instead, asserting the same budget over
-  the same four events and the same 100 runs, because `hook.rs`'s `hook()`
-  harness is shared with the kill and detach tests and re-pointing it at the
-  real tree would change what those measure as well. The property AC4 and
-  Success Criterion 3 name - `SessionStart` inside the 10 ms p99 on the real
-  corpus rather than on a fixture - is what task 2 asserts.
+- AC4 originally named `crates/verbatim/tests/hook.rs`'s existing p99 assertion,
+  which contradicted D-14: that decision binds the measurement to the
+  `VERBATIM_TEST_CORPUS` gate and its loud-skip convention, and both live in
+  `corpus.rs`. CONTEXT's AC4 has been amended to name `corpus.rs`, so the
+  criterion and this task now agree. The reason is `hook.rs`'s `hook()` harness
+  (`hook.rs:63`), which builds the temporary data and Claude directories the
+  kill, detach and stdin tests all run against - re-pointing it at the real tree
+  would change what those measure as well. The property AC4 and Success
+  Criterion 3 name - `SessionStart` inside the 10 ms p99 on the real corpus
+  rather than on a fixture - is what task 2 asserts, over the same four events
+  and the same 100 runs.
 - Task 2's gated arm is slow: it pays for one full ingest of the real tree
   before it measures anything, which the existing test already reports as
   `pass took ...`. Run it once, not in a loop.
