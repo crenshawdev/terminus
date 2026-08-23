@@ -53,6 +53,9 @@ use rusqlite::Connection;
 
 use crate::config::{visible, Config, RetentionAction};
 use crate::error::Result;
+use crate::store::Store;
+
+pub use apply::{apply, Applied};
 
 /// How many sessions one evaluation may name, per action.
 ///
@@ -247,4 +250,46 @@ fn transcript_is_gone(path: &str) -> bool {
         Ok(_) => false,
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
+}
+
+/// Evaluate and apply, in one call, reporting instead of failing.
+///
+/// The one entry point the ingest pass uses, and the reason it exists is the
+/// error handling rather than the composition: **nothing here may fail a
+/// pass.** The archive is the work, a retention step that could not run is a
+/// note, and a `?` propagated out of here is exactly what would let one damaged
+/// row stop every future ingest of every other transcript in the tree.
+///
+/// The evaluation instant is read once, here, and every age in the resulting
+/// selection is measured from it.
+pub fn retain(store: &mut Store, config: &Config) -> Applied {
+    // The state every user is in. No clock read, no query, no note - which is
+    // what leaves `runs.error` null on a pass that had no retention to do.
+    if config.retention_selects_nothing() {
+        return Applied::default();
+    }
+
+    let now = match evaluated_now(store.conn()) {
+        Ok(now) => now,
+        Err(e) => {
+            return Applied {
+                notes: vec![format!("retention could not read the clock: {e}")],
+                ..Applied::default()
+            }
+        }
+    };
+    let selection = match evaluate(store.conn(), config, &now) {
+        Ok(selection) => selection,
+        Err(e) => {
+            return Applied {
+                notes: vec![format!("retention could not be evaluated: {e}")],
+                ..Applied::default()
+            }
+        }
+    };
+
+    let mut applied = apply(store, &selection);
+    applied.over = selection.over;
+    applied.excluded = selection.excluded;
+    applied
 }

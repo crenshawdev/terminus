@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use verbatim_core::config::{Config, CONFIG_FILE_NAME};
-use verbatim_core::retention::{self, Selection, MAX_PER_PASS};
+use verbatim_core::retention::{self, Applied, Selection, MAX_PER_PASS};
 use verbatim_core::store::{Store, DB_FILE_NAME};
+use verbatim_core::{ingest, testkit};
 
 /// The instant every evaluation below measures from.
 const NOW: &str = "2026-08-22T12:00:00.000Z";
@@ -26,6 +27,9 @@ struct Bench {
     _dir: tempfile::TempDir,
     data_dir: PathBuf,
     work: PathBuf,
+    /// Where the rooted fixtures' `cwd` and stored paths point: somewhere this
+    /// test owns, so a project key is whatever the test built.
+    root: PathBuf,
     next: Cell<i64>,
 }
 
@@ -33,6 +37,7 @@ fn bench() -> Bench {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     let work = dir.path().join("work");
+    let root = dir.path().join("root");
     std::fs::create_dir_all(&work).unwrap();
     // Created here so `session_meta` exists before the first plant.
     Store::open(&data_dir).unwrap();
@@ -40,6 +45,7 @@ fn bench() -> Bench {
         _dir: dir,
         data_dir,
         work,
+        root,
         next: Cell::new(1),
     }
 }
@@ -317,4 +323,263 @@ fn the_bound_takes_the_oldest_and_counts_what_it_left() {
         .take(MAX_PER_PASS)
         .collect();
     assert_eq!(selection.evict, expected, "the bound must take the oldest");
+}
+
+// The mutating half. These cases ingest real fixtures rather than planting
+// rows, because what they assert on is the derived tables an eviction has to
+// leave standing and a deletion has to take with it.
+
+impl Bench {
+    /// Archive one transcript that fills every table a deletion has to empty.
+    ///
+    /// Three fixtures in one file, and each is there for a table: the basic
+    /// session carries the searchable token and the entities, the rooted edits
+    /// session is the only one storing an absolute path (so `paths` has a row),
+    /// and the appended boundary line is what gives `compaction_boundaries`
+    /// one. Answers its session key.
+    fn archive(&self, name: &str) -> String {
+        let edits =
+            testkit::copy_rooted_fixture_into("session-edits.jsonl", &self.work, &self.root);
+        let mut bytes = testkit::fixture_bytes("session-basic.jsonl");
+        bytes.extend_from_slice(&std::fs::read(&edits).unwrap());
+        bytes.extend_from_slice(&testkit::boundary_line());
+        bytes.push(b'\n');
+        let path = self.work.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        match ingest::run(&self.data_dir, &path).unwrap() {
+            ingest::Outcome::Committed(_) => {}
+            other => panic!("{name}: {other:?}"),
+        }
+        path.canonicalize().unwrap().to_string_lossy().into_owned()
+    }
+
+    fn apply(&self, selection: &Selection) -> Applied {
+        let mut store = Store::open(&self.data_dir).unwrap();
+        retention::apply(&mut store, selection)
+    }
+
+    fn count(&self, sql: &str, key: &str) -> i64 {
+        self.conn().query_row(sql, [key], |r| r.get(0)).unwrap()
+    }
+
+    /// How many rows each table holds for this session.
+    fn rows(&self, key: &str) -> Vec<(&'static str, i64)> {
+        vec![
+            ("sessions", self.count("SELECT count(*) FROM sessions WHERE session_key = ?1", key)),
+            ("session_meta", self.count("SELECT count(*) FROM session_meta WHERE session_key = ?1", key)),
+            ("turns", self.count("SELECT count(*) FROM turns WHERE session_key = ?1", key)),
+            ("entities", self.count("SELECT count(*) FROM entities WHERE turn_id IN (SELECT id FROM turns WHERE session_key = ?1)", key)),
+            ("paths", self.count("SELECT count(*) FROM paths WHERE turn_id IN (SELECT id FROM turns WHERE session_key = ?1)", key)),
+            ("compaction_boundaries", self.count("SELECT count(*) FROM compaction_boundaries WHERE turn_id IN (SELECT id FROM turns WHERE session_key = ?1)", key)),
+            ("observations", self.count("SELECT count(*) FROM observations WHERE session_key = ?1", key)),
+            ("watermarks", self.count("SELECT count(*) FROM watermarks WHERE transcript_path = ?1", key)),
+        ]
+    }
+
+    /// The one thing a deletion destroys that no rebuild reproduces.
+    fn plant_observation(&self, key: &str) {
+        self.conn()
+            .execute(
+                "INSERT INTO observations (session_key, session_id, generated_at, mechanical)
+                 VALUES (?1, 'sid', '2026-08-22T00:00:00.000Z', '{}')",
+                [key],
+            )
+            .unwrap();
+    }
+
+    fn matches(&self, token: &str) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT count(*) FROM turns_fts WHERE turns_fts MATCH ?1",
+                [token],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+}
+
+/// RET-02: the row, the metadata and every derived row survive an eviction.
+/// Only the bytes go - which is what lets `verbatim sessions` still list it and
+/// a search still match its turns.
+#[test]
+fn an_eviction_empties_the_blob_and_leaves_everything_else_standing() {
+    let bench = bench();
+    let key = bench.archive("evicted.jsonl");
+    let before = bench.rows(&key);
+    let matched = bench.matches(testkit::UNIQUE_TOKEN);
+    assert!(
+        matched > 0,
+        "the fixture has to be searchable to start with"
+    );
+
+    let applied = bench.apply(&Selection {
+        evict: vec![key.clone()],
+        ..Selection::default()
+    });
+    assert_eq!(applied.evicted, vec![key.clone()]);
+    assert!(applied.notes.is_empty(), "{:?}", applied.notes);
+
+    let conn = bench.conn();
+    let (len, evicted): (i64, Option<i64>) = conn
+        .query_row(
+            "SELECT length(s.blob), m.is_evicted FROM sessions s
+             JOIN session_meta m USING (session_key) WHERE s.session_key = ?1",
+            [&key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        len, 0,
+        "the blob must be emptied, never null and never dropped"
+    );
+    assert_eq!(evicted, Some(1));
+    assert_eq!(
+        bench.rows(&key),
+        before,
+        "an eviction touched a derived row"
+    );
+    assert_eq!(bench.matches(testkit::UNIQUE_TOKEN), matched);
+
+    // The lowered-watermark sweep compares these two, so leaving them alone is
+    // what stops every later pass from "repairing" this session forever.
+    let (checksum_len, uncompressed): (i64, i64) = conn
+        .query_row(
+            "SELECT length(checksum), uncompressed_len FROM session_meta WHERE session_key = ?1",
+            [&key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(checksum_len, 32);
+    assert!(
+        uncompressed > 0,
+        "uncompressed_len was lowered by the eviction"
+    );
+}
+
+/// A deletion takes the session and everything keyed on it, including the row
+/// nothing can rebuild.
+#[test]
+fn a_deletion_removes_every_row_the_session_owns() {
+    let bench = bench();
+    let key = bench.archive("doomed.jsonl");
+    bench.plant_observation(&key);
+    for (table, count) in bench.rows(&key) {
+        assert!(count > 0, "{table} has nothing to delete");
+    }
+    assert!(bench.matches(testkit::UNIQUE_TOKEN) > 0);
+
+    let applied = bench.apply(&Selection {
+        delete: vec![key.clone()],
+        ..Selection::default()
+    });
+    assert_eq!(applied.deleted, vec![key.clone()]);
+    assert_eq!(applied.observations_lost, 1);
+    assert!(applied.notes.is_empty(), "{:?}", applied.notes);
+    assert!(
+        applied.lines().iter().any(|l| l.contains("observation")),
+        "the loss of a paid model call has to be said out loud: {:?}",
+        applied.lines()
+    );
+
+    for (table, count) in bench.rows(&key) {
+        assert_eq!(
+            count, 0,
+            "{table} still holds a row for the deleted session"
+        );
+    }
+    assert_eq!(
+        bench.matches(testkit::UNIQUE_TOKEN),
+        0,
+        "a search still matches a turn of the deleted session"
+    );
+}
+
+/// FEED-03: the replay history outlives the session it was recorded against.
+/// `decisions` records prompt-time state no blob ever held, so a deletion that
+/// took it would silently delete what `verbatim replay` and `stats` are
+/// computed over.
+#[test]
+fn a_decision_naming_the_deleted_session_survives_it() {
+    let bench = bench();
+    let key = bench.archive("doomed.jsonl");
+    let session_id: String = bench
+        .conn()
+        .query_row(
+            "SELECT session_id FROM session_meta WHERE session_key = ?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    bench
+        .conn()
+        .execute(
+            "INSERT INTO decisions (session_id, ts, prompt, chars_injected)
+             VALUES (?1, '2026-08-22T00:00:00.000Z', 'what did we decide', 0)",
+            [&session_id],
+        )
+        .unwrap();
+
+    bench.apply(&Selection {
+        delete: vec![key.clone()],
+        ..Selection::default()
+    });
+
+    let decisions: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM decisions WHERE session_id = ?1",
+            [&session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(decisions, 1, "the replay history went with the session");
+}
+
+/// Retention must not be able to wedge on one damaged row, the way `pass::walk`
+/// cannot wedge on one damaged transcript. The fault is a trigger rather than a
+/// test hook: it makes SQLite refuse a real statement, so the rollback under
+/// test is the real one.
+#[test]
+fn a_failure_on_one_session_does_not_stop_the_next() {
+    let bench = bench();
+    let doomed = bench.archive("doomed.jsonl");
+    let fine = bench.archive("fine.jsonl");
+    bench.plant_observation(&doomed);
+    bench.plant_observation(&fine);
+    bench
+        .conn()
+        .execute_batch(&format!(
+            "CREATE TRIGGER retention_fault BEFORE DELETE ON sessions
+               WHEN old.session_key = '{}'
+               BEGIN SELECT RAISE(ABORT, 'planted fault'); END;",
+            doomed.replace('\'', "''")
+        ))
+        .unwrap();
+
+    let applied = bench.apply(&Selection {
+        delete: vec![doomed.clone(), fine.clone()],
+        ..Selection::default()
+    });
+
+    assert_eq!(
+        applied.deleted,
+        vec![fine.clone()],
+        "the second session was skipped"
+    );
+    assert_eq!(applied.notes.len(), 1);
+    assert!(
+        applied.notes[0].starts_with(&doomed) && applied.notes[0].contains("planted fault"),
+        "the failure has to name the session it happened to: {:?}",
+        applied.notes
+    );
+
+    for (table, count) in bench.rows(&doomed) {
+        assert!(count > 0, "{table} lost a row despite the deletion failing");
+    }
+    for (table, count) in bench.rows(&fine) {
+        assert_eq!(
+            count, 0,
+            "{table} still holds a row for the deleted session"
+        );
+    }
 }
