@@ -21,10 +21,11 @@ static ENV: Mutex<()> = Mutex::new(());
 /// rest of the file working.
 fn with_env<T>(data: Option<&Path>, config: Option<&Path>, body: impl FnOnce() -> T) -> T {
     let _guard = ENV.lock().unwrap();
-    let previous: Vec<(&str, Option<std::ffi::OsString>)> = ["VERBATIM_DATA_DIR", "VERBATIM_CONFIG_DIR"]
-        .iter()
-        .map(|name| (*name, std::env::var_os(name)))
-        .collect();
+    let previous: Vec<(&str, Option<std::ffi::OsString>)> =
+        ["VERBATIM_DATA_DIR", "VERBATIM_CONFIG_DIR"]
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
 
     for (name, value) in [("VERBATIM_DATA_DIR", data), ("VERBATIM_CONFIG_DIR", config)] {
         match value {

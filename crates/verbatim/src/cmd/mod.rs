@@ -35,6 +35,7 @@
 
 pub mod backfill;
 pub mod compact;
+pub mod data;
 pub mod doctor;
 pub mod export;
 pub mod hook;

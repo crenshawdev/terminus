@@ -33,7 +33,8 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        doctor                report what is wired into Claude Code and what is not\n  \
                        mcp                   serve the three recall tools over stdio (for Claude Code)\n  \
                        install               wire verbatim into Claude Code's hooks and mcp servers\n  \
-                       uninstall             remove what install added, keeping the archive\n\
+                       uninstall             remove what install added, keeping the archive\n  \
+                       data move <path>      relocate the whole data directory and record where\n\
                      \n\
                      every data command accepts --json: one JSON document on stdout,\n\
                      every diagnostic on stderr, exit 0 on success including an empty result.";
@@ -164,6 +165,12 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         // archive alone and prints its path, and destroys it only under
         // `--purge`, after showing the size and asking (INST-07, D-13).
         "uninstall" => cmd::uninstall::run(cmd::uninstall::parse(parser)?),
+        // STOR-07. Human-only for the third time and the same reason: it prints
+        // what is about to move, warns about the one hazard nothing can detect
+        // for the user (D-16) and asks once. The two-word form follows
+        // `observations regenerate`, and the location it records is read by
+        // `store::data_dir` and by nothing in settings.json (D-14).
+        "data" => cmd::data::run(cmd::data::parse(parser)?),
         other => Err(Failure::Misuse(format!("unknown command '{other}'"))),
     }
 }
