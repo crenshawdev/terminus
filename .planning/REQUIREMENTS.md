@@ -208,6 +208,15 @@ Explicit exclusions. The reason prevents scope creep later.
 | OBS-04 | Phase 7 | Complete |
 | OBS-06 | Phase 7 | Complete |
 | OBS-08 | Phase 7 | Complete |
+| RET-01 | Phase 8 | Pending |
+| RET-03 | Phase 8 | Pending |
+| RET-02 | Phase 8 | Pending |
+| RET-04 | Phase 8 | Pending |
+| RET-05 | Phase 8 | Pending |
+| PRIV-04 | Phase 8 | Pending |
+| STOR-06 | Phase 8 | Pending |
+| STOR-07 | Phase 8 | Pending |
+| ING-07 | Phase 8 | Pending |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 
