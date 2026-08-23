@@ -354,7 +354,7 @@ fn an_empty_line_passes_through_the_stream() {
 
 // --- The store half: what the archive holds after a pass ---------------------
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use verbatim_core::store::DB_FILE_NAME;
@@ -437,6 +437,14 @@ impl Bench {
     fn mode(&self) -> Option<String> {
         self.conn()
             .query_row("SELECT capture_mode FROM session_meta", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The watermark is a FILE offset, which is the whole point of reading it
+    /// here: under an elided mode it is NOT the stored length.
+    fn watermark(&self) -> i64 {
+        self.conn()
+            .query_row("SELECT byte_offset FROM watermarks", [], |r| r.get(0))
             .unwrap()
     }
 
@@ -619,4 +627,371 @@ fn a_reindex_of_an_elided_store_reproduces_every_derived_row() {
         before_digest,
         "the rebuild touched the archive"
     );
+}
+
+fn file_len(path: &Path) -> i64 {
+    std::fs::metadata(path).unwrap().len() as i64
+}
+
+/// (e) A second pass appends. The stored offsets continue from the stored
+/// length, and the watermark still measures the FILE - which is the one place
+/// the two coordinate systems could quietly be confused for each other.
+#[test]
+fn a_second_pass_continues_the_stored_stream_and_the_file_watermark_separately() {
+    for mode in MODES {
+        let bench = bench(mode);
+        bench.ingest();
+        let (_, first_stream_len) = bench.sizes();
+        let first_turns = bench.turns();
+
+        // Append the fixture's own two elidable records again, so the second
+        // pass has real work under every mode.
+        let source = testkit::fixture_bytes(testkit::CAPTURE_FIXTURE);
+        let mut extra = Vec::new();
+        for (index, line) in source.split(|b| *b == b'\n').enumerate() {
+            if line.is_empty() || !(index == 1 || index == 4) {
+                continue;
+            }
+            // A fresh uuid, or the appended record is the same turn twice.
+            let text = String::from_utf8(line.to_vec()).unwrap().replace(
+                "cccccccc-0000-4000-8000-0000000000",
+                "dddddddd-0000-4000-8000-0000000000",
+            );
+            extra.extend_from_slice(text.as_bytes());
+            extra.push(b'\n');
+        }
+        assert!(!extra.is_empty(), "the append must have something in it");
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&bench.transcript)
+            .unwrap();
+        std::io::Write::write_all(&mut file, &extra).unwrap();
+        drop(file);
+
+        let pass = bench.ingest();
+        assert_eq!(
+            pass.bytes_read,
+            extra.len() as u64,
+            "{mode:?}: bytes_read is FILE bytes past the watermark"
+        );
+        assert_eq!(
+            bench.watermark(),
+            file_len(&bench.transcript),
+            "{mode:?}: the watermark must still be the file's length"
+        );
+        assert_eq!(
+            pass.watermark as i64,
+            file_len(&bench.transcript),
+            "{mode:?}: and the pass must report the same one"
+        );
+
+        let turns = bench.turns();
+        assert_eq!(turns.len(), first_turns.len() + 2, "{mode:?}");
+        assert_eq!(
+            &turns[..first_turns.len()],
+            &first_turns[..],
+            "{mode:?}: the first pass's rows must not move"
+        );
+        assert_eq!(
+            turns[first_turns.len()].1,
+            first_stream_len,
+            "{mode:?}: the appended turns must continue from the stored length"
+        );
+
+        // And the whole stream still reads back turn for turn.
+        let conn = bench.conn();
+        let stream = bench.stream();
+        let (_, stream_len) = bench.sizes();
+        assert_eq!(stream.len() as i64, stream_len);
+        for (id, offset, len) in turns {
+            let (bytes, _) = testkit::read_turn(&conn, id);
+            assert!(
+                bytes == stream[offset as usize..(offset + len) as usize],
+                "{mode:?}"
+            );
+        }
+    }
+}
+
+// --- The two places that assumed the blob and the file were the same bytes ---
+
+/// (a) The steady state. Two runs over an unchanged transcript in a `lean`
+/// store change nothing and REPAIR nothing.
+///
+/// Without recovery's `full` restriction this is the failure that never
+/// announces itself: `byte_offset > uncompressed_len` is normal for an elided
+/// session, so the sweep would lower the watermark on every run and the next
+/// run would re-read and re-append bytes the blob already holds, forever.
+#[test]
+fn two_runs_over_an_unchanged_lean_transcript_repair_nothing() {
+    for mode in MODES {
+        let bench = bench(mode);
+        bench.ingest();
+
+        let (blob_len, stream_len) = bench.sizes();
+        let watermark = bench.watermark();
+        let turns = bench.turns();
+        let blob: Vec<u8> = bench
+            .conn()
+            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+            .unwrap();
+
+        let (_store, recovered) = verbatim_core::recover::recover(&bench.data_dir).unwrap();
+        assert!(
+            !recovered.repaired(),
+            "{mode:?}: recovery invented a repair: {:?}",
+            recovered.lines()
+        );
+
+        // And the run itself finds nothing to do.
+        match ingest::run_with(&bench.data_dir, &bench.transcript, &bench.config).unwrap() {
+            ingest::Outcome::UpToDate => {}
+            other => panic!("{mode:?}: a second run must be a no-op, got {other:?}"),
+        }
+
+        assert_eq!(bench.sizes(), (blob_len, stream_len), "{mode:?}");
+        assert_eq!(
+            bench.watermark(),
+            watermark,
+            "{mode:?}: the watermark moved"
+        );
+        assert_eq!(bench.turns(), turns, "{mode:?}: the turn rows moved");
+        let blob_after: Vec<u8> = bench
+            .conn()
+            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert!(blob_after == blob, "{mode:?}: the blob was rewritten");
+    }
+}
+
+/// (b) The arm is narrowed, not removed. A `full` session whose watermark
+/// really is ahead of its blob is still lowered - that is the state phase 1's
+/// crash harness enumerates and STOR-02 says must never survive.
+#[test]
+fn a_full_session_with_an_overrun_watermark_is_still_lowered() {
+    let bench = bench(CaptureMode::Full);
+    bench.ingest();
+    let (_, stream_len) = bench.sizes();
+
+    bench
+        .conn()
+        .execute(
+            "UPDATE watermarks SET byte_offset = ?1",
+            [stream_len + 4_096],
+        )
+        .unwrap();
+
+    let (_store, recovered) = verbatim_core::recover::recover(&bench.data_dir).unwrap();
+    assert_eq!(recovered.lowered.len(), 1, "{:?}", recovered.lines());
+    assert_eq!(recovered.lowered[0].from, (stream_len + 4_096) as u64);
+    assert_eq!(recovered.lowered[0].to, stream_len as u64);
+    assert_eq!(bench.watermark(), stream_len);
+}
+
+/// The same damage in a `lean` store is NOT a repair, because the comparison
+/// carries no information there. It is the other half of (b): the restriction
+/// has to actually restrict.
+#[test]
+fn a_lean_session_is_outside_the_lowered_watermark_sweep() {
+    let bench = bench(CaptureMode::Lean);
+    bench.ingest();
+    let (_, stream_len) = bench.sizes();
+    let watermark = bench.watermark();
+    assert!(
+        watermark > stream_len,
+        "the premise: an elided session's watermark is ALREADY past its blob \
+         ({watermark} > {stream_len})"
+    );
+
+    let (_store, recovered) = verbatim_core::recover::recover(&bench.data_dir).unwrap();
+    assert!(recovered.lowered.is_empty(), "{:?}", recovered.lines());
+    assert_eq!(bench.watermark(), watermark);
+}
+
+/// A tree the pass can walk, so the divergence flag - which only the pass sets -
+/// has somewhere to be set.
+struct Tree {
+    _dir: tempfile::TempDir,
+    _config_dir: tempfile::TempDir,
+    data_dir: PathBuf,
+    transcript: PathBuf,
+    config: Config,
+}
+
+fn tree(mode: CaptureMode) -> Tree {
+    use verbatim_core::config::CONFIG_FILE_NAME;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let claude_dir = dir.path().join("claude");
+    let project = claude_dir.join("projects").join("-data-projects-capture");
+    std::fs::create_dir_all(&project).unwrap();
+    let transcript = project.join("88888888-8888-4888-8888-888888888888.jsonl");
+    std::fs::copy(testkit::fixture_path(testkit::CAPTURE_FIXTURE), &transcript).unwrap();
+    let transcript = transcript.canonicalize().unwrap();
+
+    let config_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        config_dir.path().join(CONFIG_FILE_NAME),
+        format!(
+            "roots = [{:?}]\n[capture]\nmode = \"{}\"\n",
+            claude_dir.to_str().unwrap(),
+            mode.as_str()
+        ),
+    )
+    .unwrap();
+    let config = Config::load_from(config_dir.path()).expect("the tree config parses");
+    assert_eq!(config.capture_mode(), mode);
+    assert_eq!(config.roots(), [claude_dir]);
+
+    Tree {
+        _dir: dir,
+        _config_dir: config_dir,
+        data_dir,
+        transcript,
+        config,
+    }
+}
+
+impl Tree {
+    fn pass(&self) -> verbatim_core::ingest::pass::Summary {
+        match ingest::pass::run_with(&self.data_dir, &self.config).unwrap() {
+            ingest::pass::PassOutcome::Ran(summary) => summary,
+            ingest::pass::PassOutcome::LockHeld => panic!("nothing else holds the lock"),
+        }
+    }
+
+    fn conn(&self) -> Connection {
+        Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
+    }
+
+    fn diverged(&self) -> bool {
+        self.conn()
+            .query_row(
+                "SELECT coalesce(transcript_diverged, 0) <> 0 FROM session_meta",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn stream(&self) -> Vec<u8> {
+        let bytes: Vec<u8> = self
+            .conn()
+            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        blob::read_all(&bytes).unwrap()
+    }
+
+    fn verify(&self) -> verify::Report {
+        let store = Store::open(&self.data_dir).unwrap();
+        verify::verify(&store).unwrap()
+    }
+}
+
+/// The tree pass honours the capture mode, which is the whole point of the
+/// config key: the hook spawn is the scheduler, so this is the ingest a user
+/// actually gets.
+#[test]
+fn the_tree_pass_captures_under_the_configured_mode() {
+    for mode in MODES {
+        let tree = tree(mode);
+        let summary = tree.pass();
+        assert_eq!(
+            summary.files_committed, 1,
+            "{mode:?}: {:?}",
+            summary.failures
+        );
+        let stored: Option<String> = tree
+            .conn()
+            .query_row("SELECT capture_mode FROM session_meta", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(mode.as_str()), "{mode:?}");
+
+        let source = testkit::fixture_bytes(testkit::CAPTURE_FIXTURE);
+        if mode.is_full() {
+            assert!(tree.stream() == source, "full stores the transcript");
+        } else {
+            assert!(
+                tree.stream().len() < source.len(),
+                "{mode:?} must store fewer bytes than the transcript"
+            );
+        }
+    }
+}
+
+/// (c) A `lean` session whose transcript shrank is flagged, is SKIPPED rather
+/// than re-ingested from offset 0, and is named by `verify`. Then, when the
+/// file grows back past the watermark, it is STILL refused - because for a
+/// session that is not `full` the archived prefix and the file's prefix are not
+/// comparable, so `prefix_matches` has nothing to clear the flag on.
+#[test]
+fn a_truncated_lean_session_is_flagged_skipped_and_never_cleared() {
+    let tree = tree(CaptureMode::Lean);
+    tree.pass();
+    assert!(!tree.diverged(), "the premise: it starts clean");
+    let stream = tree.stream();
+    let turns: i64 = tree
+        .conn()
+        .query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+
+    // Shorter than the watermark, which is the file's own former length.
+    let source = testkit::fixture_bytes(testkit::CAPTURE_FIXTURE);
+    std::fs::write(&tree.transcript, &source[..source.len() / 3]).unwrap();
+
+    let summary = tree.pass();
+    assert_eq!(summary.files_committed, 0, "it must not be re-ingested");
+    assert_eq!(summary.failures.len(), 1, "{summary:?}");
+    assert!(tree.diverged(), "the session must be flagged");
+    assert!(tree.stream() == stream, "the archive must be untouched");
+
+    let report = tree.verify();
+    assert_eq!(report.failures.len(), 1, "verify must name it");
+    assert!(
+        report.failures[0].detail.contains("diverged")
+            || report.failures[0].detail.contains("transcript"),
+        "{:?}",
+        report.failures[0]
+    );
+
+    // Now grow it back past the watermark with bytes that are not the archived
+    // ones. Under `full` the prefix comparison would decide; under `lean` there
+    // is no comparison to make, so the refusal stands.
+    let mut rewritten = source[..source.len() / 3].to_vec();
+    rewritten.extend_from_slice(&source);
+    std::fs::write(&tree.transcript, &rewritten).unwrap();
+
+    let summary = tree.pass();
+    assert_eq!(summary.files_committed, 0, "still refused");
+    assert!(tree.diverged(), "the flag must stay set");
+    assert!(
+        tree.stream() == stream,
+        "the archive must still be untouched"
+    );
+    let turns_after: i64 = tree
+        .conn()
+        .query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(turns_after, turns, "no turn was appended at a stale offset");
+    assert_eq!(tree.verify().failures.len(), 1);
+}
+
+/// The control, and the reason the case above is a restriction rather than a
+/// regression: a `full` session put back exactly as it was DOES clear.
+#[test]
+fn a_restored_full_session_still_clears_its_flag() {
+    let tree = tree(CaptureMode::Full);
+    tree.pass();
+    let source = testkit::fixture_bytes(testkit::CAPTURE_FIXTURE);
+
+    std::fs::write(&tree.transcript, &source[..source.len() / 3]).unwrap();
+    tree.pass();
+    assert!(tree.diverged(), "the premise: it is flagged");
+
+    std::fs::write(&tree.transcript, &source).unwrap();
+    tree.pass();
+    assert!(!tree.diverged(), "a restored full session must be cleared");
+    assert!(tree.verify().is_ok());
 }

@@ -20,6 +20,27 @@
 //! Nothing here destroys archived bytes. A watermark is lowered so the next
 //! pass re-reads the gap, and an orphaned watermark is removed because it claims
 //! bytes nothing archived; `sessions` and `session_meta` are not touched.
+//!
+//! **The sweep's first arm is outside a session that was not captured under
+//! `full`** (ING-07, phase 8 D-05). It compares a FILE offset against a count of
+//! STORED bytes, and that comparison only carries information while the two
+//! coordinate systems coincide - which is exactly what a capture mode's elision
+//! ends. For a `lean` or `minimal` session `byte_offset > uncompressed_len` is
+//! the NORMAL state, so left alone the sweep would "repair" every elided session
+//! on every run, lowering its watermark and making the next pass re-read and
+//! re-append bytes the blob already holds, forever.
+//!
+//! Nothing is lost by standing back. The blob and the watermark commit in one
+//! transaction (STOR-02), so there is no divergence between them for this to
+//! find; the arm was defence in depth against a state the transaction already
+//! prevents. It does mean an elided session has no independent second witness
+//! for its watermark, and there is none available without a second
+//! `session_meta` column that D-13 deliberately did not add.
+//!
+//! The ORPHAN arm is untouched and must stay untouched. It compares nothing
+//! against the stored bytes - a non-zero watermark for a path nothing archived
+//! is wrong under every capture mode - and it is what removes the watermark of a
+//! session retention deleted.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -103,12 +124,17 @@ fn sweep_watermarks(store: &mut Store) -> Result<Recovered> {
     // `session_meta.uncompressed_len`, not a decompression: the length is the
     // whole question, and reading it keeps the sweep an indexed join over two
     // primary keys.
+    //
+    // Restricted to sessions captured under `full` (ING-07, phase 8 D-05) - see
+    // the module comment. Null is `full`: it is what every row written before
+    // the column existed means.
     let lowered: Vec<LoweredWatermark> = tx
         .prepare(
             "SELECT w.transcript_path, w.byte_offset, m.uncompressed_len
              FROM watermarks w
              JOIN session_meta m ON m.session_key = w.transcript_path
              WHERE w.byte_offset > m.uncompressed_len
+               AND coalesce(m.capture_mode, 'full') = 'full'
              ORDER BY w.transcript_path",
         )?
         .query_map([], |r| {

@@ -792,6 +792,13 @@ pub(crate) struct Existing {
     /// this column before. Read off the same `session_meta` row as the flags
     /// above, so it costs no extra query.
     uncompressed_len: u64,
+    /// The mode this session's STORED bytes were captured under, as
+    /// `session_meta.capture_mode` holds it - null for a session written before
+    /// the column existed, which means `full`.
+    ///
+    /// Read for one question only: whether the archived prefix and the file's
+    /// prefix are comparable at all. See [`prefix_matches`].
+    stored_capture_mode: Option<String>,
     session: Option<ExistingSession>,
 }
 
@@ -813,16 +820,22 @@ impl Existing {
         // All three flags off the one `session_meta` row rather than three
         // round trips: a pass reads this for every one of two thousand
         // transcripts.
-        let (agent_meta_stored, diverged, evicted, uncompressed_len): (bool, bool, bool, i64) =
-            conn.query_row(
+        let (agent_meta_stored, diverged, evicted, uncompressed_len, stored_capture_mode): (
+            bool,
+            bool,
+            bool,
+            i64,
+            Option<String>,
+        ) = conn
+            .query_row(
                 "SELECT agent_meta IS NOT NULL, coalesce(transcript_diverged, 0) <> 0,
-                        coalesce(is_evicted, 0) <> 0, uncompressed_len
+                        coalesce(is_evicted, 0) <> 0, uncompressed_len, capture_mode
                  FROM session_meta WHERE session_key = ?1",
                 [session_key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?
-            .unwrap_or((false, false, false, 0));
+            .unwrap_or((false, false, false, 0, None));
         let turn_count: i64 = conn.query_row(
             "SELECT count(*) FROM turns WHERE session_key = ?1",
             [session_key],
@@ -895,6 +908,7 @@ impl Existing {
             diverged,
             evicted,
             uncompressed_len: uncompressed_len.max(0) as u64,
+            stored_capture_mode,
             session,
         })
     }
@@ -923,10 +937,24 @@ pub(crate) fn path_key(path: &Path) -> Result<String> {
 /// A session with no archived blob cannot disagree with one, so it is treated
 /// as matching: the flag was set for a session whose bytes are gone, and
 /// refusing forever would be a permanent failure with nothing to compare.
+///
+/// A session NOT captured under `full` answers `false` (ING-07, phase 8 D-05).
+/// Its archived stream and the file's first `watermark` bytes are not the same
+/// bytes by construction - elision is what makes them differ - so the comparison
+/// cannot say anything, and the safe answer is the one the surrounding code
+/// already chooses: still divergent. The flag stays set, the file stays skipped,
+/// and `verbatim verify` keeps naming it. The alternative is appending at a
+/// stale offset onto a blob whose middle no longer exists anywhere, with
+/// `verify` reporting it clean because the blob's checksum still matches itself.
 fn prefix_matches(path: &Path, existing: &Existing, watermark: u64) -> Result<bool> {
     let Some(session) = existing.session.as_ref() else {
         return Ok(true);
     };
+    // Null is `full`: a row written before the column existed was written by a
+    // binary that had no other mode.
+    if !matches!(existing.stored_capture_mode.as_deref(), None | Some("full")) {
+        return Ok(false);
+    }
     let archived = crate::blob::read_all(&session.blob)?;
     if (archived.len() as u64) < watermark {
         // The blob is shorter than the watermark claims. That is a store
