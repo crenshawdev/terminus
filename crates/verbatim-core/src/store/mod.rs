@@ -2,6 +2,7 @@
 
 pub mod open;
 pub mod schema;
+pub mod snapshot;
 
 pub use schema::{split_turn_id, turn_id, DERIVED_TABLES, TABLES};
 
