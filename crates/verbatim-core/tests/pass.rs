@@ -6,10 +6,11 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
-use verbatim_core::config::Config;
+use verbatim_core::config::{Config, CONFIG_FILE_NAME};
 use verbatim_core::discover;
 use verbatim_core::ingest::pass::{self, PassOutcome, Summary};
-use verbatim_core::store::DB_FILE_NAME;
+use verbatim_core::retention::{Applied, MAX_PER_PASS};
+use verbatim_core::store::{Store, DB_FILE_NAME};
 use verbatim_core::{ingest, testkit};
 
 const PROJECT: &str = "-data-projects-cadence";
@@ -71,6 +72,43 @@ impl Bench {
     fn conn(&self) -> Connection {
         Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
     }
+
+    /// A config over this bench's root, plus whatever `verbatim.toml` body the
+    /// test needs. `Config::from_parts` cannot carry a `[retention]` table -
+    /// nothing in this workspace builds one in memory, because nothing writes
+    /// this file - so a retention test loads a real file like a user would.
+    ///
+    /// A TOML literal string for the root, so a Windows path is not read as a
+    /// run of escapes.
+    fn config_file(&self, body: &str) -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE_NAME),
+            format!("roots = ['{}']\n{body}", self.claude_dir.display()),
+        )
+        .unwrap();
+        Config::load_from(dir.path()).unwrap()
+    }
+
+    fn pass_with(&self, config: &Config) -> Summary {
+        match pass::run_with(&self.data_dir, config).unwrap() {
+            PassOutcome::Ran(summary) => summary,
+            PassOutcome::LockHeld => panic!("nothing else holds the lock"),
+        }
+    }
+}
+
+/// Every session's blob length and eviction flag, in ingest order.
+fn blobs(conn: &Connection) -> Vec<(i64, Option<i64>)> {
+    conn.prepare(
+        "SELECT length(s.blob), m.is_evicted FROM sessions s
+         JOIN session_meta m USING (session_key) ORDER BY s.session_no",
+    )
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
 }
 
 fn uuid(n: u8) -> String {
@@ -577,4 +615,161 @@ fn an_exclusion_with_a_trailing_separator_is_honored_before_the_open() {
         "the transcript was opened: {:?}",
         discover::opened::under(&path)
     );
+}
+
+// RET-01 and RET-03: retention runs as a bounded step at the end of every pass,
+// and reports through `runs.error` because there is no log file.
+
+const EVICT: &str = "[retention]\naction = \"evict\"\nage_days = 1\n";
+/// Comfortably outside any window these tests configure.
+const AGED: &str = "2020-01-01T00:00:00.000Z";
+
+/// Close and age every archived session, which is what a corpus older than any
+/// plausible default looks like from `session_meta`.
+fn age_everything(conn: &Connection) {
+    conn.execute(
+        "UPDATE session_meta SET is_final = 1, last_turn_at = ?1",
+        [AGED],
+    )
+    .unwrap();
+}
+
+/// AC1. The corpus predates any default, nothing configures retention, and the
+/// pass leaves every blob where it was and `runs.error` null. A note here would
+/// be a pass telling a user about a feature they never turned on.
+#[test]
+fn a_pass_with_no_retention_configured_touches_nothing_and_says_nothing() {
+    let bench = bench();
+    for n in 1..=3 {
+        bench.place(
+            PROJECT,
+            &format!("{}.jsonl", uuid(n)),
+            "session-basic.jsonl",
+        );
+    }
+    bench.pass(&[]);
+    age_everything(&bench.conn());
+
+    let summary = bench.pass(&[]);
+    assert_eq!(summary.retention, Applied::default());
+    assert!(summary.retention.lines().is_empty());
+
+    for (len, evicted) in blobs(&bench.conn()) {
+        assert!(len > 0, "a blob was emptied with retention off");
+        assert_eq!(
+            evicted, None,
+            "a session was marked evicted with retention off"
+        );
+    }
+    assert_eq!(
+        runs(&bench.conn()).last().unwrap().4,
+        None,
+        "a pass with nothing to say must leave runs.error null"
+    );
+}
+
+/// RET-02 through the pass: an evict policy over an aged corpus empties the
+/// blobs and writes what it did into the only textual channel this product has.
+#[test]
+fn a_pass_with_an_evict_policy_evicts_the_aged_sessions_and_says_so() {
+    let bench = bench();
+    for n in 1..=2 {
+        bench.place(
+            PROJECT,
+            &format!("{}.jsonl", uuid(n)),
+            "session-basic.jsonl",
+        );
+    }
+    bench.pass(&[]);
+    age_everything(&bench.conn());
+
+    let summary = bench.pass_with(&bench.config_file(EVICT));
+    assert_eq!(summary.retention.evicted.len(), 2);
+    assert_eq!(summary.retention.deleted, Vec::<String>::new());
+
+    for (len, evicted) in blobs(&bench.conn()) {
+        assert_eq!(len, 0);
+        assert_eq!(evicted, Some(1));
+    }
+    let error = runs(&bench.conn())
+        .last()
+        .unwrap()
+        .4
+        .clone()
+        .expect("an eviction has to be reported");
+    assert!(
+        error.contains("retention evicted 2 session(s)"),
+        "the note must say what it did: {error}"
+    );
+
+    // And nothing is offered twice: the next pass has nothing left to report.
+    let again = bench.pass_with(&bench.config_file(EVICT));
+    assert!(again.retention.is_silent(), "{:?}", again.retention.lines());
+    assert_eq!(runs(&bench.conn()).last().unwrap().4, None);
+}
+
+/// RET-03's bound, and the half of it that matters to a reader: a truncated
+/// pass says how many it left, so "there is nothing left to do" is
+/// distinguishable from "the rest is coming next pass". The hook spawn is the
+/// scheduler, so the next pass is the next prompt.
+#[test]
+fn the_bounded_step_leaves_the_rest_for_the_next_pass_and_says_how_many() {
+    let bench = bench();
+    let over = 3;
+    let total = MAX_PER_PASS + over;
+    {
+        // Planted rather than placed: what is under test is the bound and the
+        // note, and a hundred real transcripts would only make the same
+        // assertion slower.
+        let store = Store::open(&bench.data_dir).unwrap();
+        let conn = store.conn();
+        for n in 0..total {
+            let key = format!("/planted/{n}.jsonl");
+            conn.execute(
+                "INSERT INTO sessions (session_key, session_no, blob) VALUES (?1, ?2, ?3)",
+                rusqlite::params![key, n as i64 + 1, vec![0u8; 16]],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_meta
+                    (session_key, transcript_path, checksum, uncompressed_len,
+                     last_turn_at, project, is_final)
+                 VALUES (?1, ?1, ?2, 16, ?3, '/data/code/alpha', 1)",
+                rusqlite::params![key, vec![0u8; 32], AGED],
+            )
+            .unwrap();
+            // So `observe_new` has nothing to say about a planted blob it
+            // cannot decompress: this test is about retention's note alone.
+            conn.execute(
+                "INSERT INTO observations (session_key, generated_at, mechanical)
+                 VALUES (?1, ?2, '{}')",
+                rusqlite::params![key, AGED],
+            )
+            .unwrap();
+        }
+    }
+
+    let first = bench.pass_with(&bench.config_file(EVICT));
+    assert_eq!(first.retention.evicted.len(), MAX_PER_PASS);
+    assert_eq!(first.retention.over, over);
+    let error = runs(&bench.conn()).last().unwrap().4.clone().unwrap();
+    assert!(
+        error.contains(&format!("{over} more session(s) are waiting on retention")),
+        "a truncated pass must say what it left: {error}"
+    );
+
+    let second = bench.pass_with(&bench.config_file(EVICT));
+    assert_eq!(second.retention.evicted.len(), over);
+    assert_eq!(second.retention.over, 0);
+    let error = runs(&bench.conn()).last().unwrap().4.clone().unwrap();
+    assert!(
+        !error.contains("waiting on retention"),
+        "the second pass had nothing left and said otherwise: {error}"
+    );
+
+    let evicted = blobs(&bench.conn());
+    assert_eq!(evicted.len(), total);
+    assert!(evicted
+        .iter()
+        .all(|(len, flag)| *len == 0 && *flag == Some(1)));
 }

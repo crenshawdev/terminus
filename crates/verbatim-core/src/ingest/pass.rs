@@ -60,6 +60,10 @@ pub struct Summary {
     pub outcomes: crate::feedback::Labeled,
     /// What the sessions this pass closed had to say for themselves (OBS-01).
     pub observations: crate::observe::Observed,
+    /// What retention evicted, deleted and left for the next pass (RET-01,
+    /// RET-03, D-10). Empty and free while retention is off, which is the
+    /// default and the state every user starts in.
+    pub retention: crate::retention::Applied,
     /// What the provider was asked, after the lock dropped (OBS-02, D-07).
     ///
     /// Empty and free while judgment is off, which is the default. Its notes do
@@ -201,6 +205,21 @@ fn locked(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
     // provider held here would make every hook-spawned pass in that window exit
     // as `LockHeld` and archive nothing.
     summary.observations = crate::observe::observe_new(store.conn(), config);
+
+    // RET-03 and D-10, and both halves of the position matter. AFTER
+    // `observe_new`, because that step reads one blob per newly finalized
+    // session and an eviction that ran first would destroy the bytes it was
+    // about to read. BEFORE `record_pass`, because `runs.error` is the only
+    // textual channel this product has - there is no log file, by design - and
+    // a step placed after that row is written has nowhere to report.
+    //
+    // Nothing here fails the pass. The archive is the work; a retention step
+    // that could not run is a note, and a `?` propagated out of it is exactly
+    // what would let one damaged row stop every future ingest of every other
+    // transcript in the tree. `retention::retain` is shaped to make that the
+    // only possibility: it returns notes and never an error.
+    summary.retention = crate::retention::retain(&mut store, config);
+
     summary.duration = started.elapsed();
 
     // One row, whatever happened (D-10, D-14). A pass that died writes it in a
@@ -327,6 +346,7 @@ fn record_pass(
     notes.extend(summary.feedback.lines());
     notes.extend(summary.outcomes.lines());
     notes.extend(summary.observations.lines());
+    notes.extend(summary.retention.lines());
     if let Some(e) = fatal {
         notes.push(format!("pass failed: {e}"));
     }
