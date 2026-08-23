@@ -147,6 +147,20 @@ pub const AGENT_META_FIXTURE: &str = "subagents/agent-alpha.meta.json";
 /// The one fixture with no trailing newline: a transcript still being written.
 pub const TRUNCATED_FIXTURE: &str = "session-truncated.jsonl";
 
+/// The capture-mode fixture (ING-07, phase 8 D-05): six records covering every
+/// arm the elision has.
+///
+/// One `toolUseResult` well over [`crate::capture::LEAN_THRESHOLD_BYTES`] and
+/// one well under it, one `attachment` over and one under, and a plain user
+/// prompt and a plain assistant turn carrying neither key. So `lean` and
+/// `minimal` have different work to do over the same file, which is what makes
+/// "strictly decreasing bytes" a measurement rather than a tautology.
+///
+/// Deliberately NOT in [`TRANSCRIPT_FIXTURES`], whose members are ingested
+/// wholesale by the swept CLI and corpus tests: a new member there changes
+/// session, turn and byte counts asserted in other phases' tests.
+pub const CAPTURE_FIXTURE: &str = "session-capture.jsonl";
+
 /// A token appearing in exactly one turn across the whole fixture set.
 pub const UNIQUE_TOKEN: &str = "brillig";
 

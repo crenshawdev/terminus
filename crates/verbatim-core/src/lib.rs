@@ -23,6 +23,7 @@
 //! `rayon`, nothing that outlives the call that created it.
 
 pub mod blob;
+pub mod capture;
 pub mod config;
 pub mod credentials;
 pub mod derive;
