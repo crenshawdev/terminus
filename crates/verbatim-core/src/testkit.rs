@@ -25,24 +25,33 @@ pub const TRANSCRIPT_FIXTURES: &[&str] = &[
     "session-errors-b.jsonl",
     "subagents/agent-echo.jsonl",
     "session-edits.jsonl",
+    "session-envelope.jsonl",
 ];
 
-/// The token the phase 3 fixtures carry where a real transcript carries an
+/// The token the rooted fixtures carry where a real transcript carries an
 /// absolute `cwd`.
 ///
 /// The phase 1 and 2 fixtures hardcode `/data/code/verbatim`, which makes any
 /// project-scoped assertion over them true only on a checkout at that literal
 /// path - and, worse, true for the wrong reason on this one, since `git
-/// rev-parse` answers for a directory that really is there. The phase 3
-/// fixtures name a root the test owns instead, so a project key is whatever the
-/// test built and nothing else.
+/// rev-parse` answers for a directory that really is there. The rooted fixtures
+/// name a root the test owns instead, so a project key is whatever the test
+/// built and nothing else.
 pub const FIXTURE_ROOT_TOKEN: &str = "{{ROOT}}";
 
 /// The fixtures carrying [`FIXTURE_ROOT_TOKEN`], and the project directory each
 /// one's `cwd` names beneath the substituted root.
 ///
-/// Two distinct projects across them, which is what lets a scoped search have
+/// Three distinct projects across them, which is what lets a scoped search have
 /// something to be both true and false about.
+///
+/// `project-gamma` has exactly one member and that is deliberate.
+/// `session-envelope.jsonl` is the phase 1 v0.1.1 one: its last `user` record is
+/// a harness envelope rather than a typed prompt, so the brief's quoted turn
+/// moves under INJ-07's rule and a test at the process boundary can watch it
+/// move. Every project-scoped assertion in the repository is written against
+/// `project-alpha` or `project-beta`, so a third key is what keeps this fixture
+/// inert for all of them.
 ///
 /// `session-edits.jsonl` is the phase 5 one, and it needs the root for a second
 /// reason the others do not: the path its `Edit` call stores is ABSOLUTE
@@ -57,6 +66,7 @@ pub const ROOTED_FIXTURES: &[(&str, &str)] = &[
     ("session-errors-a.jsonl", "project-beta"),
     ("session-errors-b.jsonl", "project-beta"),
     ("session-edits.jsonl", "project-alpha"),
+    ("session-envelope.jsonl", "project-gamma"),
 ];
 
 /// The project directory one rooted fixture's `cwd` names beneath `root`.
