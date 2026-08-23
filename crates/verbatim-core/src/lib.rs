@@ -39,6 +39,7 @@ pub mod project;
 pub mod recall;
 pub mod recover;
 pub mod reindex;
+pub mod retention;
 pub mod store;
 pub mod verify;
 
