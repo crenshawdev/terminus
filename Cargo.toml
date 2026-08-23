@@ -8,6 +8,11 @@ edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/crenshawdev/verbatim"
 authors = ["John Crenshaw <john@jcrenshaw.dev>"]
+# Neither crate is a registry artifact. verbatim is a binary application
+# distributed as a prebuilt binary, and verbatim-core exists to be linked
+# by it rather than depended on. false here so a stray `cargo publish`
+# cannot push either one.
+publish = false
 
 [workspace.dependencies]
 # Store. D-19: rusqlite pinned to the current release. D-19 also asserted that
