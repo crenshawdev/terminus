@@ -8,6 +8,8 @@ files:
   - crates/verbatim-core/src/config.rs
   - crates/verbatim-core/src/store/schema.rs
   - crates/verbatim-core/src/ingest/mod.rs
+  - crates/verbatim-core/src/ingest/pass.rs
+  - crates/verbatim-core/src/ingest/backfill.rs
   - crates/verbatim-core/src/recover.rs
   - crates/verbatim-core/src/testkit.rs
   - tests/fixtures/session-capture.jsonl
@@ -261,3 +263,12 @@ still reproduces the transcript byte for byte.
 - PLAN-5 shares `crates/verbatim-core/src/config.rs` with PLAN-1 and PLAN-4 and
   `crates/verbatim-core/src/ingest/mod.rs` with PLAN-2, and is SEQUENTIAL with
   all three.
+- `crates/verbatim-core/src/ingest/pass.rs` and
+  `crates/verbatim-core/src/ingest/backfill.rs` were added to the `files:` list
+  during execution. `prepare` and `ingest_locked` are the two functions the
+  configured mode has to reach, and their only callers outside
+  `ingest/mod.rs` are `pass::walk` and `backfill`'s worker - so without those two
+  paths `[capture].mode` would be honoured by `verbatim ingest <path>` and
+  silently ignored by the hook-driven pass, which is the product's ingest. One
+  value is passed through in each and nothing else changes; no plan in this
+  phase runs in parallel with this one, and plans 1-4 are already committed.

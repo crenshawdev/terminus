@@ -10,6 +10,7 @@ files:
   - crates/verbatim-core/src/ingest/pass.rs
   - crates/verbatim-core/tests/snapshot.rs
   - crates/verbatim-core/tests/store_open.rs
+  - crates/verbatim-core/tests/backfill.rs
   - crates/verbatim-core/tests/config.rs
   - crates/verbatim/src/cmd/data.rs
   - crates/verbatim/src/cmd/ingest.rs
