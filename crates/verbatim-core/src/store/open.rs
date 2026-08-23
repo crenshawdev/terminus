@@ -590,13 +590,103 @@ fn read_versions(conn: &Connection, path: &Path) -> Result<Option<RebuildRequire
     Ok(outcome)
 }
 
+/// The file in verbatim's config directory that names where the data directory
+/// lives (STOR-07, D-06).
+///
+/// Plain text holding one absolute path, and deliberately NOT TOML: the `toml`
+/// dependency in the root `Cargo.toml` is `default-features = false` with the
+/// serializer half absent, so a TOML pointer would cost a new cargo feature on
+/// the hook-path binary to WRITE a single line. `verbatim data move` writes it;
+/// nothing else does.
+pub const LOCATION_FILE_NAME: &str = "data-location";
+
+/// Where [`LOCATION_FILE_NAME`] sits, for the one command that writes it.
+///
+/// An `Err` here is a config directory that does not resolve at all, which the
+/// READ side treats as "no pointer" ([`data_dir`]) and the write side must
+/// treat as a failure - there is nowhere to put the pointer, so the move cannot
+/// be made to stick.
+pub fn location_pointer_path() -> Result<PathBuf> {
+    Ok(crate::config::config_dir()?.join(LOCATION_FILE_NAME))
+}
+
 /// The data directory, resolved once at startup and passed down explicitly
 /// afterwards, never re-derived (`DESIGN-BRIEF.md:404`).
+///
+/// Three sources, in this order and no other (D-06):
+///
+/// 1. `VERBATIM_DATA_DIR`, which outranks everything. A test bench and a
+///    spawned child that set it behave exactly as they did before the pointer
+///    existed, which is what makes STOR-07 a change nothing else has to know
+///    about.
+/// 2. The [`LOCATION_FILE_NAME`] pointer `verbatim data move` writes.
+/// 3. The platform location, which is where every user starts.
+///
+/// **This runs on the hook path**, where `cmd::hook` resolves the data
+/// directory on every event against a p99 asserted at 10 ms with a measured
+/// 0.408 ms floor. So the pointer costs one `fs::read_to_string` of a small
+/// file that usually is not there, reached only when the environment variable
+/// is unset, and nothing else.
 pub fn data_dir() -> Result<PathBuf> {
     if let Some(dir) = non_empty_var("VERBATIM_DATA_DIR") {
         return Ok(PathBuf::from(dir));
     }
+    if let Some(dir) = pointed_at()? {
+        return Ok(dir);
+    }
     platform_data_dir()
+}
+
+/// The store location the pointer file names, if it names one.
+///
+/// `Ok(None)` is the ordinary answer and covers three states that are all
+/// "nobody has moved the store": no config directory resolves - because a store
+/// path that stopped resolving when `HOME` moved would take every command down
+/// with it, and the platform location is a better answer than an error; no
+/// pointer file, which is where every user starts; and a pointer that is empty
+/// or whitespace-only, treated as unset the way [`non_empty_var`] treats an
+/// empty environment variable.
+///
+/// A pointer file that EXISTS and cannot be read is an `Err`, and the
+/// distinction is the point: falling through to the platform location there
+/// would silently start a second store beside the one the user moved, and both
+/// would then be written to. Not-there is normal; there-and-unreadable is not.
+fn pointed_at() -> Result<Option<PathBuf>> {
+    let Ok(path) = crate::config::config_dir() else {
+        return Ok(None);
+    };
+    let path = path.join(LOCATION_FILE_NAME);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(Error::DataDirUnresolved {
+                detail: format!("{} exists and could not be read: {e}", path.display()),
+            })
+        }
+    };
+
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    // A relative pointer would resolve against the process's working directory,
+    // which on the hook path is whatever project Claude Code was invoked in - so
+    // it would scatter a store per repository rather than name one. Refused
+    // loudly rather than ignored: the file was hand-edited to say something, and
+    // silently using a different store than the one it names is the failure this
+    // whole resolver exists to avoid.
+    let pointed = PathBuf::from(trimmed);
+    if !pointed.is_absolute() {
+        return Err(Error::DataDirUnresolved {
+            detail: format!(
+                "{} names a relative path ({trimmed}); it must hold one absolute path",
+                path.display()
+            ),
+        });
+    }
+    Ok(Some(pointed))
 }
 
 #[cfg(target_os = "linux")]

@@ -1,5 +1,6 @@
 //! Opening the store, and the D-09 version gate that guards every open.
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::Connection;
@@ -9,8 +10,119 @@ use verbatim_core::store::{
 use verbatim_core::{Error, Store};
 
 /// `std::env::set_var` is process-global and the test harness is threaded, so
-/// the one test that touches the environment holds this.
+/// every test that touches the environment holds this.
 static ENV: Mutex<()> = Mutex::new(());
+
+/// Both variables the resolver reads, saved and put back whatever the body did.
+///
+/// The pointer tests have to hold `VERBATIM_DATA_DIR` UNSET while they run -
+/// it outranks the pointer by design - and the developer running the suite may
+/// well have it set, so restoring is not politeness here, it is what keeps the
+/// rest of the file working.
+fn with_env<T>(data: Option<&Path>, config: Option<&Path>, body: impl FnOnce() -> T) -> T {
+    let _guard = ENV.lock().unwrap();
+    let previous: Vec<(&str, Option<std::ffi::OsString>)> = ["VERBATIM_DATA_DIR", "VERBATIM_CONFIG_DIR"]
+        .iter()
+        .map(|name| (*name, std::env::var_os(name)))
+        .collect();
+
+    for (name, value) in [("VERBATIM_DATA_DIR", data), ("VERBATIM_CONFIG_DIR", config)] {
+        match value {
+            Some(path) => std::env::set_var(name, path),
+            None => std::env::remove_var(name),
+        }
+    }
+    let out = body();
+
+    for (name, value) in previous {
+        match value {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
+    }
+    out
+}
+
+/// STOR-07 / D-06, the whole order in one case: the environment override
+/// outranks the pointer, the pointer outranks the platform location, and an
+/// empty pointer is no pointer at all.
+///
+/// One test rather than four, because every one of them has to hold [`ENV`] for
+/// its whole body anyway and the four claims are about ONE ordering. The
+/// baseline is taken first, against a config directory with no pointer in it,
+/// so "the platform location" is a measurement of this resolver rather than a
+/// second copy of its platform arm.
+#[test]
+fn the_location_pointer_sits_below_the_environment_and_above_the_platform() {
+    let config = tempfile::tempdir().unwrap();
+    let pointed = tempfile::tempdir().unwrap();
+    let env_dir = tempfile::tempdir().unwrap();
+    let pointer = config.path().join(verbatim_core::store::LOCATION_FILE_NAME);
+
+    let baseline = with_env(None, Some(config.path()), || {
+        verbatim_core::data_dir().expect("no pointer resolves the platform location")
+    });
+    assert_ne!(baseline, pointed.path());
+
+    // (b) the pointer names a path and that path is resolved. The trailing
+    // newline is deliberate: a hand-edited file has one.
+    std::fs::write(&pointer, format!("{}\n", pointed.path().display())).unwrap();
+    let resolved = with_env(None, Some(config.path()), || {
+        verbatim_core::data_dir().expect("a pointer resolves")
+    });
+    assert_eq!(resolved, pointed.path());
+
+    // (a) VERBATIM_DATA_DIR wins over that same pointer.
+    let overridden = with_env(Some(env_dir.path()), Some(config.path()), || {
+        verbatim_core::data_dir().expect("the environment resolves")
+    });
+    assert_eq!(overridden, env_dir.path());
+
+    // (c) an empty or whitespace-only pointer is unset, not a path.
+    for empty in ["", "   \n\t "] {
+        std::fs::write(&pointer, empty).unwrap();
+        let resolved = with_env(None, Some(config.path()), || {
+            verbatim_core::data_dir().expect("an empty pointer resolves the platform location")
+        });
+        assert_eq!(resolved, baseline, "an empty pointer is no pointer");
+    }
+
+    // (d) with the file gone the answer is byte-identical to the baseline, and
+    // the baseline is what this resolver answered before the pointer existed.
+    std::fs::remove_file(&pointer).unwrap();
+    let resolved = with_env(None, Some(config.path()), || {
+        verbatim_core::data_dir().expect("no pointer resolves the platform location")
+    });
+    assert_eq!(resolved, baseline);
+
+    // A config directory that resolves to nothing on disk is the same answer:
+    // the store path must not stop resolving because HOME moved.
+    let missing = config.path().join("gone");
+    let resolved = with_env(None, Some(missing.as_path()), || {
+        verbatim_core::data_dir().expect("an absent config directory resolves")
+    });
+    assert_eq!(resolved, baseline);
+}
+
+/// A pointer that says something and cannot be honored is loud.
+///
+/// Falling through to the platform location for either of these would start a
+/// SECOND store beside the one the user moved, and both would be written to -
+/// the split-brain STOR-07 exists to prevent.
+#[test]
+fn a_pointer_that_cannot_be_honored_fails_rather_than_resolving_elsewhere() {
+    let config = tempfile::tempdir().unwrap();
+    let pointer = config.path().join(verbatim_core::store::LOCATION_FILE_NAME);
+
+    std::fs::write(&pointer, "relative/store\n").unwrap();
+    let refused = with_env(None, Some(config.path()), verbatim_core::data_dir);
+    match refused {
+        Err(Error::DataDirUnresolved { detail }) => {
+            assert!(detail.contains("relative/store"), "{detail}");
+        }
+        other => panic!("a relative pointer must not resolve: {other:?}"),
+    }
+}
 
 fn journal_mode(store: &Store) -> String {
     store
