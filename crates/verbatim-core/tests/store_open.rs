@@ -1,5 +1,6 @@
 //! Opening the store, and the D-09 version gate that guards every open.
 
+use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::Connection;
@@ -9,8 +10,120 @@ use verbatim_core::store::{
 use verbatim_core::{Error, Store};
 
 /// `std::env::set_var` is process-global and the test harness is threaded, so
-/// the one test that touches the environment holds this.
+/// every test that touches the environment holds this.
 static ENV: Mutex<()> = Mutex::new(());
+
+/// Both variables the resolver reads, saved and put back whatever the body did.
+///
+/// The pointer tests have to hold `VERBATIM_DATA_DIR` UNSET while they run -
+/// it outranks the pointer by design - and the developer running the suite may
+/// well have it set, so restoring is not politeness here, it is what keeps the
+/// rest of the file working.
+fn with_env<T>(data: Option<&Path>, config: Option<&Path>, body: impl FnOnce() -> T) -> T {
+    let _guard = ENV.lock().unwrap();
+    let previous: Vec<(&str, Option<std::ffi::OsString>)> =
+        ["VERBATIM_DATA_DIR", "VERBATIM_CONFIG_DIR"]
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+
+    for (name, value) in [("VERBATIM_DATA_DIR", data), ("VERBATIM_CONFIG_DIR", config)] {
+        match value {
+            Some(path) => std::env::set_var(name, path),
+            None => std::env::remove_var(name),
+        }
+    }
+    let out = body();
+
+    for (name, value) in previous {
+        match value {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
+    }
+    out
+}
+
+/// STOR-07 / D-06, the whole order in one case: the environment override
+/// outranks the pointer, the pointer outranks the platform location, and an
+/// empty pointer is no pointer at all.
+///
+/// One test rather than four, because every one of them has to hold [`ENV`] for
+/// its whole body anyway and the four claims are about ONE ordering. The
+/// baseline is taken first, against a config directory with no pointer in it,
+/// so "the platform location" is a measurement of this resolver rather than a
+/// second copy of its platform arm.
+#[test]
+fn the_location_pointer_sits_below_the_environment_and_above_the_platform() {
+    let config = tempfile::tempdir().unwrap();
+    let pointed = tempfile::tempdir().unwrap();
+    let env_dir = tempfile::tempdir().unwrap();
+    let pointer = config.path().join(verbatim_core::store::LOCATION_FILE_NAME);
+
+    let baseline = with_env(None, Some(config.path()), || {
+        verbatim_core::data_dir().expect("no pointer resolves the platform location")
+    });
+    assert_ne!(baseline, pointed.path());
+
+    // (b) the pointer names a path and that path is resolved. The trailing
+    // newline is deliberate: a hand-edited file has one.
+    std::fs::write(&pointer, format!("{}\n", pointed.path().display())).unwrap();
+    let resolved = with_env(None, Some(config.path()), || {
+        verbatim_core::data_dir().expect("a pointer resolves")
+    });
+    assert_eq!(resolved, pointed.path());
+
+    // (a) VERBATIM_DATA_DIR wins over that same pointer.
+    let overridden = with_env(Some(env_dir.path()), Some(config.path()), || {
+        verbatim_core::data_dir().expect("the environment resolves")
+    });
+    assert_eq!(overridden, env_dir.path());
+
+    // (c) an empty or whitespace-only pointer is unset, not a path.
+    for empty in ["", "   \n\t "] {
+        std::fs::write(&pointer, empty).unwrap();
+        let resolved = with_env(None, Some(config.path()), || {
+            verbatim_core::data_dir().expect("an empty pointer resolves the platform location")
+        });
+        assert_eq!(resolved, baseline, "an empty pointer is no pointer");
+    }
+
+    // (d) with the file gone the answer is byte-identical to the baseline, and
+    // the baseline is what this resolver answered before the pointer existed.
+    std::fs::remove_file(&pointer).unwrap();
+    let resolved = with_env(None, Some(config.path()), || {
+        verbatim_core::data_dir().expect("no pointer resolves the platform location")
+    });
+    assert_eq!(resolved, baseline);
+
+    // A config directory that resolves to nothing on disk is the same answer:
+    // the store path must not stop resolving because HOME moved.
+    let missing = config.path().join("gone");
+    let resolved = with_env(None, Some(missing.as_path()), || {
+        verbatim_core::data_dir().expect("an absent config directory resolves")
+    });
+    assert_eq!(resolved, baseline);
+}
+
+/// A pointer that says something and cannot be honored is loud.
+///
+/// Falling through to the platform location for either of these would start a
+/// SECOND store beside the one the user moved, and both would be written to -
+/// the split-brain STOR-07 exists to prevent.
+#[test]
+fn a_pointer_that_cannot_be_honored_fails_rather_than_resolving_elsewhere() {
+    let config = tempfile::tempdir().unwrap();
+    let pointer = config.path().join(verbatim_core::store::LOCATION_FILE_NAME);
+
+    std::fs::write(&pointer, "relative/store\n").unwrap();
+    let refused = with_env(None, Some(config.path()), verbatim_core::data_dir);
+    match refused {
+        Err(Error::DataDirUnresolved { detail }) => {
+            assert!(detail.contains("relative/store"), "{detail}");
+        }
+        other => panic!("a relative pointer must not resolve: {other:?}"),
+    }
+}
 
 fn journal_mode(store: &Store) -> String {
     store
@@ -210,6 +323,244 @@ fn a_file_that_is_not_a_store_is_named_as_such() {
     std::fs::write(dir.path().join(DB_FILE_NAME), b"not a database at all").unwrap();
     let err = Store::open(dir.path()).expect_err("a non-store must not be opened");
     assert!(matches!(err, Error::NotAStore { .. }), "{err:?}");
+}
+
+/// D-10's first half: a read never creates the store it did not find.
+///
+/// Asserted on the filesystem rather than on the error, because the failure
+/// this prevents - `verbatim search` on a machine that has never ingested
+/// leaving a data directory behind - is a file that exists, not a message.
+#[test]
+fn a_read_only_open_of_a_missing_store_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = dir.path().join("never-ingested");
+
+    let err = Store::open_read_only(&absent).expect_err("there is no store to open");
+    assert!(matches!(err, Error::StoreNotFound { .. }), "{err:?}");
+    assert!(!absent.exists(), "the read created the data directory");
+
+    // The other half: the directory is there and the database is not.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let err = Store::open_read_only(&empty).expect_err("an empty data directory holds no store");
+    assert!(matches!(err, Error::StoreNotFound { .. }), "{err:?}");
+    assert_eq!(
+        std::fs::read_dir(&empty).unwrap().count(),
+        0,
+        "the read wrote something into an empty data directory"
+    );
+}
+
+/// D-10's second half: the connection cannot write, whatever the caller asks of
+/// it. `readOnlyHint` is a claim about this flag and nothing else.
+#[test]
+fn a_read_only_connection_refuses_every_write() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Store::open(dir.path()).unwrap());
+
+    let store = Store::open_read_only(dir.path()).expect("an existing store opens for reading");
+    assert!(store.rebuild_required().is_none());
+    assert!(store.missing_columns().is_empty());
+    assert!(!store.predates_this_build());
+
+    for statement in [
+        "INSERT INTO runs (started_at) VALUES ('2026-08-13T00:00:00Z')",
+        "CREATE TABLE scratch (x INTEGER)",
+        "ALTER TABLE session_meta ADD COLUMN invented TEXT",
+        "DELETE FROM meta",
+    ] {
+        let err = store
+            .conn()
+            .execute_batch(statement)
+            .expect_err("a read-only connection accepted a write");
+        assert!(
+            err.to_string().contains("readonly"),
+            "unexpected refusal for `{statement}`: {err}"
+        );
+    }
+}
+
+/// D-18: a store written before this build opens, reports itself, and is left
+/// exactly as it was - no bring-forward, no pragma, no byte of the store.
+///
+/// **What "untouched" can mean for a WAL database.** Measured here: a read-only
+/// connection to a WAL database materializes `verbatim.db-shm` (32 KB) and an
+/// empty `verbatim.db-wal` whenever the directory allows it, because the
+/// shared-memory index is how WAL readers find the snapshot at all. That is
+/// SQLite's, not ours - the same mechanism this constructor's
+/// [`Error::StoreUnreadable`] exists to report when the medium will *not* allow
+/// it. So the assertion is the one that carries the meaning: `verbatim.db` is
+/// byte-identical, every file that already existed is byte-identical, and the
+/// only additions are those two, with the WAL empty because nothing was
+/// committed through it.
+#[cfg(feature = "testkit")]
+#[test]
+fn a_read_only_open_of_an_older_store_reports_it_and_writes_nothing() {
+    use verbatim_core::store::schema::BRING_FORWARD_COLUMNS;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let path = verbatim_core::testkit::copy_fixture_into("session-basic.jsonl", &work);
+    match verbatim_core::ingest::run(&data_dir, &path).unwrap() {
+        verbatim_core::ingest::Outcome::Committed(_) => {}
+        other => panic!("the fixture must archive: {other:?}"),
+    }
+
+    // Age it the way `tests/schema.rs` does: phase 2's columns back off, the
+    // derived-schema integer back where a phase 1 binary left it.
+    {
+        let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+        for (table, added) in BRING_FORWARD_COLUMNS {
+            for (name, _) in *added {
+                conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {name}"))
+                    .unwrap_or_else(|e| panic!("drop {table}.{name}: {e}"));
+            }
+        }
+        conn.execute(
+            "UPDATE meta SET value = '1' WHERE key = ?1",
+            [META_DERIVED_SCHEMA],
+        )
+        .unwrap();
+    }
+
+    let before = directory_bytes(&data_dir);
+    assert!(
+        before.iter().any(|(name, _)| name == DB_FILE_NAME),
+        "the aged store must exist to be compared"
+    );
+
+    let store = Store::open_read_only(&data_dir).expect("an aged store still opens for reading");
+    let rebuild = store
+        .rebuild_required()
+        .expect("an older derived_schema must be reported");
+    assert_eq!(rebuild.store_derived_schema, 1);
+    assert_eq!(rebuild.binary_derived_schema, DERIVED_SCHEMA);
+
+    // The columns a read query would have named. Reported, not added.
+    let missing: Vec<(&str, &str)> = store
+        .missing_columns()
+        .iter()
+        .map(|c| (c.table, c.column))
+        .collect();
+    for (table, added) in BRING_FORWARD_COLUMNS {
+        for (name, _) in *added {
+            assert!(
+                missing.contains(&(*table, *name)),
+                "{table}.{name} is gone and was not reported"
+            );
+        }
+    }
+    assert!(store.predates_this_build());
+
+    // A query naming one of them still fails - the point is that the caller was
+    // told, not that SQLite was made tolerant.
+    assert!(store
+        .conn()
+        .query_row("SELECT project_pre_worktree FROM session_meta", [], |_| Ok(
+            ()
+        ))
+        .is_err());
+
+    drop(store);
+    let after = directory_bytes(&data_dir);
+
+    for (name, bytes) in &before {
+        let found = after
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("the read-only open removed {name}"));
+        assert!(found.1 == *bytes, "the read-only open rewrote {name}");
+    }
+    for (name, bytes) in &after {
+        if before.iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        assert!(
+            name == "verbatim.db-shm" || name == "verbatim.db-wal",
+            "the read-only open created {name}"
+        );
+        assert!(
+            name != "verbatim.db-wal" || bytes.is_empty(),
+            "the read-only open committed {} bytes through the WAL",
+            bytes.len()
+        );
+    }
+}
+
+/// Every file in `dir`, by name, with its bytes. Sorted, so two snapshots
+/// compare directly.
+#[cfg(feature = "testkit")]
+fn directory_bytes(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).unwrap_or_default(),
+            )
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// D-02: phase 6's two tables reach a store a phase-5 binary initialized, on the
+/// next ordinary `Store::open`, and nothing is rebuilt to get them there.
+///
+/// The store under test is aged by dropping exactly the two tables, which is
+/// what a store written before they existed looks like. The assertion that
+/// carries the phase is the one about the rest of it: `bring_forward` runs
+/// `CREATE_SQL`, every statement in it is `IF NOT EXISTS`, and the turn rows the
+/// old binary derived are still there afterwards - so an upgraded machine gains
+/// a decision log without paying the measured ~50 s in-lock rebuild that a
+/// `DERIVED_SCHEMA` bump would have forced on its first hook-spawned pass.
+#[cfg(feature = "testkit")]
+#[test]
+fn a_store_written_before_phase_six_gains_decisions_without_a_reindex() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let path = verbatim_core::testkit::copy_fixture_into("session-basic.jsonl", &work);
+    match verbatim_core::ingest::run(&data_dir, &path).unwrap() {
+        verbatim_core::ingest::Outcome::Committed(_) => {}
+        other => panic!("the fixture must archive: {other:?}"),
+    }
+
+    let turns_before = {
+        let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+        let turns = table_count(&conn, "turns");
+        assert!(turns > 0, "the fixture archived no turns");
+        conn.execute_batch("DROP TABLE labels; DROP TABLE decisions;")
+            .expect("the tables this test ages away must exist to be dropped");
+        turns
+    };
+
+    let store = Store::open(&data_dir).expect("an aged store still opens");
+    assert!(
+        store.rebuild_required().is_none(),
+        "a missing table is not a version mismatch, and must not ask for a rebuild"
+    );
+    assert_eq!(table_count(store.conn(), "decisions"), 0);
+    assert_eq!(table_count(store.conn(), "labels"), 0);
+    assert_eq!(
+        table_count(store.conn(), "turns"),
+        turns_before,
+        "the open rebuilt the derived tables instead of adding the missing ones"
+    );
+}
+
+/// `SELECT count(*)`, which is also the assertion that the table is there at
+/// all: a missing one is an `Err` rather than a zero.
+#[cfg(feature = "testkit")]
+fn table_count(conn: &Connection, table: &str) -> i64 {
+    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap_or_else(|e| panic!("counting {table}: {e}"))
 }
 
 fn runs_count(conn: &Connection) -> i64 {

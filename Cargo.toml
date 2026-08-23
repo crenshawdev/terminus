@@ -23,9 +23,45 @@ blake3 = "1.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# Verbatim's own config file (D-15). Default features off: `display` is the
+# *writer* half and nothing here ever writes a config, so it is dead weight on a
+# binary whose cold start is the product. `parse` + `serde` pull toml_parser,
+# winnow, serde_core, toml_datetime and serde_spanned - no async runtime, no
+# thread pool, and nothing that opens a socket.
+#
+# That last clause used to read "no HTTP client" and applied to the whole
+# workspace. Phase 7 makes it false and `ureq` below says what replaced it.
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
 # CLI argument parsing. lexopt has zero dependencies of its own; cold start is
 # the product (DESIGN-BRIEF.md:39) and every transitive crate is startup cost.
 lexopt = "0.3"
+# The workspace's first HTTP dependency and its first TLS dependency (phase 7,
+# D-06), reached only by the opt-in provider call in `observe::net` and by
+# nothing on the hook path. `DESIGN-BRIEF.md:39` allowed for exactly this -
+# "blocking HTTP scoped to the observation command only" - and the bar the other
+# entries here are written to is a measured 0.408 ms startup floor, so this one
+# is measured rather than argued.
+#
+# Measured on 2026-08-21, release profile, this machine, with the client
+# reachable from `main` so the linker cannot drop it:
+#   binary      5,823,728 -> 8,195,960 bytes (+2.26 MiB, +41%)
+#   cold start  SessionStart hook, 200 runs: p50 0.794 ms -> 0.807 ms (+13 us)
+#   lockfile    70 -> 99 packages, 10 of the 29 being windows-* platform
+#               bindings that compile on Windows only
+# The binary grows and the startup floor does not, which is the trade this
+# workspace is built to take: what costs cold start is a runtime that
+# initializes at load, and a blocking client has none. Every megabyte of that
+# growth is rustls and ring, paged in only if a provider call is ever made.
+#
+# Why this client and not another: blocking, so no async runtime is dragged in
+# behind it (the constraint the whole binary is built around); pure-Rust TLS via
+# rustls with webpki roots, so there is no system OpenSSL and no native shared
+# library at runtime, which `.planning/PROJECT.md` bars outright. Default
+# features are trimmed to `rustls` alone - `gzip` is on by default and is
+# dropped because a `chat/completions` response is small and the caller pays for
+# a decompressor it never needs, and `json` is dropped because serde_json is
+# already linked and ureq's wrapper would only hide where the parse happens.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
 verbatim-core = { path = "crates/verbatim-core" }
 

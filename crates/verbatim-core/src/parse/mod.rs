@@ -9,7 +9,7 @@
 
 pub mod record;
 
-pub use record::{Record, Turn, TURN_TYPES};
+pub use record::{Record, Turn, COMPACT_BOUNDARY, TURN_TYPES};
 
 /// The result of scanning one byte range of a transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]

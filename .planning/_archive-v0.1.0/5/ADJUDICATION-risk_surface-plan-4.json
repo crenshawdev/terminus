@@ -1,0 +1,39 @@
+{
+  "phase": "5",
+  "trigger": "risk_surface",
+  "discriminator": "plan-4",
+  "round": 1,
+  "base": "4176a6b",
+  "head": "3743415",
+  "base_id": "4176a6b93ad1e9bbf846550afb635ad61eccc51d",
+  "head_id": "37434158614bb569afb343c4ec586e7525ea9e6f",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/inject/prompt.rs",
+      "line": 349,
+      "severity": "medium",
+      "claim": "`surviving()` stops iterating as soon as three injectable hits have been collected, so any later candidates are never checked or recorded in the session state, even if they would have been refused by INJ-04.",
+      "failure_scenario": "A prompt whose ranked results contain three allowed turns followed by one or more turns that should be suppressed (for example, already-injected or brief-quoted turns) will emit the same three injections, but the `suppressed` list in the state file will omit those later refusals entirely. That makes the AC4 audit log incomplete and can leave the file claiming fewer suppressions than actually occurred.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/inject/prompt.rs",
+        "line": 339,
+        "note": "The loop mechanics are read correctly, but no suppression \"actually occurred\" past the cap: a hit after MAX_TURNS injectables is never evaluated by refusal(), so there is no INJ-04 refusal to record - the doc states the function records every refusal, and a turn cut by the injection cap is refused for no INJ-04 reason. Behaviour stays correct downstream: an unexamined turn is neither marked injected nor suppressed, so it remains eligible on a later prompt, which is the right outcome for a turn the model never saw. Recording hypothetical refusals would assert reasons never checked."
+      },
+      "base_id": "4176a6b93ad1e9bbf846550afb635ad61eccc51d",
+      "head_id": "37434158614bb569afb343c4ec586e7525ea9e6f"
+    }
+  ]
+}

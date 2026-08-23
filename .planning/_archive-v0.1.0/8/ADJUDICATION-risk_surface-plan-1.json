@@ -1,0 +1,39 @@
+{
+  "phase": "8",
+  "trigger": "risk_surface",
+  "discriminator": "plan-1",
+  "round": 1,
+  "base": "86b34ad",
+  "head": "2528a85",
+  "base_id": "86b34adffefd5730a831e83f12dfb40594936466",
+  "head_id": "2528a8532d0f71e66da62188b5ff267cf9e0441a",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/retention/mod.rs",
+      "line": 173,
+      "severity": "high",
+      "claim": "Delete eligibility is decided only during evaluation by checking the transcript path once, but the mutating phase never re-validates that precondition before it removes the session rows.",
+      "failure_scenario": "If a transcript is restored or recreated after `evaluate` names it for deletion but before `apply` runs, `delete_one` still removes the session, metadata, turns and watermark rows even though the transcript is no longer gone. That makes the destructive path diverge from dry-run and can delete a session whose bytes should have been preserved.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/retention/apply.rs",
+        "line": 186,
+        "note": "Two of the three consequences the scenario asserts are contradicted by the code it cites. (1) The session bytes are NOT lost: delete_one deletes the watermarks row in the same transaction as the session row, and retention/mod.rs:203-206 states the rule the delete rests on - a session whose transcript is on disk is rediscovered by discover::discover on the next hook spawn and re-ingested from offset 0. A restored transcript is therefore re-archived on the next pass, so the transcript check is a do-not-bother filter, not a data-safety precondition. (2) There is no dry-run divergence of the kind described: --dry-run is a separate invocation of evaluate, so any change between it and a later apply is inherent to every dry-run and is not the evaluate-then-apply window this claim names. The claim itself is accurate - apply.rs:165 delete_one re-checks nothing - and the residual harm is real but narrow: the observations rows deleted at apply.rs:177 are the one thing no reingest reproduces (apply.rs:26-31). The window is the microseconds between evaluate and apply inside one retain() call under the ingest lock, on a transcript absent and untouched for at least age_days. Downgraded to low and queued as an open item."
+      },
+      "base_id": "86b34adffefd5730a831e83f12dfb40594936466",
+      "head_id": "2528a8532d0f71e66da62188b5ff267cf9e0441a"
+    }
+  ]
+}

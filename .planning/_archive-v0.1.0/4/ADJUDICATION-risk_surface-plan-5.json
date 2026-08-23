@@ -1,0 +1,34 @@
+{
+  "phase": "4",
+  "trigger": "risk_surface",
+  "discriminator": "plan-5",
+  "round": 1,
+  "base": "4f4c8a3",
+  "head": "cd096ce",
+  "base_id": "4f4c8a3f3ecb504500e22a8653340edc78af009a",
+  "head_id": "cd096ce2c2a9de0f9b5856770e3d7b119fa2db19",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "npm/verbatim/bin/verbatim.js",
+      "line": 78,
+      "severity": "medium",
+      "claim": "The shim does not actually forward signals to the child process; it only relies on shared process-group behavior and then checks `result.signal` after the fact. A signal delivered directly to the Node wrapper can terminate the shim without terminating the Rust binary.",
+      "failure_scenario": "If a supervisor or `kill -TERM` targets the `verbatim` PID while the CLI is running, the wrapper can exit while the spawned binary keeps running orphaned. That leaves the command active after the caller believes it has been stopped, which breaks CLI termination behavior.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "base_id": "4f4c8a3f3ecb504500e22a8653340edc78af009a",
+      "head_id": "cd096ce2c2a9de0f9b5856770e3d7b119fa2db19"
+    }
+  ]
+}

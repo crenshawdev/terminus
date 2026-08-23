@@ -334,3 +334,114 @@ fn truncating_anywhere_resumes_after_a_newline_and_parses_a_prefix() {
         );
     }
 }
+
+/// D-21 + D-08. The boundary line carries its subtype and the raw bytes of its
+/// `compactMetadata`, and it is an ordinary turn - `system` is already a turn
+/// type and the record carries both identity fields, so no classification rule
+/// changed to admit it.
+///
+/// "Verbatim" is checked two ways at once, because either alone is weak: the
+/// stored bytes must be a *contiguous slice of the line itself* (so nothing was
+/// re-serialized) and must deserialize to the same value the whole line's
+/// `compactMetadata` deserializes to (so the right slice was taken). Neither
+/// check knows where in the line the field sits, so the fixture is free to keep
+/// the real record's key order.
+#[test]
+fn the_boundary_line_carries_its_subtype_and_its_metadata_bytes() {
+    let line = testkit::boundary_line();
+    let scan = parse::scan(&[line.as_slice(), b"\n"].concat());
+    assert_eq!(scan.records.len(), 1);
+    let record = &scan.records[0];
+
+    assert_eq!(record.record_type.as_deref(), Some("system"));
+    assert_eq!(record.subtype.as_deref(), Some(parse::COMPACT_BOUNDARY));
+    assert!(record.is_compact_boundary());
+    assert!(record.is_turn(), "D-03 already classifies the boundary");
+
+    let bytes = record
+        .compact_metadata
+        .as_deref()
+        .expect("the boundary carries compaction metadata");
+    assert!(
+        line.windows(bytes.len()).any(|w| w == bytes),
+        "the stored metadata is not a slice of the line, so it was re-serialized"
+    );
+
+    let whole: serde_json::Value = serde_json::from_slice(&line).unwrap();
+    let stored: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(
+        stored, whole["compactMetadata"],
+        "a different slice was taken"
+    );
+
+    // The measured relation D-08 rests on: the preserved uuids are a PROPER
+    // subset of all of them, so the lists describe what survived and cannot
+    // enumerate what was dropped.
+    let preserved: std::collections::BTreeSet<&str> = stored["preservedMessages"]["uuids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let all: std::collections::BTreeSet<&str> = stored["preservedMessages"]["allUuids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(preserved.is_subset(&all) && preserved.len() < all.len());
+    for field in ["preTokens", "postTokens", "cumulativeDroppedTokens"] {
+        assert!(stored[field].is_number(), "{field} missing from {stored}");
+    }
+}
+
+/// The other half of the same change: a record with neither field is unchanged.
+/// Every phase 1 assertion compares whole `Record` values, so a subtype or a
+/// metadata blob appearing where the line has none would break them all.
+///
+/// `subtype` is read off whatever line carries one, and a phase 1 fixture
+/// already does: `session-basic.jsonl` holds a `system` record with
+/// `subtype: "local_command_output"`, exactly as real transcripts do. So the
+/// property is that no fixture but the compacted one produces a *compaction*
+/// signal, and that a line carrying neither field produces neither.
+#[test]
+fn only_the_compacted_fixture_produces_a_compaction_signal() {
+    let mut lines_with_no_subtype = 0usize;
+    for fixture in testkit::TRANSCRIPT_FIXTURES {
+        if *fixture == testkit::COMPACTED_FIXTURE {
+            continue;
+        }
+        let scan = parse::scan(&testkit::fixture_bytes(fixture));
+        for record in &scan.records {
+            assert_eq!(record.compact_metadata, None, "{fixture}: {record:?}");
+            assert!(!record.is_compact_boundary(), "{fixture}: {record:?}");
+            if record.subtype.is_none() {
+                lines_with_no_subtype += 1;
+            }
+        }
+    }
+    assert!(
+        lines_with_no_subtype > 0,
+        "no fixture line exercises the neither-field case"
+    );
+
+    // The one real subtype the phase 1 corpus carries, still read as itself.
+    let basic = parse::scan(&testkit::fixture_bytes("session-basic.jsonl"));
+    let subtypes: Vec<&str> = basic
+        .records
+        .iter()
+        .filter_map(|r| r.subtype.as_deref())
+        .collect();
+    assert_eq!(subtypes, ["local_command_output"]);
+}
+
+/// The metadata is found structurally, not by searching for the field name: a
+/// line whose message text merely quotes `compactMetadata` has none.
+#[test]
+fn a_nested_mention_of_the_field_name_is_not_the_field() {
+    let line = br#"{"type":"user","uuid":"u1","timestamp":"t","message":{"role":"user","content":[{"type":"text","text":"what is \"compactMetadata\":{\"preTokens\":1} for?"}]},"nested":{"compactMetadata":{"preTokens":2}}}"#;
+    let scan = parse::scan(&[line.as_slice(), b"\n"].concat());
+    assert_eq!(scan.records.len(), 1);
+    assert_eq!(scan.records[0].compact_metadata, None);
+    assert!(scan.records[0].is_turn());
+}

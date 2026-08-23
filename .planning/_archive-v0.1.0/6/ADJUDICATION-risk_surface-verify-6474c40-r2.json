@@ -1,0 +1,20 @@
+{
+  "phase": "6",
+  "trigger": "risk_surface",
+  "discriminator": "verify-6474c40",
+  "round": 2,
+  "base": "6474c40e0a5db36710d1c926e8ee1a362aae26f7",
+  "head": "00c6b53691f43bfb6690445f6053a4d36a74887b",
+  "base_id": "6474c40e0a5db36710d1c926e8ee1a362aae26f7",
+  "head_id": "00c6b53691f43bfb6690445f6053a4d36a74887b",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": []
+}

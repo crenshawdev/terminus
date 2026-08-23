@@ -16,6 +16,15 @@ use serde_json::Value;
 /// The four record types that can become a turn (D-03).
 pub const TURN_TYPES: [&str; 4] = ["user", "assistant", "attachment", "system"];
 
+/// The `subtype` a compaction boundary carries (D-21).
+///
+/// The record itself is a `type: "system"` record, which [`TURN_TYPES`] already
+/// covers, so this names a *subtype* and adds no record class.
+pub const COMPACT_BOUNDARY: &str = "compact_boundary";
+
+/// The field whose bytes are kept verbatim (D-08).
+const COMPACT_METADATA_FIELD: &str = "compactMetadata";
+
 /// The turn-level fields, extracted only for records that qualify as turns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Turn {
@@ -56,6 +65,25 @@ pub struct Record {
     pub foreign_session_id: Option<String>,
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
+    /// The `subtype` field, for the records that carry one.
+    ///
+    /// The only value this phase acts on is [`COMPACT_BOUNDARY`] (D-21). It is
+    /// carried for every record that has one rather than tested here, because
+    /// the parser's job is to say what the line holds, not what a caller cares
+    /// about.
+    pub subtype: Option<String>,
+    /// The bytes of the record's `compactMetadata` object, exactly as they sit
+    /// in the line - never a re-serialization (D-08).
+    ///
+    /// The upstream semantics of `preservedMessages.uuids` versus `allUuids`
+    /// versus `preservedSegment` are unsettled: exactly one `compact_boundary`
+    /// record exists in 300,556 measured records, and its own token counts
+    /// (`preTokens` 45,500, `cumulativeDroppedTokens` 38,064 against 6 preserved
+    /// uuids of 8) contradict `DESIGN-BRIEF.md:140`'s reading of it. Keeping the
+    /// bytes is what makes a wrong reading fixable in phase 5 (INJ-05) without a
+    /// reingest, so nothing here interprets them and nothing computes a
+    /// dropped-turn set.
+    pub compact_metadata: Option<Vec<u8>>,
     /// `Some` exactly when D-03 classifies this record as a turn.
     pub turn: Option<Turn>,
 }
@@ -63,6 +91,18 @@ pub struct Record {
 impl Record {
     pub fn is_turn(&self) -> bool {
         self.turn.is_some()
+    }
+
+    /// Is this the record a compaction wrote where the dropped turns used to be
+    /// (D-21)?
+    ///
+    /// Not a new record class and not a classification rule: `system` is already
+    /// in [`TURN_TYPES`] and the real boundary record carries both `uuid` and
+    /// `timestamp`, so D-03 has already made it a turn. This only names the
+    /// subtype, so the one caller that writes a derived boundary row does not
+    /// spell the literal itself.
+    pub fn is_compact_boundary(&self) -> bool {
+        self.subtype.as_deref() == Some(COMPACT_BOUNDARY)
     }
 
     /// Classify one line. `offset` is where it starts in the stream and
@@ -76,6 +116,8 @@ impl Record {
             foreign_session_id: None,
             cwd: None,
             git_branch: None,
+            subtype: None,
+            compact_metadata: None,
             turn: None,
         };
 
@@ -96,6 +138,16 @@ impl Record {
         record.foreign_session_id = string(object.get("session_id"));
         record.cwd = string(object.get("cwd"));
         record.git_branch = string(object.get("gitBranch"));
+        record.subtype = string(object.get("subtype"));
+        // Asked of the parsed object first, so a line that merely mentions the
+        // name in some string never sends the scanner looking; the scanner then
+        // takes the bytes out of the line rather than re-serializing the parsed
+        // value, because a round trip through `serde_json` renormalizes
+        // whitespace, escapes and number formatting and would make "verbatim"
+        // mean "equivalent" (D-08).
+        if object.contains_key(COMPACT_METADATA_FIELD) {
+            record.compact_metadata = raw_field(line, COMPACT_METADATA_FIELD).map(<[u8]>::to_vec);
+        }
 
         let uuid = string(object.get("uuid"));
         let timestamp = string(object.get("timestamp"));
@@ -124,6 +176,123 @@ impl Record {
 /// A JSON string field, or `None` for absent, null or non-string.
 fn string(value: Option<&Value>) -> Option<String> {
     value?.as_str().map(str::to_owned)
+}
+
+/// The bytes of one **top-level** field's value, exactly as they appear in
+/// `line`.
+///
+/// Structural rather than a substring search: it walks the object's own
+/// key/value pairs, so a `"compactMetadata"` appearing inside some nested
+/// message content or inside a string value can never be mistaken for the field.
+/// Only the first occurrence of a key is returned; `serde_json` keeps the last
+/// of a duplicated key, and a line with duplicate top-level keys is malformed
+/// enough that either answer is a guess.
+///
+/// `None` for anything this cannot answer exactly - a line that is not a JSON
+/// object, a truncated value, a key written with an escape - and the caller
+/// stores nothing rather than storing bytes it is not sure of.
+fn raw_field<'a>(line: &'a [u8], key: &str) -> Option<&'a [u8]> {
+    let mut at = skip_ws(line, 0);
+    if *line.get(at)? != b'{' {
+        return None;
+    }
+    at = skip_ws(line, at + 1);
+    if line.get(at) == Some(&b'}') {
+        return None;
+    }
+
+    loop {
+        let name_end = string_end(line, at)?;
+        // The quoted content, undecoded: the keys this is ever asked for are
+        // plain ASCII, and an escaped key simply does not match rather than
+        // being decoded to something that might.
+        let name = &line[at + 1..name_end - 1];
+
+        at = skip_ws(line, name_end);
+        if *line.get(at)? != b':' {
+            return None;
+        }
+        at = skip_ws(line, at + 1);
+        let end = value_end(line, at)?;
+        if name == key.as_bytes() {
+            return Some(&line[at..end]);
+        }
+
+        at = skip_ws(line, end);
+        if line.get(at) != Some(&b',') {
+            return None;
+        }
+        at = skip_ws(line, at + 1);
+    }
+}
+
+/// The index just past a JSON string's closing quote.
+fn string_end(line: &[u8], start: usize) -> Option<usize> {
+    if *line.get(start)? != b'"' {
+        return None;
+    }
+    let mut at = start + 1;
+    while at < line.len() {
+        match line[at] {
+            // A backslash escapes whatever follows, including a quote and
+            // including another backslash, so both bytes are consumed together.
+            b'\\' => at += 2,
+            b'"' => return Some(at + 1),
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// The index just past a JSON value that begins at `start`.
+fn value_end(line: &[u8], start: usize) -> Option<usize> {
+    match *line.get(start)? {
+        b'"' => string_end(line, start),
+        open @ (b'{' | b'[') => {
+            let close = if open == b'{' { b'}' } else { b']' };
+            let mut depth = 0usize;
+            let mut at = start;
+            while at < line.len() {
+                match line[at] {
+                    // Strings are skipped whole, so a brace inside one never
+                    // moves the depth.
+                    b'"' => {
+                        at = string_end(line, at)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return (line[at] == close).then_some(at + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+            None
+        }
+        // A number, `true`, `false` or `null`: it ends where the enclosing
+        // object does, at a comma, or at whitespace.
+        _ => {
+            let mut at = start;
+            while at < line.len()
+                && !matches!(line[at], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            {
+                at += 1;
+            }
+            (at > start).then_some(at)
+        }
+    }
+}
+
+fn skip_ws(line: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < line.len() && matches!(line[at], b' ' | b'\t' | b'\n' | b'\r') {
+        at += 1;
+    }
+    at
 }
 
 /// The first `tool_use` block's name in `message.content`.

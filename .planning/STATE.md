@@ -1,6 +1,6 @@
 # State
 
-Phase: 2 of 8 (Ingest At Scale)
-Status: planned
-Next: /cad-execute 2
-Updated: 2026-08-12
+Phase: 1 of 0 (no active cycle)
+Status: ready to plan
+Next: /cad-phase add
+Updated: 2026-08-23

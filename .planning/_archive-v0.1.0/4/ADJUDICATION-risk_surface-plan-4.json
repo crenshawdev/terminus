@@ -1,0 +1,35 @@
+{
+  "phase": "4",
+  "trigger": "risk_surface",
+  "discriminator": "plan-4",
+  "round": 1,
+  "base": "1ad6320",
+  "head": "4f4c8a3",
+  "base_id": "1ad6320de1b44c1ac32fb8ad32133f61971b5033",
+  "head_id": "4f4c8a3f3ecb504500e22a8653340edc78af009a",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/ingest/backfill.rs",
+      "line": 198,
+      "severity": "high",
+      "claim": "`dispatch_round` waits for exactly `sent` `Done` messages with a blocking `done_rx.recv()` loop, but there is no path that converts a worker panic or early exit into an error before that wait. If a worker receives a job and then panics or exits before sending its result, the writer blocks forever here; the thread scope never gets a chance to surface the panic, so the detached backfill can wedge instead of failing cleanly and being rerun.",
+      "failure_scenario": "A malformed transcript or an internal bug trips a panic inside `prepare` on one worker after the job has been counted in `sent`. The writer then waits for the missing result indefinitely, leaving `verbatim backfill --work` hung and the store half-processed until the process is killed.",
+      "ruling": "survived",
+      "convergent": false,
+      "fix_commit": "977d0b4",
+      "base_id": "1ad6320de1b44c1ac32fb8ad32133f61971b5033",
+      "head_id": "4f4c8a3f3ecb504500e22a8653340edc78af009a"
+    }
+  ]
+}

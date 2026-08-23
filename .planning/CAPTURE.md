@@ -23,6 +23,132 @@
       writes. Confirm when ING-04 consumes it.
 - [ ] (phase 1) The 64 KB block size is still the flagged unmeasured
       assumption; D-08's 11.2% framing penalty was not re-measured.
+- [ ] (phase 2) `bring_forward` (`store/open.rs`) does check-then-act `ALTER
+      TABLE ADD COLUMN` outside the ingest lock, on every `Store::open`
+      including lock-free read commands; two processes upgrading one phase-1
+      store race and the loser exits 1.
+- [ ] (phase 2) `record_run`'s single-file path omits `files_committed` /
+      `files_failed`, so a single-file ingest reports `0 committed` in status.
+- [ ] (phase 2) `ingest::run`, the single-file entry point, applies no
+      exclusion test; `verbatim ingest <path>` archives an excluded transcript.
+- [ ] (phase 2) Exclusion strings are unnormalized: a trailing separator, or
+      `/`, disables the pre-open test while the read-side test still hides
+      everything.
+- [ ] (phase 2) Sessions archived before 02592b5 keep `project_pre_worktree =
+      NULL`; nothing backfills it, so D-23's retroactive exclusion does not hold
+      for existing stores.
+- [ ] (phase 2) `verify`'s divergence message is length-only and now also fires
+      for a content-rewritten transcript, reporting a longer file as shorter.
+      The state never clears on its own.
+- [ ] (phase 2) `prefix_matches` runs after `read_tail`, so a file swapped
+      between the two reads can have one file's prefix validated and another's
+      tail appended. Closable by reading head and tail from one handle.
+- [ ] (phase 2) `parse/record.rs`: an escaped `compactMetadata` key stores NULL
+      silently, a duplicated key stores the first value while every other JSON
+      reader sees the last, and a record past serde_json's 128-level nesting
+      limit is demoted to a fieldless Record with no diagnostic.
+- [ ] (phase 2) The boundary signal reads the untrusted `subtype` with no
+      cross-check against `type`: a `user` record carrying it gets a boundary
+      row, a real boundary missing `uuid` gets none.
+- [ ] (phase 2) The crash harness `Snapshot` excludes `compaction_boundaries`,
+      `session_meta`, `entities` and `paths`, and no killed fixture carries a
+      boundary, so AC6 proves nothing about the row phase 2 added.
+- [ ] (phase 2) The forced derived rebuild measures 50.4 s over the real
+      corpus, inside the ingest lock, on the first hook-spawned pass after a
+      DERIVED_SCHEMA bump.
+- [ ] (phase 2) `verbatim status` now loads Config, so an unparseable
+      `verbatim.toml` fails a read command where it previously succeeded.
+- [ ] (phase 2) `crates/verbatim/Cargo.toml` has no `rusqlite`; richer read
+      commands in the binary will need it.
+- [ ] (phase 2) Three copies of the same reverse-drop loop exist
+      (`tests/reindex.rs`, `crates/verbatim/tests/cli.rs`,
+      `tests/compaction.rs`); a `testkit::drop_derived` would leave one.
+- [ ] (phase 2) ROADMAP still lists ING-07 under phase 2 after its deferral to
+      phase 8; needs a `/cad-phase` edit.
+- [ ] (phase 2) AC2's linkage rate: 188 `continues_from` links is 8.8% of
+      sessions against CONTEXT's measured 1.2% of files; the denominators have
+      not been reconciled.
+- [ ] (phase 3) `index/text.rs` MAX_BODY_BYTES does not bound the projected body: the newline separator is uncharged and `take` is 0 when the budget is below the next leaf's first char, so the short-circuit never fires
+- [ ] (phase 3) `index/entity.rs` path/command/symbol entity values carry no length bound; only `error` does
+- [ ] (phase 3) `index/entity.rs` splitting a command on `;&|<>()` cuts a real path containing one of them, and splitting on `|` multiplies BRE-escape debris (24.7% of unique Bash-derived path entities)
+- [ ] (phase 3) `index/entity.rs` normalize_error leaves a rejected timestamp's date or hour in the value, so one failure logged twice can normalize two ways
+- [ ] (phase 3) `index/entity.rs` program_of returns the first argv word, so a compound command records the wrapper (`cd` for 17.8% of Bash calls)
+- [ ] (phase 3) `index/entity.rs` identifier_tokens glues a regex escape's letter onto the symbol (`\\bsearch_manager` -> `bsearch_manager`)
+- [ ] (phase 3) `recall/excerpt.rs` first_token indexes the lowercased string while window slices the source, so the excerpt is displaced for any char whose lowercase changes length
+- [ ] (phase 3) `recall/excerpt.rs` excerpt cutting is unbounded in one record's size: two Vec<char> materializations per hit to produce 240 chars
+- [ ] (phase 3) `recall/search.rs` the per-value document-frequency query builds a temp b-tree (15.5-16.7 ms on a 250k-turn store) on the default search path
+- [ ] (phase 3) `recall/query.rs` a token of characters Rust calls alphanumeric but unicode61 does not index becomes a zero-term phrase and silently returns zero hits
+- [ ] (phase 3) `recall/search.rs` a query that reduces to no tokens returns no reason, so an unsearchable query cannot be told from an empty archive
+- [ ] (phase 3) `cmd/json.rs` Document::emit uses println!, which panics with exit 101 on a closed stdout pipe; the human path has broken_pipe and the JSON path does not
+- [ ] (phase 3) `cmd/mod.rs` time_bound validates shape but not the calendar, so `--since 2026-08-32` is accepted and silently hides the month with exit 0
+- [ ] (phase 3) `cmd/show.rs` a closed stdout in human mode maps to Failure::Silent (exit 1), indistinguishable from an operational failure under pipefail
+- [ ] (phase 3) `recall/get.rs` the exclusion arm names an excluded project's absolute path in a reason, where the scope arm answers NoSuchTurn so as not to confirm the id exists
+- [ ] (phase 3) `docs/json-shapes.md` the sessions shape documents nullability nowhere, though five of its eleven fields are null in ordinary states
+- [ ] (phase 3) the MCP tool result shape is pinned in no document; docs/json-shapes.md is the CLI contract only
+- [ ] (phase 3) `recall::search::run` resolves scope before validating filters, so D-23's two-shape time rule now exists twice (cmd/mod.rs and recall::search::bound)
+- [ ] (phase 3) a JSON-RPC line is materialized whole by read_until with no size cap on one message
+- [ ] (phase 3) `cmd/mcp/tools.rs` optional_time inherits shape-only date validation, so `since: 2026-02-30` is accepted and returns reason:null with isError:false
+- [ ] (phase 3) `cmd/mcp/mod.rs` serve has no size cap on one JSON-RPC line and amplifies wire bytes to resident memory ~20x (12.9 MB line -> 278.7 MiB RSS)
+- [ ] (phase 3) `cmd/mcp/rpc.rs` an integer id outside i64/u64 is parsed as f64 so the echoed id differs from the id sent; a fractional id is accepted, which MCP forbids
+- [ ] (phase 3) `cmd/mcp/tools.rs` time_bound's message hardcodes the CLI `--since` spelling in a tool result whose inputSchema forbids that argument
+- [ ] (phase 3) `cmd/mcp/tools.rs` recall_get truncates to MAX_IDS before get::records deduplicates, so duplicate ids consume the budget
+- [ ] (phase 3) `cmd/mcp/rpc.rs` PROTOCOL_VERSIONS offers 2025-03-26, which mandates JSON-RPC batching, but a batch is answered with one -32600 and every request in it goes unanswered
+- [ ] (phase 3) `crates/verbatim/tests/mcp.rs` and `tests/recall_cli.rs` are
+      `#![cfg(feature = "testkit")]` on the `verbatim` package, whose `testkit`
+      feature is not default and is enabled by nothing in the workspace. A bare
+      `cargo test --workspace` runs 0 of their 41 tests and still reports 304
+      passed / 0 failed, so the two binaries carrying AC5/AC6/AC7's
+      process-level assertions are silently absent from the default command.
+- [ ] (phase 4) The npm shim does not forward signals to the child: spawnSync blocks the event loop, so a SIGTERM aimed at the shim's own PID kills node and orphans the binary. Ctrl-C and job control signal the whole process group and are unaffected. risk_surface review finding, adjudicated downgraded (medium).
+- [ ] (phase 4) Hoist pass::record_pass and pass::walk's per-file failure arm into ingest/mod.rs (or make them pub(crate)) so pass and backfill share one runs-row writer and one skip rule. Needs a plan whose lease covers crates/verbatim-core/src/ingest/pass.rs.
+- [ ] (phase 4) The four-worker backfill pipeline is only 8% faster than the sequential pass on the real corpus (49,089 ms vs 53,007 ms). The remaining cost is the single SQLite writer's: batch derived-row inserts, or move derive_turn's text expansion and entity extraction onto the workers. Measurement-led task, not a guess.
+- [ ] (phase 4) verbatim status can fail with 'sqlite: database is locked' in the ~1 ms window while a backfill creates the store and sets journal_mode=wal (1 of 20 polls, at t=1 ms). Pre-existing in Store::open.
+- [ ] (phase 4) AC3's Windows half - no console window, no handle inherited from the hook - is unrunnable on Linux and stays a human-verify on a Windows machine.
+- [ ] (phase 4) npm's os/cpu selection of an optionalDependency cannot be exercised locally, only the shim's resolution of an already-placed platform package. AC9's remaining risk lives in the publish step (D-21).
+- [ ] (phase 4) Four of the five npm platform packages carry no binary; they arrive with cross-compilation in a later shipping step. pack-local.sh fails with a named message on any host it cannot stage.
+- [ ] (phase 4) The npm name 'verbatim' and the '@verbatim' scope have not been checked for availability, and crates.io's 'verbatim' is already taken. Publish-step question for the human.
+- [ ] (phase 4) ingest::backfill deliberately does not honour fault::pass_fails_after (the 'a pass that died still leaves its runs row' fault). The sequential walk still has it; add it if a later task wants to kill a backfill's walk rather than its process.
+- [ ] (phase 4) cargo fmt --check reports two pre-existing diffs in crates/verbatim/tests/hook.rs, both on lines committed in plan 1 and neither in code any later pass wrote. cargo fmt closes them whenever the file is next edited for its own reasons.
+- [ ] (phase 4) Declined an engines.node field on the thin npm package - nothing in the Verify exercises a Node floor and the shim uses only long-present APIs. Add one when a task states a minimum.
+- [ ] (phase 4) shellcheck is not installed on this machine, so npm/pack-local.sh's static analysis was bash -n only.
+- [ ] (phase 5) AC6's watchdog timeout arm has no test that forces it: the exclusive-writer case is bounded by SQLite before the 50 ms watchdog fires on Linux. Forcing it needs a fault point in the injection path (phase 4's testkit pattern).
+- [ ] (phase 5) crates/verbatim/tests/hook.rs flakes with ETXTBSY at its spawn-the-copied-binary sites under parallel tests; reproduced on the pre-phase-5 baseline 3fd5b19, so it pre-dates phase 5.
+- [ ] (phase 5) cargo fmt --check reports pre-existing diffs in crates/verbatim-core/src/ingest/backfill.rs:250 and crates/verbatim/tests/hook.rs:252,681 under rustfmt 1.9.0; every phase-5 file is clean.
+- [ ] (phase 5) inject/brief.rs keeps a private chars/clip pair identical to the shared definitions PLAN-3 put in inject/mod.rs; brief.rs was out of that plan's lease, so the fold-together is one pending deletion.
+- [ ] (phase 5) entity_score dwarfs bm25 whenever query terms are common (measured: -bm25 ~1e-6 per row vs entity weight 1.2-2.4 over a 48-turn store), so rank 1..3 is closer to "the three strongest entity matches" than a text ranking; phase 6's auto-tuner gates should be told before tuning anything.
+- [ ] (phase 5) The error entity kind has no candidate spelling of its own in the UserPromptSubmit query: a failure whose text is pure prose and numbers names no candidate and opens no store. Left because a normalized stderr line is not a spelling a user retypes.
+- [ ] (phase 5) inject::state::MAX_SUPPRESSED caps the suppression list at 100 oldest-dropped while injected/brief are uncapped; a very long session's state file forgets its earliest refusals. Nothing in phase 5 reads them back; FEED-01 owns the durable record.
+- [ ] (phase 5) crates/verbatim/src/cmd/hook.rs's inject doc says the abandoned injection thread writes nothing; since plan 4 task 2 it writes the D-06 per-session scratch file (the store still never sees a write). One clause of one comment, outside plan 4's lease.
+- [ ] (phase 6) PLAN-2 Task 3's miss join matches turns.tool_name ending recall_get, but nothing extracts entities from recall_get tool calls (input is a turn-id list, tools.rs:56-64) - the join arm is inert. Either drop recall_get from the join or state why it stays; plan-review finding, downgraded 2026-08-20.
+- [ ] (phase 6) verbatim stats and verbatim replay exit 1 with a raw "sqlite: no such table: decisions" on a store ingested before phase 6 - read commands never migrate by design (D-10/D-18, cmd/read.rs), so give them the "store older than this build" answer D-18 promises instead of the sqlite error.
+- [ ] (phase 6) The decisions table does not persist the record's compacted and dropped fields (feedback/mod.rs insert is eleven columns), so replay and stats cannot tell a decision taken under a compacted pool from an ordinary one.
+- [ ] (phase 6) A .tmp left by a hook that exited between write and rename is skipped by inject::decision::read_all and deleted by nothing, so the decisions directory accumulates orphans forever.
+- [ ] (phase 6) runs.error carries a routine "labelled N hit, N false positive" line whenever an ingest pass labels anything, and verbatim status prints that channel under an error heading, so a correct pass reads as a failed one.
+- [ ] (phase 6) The miss join matches a recall tool by tool_name LIKE '%recall\_search' while index::entity::is_recall_search additionally requires a _ separator, so a tool named xrecall_search is admitted by one rule and extracted from by neither.
+- [ ] (phase 6) Replay computes wasted budget as "the would-inject set is non-empty and none of it is a hit" where ingest reads chars_injected > 0; the two agree today but are two definitions of one label.
+- [ ] (phase 6) MatchedEntity is not re-exported from crate::recall (recall/mod.rs was outside plan 1's lease), so callers name recall::search::MatchedEntity.
+- [ ] (phase 6) Pre-existing cargo fmt drift in crates/verbatim-core/src/ingest/backfill.rs:250 and crates/verbatim/tests/hook.rs:252,681.
+- [ ] (phase 7) `observe::cost::spend` is a read-then-write against the `meta` row, so two concurrent increments store one and the day's token accumulator permanently under-reports. Distinct from the bounded one-call overshoot `cost::admits` documents and accepts; an atomic add closes it. Raised by the phase 7 plan 3 risk_surface review and adjudicated down to medium.
+- [ ] (phase 7) `observe::cost::admits` runs the minimum-turn and daily-budget gates before the reservation check, so a concurrent caller on an in-flight session reports `BudgetSpent` rather than the new `InFlight` skip. Affects the skip string only, not whether a request is made or what is charged.
+- [ ] (phase 7) `crates/verbatim/tests/hook.rs` fails nondeterministically under full-workspace parallel load - a different subset each run, all passing in isolation. Pre-existing process-spawn contention, not a regression (hook.rs is untouched by phase 7). Needs either serialization or a resource guard so the suite is trustworthy under `cargo test --workspace`.
+- [ ] (phase 7) Verify AC4's remote half for observations: put a key in the shared credentials file, change only `base_url`, `model` and the key in `verbatim.toml`, run the same call against a remote OpenAI-compatible endpoint, and confirm a parsed response. Not runnable on this machine during phase 7 - no remote key.
+- [ ] (phase 7) `observe::provider::complete` sends `response_format: {"type":"json_schema","strict":true}` from a private constant with no `json_schema` object beside it; the actual schema travels in the system message. A strict remote OpenAI-compatible endpoint may reject that shape - a one-line change in `provider.rs` if AC4's remote verification hits it.
+- [ ] (phase 7) OBS-05's Anthropic subscription-auth half was deferred out of phase 7 (CONTEXT's deferral list). The REQUIREMENTS row needs the note saying phase 7 delivered the OpenAI-compatible half only.
+- [ ] (phase 7) A judgment reservation abandoned by a killed process is retaken once its 900s lease lapses; where the dead run was an `observations regenerate` over an already-judged row, retaking it buys a second answer for a session that already had one. Bounded by `JUDGED_PER_PASS`. Carrying the replaced status inside the reservation token would let the stealer restore it instead.
+- [ ] (phase 7) Promote `judged` and `unasked` from `notes` text to real `data` fields on `observations regenerate --json`. They are already typed on `Regenerated`; promoting them breaks `crates/verbatim/tests/cli.rs`'s exact key-set assertion, so it needs a lease that includes `cli.rs`.
+- [ ] (phase 7) `observe::regenerate` runs each row's UPDATE on its own rather than one transaction over the selected set, so a row whose blob will not decompress becomes a note and the rest still rebuild. A caller wanting all-or-nothing does not have it.
+- [ ] (phase 7) Pre-existing `cargo fmt --check` drift in `crates/verbatim-core/src/ingest/backfill.rs:250` and `crates/verbatim/tests/hook.rs:252,681`. Untouched through phases 6 and 7 because it sits outside every plan's lease; needs a standalone formatting pass.
+- [ ] (phase 7) The SessionStart resume brief still does not read observations, and nothing schedules the work. INJ-01's own text says the brief covers "the index pointer and observations when enabled", and DESIGN-BRIEF.md:233 lists observations as a brief block, but D-19 deferred that line out of phase 7 and `crates/verbatim-core/tests/inject_brief.rs:282` actively fails if any file under `src/inject/` names the string. Phase 8 is retention only - INJ-01 is not in its requirement list and observations appear in none of its seven success criteria - and there is no phase 9. Meanwhile INJ-01 reads Complete against phase 5 in the traceability table, so /cad-audit finds a phase, a plan and a verification for it and passes: the gap is invisible to the one check meant to catch it. Closing it means either wiring observations into the brief (which retires the inject_brief.rs guard) or amending INJ-01's text to say the brief is complete without them, as phase 5 signed off. Distinct from the OBS-05 and PRIV-02 deferrals, which now carry notes on their REQUIREMENTS rows in c9f7f1c; this one has neither a note nor a phase.
+- [ ] (phase 8) `verbatim reindex` does not say how many sessions it preserved: the count is on `Rebuilt::preserved` and documented, but `crates/verbatim/src/cmd/reindex.rs` was in no phase-8 plan's lease, so the stderr line, the `--json` `data` object, `DATA_COMMANDS` and `docs/json-shapes.md` are untouched.
+- [ ] (phase 8) `crates/verbatim-core/src/parse/mod.rs:3-5` still says the ingest hands the blob bytes identical to the source without qualification; phase 8's D-05 narrows that to `full` capture mode. One sentence, one file, no behaviour.
+- [ ] (phase 8) `verify` skips an evicted session entirely rather than asserting the one thing eviction guarantees about it - that its blob is empty - so it has a class of row it never checks. From the phase-8 plan-2 risk_surface fire, downgraded from medium: `evict_one` is the only writer of the flag and it empties the blob in the same transaction.
+- [ ] (phase 8) `retention::delete_one` does not re-check `transcript_is_gone` before removing a session; the precondition is evaluated once, in `evaluate`. Archived bytes are recoverable (the watermark row goes in the same transaction so `discover` re-ingests from offset 0) but the `observations` rows are not. From the phase-8 plan-1 risk_surface fire, downgraded from high.
+- [ ] (phase 8) The `verbatimElided` figure is the canonical reserialized size of the dropped subtree, not the source bytes it occupied on the line, and the doc comment does not say so. Nothing in production reads it today. From the phase-8 plan-5 risk_surface fire, downgraded from medium.
+- [ ] (phase 8) `cmd::status` and `cmd::uninstall` still hold private copies of the three-file footprint rule that `cmd::mod::footprint`/`human` now also expresses.
+- [ ] (phase 8) `cargo fmt --check` reports pre-existing diffs in `crates/verbatim-core/tests/{retention,verify}.rs` and `crates/verbatim/tests/{hook,retention}.rs`, formatting debt from plans before phase 8.
+- [ ] (phase 8) Several test files are `#![cfg(feature = "testkit")]`, so `cargo test --test <name>` without `--features testkit` compiles an empty binary and reports green. Some plans' `Verify:` commands are written in that vacuous form.
+- [ ] (phase 8) `verbatim data move` skips the `LOCK` file in the copy and creates an empty one at the destination: the file's contents carry no meaning, only the OS lock attached to it, and copying a locked file is a read Windows refuses.
+
 
 ## Seeds
 

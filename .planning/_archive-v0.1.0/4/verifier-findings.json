@@ -1,0 +1,124 @@
+{
+  "status": "gaps",
+  "score": "10/12",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "A fresh machine with no data directory boots clean: backfill creates the store with its schema and a primary query returns real data.",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "release binary, scratch HOME: `verbatim backfill` on an absent data dir printed '2 transcript(s), 8.5 KB not yet archived' and returned in 0 ms; `verbatim status` then reported sessions 2, turns 14, watermarks 2 covering 8554 bytes, last run duration 1 ms, 2 walked / 2 committed / 0 failed."
+    },
+    {
+      "n": 2,
+      "truth": "Each of the four hooks fed the exact Claude Code payload exits 0 with empty stdout, p99 under 10 ms over 100 runs.",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "crates/verbatim/tests/hook.rs:343 every_event_exits_zero_with_an_empty_stdout_inside_the_budget passed (release): SessionStart p99 0.89 ms, UserPromptSubmit 0.72 ms, SessionEnd 0.80 ms, PostCompact 0.82 ms over 100 runs each, against a 10 ms budget; payloads are tests/fixtures/hooks/*.json carrying the D-14 base fields plus per-event extras. crates/verbatim/src/cmd/hook.rs writes nothing to stdout on any path."
+    },
+    {
+      "n": 3,
+      "truth": "A hook killed the way Claude Code kills one (group SIGKILL then a ps-walked descendant sweep) leaves the spawned ingest alive and committing.",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "crates/verbatim/tests/hook.rs:649 the_ingest_survives_a_group_kill_and_a_descendant_sweep and :225 the_working_process_leaves_the_group_and_the_parentage_of_the_process_that_spawned_it both passed (release). Mechanism is a double fork in crates/verbatim/src/cmd/spawn.rs: process_group(0) plus a --reparent intermediate that re-spawns and exits, all three stdio Stdio::null()."
+    },
+    {
+      "n": 4,
+      "truth": "On Windows the spawned child shows no console window and holds no handle inherited from the hook.",
+      "status": "UNCERTAIN",
+      "uat_item": 4,
+      "evidence": "crates/verbatim/src/cmd/spawn.rs:64-67,118-121 sets creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW) and Stdio::null() on all three streams, but no Windows machine is present to observe it."
+    },
+    {
+      "n": 5,
+      "truth": "One `verbatim install` places the binary at the stable path, writes four exec-form hook entries and the .mcpServers registration, and a second run adds nothing and writes no second backup.",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "end-to-end with the release binary and a scratch HOME: install --yes wrote 4 exec-form entries ({type:command, command:<stable path>, args:[hook,<event>]}) into ~/.claude/settings.json keeping theme/model, added .mcpServers.verbatim beside context7 in ~/.claude.json, and wrote exactly one settings.json.verbatim-backup and one .claude.json.verbatim-backup. Second run: md5sum -c on both files OK, 4 hook entries still, 'backups none', exit 0. Tests two_installs_leave_one_hook_entry_per_event_and_change_nothing_else and two_installs_leave_one_mcp_entry_beside_the_servers_already_there passed."
+    },
+    {
+      "n": 6,
+      "truth": "An upgrade rewrites no byte of the hooks object, and a foreign binary at the stable path is refused with no writes and a command that fixes it.",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "crates/verbatim/tests/install.rs an_upgrade_rewrites_no_byte_of_the_hooks_object passed. Manual: with /bin/true placed at the stable path, install --yes exited 1 with 'is not a verbatim build; install will not overwrite it, and nothing was changed' plus the exact `rm -f '<path>' && <exe> install` line, and md5sum -c on settings.json and .claude.json both OK."
+    },
+    {
+      "n": 7,
+      "truth": "`verbatim doctor` creates nothing and names the command that fixes each problem it reports.",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "crates/verbatim/tests/doctor.rs a_data_directory_that_does_not_exist_is_a_state_and_stays_absent, a_missing_binary_is_a_problem_whose_printed_command_fixes_it, the_settings_it_reads_are_reported_and_left_exactly_as_they_are all passed (14/14). Manual run printed 14 named checks, two `fix` lines, and 'no problems. doctor changed nothing and never does.' crates/verbatim/src/cmd/backfill.rs and doctor.rs open through cmd::read, never Store::open (D-12)."
+    },
+    {
+      "n": 8,
+      "truth": "Uninstall restores settings.json and .claude.json to their pre-install bytes, removes only the verbatim key, and leaves the data directory printing its path.",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "manual: after install+uninstall --yes, settings.json is byte-identical to the original {\"theme\":\"dark\",\"model\":\"opus\"} and .claude.json back to {\"mcpServers\":{\"context7\":...},\"projects\":{}}; output printed 'data directory ... kept: the archive is the product' and the data dir still holds verbatim.db. crates/verbatim/tests/uninstall.rs 14/14 passed including install_then_uninstall_leaves_both_files_exactly_as_they_were and only_verbatims_key_leaves_mcp_servers."
+    },
+    {
+      "n": 9,
+      "truth": "Backfill prints session count, byte total and a time estimate before any ingest work, returns the shell well under 100 ms, and converges on the uninterrupted store after being killed mid-pass.",
+      "status": "VERIFIED",
+      "uat_item": 9,
+      "evidence": "manual: estimate line then a 0 ms return, store filled behind it. crates/verbatim/tests/backfill.rs backfill_prints_an_estimate_returns_at_once_and_finishes_behind_the_shell passed; a_killed_backfill_converges_on_the_store_an_uninterrupted_one_reaches reached and passed its 8-kill convergence assertion (with interrupted >= 2) in 6 of 9 runs - see the gap below for the other 3."
+    },
+    {
+      "n": 10,
+      "truth": "`npm pack` on the in-repo workspace plus a tarball install puts a working verbatim on the path whose --version matches the Rust build, with no install-time script.",
+      "status": "VERIFIED",
+      "uat_item": 10,
+      "evidence": "offline in a scratch prefix: npm pack of npm/platforms/linux-x64 (with the release binary staged) and npm/verbatim, then `npm install --global --prefix <scratch> --offline` of both tarballs; <prefix>/bin/verbatim -> lib/node_modules/verbatim/bin/verbatim.js printed 0.1.0, identical to the release binary's --version. Neither packed package.json carries a `scripts` key; the thin tarball ships only bin/verbatim.js, README.md, package.json."
+    },
+    {
+      "n": 11,
+      "truth": "Install's last step actually starts the backfill it announces.",
+      "status": "FAILED",
+      "uat_item": null,
+      "evidence": "crates/verbatim/src/cmd/install/mod.rs:268 start_backfill -> cmd::backfill::start -> cmd::spawn::detached, which spawns std::env::current_exe(). install re-copies itself onto the stable path by rename, so when install is run FROM the stable path the running image's inode is unlinked and /proc/self/exe names '<path> (deleted)'. Reproduced: first install from the build dir archived 1 session; a second `~/bin/verbatim install --yes` with two transcripts pending printed '2 transcript(s), 2.8 KB not yet archived' then 'problem: the backfill could not be started: No such file or directory (os error 2)', and status still showed sessions 1."
+    },
+    {
+      "n": 12,
+      "truth": "An upgraded binary keeps working with no rewiring, because every hook entry and the MCP registration name a stable path rather than a build.",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "settings.json entries carry command=<stable path> and args=[hook,<event>] (observed in the e2e install); crates/verbatim/tests/install.rs an_upgrade_rewrites_no_byte_of_the_hooks_object passed. Note the 'no user action' half of the goal has no mechanism in this repo - nothing polls or self-updates, so currency is npm's, exactly as SUMMARY.md's goal check states."
+    }
+  ],
+  "passes": [
+    { "k": 1, "name": "Cold start from scratch", "evidence": "backfill on an absent data dir created the store and status returned 2 sessions / 14 turns / 2 watermarks with a real last-run row." },
+    { "k": 2, "name": "Four hooks: exit 0, empty stdout, under budget", "evidence": "tests/hook.rs every_event_exits_zero_with_an_empty_stdout_inside_the_budget passed in release: p99 0.89 / 0.72 / 0.80 / 0.82 ms over 100 runs per event against 10 ms, stdout empty on all 400." },
+    { "k": 3, "name": "Spawned ingest survives Claude Code's kill", "evidence": "tests/hook.rs the_ingest_survives_a_group_kill_and_a_descendant_sweep passed; spawn.rs double fork with process_group(0) and null stdio." },
+    { "k": 5, "name": "Install twice is idempotent", "evidence": "second install --yes left both files md5-identical, 4 hook entries, one .mcpServers.verbatim, exactly one backup per file from the first run only." },
+    { "k": 6, "name": "Upgrade rewrites no hooks; foreign binary is refused", "evidence": "an_upgrade_rewrites_no_byte_of_the_hooks_object passed; /bin/true at the stable path made install exit 1, change neither file, and print the `rm -f ... && ... install` fix." },
+    { "k": 7, "name": "Doctor is read-only and names its fix", "evidence": "doctor.rs tests 14/14 passed; manual run printed 14 named checks plus two fix lines and created nothing." },
+    { "k": 8, "name": "Uninstall restores and leaves data", "evidence": "settings.json and .claude.json returned to their pre-install bytes, only the verbatim key left .mcpServers, data directory kept and its path printed." },
+    { "k": 9, "name": "Backfill estimates first, returns the shell, converges", "evidence": "estimate printed then a 0 ms return with the store filling behind it; the 8-kill convergence test reached and passed its assertions in 6 of 9 runs." },
+    { "k": 10, "name": "npm pack and tarball install", "evidence": "both tarballs packed and installed offline into a scratch prefix; the shim resolved @verbatim/linux-x64 and printed 0.1.0, matching the Rust build; no scripts key in either packed manifest." }
+  ],
+  "gaps": [
+    {
+      "name": "Install run from the stable path cannot start its own backfill",
+      "reason": "behavior wrong - install replaces its own executable inode by rename, then spawns std::env::current_exe(), which by then names a deleted file",
+      "evidence": "crates/verbatim/src/cmd/install/mod.rs:268 start_backfill -> crates/verbatim/src/cmd/backfill.rs start -> crates/verbatim/src/cmd/spawn.rs spawn(), which does Command::new(std::env::current_exe()?). Reproduced with the release build: install once from the build directory (archives fine), add two transcripts, then run `<stable path>/verbatim install --yes` - it prints '2 transcript(s), 2.8 KB not yet archived' and then 'problem: the backfill could not be started: No such file or directory (os error 2)', and the store is unchanged. The npm path is unaffected (current_exe is the platform-package binary), but `~/.local/bin/verbatim install` is exactly what doctor's own fix line and the install-twice case tell a user to run.",
+      "severity": "major",
+      "missing": "Resolve the spawn target to the stable path (or re-resolve current_exe before the copy, or skip the copy when source and destination are the same file) so the announced backfill actually starts on a rerun; add a test that runs install a second time from the stable path with work pending and asserts the store grows."
+    },
+    {
+      "name": "The AC8 convergence test panics about one run in three",
+      "reason": "behavior wrong - the acceptance test that proves AC8's convergence half is nondeterministic and fails before it reaches its convergence assertion",
+      "evidence": "crates/verbatim/tests/backfill.rs:332 (Snapshot::of, `SELECT session_key, blob FROM sessions`) panics with SqliteFailure(..., 'no such table: sessions'). The `mid` check at tests/backfill.rs:435 guards only on `data_dir.join(DB_FILE_NAME).exists()`, so a kill landing in the window where the store file exists but the schema is not yet committed makes Snapshot::of unwrap on a table-less database. Observed 3 failures in 9 release runs of a_killed_backfill_converges_on_the_store_an_uninterrupted_one_reaches; the other 6 passed with interrupted >= 2. Related open item already recorded in SUMMARY.md (status racing Store::open's ~1 ms window).",
+      "severity": "major",
+      "missing": "Make Snapshot::of tolerate a store with no schema yet (treat it as an empty, still-interrupted snapshot) rather than unwrapping, so the convergence assertion is what decides the test."
+    }
+  ],
+  "human_checks": [
+    {
+      "name": "On a Windows machine, fire a hook and watch the spawned ingest",
+      "expected": "No console window appears, and the child holds no handle inherited from the hook (all three stdio null, DETACHED_PROCESS | CREATE_NO_WINDOW).",
+      "why_human": "Out of reach here: no Windows machine is present, so the creation flags in crates/verbatim/src/cmd/spawn.rs cannot be exercised at all on this host."
+    }
+  ]
+}

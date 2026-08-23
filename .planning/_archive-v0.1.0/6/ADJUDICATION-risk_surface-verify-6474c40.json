@@ -1,0 +1,48 @@
+{
+  "phase": "6",
+  "trigger": "risk_surface",
+  "discriminator": "verify-6474c40",
+  "round": 1,
+  "base": "6474c40e0a5db36710d1c926e8ee1a362aae26f7",
+  "head": "00c6b53691f43bfb6690445f6053a4d36a74887b",
+  "base_id": "6474c40e0a5db36710d1c926e8ee1a362aae26f7",
+  "head_id": "00c6b53691f43bfb6690445f6053a4d36a74887b",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim/src/cmd/read.rs",
+      "line": 117,
+      "severity": "medium",
+      "claim": "`no_decision_log` snapshots schema state once at open and never revalidates it before the later query. That means the new guard only works if nothing changes the database between open and execution; a concurrent writer can still drop `decisions`/`labels` after the snapshot and send `stats`/`replay` back down the raw sqlite error path.",
+      "failure_scenario": "Process A starts `verbatim stats --json` on a live database, process B drops `decisions` immediately after A opens the store, and A then reaches the query with a stale `missing_tables` snapshot; the command again prints `sqlite: no such table: decisions` and exits 1 instead of emitting the promised JSON envelope.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "base_id": "6474c40e0a5db36710d1c926e8ee1a362aae26f7",
+      "head_id": "00c6b53691f43bfb6690445f6053a4d36a74887b"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim/src/cmd/read.rs",
+      "line": 120,
+      "severity": "high",
+      "claim": "Treating the absence of either `decisions` or `labels` as the benign \"predates the decision log\" case can mask a genuinely corrupted or partially dropped current store. A store with one table manually removed, truncated, or lost to disk corruption is now reported as a successful empty answer rather than a data-integrity failure.",
+      "failure_scenario": "A post-phase-6 store has `labels` missing because of a bad manual `DROP TABLE` or partial corruption. `verbatim stats --json` and `verbatim replay --json` now return `ok:true` with zeroed data and exit 0, hiding the fact that the store is damaged.",
+      "ruling": "survived",
+      "convergent": false,
+      "fix_commit": "00c6b53691f43bfb6690445f6053a4d36a74887b",
+      "base_id": "6474c40e0a5db36710d1c926e8ee1a362aae26f7",
+      "head_id": "00c6b53691f43bfb6690445f6053a4d36a74887b"
+    }
+  ]
+}

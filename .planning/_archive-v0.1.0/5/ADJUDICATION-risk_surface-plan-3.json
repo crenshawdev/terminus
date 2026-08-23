@@ -1,0 +1,57 @@
+{
+  "phase": "5",
+  "trigger": "risk_surface",
+  "discriminator": "plan-3",
+  "round": 1,
+  "base": "fa4fbde",
+  "head": "4176a6b",
+  "base_id": "fa4fbdedefcff6b69b2f1693a92045b47289372c",
+  "head_id": "4176a6b93ad1e9bbf846550afb635ad61eccc51d",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/inject/prompt.rs",
+      "line": 48,
+      "severity": "medium",
+      "claim": "The hard cap of 8 candidate spellings can drop the actual target from the search set before `MATCH` runs.",
+      "failure_scenario": "A prompt that mentions more than four relative file paths (each one contributes both a resolved absolute spelling and the original relative spelling) can exhaust the 8-slot budget before the real file appears. If the target path is later in the prompt, `select()` never searches it and silently returns no context even though the user named it.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/inject/prompt.rs",
+        "line": 64,
+        "note": "Accurate behaviour, but a documented precision-first bound, not a defect: MAX_CANDIDATES doc (crates/verbatim-core/src/inject/prompt.rs:64-70) states the cut deliberately falls on the weakest signals under the hook deadline, and the module doc plus DESIGN-BRIEF.md:245 price a missed recall below a false injection. A dropped candidate produces silence, which is the design's stated ordinary answer."
+      },
+      "base_id": "fa4fbdedefcff6b69b2f1693a92045b47289372c",
+      "head_id": "4176a6b93ad1e9bbf846550afb635ad61eccc51d"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/inject/prompt.rs",
+      "line": 34,
+      "severity": "medium",
+      "claim": "Limiting the ranked window to 10 before applying the structural threshold can hide eligible hits that rank below 10.",
+      "failure_scenario": "If a prompt produces many higher-scoring free-text hits and one corroborated turn that would qualify by the entity-count rule at rank 11 or later, that turn is never examined because only the top 10 are requested. The hook then misses the only eligible injection for that prompt.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/inject/prompt.rs",
+        "line": 44,
+        "note": "Accurate behaviour, but the RANKED=10 window is a documented deliberate bound (crates/verbatim-core/src/inject/prompt.rs:44-49): wider than the cap of three precisely to admit corroborated hits below the top three, bounded to keep the re-rank off the blobs. A corroborated hit at rank 11 missing produces silence, the design's accepted cost."
+      },
+      "base_id": "fa4fbdedefcff6b69b2f1693a92045b47289372c",
+      "head_id": "4176a6b93ad1e9bbf846550afb635ad61eccc51d"
+    }
+  ]
+}

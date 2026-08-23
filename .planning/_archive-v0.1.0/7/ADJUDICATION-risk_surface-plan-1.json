@@ -1,0 +1,57 @@
+{
+  "phase": "7",
+  "trigger": "risk_surface",
+  "discriminator": "plan-1",
+  "round": 1,
+  "base": "45c8f86",
+  "head": "a9f0fc6",
+  "base_id": "45c8f864d7aa96f5b074ab537990d6d4525d3c38",
+  "head_id": "a9f0fc6914ca1db138522e13c347a5b4745a5b3b",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/observe/mechanical.rs",
+      "line": 281,
+      "severity": "medium",
+      "claim": "`commit_subject()` only understands bare whitespace, quotes, and the special heredoc form; valid shell commit commands that use escaping or other shell constructs are parsed into the wrong message or no message at all, so the stored `commits` fact can be wrong for a real transcript.",
+      "failure_scenario": "A session runs `git commit -m fix\\ gate` or another escaped/command-substituted message. `shell_words()` splits on the backslash-escaped space, `commit_subject()` records only `fix\\` (or nothing), and the archived observation no longer matches the commit the session actually made.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/observe/mechanical.rs",
+        "line": 383,
+        "note": "Real but overstated at medium. shell_words is documented here as deliberately not a shell parser - no expansion, no escaping rules, no operator handling - and commit_subject carries a dedicated arm for the heredoc form Claude Code itself writes. The escaped-space case does yield a truncated subject, so the claim is not false; the consequence is one imprecise entry in a best-effort mechanical fact list, not lost or corrupted archive data, and neither risk surface this fire matched (migrations, destructive) is touched by it. Filed as an open item on phase 7."
+      },
+      "base_id": "45c8f864d7aa96f5b074ab537990d6d4525d3c38",
+      "head_id": "a9f0fc6914ca1db138522e13c347a5b4745a5b3b"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim/src/cmd/observations.rs",
+      "line": 352,
+      "severity": "low",
+      "claim": "The human listing path discards any stored `mechanical` value that fails JSON parsing instead of showing the raw stored text, even though the JSON path preserves it via `nested()`. That makes the reader silently lose archived observation data on a malformed or partially-migrated row.",
+      "failure_scenario": "If the store contains an observation row whose `mechanical` column is a raw string from an older bug or manual repair, `verbatim observations` prints only the header and omits the facts entirely, while the row still exists in SQLite.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim/src/cmd/observations.rs",
+        "line": 294,
+        "note": "Confirmed as described. print() here does serde_json::from_str(..).ok().unwrap_or(Value::Null), while nested() at line 338 falls back to the raw string and its own doc argues the opposite - the bytes that are actually there are more use than a silent absence. The asymmetry is real. Below low in practice: nothing in this code path writes an unparseable mechanical column (the writer serializes through serde), so the row it needs does not occur without external corruption or manual repair. Reader-robustness gap, not a defect in the committed range. Filed as an open item on phase 7."
+      },
+      "base_id": "45c8f864d7aa96f5b074ab537990d6d4525d3c38",
+      "head_id": "a9f0fc6914ca1db138522e13c347a5b4745a5b3b"
+    }
+  ]
+}

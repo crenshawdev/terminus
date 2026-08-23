@@ -493,6 +493,10 @@ fn a_pass_moves_the_session_its_turns_and_its_watermark_together() {
             "session_meta",
             "turns",
             "turns_fts",
+            // `session-basic.jsonl` carries a `Bash` tool_use, so phase 3's
+            // extractor fills `entities` on the same pass. `paths` stays
+            // absent: that command line names no file.
+            "entities",
             "watermarks",
             "runs"
         ],

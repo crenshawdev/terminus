@@ -1,11 +1,13 @@
 //! `verbatim reindex`: rebuild every derived table from the blobs (STOR-04).
 
+use serde_json::json;
 use verbatim_core::ingest::{lock, Attempt};
 use verbatim_core::reindex;
 
+use super::json::Document;
 use super::Failure;
 
-pub fn run() -> Result<(), Failure> {
+pub fn run(json: bool) -> Result<(), Failure> {
     let data_dir = super::data_dir()?;
 
     // The lock, and it belongs here rather than inside `reindex::reindex`.
@@ -28,10 +30,23 @@ pub fn run() -> Result<(), Failure> {
             // hook path, where a skipped pass is caught by the next one. A
             // reindex is asked for explicitly, so silently not doing it would
             // be the wrong answer.
-            return Err(Failure::Operational(format!(
+            let held = format!(
                 "another verbatim process holds {}; try again when it finishes",
                 data_dir.join(lock::LOCK_FILE_NAME).display()
-            )));
+            );
+            if json {
+                // A refusal is still an answer, and a `--json` caller that got
+                // an empty stdout could not tell it from a crash.
+                Document::new("reindex")
+                    .failed()
+                    .because(&held)
+                    .field("sessions", 0)
+                    .field("turns", 0)
+                    .field("skipped", Vec::<serde_json::Value>::new())
+                    .emit();
+                return Err(Failure::Silent);
+            }
+            return Err(Failure::Operational(held));
         }
         Attempt::Acquired(guard) => guard,
     };
@@ -42,23 +57,48 @@ pub fn run() -> Result<(), Failure> {
     let mut store = reindex::open_up_to_date(&data_dir)?;
     let rebuilt = reindex::reindex(&mut store)?;
 
-    // Nothing on stdout: this command produces no data, and a phase-3 `--json`
-    // caller must not have to filter a progress line out of it.
-    eprintln!(
-        "rebuilt {} turn(s) across {} session(s)",
-        rebuilt.turns, rebuilt.sessions
-    );
+    if json {
+        let mut document = Document::new("reindex")
+            .field("sessions", rebuilt.sessions as i64)
+            .field("turns", rebuilt.turns as i64)
+            .field(
+                "skipped",
+                rebuilt
+                    .failed
+                    .iter()
+                    .map(|(session_key, reason)| json!({"session_key": session_key, "reason": reason}))
+                    .collect::<Vec<_>>(),
+            );
+        if !rebuilt.failed.is_empty() {
+            document = document.failed().because(format!(
+                "{} session(s) could not be rebuilt and were skipped",
+                rebuilt.failed.len()
+            ));
+        }
+        document.emit();
+    } else {
+        // Nothing on stdout without `--json`: this command produces no data, and
+        // a caller must not have to filter a progress line out of the document.
+        // In JSON mode the same counts are in the document, so printing them
+        // here as well would be two accounts of one rebuild.
+        eprintln!(
+            "rebuilt {} turn(s) across {} session(s)",
+            rebuilt.turns, rebuilt.sessions
+        );
+        for (session_key, reason) in &rebuilt.failed {
+            eprintln!("{session_key}: {reason}");
+        }
+        if !rebuilt.failed.is_empty() {
+            eprintln!(
+                "{} session(s) could not be rebuilt and were skipped",
+                rebuilt.failed.len()
+            );
+        }
+    }
 
     if rebuilt.failed.is_empty() {
         return Ok(());
     }
-    for (session_key, reason) in &rebuilt.failed {
-        eprintln!("{session_key}: {reason}");
-    }
-    eprintln!(
-        "{} session(s) could not be rebuilt and were skipped",
-        rebuilt.failed.len()
-    );
     // Every undamaged session was still rebuilt; the exit code is what tells a
     // script the store is not whole.
     Err(Failure::Silent)

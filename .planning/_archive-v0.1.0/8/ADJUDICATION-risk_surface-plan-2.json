@@ -1,0 +1,57 @@
+{
+  "phase": "8",
+  "trigger": "risk_surface",
+  "discriminator": "plan-2",
+  "round": 1,
+  "base": "2528a85",
+  "head": "ffa8123",
+  "base_id": "2528a8532d0f71e66da62188b5ff267cf9e0441a",
+  "head_id": "ffa8123715f515dd1121f45b03193eae79f10a6e",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim/src/cmd/retention.rs",
+      "line": 148,
+      "severity": "low",
+      "claim": "`parse` accepts `verbatim retention` even though the new command is documented and advertised as `retention --dry-run`; `--dry-run` is parsed as a no-op rather than a requirement.",
+      "failure_scenario": "A user or script that relies on the documented grammar can invoke the command without the flag and still get a dry-run report instead of a misuse error, so the CLI surface does not match the contract in the usage/help text.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim/src/cmd/retention.rs",
+        "line": 147,
+        "note": "The scenario describes the intended behaviour as a defect. The doc comment on parse states the rule and its authority: the command has exactly one behaviour, --dry-run is the documented spelling of it (RET-03, D-04), and accepting it silently is what keeps the documented command line working if a second verb is ever added. Nothing mutates on this path - it calls retention::evaluate, which opens no transaction and writes no row (retention/mod.rs:126-129) - so the bare form yields the same read-only report and there is no state a misuse error would protect. Rejecting every OTHER flag is the rule that is enforced, and it is (retention.rs:161)."
+      },
+      "base_id": "2528a8532d0f71e66da62188b5ff267cf9e0441a",
+      "head_id": "ffa8123715f515dd1121f45b03193eae79f10a6e"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/verify.rs",
+      "line": 113,
+      "severity": "medium",
+      "claim": "The eviction arm trusts `session_meta.is_evicted` alone and skips checksum verification for any row marked evicted, without checking that the blob is actually empty or otherwise consistent.",
+      "failure_scenario": "If the store ever contains a stale or incorrect `is_evicted=1` row with a non-empty or corrupt blob, `verify` will report the session as clean and `ingest` will keep short-circuiting it, hiding real corruption indefinitely instead of surfacing it as a failure.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/retention/apply.rs",
+        "line": 126,
+        "note": "The claim is accurate and the gap is real, but the reachability the scenario needs is not. evict_one is the only writer of is_evicted=1, and it sets that flag and empties the blob to a zero-byte value in one transaction, so a row carrying is_evicted=1 beside a non-empty blob is not a state this code can produce - it takes external tampering or SQLite-level corruption. What survives is narrower than 'hiding real corruption indefinitely': verify now has one class of row it does not check at all, and the cheap closure is asserting that an evicted row's blob is empty rather than skipping the row. Downgraded from medium to low and queued as an open item."
+      },
+      "base_id": "2528a8532d0f71e66da62188b5ff267cf9e0441a",
+      "head_id": "ffa8123715f515dd1121f45b03193eae79f10a6e"
+    }
+  ]
+}

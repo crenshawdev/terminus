@@ -1,0 +1,86 @@
+{
+  "status": "needs_human",
+  "score": "8/9",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "SessionStart against a store with indexed history for the payload's project emits exactly one JSON object with hookSpecificOutput.hookEventName=SessionStart, additionalContext inside the configured [injection] brief_chars budget, at p99 under the 10 ms wall budget over 100 spawns.",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "cargo test -p verbatim --test brief -- --nocapture a_hundred -> 'SessionStart brief: p50 1.27 ms, p99 2.36 ms over 100 runs'; 1 passed, 0 failed. The test (crates/verbatim/tests/brief.rs:203-283) asserts one line only, parses it as JSON, checks hookEventName == SessionStart and context.chars().count() <= 1200 written into verbatim.toml, so the configured value is traced from the file to the spawned binary's stdout. Config seam: crates/verbatim-core/src/config.rs:95-230 ([injection] brief_chars/prompt_chars with defaults 6000/4000). Wiring: crates/verbatim/src/cmd/hook.rs:236-240 dispatches SessionStart -> inject::brief::session_start."
+    },
+    {
+      "n": 2,
+      "truth": "Two SessionStart runs against an unchanged store produce byte-identical stdout and no time-of-day appears anywhere in the brief.",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "crates/verbatim/tests/brief.rs:163-190 (two_session_starts_against_an_unchanged_store_are_byte_identical) compares both spawns' stdout and asserts time_of_day(text) == None over a char-window NN:NN scan; passed. Dates are cut to the day in inject/brief.rs::day (:442). Live probe of the real binary produced 'ended 2026-08-12, on branch phase-3' with no clock component."
+    },
+    {
+      "n": 3,
+      "truth": "A UserPromptSubmit prompt naming a path relative to the payload cwd injects the past turn that stored the path absolute; the same prompt with the path removed emits nothing and exits 0.",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "cargo test -p verbatim --test prompt -> a_prompt_naming_a_file_gets_the_turn_that_edited_it ok (crates/verbatim/tests/prompt.rs:188-206, RELATIVE = 'crates/gizmo/lantern.rs'). Independent live probe with the built binary against a temp store ingested from tests/fixtures/session-edits.jsonl: prompt 'what changed in crates/gizmo/lantern.rs' returned {\"hookSpecificOutput\":{\"additionalContext\":\"...turn 1 (2026-08-13): Edit <abs>/crates/gizmo/lantern.rs let glow = lanternFlicker(seed);\",\"hookEventName\":\"UserPromptSubmit\"}}. Resolution seam: inject/prompt.rs::resolved/join (:496-568) against Payload.cwd."
+    },
+    {
+      "n": 4,
+      "truth": "The same entity-bearing prompt fed twice under one session_id injects once, and the refusal with its reason is readable in the per-session state file.",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "cargo test -p verbatim --test suppression -> the_same_prompt_twice_in_one_session_is_answered_once ok (tests/suppression.rs:427-466, including the cross-session control proving the suppression is per session). Live probe: second identical prompt under the same session_id wrote nothing; $DATA/injection/<session>.json contained {\"injected\":[1],\"suppressed\":[{\"turn_id\":1,\"reason\":\"already_injected\"}],\"compaction_owed\":false}. Implementation: inject/state.rs:186-226, inject/prompt.rs::surviving/refusal (:347-410)."
+    },
+    {
+      "n": 5,
+      "truth": "A SessionStart with source 'compact' owes the next prompt, and that prompt draws only from turns absent from preservedMessages.uuids (capped at 3); a later prompt in the same session is unrestricted.",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "cargo test -p verbatim --test suppression -> after_a_compaction_the_next_prompt_draws_from_what_fell_out ok and a_compaction_whose_boundary_is_not_committed_yet_keeps_the_debt ok (tests/suppression.rs:586-661). The test carries its own falsifier: an unflagged control session reaches BOTH turns and ranks the preserved one first, then the flagged run injects the dropped turn and not the preserved one, then the flag reads false and a later prompt is answered normally. Dropped set = complement of preservedMessages.uuids: inject/compaction.rs:59-136, asserted by crates/verbatim-core/tests/inject_compaction.rs (4 tests, all pass with --features testkit). Cap of 3: inject/prompt.rs MAX_TURNS (:91) with crates/verbatim-core/tests/inject_prompt.rs::at_most_three_turns_are_ever_injected passing."
+    },
+    {
+      "n": 6,
+      "truth": "A missing, corrupt or exclusively-locked store makes UserPromptSubmit exit 0 with empty stdout inside the deadline.",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "cargo test -p verbatim --test inject -> all 7 pass, including a_deleted_store_is_silence_inside_the_deadline, a_store_held_by_an_exclusive_writer_is_silence_inside_the_deadline and a_store_that_is_not_a_database_is_silence_inside_the_deadline (tests/inject.rs:299-396, wall-clock bounded). Live probe after rm of verbatim.db: exit=0, stdout empty, elapsed 1 ms. Mechanisms: 3 ms busy timeout (inject/mod.rs:109) plus the 50 ms watchdog and catch_unwind in cmd/hook.rs:227-283. Known and captured limit: the watchdog's timeout arm itself is exercised by no test (.planning/CAPTURE.md:114); the arm is the two-line `Err(RecvTimeoutError::Timeout) => None` at cmd/hook.rs:276-282, so inspection settles it and both AC6 cases are covered by the other mechanism."
+    },
+    {
+      "n": 7,
+      "truth": "A prompt whose only match is free text - no rank 1-3 exact entity match and no two co-occurring entities - injects nothing.",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "crates/verbatim/tests/prompt.rs:213-231 covers both shapes (nothing structural at all, and an identifier-shaped word the archive carries only in prose) and passes. Threshold: inject/prompt.rs::eligible (:290-299) requires hit.entity_match.is_some() && (rank < 3 || entity_count >= 2). Core-level coverage: crates/verbatim-core/tests/inject_prompt.rs::a_free_text_only_match_fires_on_nothing_and_reads_no_blob and two_entities_on_one_turn_fire_from_below_the_top_three, both pass. Live probe: 'how should we think about this in general' produced empty stdout, exit 0."
+    },
+    {
+      "n": 8,
+      "truth": "Injection reaches Claude Code only through the phase-4 hook seam, on the two events that have an additionalContext variant, with the other two silent and no argv change.",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "cmd/hook.rs::inject (:231-236) maps SessionStart/UserPromptSubmit to the two arms and returns None for everything else; emit (:286-302) builds the object with serde_json and drops whitespace-only text. Registration is off the same list: crates/verbatim/src/cmd/install/targets.rs:124,264 iterate hook::EVENTS, and argv stays [\"hook\", event]. tests/inject.rs::session_end_and_post_compact_write_nothing_against_a_store_with_history passes. Full workspace run: cargo test --workspace --features testkit -> 489 passed, 0 failed across 44 test binaries (no `test result` line without ' 0 failed')."
+    },
+    {
+      "n": 9,
+      "truth": "A real Claude Code session in a project with indexed history opens with the resume brief and no hook error banner.",
+      "status": "UNCERTAIN",
+      "uat_item": 8,
+      "evidence": "The brief itself was produced end to end by the built binary from a real-shaped SessionStart payload (live probe above), but whether the harness renders it and shows no hook_non_blocking_error banner is only observable inside an interactive Claude Code session."
+    }
+  ],
+  "passes": [
+    { "k": 1, "name": "SessionStart brief: one JSON object, in budget, under wall budget", "evidence": "cargo test -p verbatim --test brief -- --nocapture: 'SessionStart brief: p50 1.27 ms, p99 2.36 ms over 100 runs', 1 passed; the test parses each run's single stdout line, checks hookEventName=SessionStart and additionalContext <= the brief_chars written into verbatim.toml." },
+    { "k": 2, "name": "Brief is deterministic and clock-free", "evidence": "two_session_starts_against_an_unchanged_store_are_byte_identical passes: both spawns' stdout compared byte for byte, and a char-window NN:NN scan over the output finds no time of day." },
+    { "k": 3, "name": "Relative path in prompt finds the stored absolute turn", "evidence": "a_prompt_naming_a_file_gets_the_turn_that_edited_it passes; independent live probe of the built binary injected 'turn 1 (2026-08-13): Edit <abs>/crates/gizmo/lantern.rs ... lanternFlicker' for the prompt 'what changed in crates/gizmo/lantern.rs', and the same prompt with the path removed wrote nothing at exit 0." },
+    { "k": 4, "name": "Repeat prompt suppressed, reason on disk", "evidence": "the_same_prompt_twice_in_one_session_is_answered_once passes with a cross-session control; live probe left $DATA/injection/<session>.json holding {\"injected\":[1],\"suppressed\":[{\"turn_id\":1,\"reason\":\"already_injected\"}]} and the second prompt wrote nothing." },
+    { "k": 5, "name": "Post-compaction prompt draws only from dropped turns", "evidence": "after_a_compaction_the_next_prompt_draws_from_what_fell_out passes, with an unflagged control proving the prompt reaches both turns and ranks the preserved one FIRST, so the restricted answer is not an artifact; compaction_owed flips true on source=compact and false after the prompt spends it; a_compaction_whose_boundary_is_not_committed_yet_keeps_the_debt covers the ingest race; MAX_TURNS=3 asserted by at_most_three_turns_are_ever_injected." },
+    { "k": 6, "name": "Missing or locked store: silent exit 0 inside deadline", "evidence": "tests/inject.rs 7/7 pass including the deleted-store, exclusive-writer and not-a-database cases, each wall-clock bounded; live probe after deleting verbatim.db: exit=0, empty stdout, 1 ms." },
+    { "k": 7, "name": "Free-text-only match emits nothing", "evidence": "a_prompt_that_matches_only_free_text_writes_nothing passes for both shapes; eligible() requires an entity match plus rank<3 or >=2 distinct entities (inject/prompt.rs:290-299); live probe of a generic prose prompt wrote nothing at exit 0." }
+  ],
+  "gaps": [],
+  "human_checks": [
+    {
+      "name": "Start a real Claude Code session in a project with indexed history and read the opening context",
+      "expected": "The session begins with the resume brief - last session's date, branch and final exchange - and no red hook_non_blocking_error banner appears.",
+      "why_human": "Out-of-reach resource: it needs an interactive Claude Code harness rendering hook stdout. The brief bytes themselves were produced and inspected here from the real binary; what cannot be observed from this process is the harness accepting and displaying them."
+    }
+  ]
+}
