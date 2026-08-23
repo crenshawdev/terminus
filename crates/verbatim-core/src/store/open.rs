@@ -30,7 +30,16 @@ pub const ARCHIVE_FORMAT: i64 = 1;
 /// expansion tokens, and `entities` and `paths` are filled for the first time.
 /// Without the bump a store written by a phase 2 binary would keep an index that
 /// matches JSON keys and holds no entity at all, and no integer would say so.
-pub const DERIVED_SCHEMA: i64 = 3;
+///
+/// 4 as of v0.1.1 phase 1 (D-03): `turns` gained `is_typed`, the per-turn
+/// discriminator INJ-07's resume brief reads. The bump is what makes
+/// [`crate::reindex::reindex`] the blob-only backfill that fills the column on
+/// a store an earlier build wrote - the bring-forward `ALTER` adds it empty, and
+/// nothing else would ever populate a turn already archived. Note the naming
+/// collision: `crate::ingest::backfill` is the parallel transcript-reading pass
+/// and is NOT this mechanism; it reads the files on disk, and this reads only
+/// `sessions.blob`.
+pub const DERIVED_SCHEMA: i64 = 4;
 
 /// The store file inside the data directory.
 pub const DB_FILE_NAME: &str = "verbatim.db";

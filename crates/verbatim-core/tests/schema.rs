@@ -504,6 +504,20 @@ fn a_brought_forward_session_meta_has_the_same_column_order_as_a_fresh_one() {
         column_layout(brought.conn(), "runs"),
         column_layout(fresh_store.conn(), "runs")
     );
+
+    // And for `turns`, the third: the only DERIVED table with a bring-forward
+    // list (v0.1.1 phase 1 D-08), where the layout claim matters twice over -
+    // the preserving rebuild path never recreates the table, so a brought-forward
+    // `turns` is the only `turns` such a store will ever have.
+    let brought_turns = column_layout(brought.conn(), "turns");
+    assert_eq!(
+        brought_turns,
+        column_layout(fresh_store.conn(), "turns"),
+        "a brought-forward turns must be laid out exactly like a fresh one"
+    );
+    let last = brought_turns.last().expect("turns has columns");
+    assert_eq!(last.1, "is_typed", "is_typed must be the last column");
+    assert_eq!(last.2, "INTEGER");
 }
 
 /// The upgrade a phase 8 binary actually performs on a phase 7 store: ONE

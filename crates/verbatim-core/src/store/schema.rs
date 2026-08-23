@@ -269,6 +269,26 @@ CREATE TABLE IF NOT EXISTS turns (
     ts            TEXT,
     stream_offset INTEGER NOT NULL,
     byte_len      INTEGER NOT NULL,
+    -- Whether the PERSON typed this turn or the harness wrote it (INJ-07,
+    -- phase 1 D-02): 1 typed, 0 harness-authored. The rule reads the record's
+    -- own `message.content` blocks and nothing else, so it survives `[capture]`
+    -- elision and needs no cross-record join (D-01, D-07).
+    --
+    -- Null means nothing derived this, which is what a non-`user` row is - the
+    -- classification is written for `record_type = 'user'` and for no other
+    -- type - and what a preserved evicted session's rows are: `reindex` skips
+    -- them, so they keep null whatever the declaration says. Nullable rather
+    -- than `NOT NULL DEFAULT` for exactly that reason (D-04): a default would
+    -- silently read every preserved row as one class, and the no-third-state
+    -- claim is asserted as a count query returning zero instead. The `capture_mode`
+    -- column above is the same shape - a nullable added column whose null has a
+    -- documented meaning.
+    --
+    -- Declared last, and appended last in `BRING_FORWARD_COLUMNS`, which is that
+    -- constant's own rule: `ALTER TABLE ADD COLUMN` appends, so a column placed
+    -- mid-table would give a fresh store and an upgraded store different column
+    -- orders.
+    is_typed      INTEGER,
     UNIQUE (session_key, turn_seq)
 );
 
@@ -428,4 +448,12 @@ pub const BRING_FORWARD_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             ("files_failed", "INTEGER NOT NULL DEFAULT 0"),
         ],
     ),
+    // `turns` is a DERIVED table, and it is here anyway (phase 1 D-08). The
+    // preserving rebuild path - a store holding an evicted session - skips the
+    // DROP loop and runs only `CREATE TABLE IF NOT EXISTS`, a no-op on a table
+    // that already exists, so nothing there would ever create the column;
+    // `derive::derive_turn` names it in an explicit INSERT list and would then
+    // fail with `no such column` on every future pass, permanently, because
+    // `reindex::open_up_to_date` runs at the top of each one.
+    ("turns", &[("is_typed", "INTEGER")]),
 ];
