@@ -351,3 +351,272 @@ fn an_empty_line_passes_through_the_stream() {
         );
     }
 }
+
+// --- The store half: what the archive holds after a pass ---------------------
+
+use std::path::PathBuf;
+
+use rusqlite::Connection;
+use verbatim_core::store::DB_FILE_NAME;
+use verbatim_core::{blob, ingest, recall, reindex, verify, Config, Store};
+
+/// One temp store fed one transcript under one mode.
+struct Bench {
+    _dir: tempfile::TempDir,
+    _config_dir: tempfile::TempDir,
+    data_dir: PathBuf,
+    transcript: PathBuf,
+    config: Config,
+}
+
+fn bench(mode: CaptureMode) -> Bench {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let transcript = testkit::copy_fixture_into(testkit::CAPTURE_FIXTURE, &work);
+
+    let config_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        config_dir
+            .path()
+            .join(verbatim_core::config::CONFIG_FILE_NAME),
+        format!("[capture]\nmode = \"{}\"\n", mode.as_str()),
+    )
+    .unwrap();
+    let config = Config::load_from(config_dir.path()).expect("a capture table parses");
+    assert_eq!(
+        config.capture_mode(),
+        mode,
+        "the bench must ask for {mode:?}"
+    );
+
+    Bench {
+        _dir: dir,
+        _config_dir: config_dir,
+        data_dir,
+        transcript,
+        config,
+    }
+}
+
+impl Bench {
+    fn ingest(&self) -> ingest::Pass {
+        match ingest::run_with(&self.data_dir, &self.transcript, &self.config)
+            .unwrap_or_else(|e| panic!("ingest: {e}"))
+        {
+            ingest::Outcome::Committed(pass) => pass,
+            other => panic!("expected a committed pass, got {other:?}"),
+        }
+    }
+
+    fn conn(&self) -> Connection {
+        Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
+    }
+
+    /// `(compressed blob bytes, uncompressed stream bytes)`.
+    fn sizes(&self) -> (i64, i64) {
+        self.conn()
+            .query_row(
+                "SELECT length(s.blob), m.uncompressed_len
+                 FROM sessions s JOIN session_meta m USING (session_key)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn stream(&self) -> Vec<u8> {
+        let bytes: Vec<u8> = self
+            .conn()
+            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        blob::read_all(&bytes).unwrap()
+    }
+
+    fn mode(&self) -> Option<String> {
+        self.conn()
+            .query_row("SELECT capture_mode FROM session_meta", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// `(turn id, stream_offset, byte_len)` for every turn, in order.
+    fn turns(&self) -> Vec<(i64, i64, i64)> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT id, stream_offset, byte_len FROM turns ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows
+    }
+}
+
+/// AC7, at the store: the same transcript into three stores leaves strictly
+/// fewer archived bytes each time, compressed AND uncompressed.
+#[test]
+fn the_three_modes_store_strictly_decreasing_blobs() {
+    let mut compressed = Vec::new();
+    let mut uncompressed = Vec::new();
+    for mode in MODES {
+        let bench = bench(mode);
+        bench.ingest();
+        let (blob_bytes, stream_bytes) = bench.sizes();
+        assert_eq!(bench.mode().as_deref(), Some(mode.as_str()));
+        compressed.push(blob_bytes);
+        uncompressed.push(stream_bytes);
+    }
+
+    assert!(
+        compressed[0] > compressed[1] && compressed[1] > compressed[2],
+        "length(sessions.blob) must strictly decrease: {compressed:?}"
+    );
+    assert!(
+        uncompressed[0] > uncompressed[1] && uncompressed[1] > uncompressed[2],
+        "the stored stream must strictly decrease: {uncompressed:?}"
+    );
+    assert_eq!(
+        uncompressed[0],
+        testkit::fixture_bytes(testkit::CAPTURE_FIXTURE).len() as i64,
+        "full stores the transcript"
+    );
+}
+
+/// `full` is still the byte-for-byte mode, said about this fixture as well as
+/// about `session-basic.jsonl` over in `tests/ingest.rs`.
+#[test]
+fn full_still_reproduces_the_transcript_byte_for_byte() {
+    let bench = bench(CaptureMode::Full);
+    let pass = bench.ingest();
+    let source = std::fs::read(&bench.transcript).unwrap();
+
+    assert!(bench.stream() == source, "AC7, for the capture fixture");
+    assert_eq!(pass.watermark, source.len() as u64);
+    assert_eq!(bench.mode().as_deref(), Some("full"));
+}
+
+/// (b) Every turn row addresses the STORED stream. Read the range each row
+/// claims and it is that record's line - which is the property elision could
+/// most easily have broken, because the file and the blob stopped agreeing.
+#[test]
+fn every_turn_reads_back_the_stored_line_at_its_recorded_range() {
+    for mode in MODES {
+        let bench = bench(mode);
+        bench.ingest();
+        let conn = bench.conn();
+        let stream = bench.stream();
+
+        let turns = bench.turns();
+        assert_eq!(turns.len(), 6, "{mode:?}: every fixture record is a turn");
+
+        let mut marked = 0;
+        for (id, offset, len) in turns {
+            let (bytes, _blocks) = testkit::read_turn(&conn, id);
+            assert_eq!(bytes.len(), len as usize, "{mode:?}: turn {id} byte_len");
+            assert!(
+                bytes == stream[offset as usize..(offset + len) as usize],
+                "{mode:?}: turn {id} does not sit where its row says"
+            );
+
+            let object = as_object(&bytes);
+            let elided: Vec<u64> = ELIDED_FIELDS
+                .iter()
+                .filter_map(|field| object.get(*field))
+                .filter_map(capture::elided_bytes)
+                .collect();
+            marked += elided.len();
+            for bytes_elided in elided {
+                assert!(bytes_elided > 0, "{mode:?}: a mark with no size");
+            }
+        }
+        let expected = match mode {
+            CaptureMode::Full => 0,
+            CaptureMode::Lean => 2,
+            CaptureMode::Minimal => 4,
+        };
+        assert_eq!(
+            marked, expected,
+            "{mode:?}: wrong number of elided subtrees"
+        );
+    }
+}
+
+/// The recall path, not just the raw blob: `recall::get` hands back the stored
+/// line for a turn in an elided store, and it is the same bytes the row claims.
+#[test]
+fn recall_get_returns_the_stored_line_from_an_elided_store() {
+    let bench = bench(CaptureMode::Minimal);
+    bench.ingest();
+    let conn = bench.conn();
+    let ids: Vec<i64> = bench.turns().into_iter().map(|(id, _, _)| id).collect();
+
+    let scope = recall::scope::Scope::Everything;
+    let fetched = recall::get::records(&conn, &Config::default(), &scope, &ids).unwrap();
+    assert_eq!(fetched.records.len(), ids.len(), "{:?}", fetched.absent);
+
+    for record in &fetched.records {
+        assert!(!record.body_evicted, "nothing here is evicted");
+        let body = record.body.as_ref().expect("a stored body");
+        let (direct, _) = testkit::read_turn(&conn, record.turn_id);
+        assert!(body == &direct, "recall disagreed with the turn row");
+        // And it is JSON, which is what an elided line still has to be.
+        as_object(body);
+    }
+}
+
+/// (c) An elided store is a HEALTHY store. `verify` checksums what is stored,
+/// so a well-formed elided stream has nothing wrong with it - and if this ever
+/// reported a finding, retention's evicted-session arm and a genuinely corrupt
+/// blob would become indistinguishable.
+#[test]
+fn verify_finds_nothing_wrong_with_an_elided_store() {
+    for mode in MODES {
+        let bench = bench(mode);
+        bench.ingest();
+        let store = Store::open(&bench.data_dir).unwrap();
+        let report = verify::verify(&store).unwrap();
+        assert!(
+            report.failures.is_empty(),
+            "{mode:?}: {:?}",
+            report.failures
+        );
+    }
+}
+
+/// (d) A rebuild derives the same rows from the stored bytes alone - which is
+/// STOR-04's claim, now about a stream that is not the transcript.
+#[test]
+fn a_reindex_of_an_elided_store_reproduces_every_derived_row() {
+    let bench = bench(CaptureMode::Lean);
+    bench.ingest();
+
+    let before_turns = bench.turns();
+    let before_queries = testkit::query_set_json(&bench.conn());
+    let before_digest = testkit::archive_digest(&bench.conn());
+
+    let mut store = Store::open(&bench.data_dir).unwrap();
+    let rebuilt = reindex::reindex(&mut store).unwrap();
+    assert!(rebuilt.failed.is_empty(), "{:?}", rebuilt.failed);
+    assert_eq!(rebuilt.sessions, 1);
+    assert_eq!(rebuilt.turns, before_turns.len());
+    drop(store);
+
+    assert_eq!(
+        bench.turns(),
+        before_turns,
+        "the rebuild moved a turn id, offset or length"
+    );
+    assert_eq!(
+        testkit::query_set_json(&bench.conn()),
+        before_queries,
+        "the rebuild changed what the index answers"
+    );
+    assert_eq!(
+        testkit::archive_digest(&bench.conn()),
+        before_digest,
+        "the rebuild touched the archive"
+    );
+}

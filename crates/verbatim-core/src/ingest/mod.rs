@@ -183,13 +183,26 @@ pub(crate) struct Prepared {
 
 /// The compressed, parsed result of reading one file's tail.
 struct Work {
-    existing_watermark: u64,
+    /// Where the bytes this pass stores begin in the ARCHIVED stream: the
+    /// uncompressed length the session's blob already holds, and zero for a
+    /// session with no blob (ING-07, phase 8 D-05).
+    ///
+    /// Not the watermark. The watermark is a file offset and this is a stream
+    /// offset; under `full` they are the same number and under every other mode
+    /// they are not. Every `turns.stream_offset` this pass writes is measured
+    /// from here, because that is the coordinate system `blob::BlobReader`,
+    /// `recall::get` and `reindex` all read.
+    stream_base: u64,
     /// The `session_no` this session already has, or `None` for one that has
     /// never been archived and needs the next free number - which only the
     /// writer can allocate.
     existing_session_no: Option<i64>,
+    /// The scan of the STORED bytes, not of the file's. It is what the turn rows
+    /// are derived from, so their offsets address what a reader will find.
     scan: Scan,
-    fresh: Vec<u8>,
+    /// The bytes this pass appends to the blob: the file's tail with whatever
+    /// the capture mode elided already taken out of it.
+    stored: Vec<u8>,
     bytes: Vec<u8>,
     checksum: [u8; 32],
     uncompressed_len: u64,
@@ -264,8 +277,14 @@ pub(crate) fn prepare(
         clear_divergence = true;
     }
 
-    let scan = parse::scan_from(&tail, existing.watermark, existing.turn_count);
-    let consumed = scan.consumed(existing.watermark);
+    // The FIRST scan, over the raw tail, and its only job is to say where this
+    // pass stops in the FILE. The watermark is a file offset - `read_tail` seeks
+    // by it and `read_tail` refuses a file shorter than it - so it has to keep
+    // being measured against the file, whatever the capture mode does to the
+    // bytes afterwards. `consumed` is likewise file bytes, and is what
+    // `runs.bytes_read` and `status` report.
+    let file_scan = parse::scan_from(&tail, existing.watermark, existing.turn_count);
+    let consumed = file_scan.consumed(existing.watermark);
     if consumed == 0 {
         // No complete record past the watermark. A rerun on an unchanged file
         // lands here, and adds no row to any table.
@@ -278,17 +297,43 @@ pub(crate) fn prepare(
     }
     let fresh = &tail[..consumed];
 
+    // The capture mode acts HERE, between the file and the blob (ING-07, phase 8
+    // D-05), line by line and preserving the framing exactly. Under `full` this
+    // borrows `fresh` and examines not one byte of it, which is what keeps the
+    // default path identical to what it has always been.
+    let stored = crate::capture::elide_stream(fresh, mode);
+
+    // Where those bytes land in the archived stream. It is the blob's own
+    // uncompressed length and NOT the watermark: `blob::append` appends at the
+    // end of the blob, so that is where the new bytes really go, and once a mode
+    // elides anything the file offset stops being able to say so. Under `full`
+    // the two are the same number in a healthy store, which is why every offset
+    // below is arithmetically what it was before this existed.
+    let stream_base = if existing.session.is_some() {
+        existing.uncompressed_len
+    } else {
+        0
+    };
+
+    // The SECOND scan, over the bytes actually being stored, and it is the one
+    // `apply` derives turns from - so `turns.stream_offset` and `byte_len`
+    // address the stored stream, which is what `blob::BlobReader`,
+    // `recall::get` and `reindex` read. Elision preserves the line framing and
+    // every field a record is classified on, so this scan finds the same records
+    // in the same order at the same ordinals; only their lengths differ.
+    let scan = parse::scan_from(&stored, stream_base, existing.turn_count);
+
     // Compression and hashing happen here, outside the transaction. `append`
     // takes the checksum already recorded for what the blob holds and verifies
     // it before writing, so a re-ingest of a growing session cannot mint a
     // fresh checksum over corruption.
     let (bytes, checksum, uncompressed_len) = match &existing.session {
         Some(session) => {
-            let appended = blob::append(&session.blob, &session.checksum, fresh)?;
+            let appended = blob::append(&session.blob, &session.checksum, &stored)?;
             (appended.bytes, appended.checksum, appended.uncompressed_len)
         }
         None => {
-            let written = blob::write(fresh)?;
+            let written = blob::write(&stored)?;
             (written.bytes, written.checksum, written.uncompressed_len)
         }
     };
@@ -310,11 +355,15 @@ pub(crate) fn prepare(
         read_agent_meta(path)
     };
 
+    // Both numbers here are the FILE's, and deliberately: `bytes_read` is what
+    // this pass read past the watermark, and `watermark` is where the next pass
+    // seeks to. Only `turns_added` comes off the stored scan, and the two scans
+    // agree about it by construction.
     let pass = Pass {
         session_key: session_key.clone(),
         bytes_read: consumed as u64,
         turns_added: scan.turn_count(),
-        watermark: scan.resume_offset,
+        watermark: file_scan.resume_offset,
     };
 
     fault::stall(fault::AFTER_BLOB);
@@ -323,10 +372,10 @@ pub(crate) fn prepare(
         path: path.to_path_buf(),
         clear_divergence,
         work: Some(Work {
-            existing_watermark: existing.watermark,
+            stream_base,
             existing_session_no: existing.session.as_ref().map(|s| s.session_no),
             scan,
-            fresh: fresh.to_vec(),
+            stored: stored.into_owned(),
             bytes,
             checksum,
             uncompressed_len,
@@ -369,10 +418,10 @@ pub(crate) fn apply(
         return Ok(Outcome::UpToDate);
     };
     let Work {
-        existing_watermark,
+        stream_base,
         existing_session_no,
         scan,
-        fresh,
+        stored,
         bytes,
         checksum,
         uncompressed_len,
@@ -438,9 +487,11 @@ pub(crate) fn apply(
     for (record, turn) in scan.turns() {
         // The seam, not an insert of our own: the rebuild path calls the same
         // function, which is what stops it from drifting from what ingest wrote
-        // (STOR-04). `fresh` starts at the watermark, so a record's stream
-        // offset has to be rebased to index it.
-        let from = (record.offset - existing_watermark) as usize;
+        // (STOR-04). `stored` starts at `stream_base`, so a record's stream
+        // offset has to be rebased to index it - and the offset and the buffer
+        // are in the SAME coordinate system, which is the whole reason the
+        // second scan exists.
+        let from = (record.offset - stream_base) as usize;
         derive::derive_turn(
             &tx,
             derive::TurnRow {
@@ -449,7 +500,7 @@ pub(crate) fn apply(
                 turn,
                 stream_offset: record.offset,
                 byte_len: record.len,
-                record: &fresh[from..from + record.len as usize],
+                record: &stored[from..from + record.len as usize],
                 subtype: record.subtype.as_deref(),
                 compact_metadata: record.compact_metadata.as_deref(),
             },
@@ -731,6 +782,16 @@ pub(crate) struct Existing {
     /// 8 D-03). Read off the same `session_meta` row as the two flags above, so
     /// the steady state still costs one query and no write.
     evicted: bool,
+    /// How many uncompressed bytes this session's blob already holds - the base
+    /// of the STORED stream's coordinate system (ING-07, phase 8 D-05).
+    ///
+    /// Not the same number as [`Existing::watermark`] once a capture mode elides
+    /// anything: the watermark is an offset into the transcript FILE and this is
+    /// an offset into the archived stream, and elision is exactly what makes the
+    /// two diverge. Under `full` they are equal, which is why nothing needed
+    /// this column before. Read off the same `session_meta` row as the flags
+    /// above, so it costs no extra query.
+    uncompressed_len: u64,
     session: Option<ExistingSession>,
 }
 
@@ -752,16 +813,16 @@ impl Existing {
         // All three flags off the one `session_meta` row rather than three
         // round trips: a pass reads this for every one of two thousand
         // transcripts.
-        let (agent_meta_stored, diverged, evicted): (bool, bool, bool) = conn
-            .query_row(
+        let (agent_meta_stored, diverged, evicted, uncompressed_len): (bool, bool, bool, i64) =
+            conn.query_row(
                 "SELECT agent_meta IS NOT NULL, coalesce(transcript_diverged, 0) <> 0,
-                        coalesce(is_evicted, 0) <> 0
+                        coalesce(is_evicted, 0) <> 0, uncompressed_len
                  FROM session_meta WHERE session_key = ?1",
                 [session_key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?
-            .unwrap_or((false, false, false));
+            .unwrap_or((false, false, false, 0));
         let turn_count: i64 = conn.query_row(
             "SELECT count(*) FROM turns WHERE session_key = ?1",
             [session_key],
@@ -833,6 +894,7 @@ impl Existing {
             turn_count,
             diverged,
             evicted,
+            uncompressed_len: uncompressed_len.max(0) as u64,
             session,
         })
     }
