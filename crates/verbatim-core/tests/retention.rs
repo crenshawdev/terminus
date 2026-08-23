@@ -14,6 +14,7 @@ use rusqlite::Connection;
 use verbatim_core::config::{Config, CONFIG_FILE_NAME};
 use verbatim_core::retention::{self, Applied, Selection, MAX_PER_PASS};
 use verbatim_core::store::{Store, DB_FILE_NAME};
+use verbatim_core::ingest::pass;
 use verbatim_core::{ingest, testkit};
 
 /// The instant every evaluation below measures from.
@@ -582,4 +583,227 @@ fn a_failure_on_one_session_does_not_stop_the_next() {
             "{table} still holds a row for the deleted session"
         );
     }
+}
+
+// D-03 on the ingest side. An evicted session's blob was emptied on purpose, so
+// `blob::append` has no header to parse out of it: left to the ordinary path
+// the transcript becomes a per-file failure on every pass forever, and writing
+// its tail as a FRESH blob instead would resurrect a session retention
+// deliberately emptied while leaving every stored `turns.stream_offset`
+// pointing into bytes that are no longer there. The only safe answer is to do
+// nothing at all, which is what these two cases assert - one through the
+// single-file entry point and one through a whole pass.
+
+impl Bench {
+    fn watermark(&self, key: &str) -> Option<i64> {
+        self.conn()
+            .query_row(
+                "SELECT byte_offset FROM watermarks WHERE transcript_path = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .ok()
+    }
+
+    fn blob_len(&self, key: &str) -> i64 {
+        self.count("SELECT length(blob) FROM sessions WHERE session_key = ?1", key)
+    }
+
+    fn is_evicted(&self, key: &str) -> Option<i64> {
+        self.conn()
+            .query_row(
+                "SELECT is_evicted FROM session_meta WHERE session_key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+}
+
+/// Append one more complete record to a transcript, the way Claude Code does.
+fn grow(path: &Path) {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(&testkit::boundary_line()).unwrap();
+    file.write_all(b"\n").unwrap();
+}
+
+/// The single-file entry point, over a transcript that GREW after its session
+/// was evicted: up to date, and not one byte written anywhere.
+///
+/// The growth is the whole point. A file that has not changed reaches
+/// `Prepared { work: None }` by the ordinary route and would pass this test
+/// with no arm at all.
+#[test]
+fn re_ingesting_an_evicted_transcript_that_grew_is_up_to_date_and_writes_nothing() {
+    let bench = bench();
+    let key = bench.archive("evicted.jsonl");
+    let applied = bench.apply(&Selection {
+        evict: vec![key.clone()],
+        ..Selection::default()
+    });
+    assert_eq!(applied.evicted, vec![key.clone()]);
+
+    let rows = bench.rows(&key);
+    let watermark = bench.watermark(&key).expect("the archive left a watermark");
+    let digest = testkit::archive_digest(&bench.conn());
+
+    let path = PathBuf::from(&key);
+    let size_before = std::fs::metadata(&path).unwrap().len();
+    grow(&path);
+    assert!(
+        std::fs::metadata(&path).unwrap().len() > size_before,
+        "the transcript has to have grown, or the arm is never reached"
+    );
+
+    let outcome = ingest::run_with(&bench.data_dir, &path, &Config::default()).unwrap();
+    assert_eq!(outcome, ingest::Outcome::UpToDate);
+
+    assert_eq!(bench.blob_len(&key), 0, "the emptied blob was written back");
+    assert_eq!(bench.is_evicted(&key), Some(1), "the session was un-evicted");
+    assert_eq!(
+        bench.watermark(&key),
+        Some(watermark),
+        "the watermark moved over bytes no blob holds"
+    );
+    assert_eq!(bench.rows(&key), rows, "a derived row moved");
+    assert_eq!(
+        testkit::archive_digest(&bench.conn()),
+        digest,
+        "the archive is not byte for byte what it was"
+    );
+}
+
+// The same fact through a whole pass, where the question is what the walk
+// RECORDS: a file it can do nothing with must not be a per-file failure, or
+// every pass for the rest of the store's life reports one.
+
+const PROJECT: &str = "-data-projects-cadence";
+
+/// A Claude config directory whose `projects` tree a pass walks. Nothing here
+/// ever resolves a real transcript root.
+struct Tree {
+    _dir: tempfile::TempDir,
+    data_dir: PathBuf,
+    claude_dir: PathBuf,
+}
+
+fn tree() -> Tree {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let claude_dir = dir.path().join("claude");
+    std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
+    Tree {
+        _dir: dir,
+        data_dir,
+        claude_dir,
+    }
+}
+
+impl Tree {
+    fn place(&self, name: &str) -> PathBuf {
+        let dest = self.claude_dir.join("projects").join(PROJECT).join(name);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::copy(testkit::fixture_path("session-basic.jsonl"), &dest).unwrap();
+        dest.canonicalize().unwrap()
+    }
+
+    fn pass(&self) -> pass::Summary {
+        let config = Config::from_parts(vec![self.claude_dir.clone()], Vec::new());
+        match pass::run_with(&self.data_dir, &config).unwrap() {
+            pass::PassOutcome::Ran(summary) => summary,
+            pass::PassOutcome::LockHeld => panic!("nothing else holds the lock"),
+        }
+    }
+
+    fn conn(&self) -> Connection {
+        Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
+    }
+
+    fn watermark(&self, path: &Path) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT byte_offset FROM watermarks WHERE transcript_path = ?1",
+                [path.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+}
+
+/// A pass whose tree holds an evicted session's grown transcript records no
+/// failure for it, moves nothing of it, and still commits every other file.
+///
+/// The unevicted sibling is what keeps this from being vacuous: it grew by the
+/// same bytes on the same pass, so a pass that committed nothing at all would
+/// fail here rather than looking like the arm working.
+#[test]
+fn a_pass_records_no_failure_for_an_evicted_session_whose_transcript_grew() {
+    let tree = tree();
+    let evicted_path = tree.place("11111111-1111-4111-8111-111111111111.jsonl");
+    let control_path = tree.place("22222222-2222-4222-8222-222222222222.jsonl");
+
+    let first = tree.pass();
+    assert_eq!(first.files_committed, 2);
+    assert!(first.failures.is_empty(), "{:?}", first.failures);
+
+    let evicted = evicted_path.to_string_lossy().into_owned();
+    let mut store = Store::open(&tree.data_dir).unwrap();
+    let applied = retention::apply(
+        &mut store,
+        &Selection {
+            evict: vec![evicted.clone()],
+            ..Selection::default()
+        },
+    );
+    drop(store);
+    assert_eq!(applied.evicted, vec![evicted.clone()]);
+
+    let watermark = tree.watermark(&evicted_path);
+    let control_watermark = tree.watermark(&control_path);
+    grow(&evicted_path);
+    grow(&control_path);
+
+    let second = tree.pass();
+    assert!(
+        second.failures.is_empty(),
+        "an evicted session became a per-file failure: {:?}",
+        second.failures
+    );
+    assert_eq!(
+        second.files_walked, 2,
+        "the evicted transcript is still discovered and still walked"
+    );
+    assert_eq!(
+        second.files_committed, 1,
+        "exactly the unevicted sibling had its tail archived"
+    );
+    assert!(second.turns_added > 0, "the sibling's tail added no turn");
+
+    let (len, flag): (i64, Option<i64>) = tree
+        .conn()
+        .query_row(
+            "SELECT length(s.blob), m.is_evicted FROM sessions s
+             JOIN session_meta m USING (session_key) WHERE s.session_key = ?1",
+            [&evicted],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(len, 0, "the pass wrote bytes into an emptied blob");
+    assert_eq!(flag, Some(1), "the pass un-evicted the session");
+    assert_eq!(
+        tree.watermark(&evicted_path),
+        watermark,
+        "the watermark moved over bytes no blob holds"
+    );
+    assert!(
+        tree.watermark(&control_path) > control_watermark,
+        "the sibling's watermark did not move, so this pass proved nothing"
+    );
+
+    // And it does not become a failure on the pass after that either: the state
+    // is stable, not merely quiet once.
+    let third = tree.pass();
+    assert!(third.failures.is_empty(), "{:?}", third.failures);
 }

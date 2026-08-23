@@ -18,6 +18,14 @@
 //! statement about the *file*, not about the blob - the blob is intact, and
 //! saying so is most of the message.
 //!
+//! Phase 8 adds one *silence*, on the same terms: a session
+//! `session_meta.is_evicted` marks (RET-02, D-03) holds a deliberately emptied
+//! blob, so there is nothing to decompress and nothing to hash. It is counted
+//! and it is never a failure. The divergence check stays independent of it,
+//! exactly as it is independent of the checksum verdict - "the file on disk is
+//! shorter than what was archived" is a statement about the FILE, and an
+//! evicted session's file can still be wrong about it.
+//!
 //! # Which identifier names a failure
 //!
 //! The `session_key` - the canonical transcript path - and never the record's
@@ -92,7 +100,7 @@ const DIVERGED: &str = "the transcript on disk is shorter than the bytes the arc
 
 fn walk(conn: &Connection) -> Result<Report> {
     let mut statement = conn.prepare(
-        "SELECT s.session_key, s.blob, m.checksum, m.transcript_diverged
+        "SELECT s.session_key, s.blob, m.checksum, m.transcript_diverged, m.is_evicted
          FROM sessions s LEFT JOIN session_meta m USING (session_key)
          ORDER BY s.session_key",
     )?;
@@ -102,18 +110,28 @@ fn walk(conn: &Connection) -> Result<Report> {
             r.get::<_, Vec<u8>>(1)?,
             r.get::<_, Option<Vec<u8>>>(2)?,
             r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
+            r.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
         ))
     })?;
 
     let mut report = Report::default();
     for row in rows {
-        let (session_key, bytes, expected, diverged) = row?;
+        let (session_key, bytes, expected, diverged, evicted) = row?;
         report.checked += 1;
-        if let Err(detail) = check(&bytes, expected.as_deref()) {
-            report.failures.push(Failure {
-                session_key: session_key.clone(),
-                detail,
-            });
+        // Counted, and never a failure. An evicted session's blob was emptied
+        // on purpose (RET-02, phase 8 D-03), so `blob::read_all` has no header
+        // to find and would report every one of them as "does not decompress" -
+        // which is the confusion the divergence arm above exists to prevent,
+        // arriving from the other side. The count still moves because the walk
+        // did visit the session and can say what it is; the check is what has
+        // nothing left to check.
+        if !evicted {
+            if let Err(detail) = check(&bytes, expected.as_deref()) {
+                report.failures.push(Failure {
+                    session_key: session_key.clone(),
+                    detail,
+                });
+            }
         }
         // Independent of the checksum verdict, not an alternative to it. A
         // session can have both a diverged transcript and a damaged blob, and

@@ -200,6 +200,28 @@ struct Work {
 /// Every expensive thing a pass does is here - the file read, the JSON scan and
 /// the zstd compression - and none of the cheap ones that need the store.
 pub(crate) fn prepare(path: &Path, session_key: String, existing: &Existing) -> Result<Prepared> {
+    // Before the file is even opened, and the only safe answer for a session
+    // retention emptied (RET-02, phase 8 D-03). `blob::append` parses a header
+    // out of the stored bytes and an emptied blob has none, so left to the
+    // ordinary path this file becomes a per-file failure on every pass forever;
+    // writing the tail as a FRESH blob instead would resurrect a session that
+    // was deliberately emptied and leave every stored `turns.stream_offset`
+    // pointing into bytes that are no longer there.
+    //
+    // So: no work, and `apply` answers `Outcome::UpToDate`. No bytes are read,
+    // the watermark does not move, and the walk records no failure - the file
+    // is simply one this store has nothing more to do with until the policy
+    // that emptied it changes. D-13's flag is not cleared either, and cannot
+    // be: `prefix_matches` would have to decompress the blob that is gone.
+    if existing.evicted {
+        return Ok(Prepared {
+            session_key,
+            path: path.to_path_buf(),
+            clear_divergence: false,
+            work: None,
+        });
+    }
+
     let tail = read_tail(path, existing.watermark)?;
 
     // A flagged session stops being flagged only when the file is provably the
@@ -689,6 +711,10 @@ pub(crate) struct Existing {
     /// the file is whole again, and read here so the steady state costs no
     /// extra query and no write at all.
     diverged: bool,
+    /// Whether retention emptied this session's blob on purpose (RET-02, phase
+    /// 8 D-03). Read off the same `session_meta` row as the two flags above, so
+    /// the steady state still costs one query and no write.
+    evicted: bool,
     session: Option<ExistingSession>,
 }
 
@@ -707,17 +733,19 @@ impl Existing {
                 |r| r.get(0),
             )
             .optional()?;
-        // Both flags off the one `session_meta` row rather than two round
-        // trips: a pass reads this for every one of two thousand transcripts.
-        let (agent_meta_stored, diverged): (bool, bool) = conn
+        // All three flags off the one `session_meta` row rather than three
+        // round trips: a pass reads this for every one of two thousand
+        // transcripts.
+        let (agent_meta_stored, diverged, evicted): (bool, bool, bool) = conn
             .query_row(
-                "SELECT agent_meta IS NOT NULL, coalesce(transcript_diverged, 0) <> 0
+                "SELECT agent_meta IS NOT NULL, coalesce(transcript_diverged, 0) <> 0,
+                        coalesce(is_evicted, 0) <> 0
                  FROM session_meta WHERE session_key = ?1",
                 [session_key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?
-            .unwrap_or((false, false));
+            .unwrap_or((false, false, false));
         let turn_count: i64 = conn.query_row(
             "SELECT count(*) FROM turns WHERE session_key = ?1",
             [session_key],
@@ -788,6 +816,7 @@ impl Existing {
             agent_meta_stored,
             turn_count,
             diverged,
+            evicted,
             session,
         })
     }
@@ -960,8 +989,10 @@ fn first_cwd(scan: &Scan) -> Option<String> {
 /// `is_final` is not written here and is not written by any ingest of a file:
 /// it is the idle rule's, evaluated once at the end of a whole pass over
 /// `last_turn_at` (D-06, [`crate::feedback::finalize`]), which is what lets one
-/// mechanism cover a clean exit and a crash alike. `is_evicted` stays null -
-/// retention is phase 8.
+/// mechanism cover a clean exit and a crash alike. `is_evicted` is not written
+/// here either, and must not be: it is retention's (RET-02), and an ingest that
+/// cleared it would un-evict a session on the pass after the one that emptied
+/// it. `prepare` never reaches this function for an evicted session at all.
 fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
     let scan = row.scan;
     let session_id = scan.records.iter().find_map(|r| r.session_id.clone());

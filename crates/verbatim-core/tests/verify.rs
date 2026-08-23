@@ -100,6 +100,27 @@ impl Bench {
         assert_eq!(changed, 1, "no session_meta row for {key}");
     }
 
+    /// Empty a session's blob and mark it, exactly as `retention::apply` does.
+    ///
+    /// A direct UPDATE for the reason `flag_divergence` is one: what retention
+    /// does to reach this state is asserted in `tests/retention.rs`, and the
+    /// question here is only what `verify` reports off the two columns.
+    fn evict(&self, key: &str) {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE sessions SET blob = x'' WHERE session_key = ?1",
+            [key],
+        )
+        .unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE session_meta SET is_evicted = 1 WHERE session_key = ?1",
+                [key],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "no session_meta row for {key}");
+    }
+
     /// Replace a session's stream with different bytes, validly compressed.
     ///
     /// The other half of the corruption space: `flip_a_byte` usually makes zstd
@@ -363,6 +384,87 @@ fn clearing_the_flag_makes_the_store_clean_again() {
     let report = verify::verify(&bench.store()).unwrap();
     assert!(report.is_ok(), "{:?}", report.failures);
     assert_eq!(report.render(), "");
+}
+
+/// D-03. An evicted session's blob was emptied on purpose, so `verify` counts
+/// it and says nothing about it - while a genuinely corrupt blob beside it is
+/// still named, and only it.
+///
+/// Without the arm this is the failure mode: `blob::read_all` finds no header
+/// in zero bytes, every evicted session reports "blob does not decompress", and
+/// a store whose retention policy is doing exactly what it was told reads as
+/// wholesale corruption.
+#[test]
+fn an_evicted_session_is_counted_and_never_named_while_a_corrupt_one_still_is() {
+    let bench = bench();
+    let evicted = bench.keys[0].clone();
+    let corrupt = bench.keys[2].clone();
+    bench.evict(&evicted);
+    bench.rewrite_the_stream(&corrupt);
+
+    // The premise: the emptied blob really is unreadable, so the arm is what
+    // keeps it out of the report rather than the bytes happening to survive.
+    let bytes: Vec<u8> = bench
+        .conn()
+        .query_row(
+            "SELECT blob FROM sessions WHERE session_key = ?1",
+            [&evicted],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(bytes.is_empty());
+    assert!(blob::read_all(&bytes).is_err());
+
+    let report = verify::verify(&bench.store()).unwrap();
+    assert_eq!(
+        report.checked, 3,
+        "an evicted session is still a session the walk visited"
+    );
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(report.failures[0].session_key, corrupt);
+
+    let text = report.render();
+    assert!(!text.contains(&evicted), "named the evicted session: {text}");
+    for other in others(&bench.keys, &[&corrupt]) {
+        assert!(!text.contains(other.as_str()), "named {other}: {text}");
+    }
+}
+
+/// A store whose every session has been evicted has no findings at all, which
+/// is what makes the case above a claim about the arm and not about the one
+/// corrupt session drowning out the rest.
+#[test]
+fn a_store_of_evicted_sessions_verifies_clean() {
+    let bench = bench();
+    for key in bench.keys.clone() {
+        bench.evict(&key);
+    }
+
+    let report = verify::verify(&bench.store()).unwrap();
+    assert_eq!(report.checked, 3);
+    assert!(report.is_ok(), "{:?}", report.failures);
+    assert_eq!(report.render(), "");
+}
+
+/// The divergence check stays independent of the eviction arm, exactly as it is
+/// independent of the checksum verdict. "The file on disk is shorter than what
+/// was archived" is a statement about the FILE, and emptying the blob answers
+/// nothing about the file.
+#[test]
+fn an_evicted_session_can_still_report_a_divergence() {
+    let bench = bench();
+    let both = bench.keys[1].clone();
+    bench.evict(&both);
+    bench.flag_divergence(&both);
+
+    let report = verify::verify(&bench.store()).unwrap();
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(report.failures[0].session_key, both);
+    let text = report.render();
+    assert!(text.contains("archive was left untouched"), "{text}");
+    // And not a word about the blob, which is the arm doing its job underneath.
+    assert!(!text.contains("does not decompress"), "{text}");
+    assert!(!text.contains("checksum"), "{text}");
 }
 
 fn report_text(bench: &Bench) -> String {
