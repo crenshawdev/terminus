@@ -1,5 +1,5 @@
 //! The subcommands: `ingest`, `backfill`, `search`, `show`, `sessions`, `verify`,
-//! `reindex`, `status`, `compact`, `usage`, `doctor`, `mcp`.
+//! `reindex`, `status`, `compact`, `usage`, `export`, `doctor`, `mcp`.
 //!
 //! `mcp` is the one that keeps none of what follows. It is not a data command
 //! typed at a terminal: it is a JSON-RPC server spawned by Claude Code, its
@@ -36,6 +36,7 @@
 pub mod backfill;
 pub mod compact;
 pub mod doctor;
+pub mod export;
 pub mod hook;
 pub mod ingest;
 pub mod install;

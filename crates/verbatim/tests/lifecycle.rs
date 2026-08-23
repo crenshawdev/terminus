@@ -31,6 +31,8 @@ const SESSIONS: u8 = 8;
 /// developer's real config and walk the live `~/.claude` tree.
 struct Bench {
     _dir: tempfile::TempDir,
+    /// The temporary root, which is where an export destination goes.
+    root: PathBuf,
     data_dir: PathBuf,
     config_dir: PathBuf,
     claude_dir: PathBuf,
@@ -46,6 +48,7 @@ fn bench() -> Bench {
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
     Bench {
         _dir: dir,
+        root,
         data_dir,
         config_dir,
         claude_dir,
@@ -94,6 +97,21 @@ impl Bench {
         document(&out)["data"]["size_bytes"]
             .as_u64()
             .expect("status reports size_bytes")
+    }
+
+    /// Evict these sessions through the product's own eviction (RET-02): the
+    /// row and every derived row stay, the archived bytes go.
+    fn evict(&self, keys: &[&Path]) {
+        let mut store = Store::open(&self.data_dir).unwrap();
+        let selection = Selection {
+            evict: keys
+                .iter()
+                .map(|k| k.to_string_lossy().into_owned())
+                .collect(),
+            ..Selection::default()
+        };
+        let applied = retention::apply(&mut store, &selection);
+        assert_eq!(applied.evicted.len(), keys.len(), "{applied:?}");
     }
 
     /// Delete these sessions through the product's own delete (RET-02), not
@@ -530,5 +548,258 @@ fn usage_against_no_store_is_a_reason_and_creates_nothing() {
     assert!(
         !bench.data_dir.exists(),
         "a read created the data directory"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `export` (PRIV-04)
+// ---------------------------------------------------------------------------
+
+/// The manifest one export wrote.
+fn manifest(dir: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(dir.join("manifest.json"))
+        .unwrap_or_else(|e| panic!("no manifest at {}: {e}", dir.display()));
+    serde_json::from_str(&text).expect("the manifest is JSON")
+}
+
+/// Every `.jsonl` file in an export directory, by name.
+fn exported_files(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".jsonl"))
+        .collect();
+    out.sort();
+    out
+}
+
+/// PRIV-04: the exported files ARE the archived streams, byte for byte, and the
+/// manifest accounts for every one of them and says in words what they are.
+///
+/// The comparison is against `blob::read_all` over the stored blob rather than
+/// against the transcript on disk: what export claims to write is what the
+/// archive holds, and those are the same bytes only for a session captured in
+/// full. Comparing to the source file would be testing ingest.
+#[test]
+fn an_export_is_the_archived_streams_byte_for_byte_with_a_manifest_over_them() {
+    let (bench, keys) = stocked();
+    let dest = bench.root.join("export");
+
+    let out = bench.run(&["export", dest.to_str().unwrap(), "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "", "the document already carries the notice");
+    let value = document(&out);
+    assert_eq!(value["data"]["sessions"], SESSIONS as i64, "{value}");
+    assert!(
+        value["data"]["notice"]
+            .as_str()
+            .is_some_and(|n| n.contains("unredacted")),
+        "the document must say what it wrote: {value}"
+    );
+
+    // Every session's file holds exactly what the archive holds.
+    let conn = bench.conn();
+    for key in &keys {
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT blob FROM sessions WHERE session_key = ?1",
+                [key.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let expected = verbatim_core::blob::read_all(&blob).unwrap();
+        let named = manifest(&dest)["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["session_key"] == key.to_string_lossy().as_ref())
+            .unwrap_or_else(|| panic!("{} is not in the manifest", key.display()))
+            .clone();
+        let written = std::fs::read(dest.join(named["file"].as_str().unwrap())).unwrap();
+        assert_eq!(
+            written,
+            expected,
+            "{} was not written byte for byte",
+            key.display()
+        );
+        assert_eq!(named["bytes"], expected.len() as i64, "{named}");
+    }
+
+    // The manifest accounts for the directory and for nothing that is not in it.
+    let doc = manifest(&dest);
+    assert_eq!(doc["sessions"], SESSIONS as i64, "{doc}");
+    assert_eq!(
+        doc["files"].as_array().unwrap().len(),
+        exported_files(&dest).len(),
+        "the manifest and the directory disagree about how many files there are"
+    );
+    assert!(
+        doc["notice"]
+            .as_str()
+            .is_some_and(|n| n.contains("unredacted") && n.contains("Not in this export")),
+        "the manifest must state what it is and what it is not: {doc}"
+    );
+    assert!(doc["archive_format"].is_i64(), "{doc}");
+    assert!(doc["first_turn_at"].is_string(), "{doc}");
+    assert!(doc["last_turn_at"].is_string(), "{doc}");
+    assert!(doc["turns"].as_i64().unwrap() > 0, "{doc}");
+}
+
+/// An evicted session is named and empty, never missing.
+///
+/// Its blob is `x''`, which no reader can parse a header out of, so the choice
+/// is between a file with nothing in it and no file at all. A missing file
+/// would read as an export that dropped a session; an empty one beside a
+/// manifest line saying why is the honest account of what retention did.
+#[test]
+fn an_evicted_session_is_exported_as_an_empty_file_the_manifest_explains() {
+    let (bench, keys) = stocked();
+    bench.evict(&[keys[0].as_path()]);
+    let dest = bench.root.join("export");
+
+    let out = bench.run(&["export", dest.to_str().unwrap(), "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(document(&out)["data"]["evicted"], 1, "{}", stdout(&out));
+
+    let doc = manifest(&dest);
+    assert_eq!(
+        doc["sessions"], SESSIONS as i64,
+        "the evicted session vanished"
+    );
+    let named = doc["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["session_key"] == keys[0].to_string_lossy().as_ref())
+        .expect("the evicted session is still in the manifest")
+        .clone();
+    assert_eq!(named["evicted"], true, "{named}");
+    assert_eq!(named["bytes"], 0, "{named}");
+
+    let path = dest.join(named["file"].as_str().unwrap());
+    assert!(path.exists(), "the evicted session has no file at all");
+    assert_eq!(std::fs::read(&path).unwrap(), Vec::<u8>::new());
+}
+
+/// ING-08: a project excluded after its sessions were archived is in neither
+/// the manifest nor the directory.
+///
+/// Export is the read path where this matters most: the output is a directory a
+/// user may hand to someone else, and "exclusion honoured on write and ignored
+/// on read" is the incumbent's bug this product exists to not have.
+#[test]
+fn an_excluded_project_is_in_neither_the_manifest_nor_the_directory() {
+    let (bench, keys) = stocked();
+    const HIDDEN: &str = "/data/projects/excluded-from-export";
+
+    bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET project = ?2 WHERE session_key = ?1",
+            rusqlite::params![keys[0].to_string_lossy(), HIDDEN],
+        )
+        .unwrap();
+    bench.config(&format!("exclude = [\"{HIDDEN}\"]\n"));
+    let dest = bench.root.join("export");
+
+    let out = bench.run(&["export", dest.to_str().unwrap(), "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(document(&out)["data"]["sessions"], (SESSIONS - 1) as i64);
+
+    let doc = manifest(&dest);
+    assert_eq!(exported_files(&dest).len(), (SESSIONS - 1) as usize);
+    assert!(
+        !doc["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["session_key"] == keys[0].to_string_lossy().as_ref()),
+        "the excluded session is in the manifest: {doc}"
+    );
+    assert!(
+        !doc["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == HIDDEN),
+        "{doc}"
+    );
+}
+
+/// A destination that already holds something is refused, and nothing in it
+/// moves.
+///
+/// Both halves matter. Exit non-zero is what a script reads; the untouched
+/// bytes are what the user keeps. An export that merged into an older one would
+/// leave a manifest describing some of the files beside it and no way to tell
+/// which.
+#[test]
+fn exporting_into_an_occupied_directory_refuses_and_overwrites_nothing() {
+    let (bench, _keys) = stocked();
+    let dest = bench.root.join("export");
+
+    let out = bench.run(&["export", dest.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let first = manifest(&dest);
+    let files = exported_files(&dest);
+    let sample = files.first().expect("an export wrote files").clone();
+    let sample_bytes = std::fs::read(dest.join(&sample)).unwrap();
+
+    let out = bench.run(&["export", dest.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("already holds an export"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(manifest(&dest), first, "the manifest was rewritten");
+    assert_eq!(exported_files(&dest), files, "the directory changed");
+    assert_eq!(std::fs::read(dest.join(&sample)).unwrap(), sample_bytes);
+
+    // And a directory that holds something that is NOT an export is refused
+    // just as hard: this command never overwrites a file it did not write.
+    let occupied = bench.root.join("not-an-export");
+    std::fs::create_dir_all(&occupied).unwrap();
+    std::fs::write(occupied.join("notes.txt"), b"mine").unwrap();
+    let out = bench.run(&["export", occupied.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stderr(&out).contains("is not empty"), "{}", stderr(&out));
+    assert_eq!(std::fs::read(occupied.join("notes.txt")).unwrap(), b"mine");
+    assert!(!occupied.join("manifest.json").exists());
+}
+
+/// A machine that has never ingested: an answer, exit 0, and neither a store
+/// nor an export directory brought into being by the asking.
+#[test]
+fn export_against_no_store_creates_neither_a_store_nor_a_directory() {
+    let bench = bench();
+    let dest = bench.root.join("export");
+
+    let out = bench.run(&["export", dest.to_str().unwrap(), "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let value = document(&out);
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["data"]["sessions"], 0, "{value}");
+
+    assert!(
+        !bench.data_dir.exists(),
+        "a read created the data directory"
+    );
+    assert!(!dest.exists(), "an empty export still made a directory");
+}
+
+/// Misuse, not a default: there is no sensible place to put an unredacted copy
+/// of every transcript that the user did not name.
+#[test]
+fn export_without_a_destination_is_misuse() {
+    let (bench, _keys) = stocked();
+
+    let out = bench.run(&["export"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(
+        stderr(&out).contains("needs a destination"),
+        "{}",
+        stderr(&out)
     );
 }

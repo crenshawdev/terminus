@@ -24,6 +24,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        status                sizes, counts, watermarks and the last ingest run\n  \
                        compact               reclaim the space retention freed, then truncate the wal\n  \
                        usage                 where the bytes went: by project, by month, by table\n  \
+                       export <dir>          write the archived transcripts out, with a manifest\n  \
                        stats                 whether injection is helping: precision, misses, chars\n  \
                        observations          what happened in every session that has closed\n  \
                        observations regenerate   recompute those facts for a selected set\n  \
@@ -125,6 +126,11 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         // pages by table. Never one number for both - the file is 2.4x the
         // archive, and the difference is the derived tables.
         "usage" => cmd::usage::run(cmd::json_flag(parser)?),
+        // PRIV-04. The transcripts as they arrived, one file per session, plus
+        // a manifest that states in words that they are unredacted and what is
+        // not in them. Redaction is keyed on destination and a directory the
+        // user named is not egress (PRIV-01), so the statement is the answer.
+        "export" => cmd::export::run(cmd::export::parse(parser)?),
         // FEED-04. A CLI data command and never an MCP tool (D-14): every
         // tool description sits in every session's context forever.
         "stats" => cmd::stats::run(cmd::json_flag(parser)?),
