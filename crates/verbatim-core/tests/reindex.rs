@@ -16,11 +16,15 @@ use rusqlite::Connection;
 use verbatim_core::store::{
     schema, Store, DB_FILE_NAME, DERIVED_SCHEMA, META_ARCHIVE_FORMAT, META_DERIVED_SCHEMA,
 };
-use verbatim_core::{ingest, reindex, testkit};
+use verbatim_core::{ingest, reindex, testkit, verify};
 
 struct Bench {
     _dir: tempfile::TempDir,
     data_dir: PathBuf,
+    /// Where the transcripts were copied to. Removable, which is how a test
+    /// makes "the rebuild read no transcript" a fact about the filesystem
+    /// rather than an inference about the code.
+    work: PathBuf,
 }
 
 /// A store with every transcript fixture ingested.
@@ -41,6 +45,7 @@ fn bench() -> Bench {
     Bench {
         _dir: dir,
         data_dir,
+        work,
     }
 }
 
@@ -732,4 +737,165 @@ fn rebuilding_twice_with_an_evicted_session_changes_nothing() {
 
     assert_eq!(twice.preserved, 1);
     assert_eq!(testkit::query_set_json(&bench.conn()), after_one);
+}
+
+/// Does this table carry this column?
+fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .map(Result::unwrap)
+        .any(|name| name == column)
+}
+
+fn count_where(conn: &Connection, predicate: &str) -> i64 {
+    conn.query_row(
+        &format!("SELECT count(*) FROM turns WHERE {predicate}"),
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// AC5, end to end: a store the PREVIOUS build wrote - no `turns.is_typed`, an
+/// older `derived_schema` - opens, acquires the column, is filled from the
+/// blobs with no transcript on disk to read, and then keeps working.
+///
+/// The evicted session is what makes this more than a schema test. Its rows
+/// send `reindex` down the preserving path, which skips the DROP loop and runs
+/// only `CREATE TABLE IF NOT EXISTS` - a no-op on a table that already exists -
+/// so nothing there would create the column and `derive_turn`'s explicit INSERT
+/// list would fail with `no such column` on the rebuild itself and on every
+/// pass afterwards, permanently, since `open_up_to_date` runs at the top of
+/// each one. The `turns` entry in `BRING_FORWARD_COLUMNS` is the only thing
+/// standing between this store and that (v0.1.1 phase 1 D-08); delete it and
+/// this test fails with exactly that message.
+#[test]
+fn a_previous_builds_store_gains_is_typed_and_is_filled_from_the_blobs() {
+    let bench = bench();
+    let evicted = bench.key_ending("session-basic.jsonl");
+    bench.evict(&evicted);
+
+    // The premise for the untouched claim below: there is something to lose.
+    let rows_before = derived_rows(&bench.conn(), &evicted);
+    let ids_before = turn_ids(&bench.conn(), &evicted);
+    // `turns` and its FTS row, which is what this test is about; the
+    // all-four-tables claim is
+    // `a_reindex_carries_an_evicted_session_across_rather_than_losing_its_index`'s,
+    // and it picks a different fixture for it because `session-basic.jsonl`
+    // produces no `paths` row.
+    for table in ["turns", "turns_fts"] {
+        let count = rows_before
+            .iter()
+            .find(|(name, _)| *name == table)
+            .map(|(_, count)| *count)
+            .unwrap_or_else(|| panic!("no {table} count"));
+        assert!(count > 0, "{table} has nothing to preserve");
+    }
+    let evicted_users = count_where(
+        &bench.conn(),
+        &format!("record_type = 'user' AND session_key = '{evicted}'"),
+    );
+    assert!(
+        evicted_users > 0,
+        "the evicted session must hold a user turn for its nulls to mean anything"
+    );
+
+    // Age it to what the previous build wrote.
+    {
+        let conn = bench.conn();
+        conn.execute_batch("ALTER TABLE turns DROP COLUMN is_typed")
+            .unwrap();
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = ?2",
+            rusqlite::params![(DERIVED_SCHEMA - 1).to_string(), META_DERIVED_SCHEMA],
+        )
+        .unwrap();
+        assert!(
+            !has_column(&conn, "turns", "is_typed"),
+            "the premise: the column has to be gone"
+        );
+    }
+
+    // AC5's "with no transcript read", as a fact about the filesystem: every
+    // file the store was built from is deleted, so anything that comes back
+    // came out of `sessions.blob`.
+    std::fs::remove_dir_all(&bench.work).unwrap();
+
+    let store = reindex::open_up_to_date(&bench.data_dir)
+        .expect("a store written by the previous build still opens for work");
+    assert_eq!(
+        store.meta_int(META_DERIVED_SCHEMA).unwrap(),
+        Some(DERIVED_SCHEMA),
+        "the store was not stamped forward"
+    );
+    drop(store);
+
+    let conn = bench.conn();
+    assert!(has_column(&conn, "turns", "is_typed"), "the column is missing");
+
+    // Every rebuilt session's user rows are classified, and nothing else is.
+    assert_eq!(
+        count_where(
+            &conn,
+            &format!("record_type = 'user' AND session_key <> '{evicted}' AND is_typed IS NULL"),
+        ),
+        0,
+        "a rebuilt user turn carries no classification"
+    );
+    assert!(
+        count_where(
+            &conn,
+            &format!("record_type = 'user' AND session_key <> '{evicted}'"),
+        ) > 0,
+        "the rebuild classified nothing, so the count above is empty"
+    );
+    assert_eq!(
+        count_where(&conn, "record_type <> 'user' AND is_typed IS NOT NULL"),
+        0
+    );
+
+    // The evicted session: rows carried across untouched, and null is what its
+    // classification stays, because nothing re-derived it (D-04).
+    assert_eq!(derived_rows(&conn, &evicted), rows_before);
+    assert_eq!(turn_ids(&conn, &evicted), ids_before);
+    assert_eq!(
+        count_where(&conn, &format!("session_key = '{evicted}' AND is_typed IS NOT NULL")),
+        0,
+        "a preserved evicted row was given a classification nothing derived"
+    );
+    drop(conn);
+
+    // And the store still ingests: this is where `no such column` would land
+    // if the column had not reached `turns`.
+    let more = bench.data_dir.parent().unwrap().join("more");
+    std::fs::create_dir_all(&more).unwrap();
+    let path = testkit::copy_fixture_into("session-recall.jsonl", &more);
+    match ingest::run(&bench.data_dir, &path).unwrap() {
+        ingest::Outcome::Committed(_) => {}
+        other => panic!("a further ingest must commit: {other:?}"),
+    }
+    assert_eq!(
+        count_where(
+            &bench.conn(),
+            &format!("record_type = 'user' AND session_key <> '{evicted}' AND is_typed IS NULL"),
+        ),
+        0,
+        "the newly ingested session left a user turn unclassified"
+    );
+    // The evicted session is the exception and stays one: its rows were never
+    // re-derived, so they are still the only NULLs in the table (D-04).
+    assert_eq!(
+        count_where(&bench.conn(), "record_type = 'user' AND is_typed IS NULL"),
+        evicted_users
+    );
+
+    // A regression guard rather than new work: `verify` reads `sessions` and
+    // `session_meta` and never touches `turns` (D-09), so it must be as clean
+    // over this store as over any other.
+    let store = bench.store();
+    let report = verify::verify(&store).unwrap();
+    assert!(report.is_ok(), "{}", report.render());
+    assert!(report.checked > 0);
 }
