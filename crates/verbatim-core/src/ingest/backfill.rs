@@ -137,6 +137,7 @@ pub fn run_with(data_dir: &Path, config: &Config, workers: usize) -> Result<Repo
         &mut projects,
         workers,
         &mut threads,
+        config.capture_mode(),
     );
     summary.duration = started.elapsed();
 
@@ -213,6 +214,9 @@ fn pipeline(
     projects: &mut Resolver,
     workers: usize,
     threads: &mut HashSet<ThreadId>,
+    // Resolved once for the whole run and copied into every worker (ING-07).
+    // `CaptureMode` is `Copy`, so the workers share a value rather than a lock.
+    mode: crate::config::CaptureMode,
 ) -> Result<()> {
     if transcripts.is_empty() {
         return Ok(());
@@ -250,15 +254,14 @@ fn pipeline(
                     // Every job that was sent comes back exactly once,
                     // whatever happened to it - see `panic_error`.
                     let path = job.path.clone();
-                    let prepared = match std::panic::catch_unwind(
-                        std::panic::AssertUnwindSafe(|| {
+                    let prepared =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             crate::ingest::fault::panic_preparing(&job.path);
-                            crate::ingest::prepare(&job.path, job.session_key, &job.existing)
-                        }),
-                    ) {
-                        Ok(prepared) => prepared,
-                        Err(payload) => Err(panic_error(&path, payload)),
-                    };
+                            crate::ingest::prepare(&job.path, job.session_key, &job.existing, mode)
+                        })) {
+                            Ok(prepared) => prepared,
+                            Err(payload) => Err(panic_error(&path, payload)),
+                        };
                     if done
                         .send(Done {
                             slot,

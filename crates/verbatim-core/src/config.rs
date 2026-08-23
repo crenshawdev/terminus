@@ -106,6 +106,24 @@ struct FileConfig {
     /// (STOR-06, D-15).
     #[serde(default)]
     snapshot: FileSnapshot,
+    /// How much of each record the archive stores (ING-07, D-05).
+    #[serde(default)]
+    capture: FileCapture,
+}
+
+/// The `[capture]` table of `verbatim.toml` (ING-07, D-05).
+///
+/// One key, and a missing table means [`CaptureMode::Full`] - the default the
+/// whole archive is specified against, where the stored blob reproduces the
+/// transcript byte for byte. Every other mode trades that away for bytes.
+///
+/// Unrecognized values resolve to `full` rather than failing the load, under the
+/// same rule [`ResponseFormat::parse`] states, and here the reason is sharper
+/// than "the file grows across phases": a typo in this key must not silently
+/// start throwing away tool output.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FileCapture {
+    mode: Option<String>,
 }
 
 /// The `[snapshot]` table of `verbatim.toml` (STOR-06, D-15).
@@ -332,6 +350,71 @@ impl ResponseFormat {
     }
 }
 
+/// How much of each record the archive stores (ING-07, D-05).
+///
+/// The mode acts at ingest, on the record's own JSON line, BEFORE it enters the
+/// blob ([`crate::capture`]): the two reduced modes replace the top-level
+/// `toolUseResult` and `attachment` subtrees with a mark saying how many bytes
+/// stood there. That is an ELISION and not a redaction - it drops a whole named
+/// subtree and records that it did, it never rewrites content in place, and
+/// ingest-time redaction stays barred outright (`.planning/PROJECT.md`).
+///
+/// Two consequences are worth knowing before choosing one:
+///
+/// - Only [`CaptureMode::Full`] reproduces the transcript byte for byte. It is
+///   the default, and a store on defaults behaves exactly as it always has,
+///   down to the bytes - the full path does not even parse the line.
+/// - An elided record's searchable text shrinks with it. `index::text::project`
+///   reads those same two subtrees, so under `lean` and `minimal` the tokens
+///   that were in them are no longer in `turns_fts`. That is the half a user
+///   notices as "search stopped finding that".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// Store every byte of every record. The default (ING-07), and the only
+    /// mode phase 1 D-13's byte-for-byte invariant is a statement about.
+    #[default]
+    Full,
+    /// Elide a `toolUseResult` or `attachment` subtree only when it is LARGE -
+    /// over [`crate::capture::LEAN_THRESHOLD_BYTES`] serialized
+    /// (`DESIGN-BRIEF.md:163`).
+    Lean,
+    /// Elide both subtrees unconditionally, keeping prompts, assistant text,
+    /// tool names and tool arguments (`DESIGN-BRIEF.md:163`).
+    Minimal,
+}
+
+impl CaptureMode {
+    /// Parse the config value. An unrecognized one is [`CaptureMode::Full`],
+    /// under the same rule [`ResponseFormat::parse`] states and for a sharper
+    /// reason: a typo must not silently start throwing away tool output.
+    fn parse(value: &str) -> CaptureMode {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "lean" => CaptureMode::Lean,
+            "minimal" => CaptureMode::Minimal,
+            _ => CaptureMode::Full,
+        }
+    }
+
+    /// Does this mode store the record's bytes untouched?
+    ///
+    /// The one question the ingest path asks, because the answer is what keeps
+    /// the default free: a full pass never parses a line to decide.
+    pub fn is_full(&self) -> bool {
+        matches!(self, CaptureMode::Full)
+    }
+
+    /// The spelling stored in `session_meta.capture_mode` and printed in a
+    /// report. Same strings the config file accepts, so a column value can be
+    /// pasted back into `verbatim.toml`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CaptureMode::Full => "full",
+            CaptureMode::Lean => "lean",
+            CaptureMode::Minimal => "minimal",
+        }
+    }
+}
+
 /// The resolved `[provider]` block (OBS-05, D-05, D-10).
 ///
 /// Base URL, model and key are what differ between a local ollama and a remote
@@ -453,6 +536,7 @@ pub struct Config {
     provider: Provider,
     retention: Retention,
     snapshot: Snapshot,
+    capture: CaptureMode,
 }
 
 /// The defaults, spelled once. Derived `Default` would give both budgets zero,
@@ -480,6 +564,11 @@ impl Default for Config {
             // by default, so a user who never wrote a `[snapshot]` table has
             // them on, daily, three kept.
             snapshot: Snapshot::default(),
+            // `Full` is both the derived zero and the specified default
+            // (ING-07), so this line is the one place in this impl where the
+            // two agree and it is still spelled out: the mode a store captures
+            // under is not a value to leave to a derive.
+            capture: CaptureMode::Full,
         }
     }
 }
@@ -580,6 +669,10 @@ impl Config {
             // same step, every interval, forever. Keeping none is `enabled`.
             keep: file.snapshot.keep.unwrap_or(defaults.keep).max(1),
         };
+        config.capture = non_empty(file.capture.mode)
+            .as_deref()
+            .map(CaptureMode::parse)
+            .unwrap_or_default();
         Ok(config)
     }
 
@@ -737,6 +830,15 @@ impl Config {
     /// How many of the most recent snapshots survive the prune (D-15).
     pub fn snapshots_kept(&self) -> usize {
         self.snapshot.keep
+    }
+
+    /// How much of each record this store archives (ING-07, D-05).
+    ///
+    /// [`CaptureMode::Full`] unless the config says otherwise, including for a
+    /// config file with no `[capture]` table and for no config file at all.
+    /// Nothing in this workspace elides a byte while this is `Full`.
+    pub fn capture_mode(&self) -> CaptureMode {
+        self.capture
     }
 
     /// The Claude config directories, in the order they were configured.

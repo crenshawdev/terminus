@@ -453,3 +453,203 @@ fn observations_declares_no_reference_to_turns() {
     );
     assert!(sql.contains("REFERENCES sessions"), "{sql}");
 }
+
+// --- Phase 8: session_meta.capture_mode (ING-07, D-13, D-19) -----------------
+
+/// Every column of a table, in declaration order, as `(cid, name, type)`.
+///
+/// The ORDER is the assertion. `ALTER TABLE ADD COLUMN` appends, so a column
+/// declared mid-table in `CREATE_SQL` gives a fresh store one order and an
+/// upgraded store another, and any positional `r.get(n)` then reads a different
+/// column depending on how old the store is.
+#[cfg(feature = "testkit")]
+fn column_layout(conn: &Connection, table: &str) -> Vec<(i64, String, String)> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// D-19's whole point, stated as an assertion over both stores at once: a store
+/// written by an earlier binary and brought forward carries `session_meta` in
+/// the same column order a fresh one does.
+#[cfg(feature = "testkit")]
+#[test]
+fn a_brought_forward_session_meta_has_the_same_column_order_as_a_fresh_one() {
+    let aged = aged_store();
+    let brought = Store::open(&aged.data_dir).expect("an aged store opens");
+    let (_dir, fresh_store) = fresh();
+
+    let brought_layout = column_layout(brought.conn(), "session_meta");
+    let fresh_layout = column_layout(fresh_store.conn(), "session_meta");
+    assert_eq!(
+        brought_layout, fresh_layout,
+        "a brought-forward session_meta must be laid out exactly like a fresh one"
+    );
+
+    // The premise: the column this phase added is really there, and really last.
+    let last = brought_layout.last().expect("session_meta has columns");
+    assert_eq!(
+        last.1, "capture_mode",
+        "capture_mode must be the last column"
+    );
+    assert_eq!(last.2, "TEXT");
+
+    // And the same for `runs`, which is the other table with a bring-forward
+    // list - a regression here would be silent everywhere else.
+    assert_eq!(
+        column_layout(brought.conn(), "runs"),
+        column_layout(fresh_store.conn(), "runs")
+    );
+}
+
+/// The upgrade a phase 8 binary actually performs on a phase 7 store: ONE
+/// column missing, `derived_schema` already current. It is added, the store is
+/// not rebuilt, and nothing asks for a rebuild.
+///
+/// `aged_store` cannot answer this - it lowers `derived_schema` to 1, so a
+/// rebuild is required there for a reason that has nothing to do with the
+/// column. D-19's claim is that an added column costs no `DERIVED_SCHEMA` bump,
+/// and this is the only shape that can falsify it.
+#[cfg(feature = "testkit")]
+#[test]
+fn the_capture_mode_column_reaches_an_older_store_without_a_rebuild() {
+    use verbatim_core::store::{DB_FILE_NAME, DERIVED_SCHEMA, META_DERIVED_SCHEMA};
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let path = verbatim_core::testkit::copy_fixture_into("session-basic.jsonl", &work);
+    match verbatim_core::ingest::run(&data_dir, &path).unwrap() {
+        verbatim_core::ingest::Outcome::Committed(_) => {}
+        other => panic!("the fixture must archive: {other:?}"),
+    }
+
+    let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+    let turns_before: i64 = conn
+        .query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    let blob_before: Vec<u8> = conn
+        .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    conn.execute_batch("ALTER TABLE session_meta DROP COLUMN capture_mode")
+        .unwrap();
+    assert!(
+        !columns(&conn, "session_meta").contains("capture_mode"),
+        "the premise: the column is gone"
+    );
+    drop(conn);
+
+    let store = Store::open(&data_dir).expect("a store one column behind still opens");
+    assert!(
+        columns(store.conn(), "session_meta").contains("capture_mode"),
+        "the column did not come back"
+    );
+    assert_eq!(
+        store.meta_int(META_DERIVED_SCHEMA).unwrap(),
+        Some(DERIVED_SCHEMA),
+        "an added column must not move derived_schema"
+    );
+    assert!(
+        store.rebuild_required().is_none(),
+        "an added column must not force a rebuild of the derived tables"
+    );
+
+    let turns_after: i64 = store
+        .conn()
+        .query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    let blob_after: Vec<u8> = store
+        .conn()
+        .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(turns_after, turns_before, "the derived tables were rebuilt");
+    assert!(
+        blob_after == blob_before,
+        "the bring-forward touched the blob"
+    );
+}
+
+/// A config directory holding one `verbatim.toml` naming a capture mode.
+#[cfg(feature = "testkit")]
+fn mode_config(mode: &str) -> (tempfile::TempDir, verbatim_core::Config) {
+    use verbatim_core::config::CONFIG_FILE_NAME;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(CONFIG_FILE_NAME),
+        format!("[capture]\nmode = \"{mode}\"\n"),
+    )
+    .unwrap();
+    let config = verbatim_core::Config::load_from(dir.path()).expect("a capture table parses");
+    (dir, config)
+}
+
+/// D-13's rule, both directions: `full` only while every append was full.
+///
+/// The asymmetry is the point. A `full` pass over a session already captured
+/// lean must NOT move the column back, because `blob::append` copies completed
+/// blocks across untouched - the elided bytes are gone from that blob and no
+/// later pass revisits them.
+#[cfg(feature = "testkit")]
+#[test]
+fn capture_mode_records_the_reduced_mode_whichever_pass_came_first() {
+    use verbatim_core::store::DB_FILE_NAME;
+
+    /// Ingest `fixture`, then append a second fixture's lines to the same file
+    /// and ingest again, under the two named modes in order.
+    fn stored_mode(first: &str, second: &str) -> Option<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let path = verbatim_core::testkit::copy_fixture_into("session-basic.jsonl", &work);
+
+        let (_c1, config) = mode_config(first);
+        match verbatim_core::ingest::run_with(&data_dir, &path, &config).unwrap() {
+            verbatim_core::ingest::Outcome::Committed(_) => {}
+            other => panic!("the first pass must commit: {other:?}"),
+        }
+
+        // Real new bytes, so the second pass is an APPEND and not a no-op: a
+        // session with nothing new never reaches the upsert at all.
+        let mut line = verbatim_core::testkit::boundary_line();
+        line.push(b'\n');
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, &line).unwrap();
+        drop(file);
+
+        let (_c2, config) = mode_config(second);
+        match verbatim_core::ingest::run_with(&data_dir, &path, &config).unwrap() {
+            verbatim_core::ingest::Outcome::Committed(_) => {}
+            other => panic!("the second pass must commit: {other:?}"),
+        }
+
+        let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+        conn.query_row("SELECT capture_mode FROM session_meta", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    assert_eq!(stored_mode("full", "full").as_deref(), Some("full"));
+    assert_eq!(
+        stored_mode("full", "lean").as_deref(),
+        Some("lean"),
+        "a lean append to a full session makes the session lean"
+    );
+    assert_eq!(
+        stored_mode("lean", "full").as_deref(),
+        Some("lean"),
+        "a full append must not un-lean a session whose earlier blocks are elided"
+    );
+    assert_eq!(
+        stored_mode("minimal", "full").as_deref(),
+        Some("minimal"),
+        "the same, for the mode that elides unconditionally"
+    );
+}

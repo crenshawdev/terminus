@@ -317,6 +317,7 @@ fn locked(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
         &found.transcripts,
         &mut summary,
         &mut projects,
+        config.capture_mode(),
     );
 
     // FEED-02, AFTER the walk and before the `runs` row. The turns this pass
@@ -381,6 +382,10 @@ fn walk(
     transcripts: &[PathBuf],
     summary: &mut Summary,
     projects: &mut Resolver,
+    // Resolved once for the whole walk, not per file (ING-07): it is one config
+    // read either way, and a mode that could change between two files of one
+    // pass would be a store whose blobs disagree about what a pass captured.
+    mode: crate::config::CaptureMode,
 ) -> Result<()> {
     for path in transcripts {
         if let Some(after) = crate::ingest::fault::pass_fails_after(data_dir) {
@@ -395,8 +400,14 @@ fn walk(
         summary.files_walked += 1;
         // A fresh `Instant` per file: the elapsed time the pass reports is the
         // walk's, measured by the caller, not this file's.
-        match crate::ingest::ingest_locked(store, path, Instant::now(), RunRow::PassOwns, projects)
-        {
+        match crate::ingest::ingest_locked(
+            store,
+            path,
+            Instant::now(),
+            RunRow::PassOwns,
+            projects,
+            mode,
+        ) {
             Ok(Outcome::Committed(pass)) => {
                 summary.files_committed += 1;
                 summary.bytes_read += pass.bytes_read;

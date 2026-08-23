@@ -26,6 +26,7 @@ pub use lock::{Attempt, IngestLock, LOCK_FILE_NAME};
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::blob;
+use crate::config::CaptureMode;
 use crate::derive;
 use crate::error::{Error, Result};
 use crate::lineage;
@@ -121,6 +122,7 @@ pub fn run_with(
         started,
         RunRow::PerFile,
         &mut projects,
+        config.capture_mode(),
     )
 }
 
@@ -147,6 +149,7 @@ pub(crate) fn ingest_locked(
     started: Instant,
     run_row: RunRow,
     projects: &mut Resolver,
+    mode: CaptureMode,
 ) -> Result<Outcome> {
     // The session is keyed on the transcript FILE identity, never on the
     // record's session id (D-01): 812 real sidecar files report their parent's
@@ -154,7 +157,7 @@ pub(crate) fn ingest_locked(
     // 3 KB agent transcript. The watermark is keyed on the same value.
     let session_key = path_key(path)?;
     let existing = Existing::read(store.conn(), &session_key)?;
-    let prepared = prepare(path, session_key, &existing)?;
+    let prepared = prepare(path, session_key, &existing, mode)?;
     apply(store, prepared, started, run_row, projects)
 }
 
@@ -192,6 +195,11 @@ struct Work {
     uncompressed_len: u64,
     parent_session_key: Option<String>,
     agent_meta: Option<Vec<u8>>,
+    /// The mode this pass's bytes were captured under (ING-07, D-13). Carried
+    /// through to `session_meta.capture_mode` rather than re-read at the write,
+    /// so the column records the mode the blob in this same `Work` was built
+    /// under and cannot drift from it.
+    capture_mode: CaptureMode,
     pass: Pass,
 }
 
@@ -199,7 +207,12 @@ struct Work {
 ///
 /// Every expensive thing a pass does is here - the file read, the JSON scan and
 /// the zstd compression - and none of the cheap ones that need the store.
-pub(crate) fn prepare(path: &Path, session_key: String, existing: &Existing) -> Result<Prepared> {
+pub(crate) fn prepare(
+    path: &Path,
+    session_key: String,
+    existing: &Existing,
+    mode: CaptureMode,
+) -> Result<Prepared> {
     // Before the file is even opened, and the only safe answer for a session
     // retention emptied (RET-02, phase 8 D-03). `blob::append` parses a header
     // out of the stored bytes and an emptied blob has none, so left to the
@@ -319,6 +332,7 @@ pub(crate) fn prepare(path: &Path, session_key: String, existing: &Existing) -> 
             uncompressed_len,
             parent_session_key,
             agent_meta,
+            capture_mode: mode,
             pass,
         }),
         session_key,
@@ -364,6 +378,7 @@ pub(crate) fn apply(
         uncompressed_len,
         parent_session_key,
         agent_meta,
+        capture_mode,
         pass,
     } = work;
     let path = path.as_path();
@@ -415,6 +430,7 @@ pub(crate) fn apply(
             project: project.as_ref(),
             parent_session_key: parent_session_key.as_deref(),
             agent_meta: agent_meta.as_deref(),
+            capture_mode,
             scan: &scan,
         },
     )?;
@@ -971,6 +987,9 @@ struct MetaRow<'a> {
     parent_session_key: Option<&'a str>,
     /// The bytes of the sidecar's `agent-*.meta.json`, stored opaquely (D-04).
     agent_meta: Option<&'a [u8]>,
+    /// Which `[capture]` mode produced the bytes this pass is writing (ING-07,
+    /// D-13). Not `coalesce`d like the columns above - see [`write_session_meta`].
+    capture_mode: CaptureMode,
     scan: &'a Scan,
 }
 
@@ -993,6 +1012,19 @@ fn first_cwd(scan: &Scan) -> Option<String> {
 /// here either, and must not be: it is retention's (RET-02), and an ingest that
 /// cleared it would un-evict a session on the pass after the one that emptied
 /// it. `prepare` never reaches this function for an evicted session at all.
+///
+/// `capture_mode` is the one column that is neither `coalesce`d onto what is
+/// there nor overwritten outright (ING-07, D-13). It reads `full` only while
+/// EVERY append to the session has been full, so:
+///
+/// - a stored null or `full` is replaced by whatever this pass captured under;
+/// - a stored `lean` or `minimal` is never moved back to `full` by a later full
+///   pass, because `blob::append` copies completed blocks across untouched and
+///   the bytes elided under the earlier mode are never revisited;
+/// - a session appended to under two different REDUCED modes reads as the later
+///   one. The guarantee the column carries is exactly "`full` means every append
+///   was full", and a mixed reduced session has no single honest answer beyond
+///   "not full".
 fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
     let scan = row.scan;
     let session_id = scan.records.iter().find_map(|r| r.session_id.clone());
@@ -1011,8 +1043,9 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
         "INSERT INTO session_meta (
             session_key, session_id, transcript_path, checksum, uncompressed_len,
             continues_from, first_turn_at, last_turn_at, cwd, branch,
-            project, project_pre_worktree, parent_session_key, agent_meta
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            project, project_pre_worktree, parent_session_key, agent_meta,
+            capture_mode
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(session_key) DO UPDATE SET
             session_id = coalesce(session_meta.session_id, excluded.session_id),
             transcript_path = excluded.transcript_path,
@@ -1028,7 +1061,12 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
                 session_meta.project_pre_worktree, excluded.project_pre_worktree),
             parent_session_key = coalesce(
                 session_meta.parent_session_key, excluded.parent_session_key),
-            agent_meta = coalesce(session_meta.agent_meta, excluded.agent_meta)",
+            agent_meta = coalesce(session_meta.agent_meta, excluded.agent_meta),
+            capture_mode = CASE
+                WHEN excluded.capture_mode = 'full'
+                    THEN coalesce(session_meta.capture_mode, excluded.capture_mode)
+                ELSE excluded.capture_mode
+            END",
         rusqlite::params![
             row.session_key,
             session_id,
@@ -1044,6 +1082,7 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
             pre_worktree,
             row.parent_session_key,
             row.agent_meta,
+            row.capture_mode.as_str(),
         ],
     )?;
     Ok(())

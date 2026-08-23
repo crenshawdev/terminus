@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use verbatim_core::config::{
-    Config, ResponseFormat, RetentionAction, Secret, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME,
-    DEFAULT_BRIEF_CHARS, DEFAULT_CLAUDE_DIR, DEFAULT_PROMPT_CHARS, DEFAULT_SNAPSHOTS_KEPT,
-    DEFAULT_SNAPSHOT_INTERVAL_HOURS, PROJECTS_SUBDIR, REDACTED,
+    CaptureMode, Config, ResponseFormat, RetentionAction, Secret, CLAUDE_CONFIG_DIR_ENV,
+    CONFIG_FILE_NAME, DEFAULT_BRIEF_CHARS, DEFAULT_CLAUDE_DIR, DEFAULT_PROMPT_CHARS,
+    DEFAULT_SNAPSHOTS_KEPT, DEFAULT_SNAPSHOT_INTERVAL_HOURS, PROJECTS_SUBDIR, REDACTED,
 };
 use verbatim_core::Error;
 
@@ -952,4 +952,101 @@ fn an_unknown_key_inside_the_snapshot_table_is_ignored_rather_than_rejected() {
 
     assert_eq!(config.snapshots_kept(), 5);
     assert!(config.snapshots_enabled());
+}
+
+// ---------------------------------------------------------------------------
+// The `[capture]` table (ING-07, D-05)
+
+fn capture_config(body: &str) -> Config {
+    let dir = config_dir_holding(&[(CONFIG_FILE_NAME, body)]);
+    with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).expect("a capture table is not a parse failure")
+    })
+}
+
+/// The state every user starts in. `full` is the only mode the byte-for-byte
+/// invariant is a statement about, so every way of arriving with nothing
+/// configured has to land on it.
+#[test]
+fn every_unconfigured_route_resolves_to_full_capture() {
+    let missing = config_dir_holding(&[]);
+    let no_file = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(missing.path()).expect("a missing config file is not an error")
+    });
+
+    for (name, config) in [
+        ("no verbatim.toml at all", no_file),
+        (
+            "a file with no [capture] table",
+            capture_config("exclude = []\n"),
+        ),
+        ("an empty [capture] table", capture_config("[capture]\n")),
+        (
+            "an empty mode string",
+            capture_config("[capture]\nmode = \"\"\n"),
+        ),
+        ("a config built with no file", Config::default()),
+        (
+            "a config built from parts",
+            Config::from_parts(Vec::new(), Vec::new()),
+        ),
+    ] {
+        assert_eq!(
+            config.capture_mode(),
+            CaptureMode::Full,
+            "{name}: the default must store every byte"
+        );
+        assert!(config.capture_mode().is_full(), "{name}");
+    }
+}
+
+/// The two reduced modes, and the spellings the column stores.
+#[test]
+fn the_mode_key_selects_the_capture_mode() {
+    for (written, expected) in [
+        ("full", CaptureMode::Full),
+        ("lean", CaptureMode::Lean),
+        ("minimal", CaptureMode::Minimal),
+        // Same rule the other tables follow: trimmed and case-folded, so a
+        // hand-edited file is not held to an exact spelling.
+        ("  LEAN  ", CaptureMode::Lean),
+        ("Minimal", CaptureMode::Minimal),
+    ] {
+        let config = capture_config(&format!("[capture]\nmode = \"{written}\"\n"));
+        assert_eq!(config.capture_mode(), expected, "mode = {written:?}");
+        assert_eq!(config.capture_mode().as_str(), expected.as_str());
+    }
+}
+
+/// A typo must not silently start throwing away tool output, and must not stop
+/// the store from opening either. It resolves to `full`, the same rule
+/// `ResponseFormat::parse` and `RetentionAction::parse` state.
+#[test]
+fn an_unrecognized_capture_mode_resolves_to_full_rather_than_failing_the_load() {
+    for written in ["leen", "none", "off", "everything", "MINIMAL_"] {
+        let config = capture_config(&format!("[capture]\nmode = \"{written}\"\n"));
+        assert_eq!(
+            config.capture_mode(),
+            CaptureMode::Full,
+            "mode = {written:?} must resolve to full, not to an elision"
+        );
+    }
+}
+
+/// The documented rule holds one level down here too.
+#[test]
+fn an_unknown_key_inside_the_capture_table_is_ignored_rather_than_rejected() {
+    let config = capture_config("[capture]\nmode = \"lean\"\nsomething_phase_9_writes = 3\n");
+
+    assert_eq!(config.capture_mode(), CaptureMode::Lean);
+}
+
+/// The spellings round-trip: what `session_meta.capture_mode` stores is what
+/// `verbatim.toml` accepts, so a column value can be pasted back into the file.
+#[test]
+fn the_stored_spelling_is_a_configurable_one() {
+    for mode in [CaptureMode::Full, CaptureMode::Lean, CaptureMode::Minimal] {
+        let config = capture_config(&format!("[capture]\nmode = \"{}\"\n", mode.as_str()));
+        assert_eq!(config.capture_mode(), mode);
+    }
 }

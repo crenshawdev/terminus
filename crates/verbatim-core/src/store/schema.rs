@@ -101,7 +101,24 @@ CREATE TABLE IF NOT EXISTS session_meta (
     -- its parent repo (D-06, ING-05). Both keys are stored so a later deletion
     -- of the worktree directory cannot un-key an already-archived session, and
     -- so the read-side exclusion test can match either path.
-    project_pre_worktree TEXT
+    project_pre_worktree TEXT,
+    -- Which `[capture]` mode this session's bytes were stored under (ING-07,
+    -- phase 8 D-13). Per session rather than a store-wide `meta` key, because
+    -- the byte-for-byte claim for `full` has to be assertable about a session in
+    -- an existing store and not only about a store built from scratch.
+    --
+    -- Null is `full`: it is what every row written before this column existed
+    -- means, and those rows were all written by a binary that had no other mode.
+    -- The column reads `full` only while EVERY append to the session has been
+    -- full - `blob::append` copies completed blocks across untouched, so bytes
+    -- written under an earlier mode are never revisited and a store whose mode
+    -- changes mid-life holds a mix inside one blob.
+    --
+    -- Declared last, and appended last in `BRING_FORWARD_COLUMNS`, which is that
+    -- constant's own rule: `ALTER TABLE ADD COLUMN` appends, so a column placed
+    -- mid-table would give a fresh store and an upgraded store different column
+    -- orders.
+    capture_mode      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_meta_session_id
@@ -401,6 +418,7 @@ pub const BRING_FORWARD_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             ("agent_meta", "BLOB"),
             ("transcript_diverged", "INTEGER"),
             ("project_pre_worktree", "TEXT"),
+            ("capture_mode", "TEXT"),
         ],
     ),
     (
