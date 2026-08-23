@@ -35,6 +35,25 @@ use verbatim_core::testkit;
 /// The fixture whose `cwd` names `project-alpha` beneath the test's own root.
 const FIXTURE: &str = "session-recall.jsonl";
 
+/// The fixture whose `cwd` names `project-gamma`, and whose last `user` record
+/// is a `<task-notification>` envelope rather than a prompt.
+///
+/// The byte-identity test seeds from this one and not from [`FIXTURE`] (D-15).
+/// `session-recall.jsonl`'s only `user` record is a plain text block, so the
+/// turn the brief quotes is the same one under INJ-07's rule and under the rule
+/// it replaced - a test on it cannot observe this phase's change at all, and
+/// two identical briefs of the wrong turn would satisfy byte identity just as
+/// well as two right ones.
+const MOVED_FIXTURE: &str = "session-envelope.jsonl";
+
+/// The one `user` record of [`MOVED_FIXTURE`] a person typed, which is what the
+/// brief must quote.
+const TYPED: &str = "wire up the quince exporter";
+
+/// The two it did not: the tool result's output and the envelope's text. Either
+/// one in the brief is the defect INJ-07 exists to close.
+const NOT_TYPED: [&str; 2] = ["press.toml", "background scan of the modules directory"];
+
 /// Every directory a spawned `verbatim` may touch, all of them temporary.
 struct Bench {
     _dir: tempfile::TempDir,
@@ -160,14 +179,19 @@ fn time_of_day(text: &str) -> Option<String> {
 /// it stands on its own: a brief that changes while the archive does not is a
 /// brief nobody can reason about.
 ///
-/// The time-of-day half is the falsifiable one. Dates are rounded to the day
-/// (INJ-02), so no `NN:NN` may appear anywhere in the output - not in the
-/// rendered date, not carried in from a quoted turn.
+/// Two halves are falsifiable, and both have to be: two empty briefs are
+/// byte-identical, and so are two briefs quoting the wrong turn.
+///
+/// Dates are rounded to the day (INJ-02), so no `NN:NN` may appear anywhere in
+/// the output - not in the rendered date, not carried in from a quoted turn.
+/// And the store is seeded from [`MOVED_FIXTURE`], whose last `user` record is
+/// a harness envelope, so the bytes have to carry the prompt somebody typed and
+/// neither of the two records nobody did (INJ-07).
 #[test]
 fn two_session_starts_against_an_unchanged_store_are_byte_identical() {
     let bench = bench();
-    bench.ingest(FIXTURE);
-    let payload = payload(&bench.project(FIXTURE));
+    bench.ingest(MOVED_FIXTURE);
+    let payload = payload(&bench.project(MOVED_FIXTURE));
 
     let first = bench.hook("SessionStart", &payload);
     let second = bench.hook("SessionStart", &payload);
@@ -194,6 +218,17 @@ fn two_session_starts_against_an_unchanged_store_are_byte_identical() {
         None,
         "the brief carries a time of day: {text}"
     );
+
+    assert!(
+        text.contains(TYPED),
+        "the brief does not quote the prompt somebody typed: {text}"
+    );
+    for absent in NOT_TYPED {
+        assert!(
+            !text.contains(absent),
+            "the brief carries {absent:?}, out of a user record nobody typed: {text}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +246,11 @@ fn two_session_starts_against_an_unchanged_store_are_byte_identical() {
 /// The percentiles are printed as well as asserted: a regression that says
 /// "p99 12.4 ms against 10 ms" is a number the next run can be compared
 /// against, where a bare failed assertion is not.
+///
+/// This one stays on [`FIXTURE`] while the byte-identity test above moved to
+/// [`MOVED_FIXTURE`]: the numbers printed here have been measured against
+/// `session-recall.jsonl` since phase 5, and re-pointing them at a different
+/// session would silently make every earlier reading incomparable.
 #[test]
 fn a_hundred_session_starts_stay_inside_the_budget_and_the_wall_clock() {
     const RUNS: usize = 100;
