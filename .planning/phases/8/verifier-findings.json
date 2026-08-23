@@ -1,0 +1,74 @@
+{
+  "status": "delivered",
+  "score": "8/8",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "A fresh data directory becomes a full phase-8 store on the first ingest, and a primary query returns real rows",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "Spot-check with the built binary against an empty VERBATIM_DATA_DIR: `verbatim ingest <fixture>` created verbatim.db carrying every table in schema::TABLES (sessions, session_meta, turns, turns_fts + shadows, entities, paths, watermarks, runs, meta, compaction_boundaries, decisions, labels, observations) and session_meta ending in the phase-8 columns is_evicted / capture_mode; `verbatim sessions --project '*' --json` then returned ok:true with one real session (8 turns, watermark 5656). Table-set and column-order invariants are pinned by crates/verbatim-core/tests/schema.rs:30 and :457-549, upgrade arm included."
+    },
+    {
+      "n": 2,
+      "truth": "Retention unset deletes and evicts nothing, structurally rather than by luck",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "crates/verbatim-core/src/retention/mod.rs short-circuits on Config::retention_selects_nothing before issuing any query; crates/verbatim-core/tests/retention.rs:134 an_off_policy_names_nothing_however_old_the_store_is (empty, unrelated-table, action-only and age-only configs, ANCIENT corpus) and crates/verbatim-core/tests/pass.rs:641 a_pass_with_no_retention_configured_touches_nothing_and_says_nothing (asserts summary.retention == Applied::default() and every blob still non-empty). Both pass under --features testkit."
+    },
+    {
+      "n": 3,
+      "truth": "An evicted session stays listed, stays searchable, reports body_evicted, survives reindex; a deleted one is gone from both",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "End-to-end at the process boundary after a REAL eviction pass: crates/verbatim/tests/retention.rs:320 an_evicted_session_stays_listed_and_searchable_while_a_deleted_one_is_gone asserts sessions listing contains the evicted key and not the deleted one, that the same UNIQUE_TOKEN search returns the identical turn ids as before eviction, and that `show --json` reports body_evicted true with a null body (:396). Value trace: retention/apply.rs evict_one sets session_meta.is_evicted -> recall/get.rs:192 body_evicted: row.evicted -> both cmd/show.rs:190 and cmd/mcp/tools.rs:556 emit the same field, so the MCP tool consumes the identical Record (mcp.rs:888 asserts the key on the non-evicted path). Reindex half: reindex.rs takes the per-session clear_derived path when preserved > 0 (src/reindex.rs:116-162) and crates/verbatim-core/tests/reindex.rs:574 a_reindex_carries_an_evicted_session_across_rather_than_losing_its_index checks turns/entities/paths/turns_fts rows, turn ids and the fixed query set across the rebuild; :720 rebuilding_twice_with_an_evicted_session_changes_nothing. verify.rs:398/:437 cover the verify arm. All pass under --features testkit."
+    },
+    {
+      "n": 4,
+      "truth": "`retention --dry-run --json` names the set, mutates nothing, and the next pass acts on exactly that set",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "One shared evaluation with the instant passed in rather than re-read (crates/verbatim-core/src/retention/mod.rs, Selection::evaluated_at); command at crates/verbatim/src/cmd/retention.rs wired in crates/verbatim/src/main.rs:149. crates/verbatim/tests/retention.rs:237 the_dry_run_names_exactly_what_the_next_ingest_pass_evicts and :289 running_the_dry_run_twice_changes_no_row_in_any_table both pass under --features testkit; :403 distinguishes off from nothing-due."
+    },
+    {
+      "n": 5,
+      "truth": "`compact` strictly shrinks the size the product itself reports, and `usage` reconciles both archive tables and the footprint",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "crates/verbatim/src/cmd/compact.rs (VACUUM + wal_checkpoint(TRUNCATE) under the ingest lock) and cmd/usage.rs, dispatched at main.rs:124 and :129. Passing under --features testkit: crates/verbatim/tests/lifecycle.rs:185 compact_shrinks_the_footprint_status_reports_and_moves_no_archived_byte, :230 compact_json_reports_an_empty_write_ahead_log_and_the_bytes_it_reclaimed, :260 compact_refuses_while_an_ingest_holds_the_lock_and_changes_nothing, :380 both_archive_tables_and_the_footprint_each_reconcile_to_their_own_total, :492 an_excluded_project_is_in_neither_archive_total."
+    },
+    {
+      "n": 6,
+      "truth": "`data move` relocates the whole data directory and every entry point reads the new location with settings.json untouched",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "Single resolver arm at crates/verbatim-core/src/store/open.rs:630 data_dir() (VERBATIM_DATA_DIR, then the data-location pointer at :601-611, then platform), command at crates/verbatim/src/cmd/data.rs via main.rs:173. crates/verbatim/tests/datamove.rs (no spawn sets VERBATIM_DATA_DIR, by design) :232 the_whole_directory_moves_and_the_settings_file_does_not_change and :293 a_hook_and_an_mcp_server_both_answer_off_the_new_location pass under --features testkit, plus the refusal and confirmation arms at :359 and :385."
+    },
+    {
+      "n": 7,
+      "truth": "A snapshot taken while a pass owns the store is a valid, verifiable store holding exactly the committed sessions",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "SUMMARY's own lead that AC6 is thin does not hold up: crates/verbatim-core/tests/snapshot.rs:111 a_snapshot_taken_mid_pass_opens_verifies_and_excludes_the_uncommitted_session holds the real ingest lock (lock::try_acquire) AND a second connection in an open BEGIN IMMEDIATE with an uncommitted INSERT, takes snapshot::take, commits only afterwards, reopens the copy, asserts verify::verify reports zero failures with report.checked == committed count, and asserts the uncommitted 'mid-pass' key is absent. :160 adds PRAGMA integrity_check = ok. Scheduling is wired at ingest/pass.rs:164 roll(), outside the lock, with :316/:343/:378/:417/:445 covering interval, prune count, off and failure-is-a-note. All 10 pass under --features testkit."
+    },
+    {
+      "n": 8,
+      "truth": "The three capture modes store strictly decreasing bytes, mark every elision, and `full` still reproduces the transcript byte for byte",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "crates/verbatim-core/src/capture.rs elides before the blob at ingest/mod.rs:304 (elide_stream), mode threaded from config through ingest/mod.rs:125 and ingest/pass.rs:320 so the hook-driven pass honours it, recorded per session in session_meta.capture_mode. Passing under --features testkit: tests/capture.rs:469 the_three_modes_store_strictly_decreasing_blobs, :499 full_still_reproduces_the_transcript_byte_for_byte, :107/:171 the mark shape under minimal and lean, :897 the_tree_pass_captures_under_the_configured_mode, plus :513/:558/:583/:600 showing byte ranges, recall_get, verify and reindex all still correct over an elided store, and :640/:772/:796 covering the file-offset vs stored-bytes split that f0397dd fixed. 23/23 pass."
+    }
+  ],
+  "passes": [
+    { "k": 1, "name": "Cold start on a fresh data directory", "evidence": "Fresh VERBATIM_DATA_DIR + `verbatim ingest` created the store with every schema::TABLES table and session_meta ending in is_evicted/capture_mode; `verbatim sessions --project '*' --json` returned ok:true with one real session. Table set and append-at-the-end column order pinned by crates/verbatim-core/tests/schema.rs:30 and :457-549." },
+    { "k": 2, "name": "Retention unset deletes and evicts nothing", "evidence": "Config::retention_selects_nothing short-circuits before any query (crates/verbatim-core/src/retention/mod.rs); tests/retention.rs:134 and tests/pass.rs:641 pass under --features testkit." },
+    { "k": 3, "name": "An evicted session survives listing, search, recall_get and reindex", "evidence": "crates/verbatim/tests/retention.rs:320 (listing, identical search hits, show --json body_evicted true / body null after a real eviction pass, deleted session absent from both) plus crates/verbatim-core/tests/reindex.rs:574 and :720 for the reindex half; body_evicted reaches the MCP tool through the same Record (crates/verbatim/src/cmd/mcp/tools.rs:556)." },
+    { "k": 4, "name": "`retention --dry-run` names the set and changes nothing", "evidence": "crates/verbatim/tests/retention.rs:237 and :289 pass under --features testkit; one shared evaluation with the instant passed in (crates/verbatim-core/src/retention/mod.rs)." },
+    { "k": 5, "name": "`compact` shrinks the reported size and `usage` reconciles", "evidence": "crates/verbatim/tests/lifecycle.rs:185, :230, :260, :380, :492 all pass under --features testkit." },
+    { "k": 6, "name": "`data move` relocates the store without touching settings.json", "evidence": "crates/verbatim/tests/datamove.rs:232 and :293 pass under --features testkit, against the pointer arm in crates/verbatim-core/src/store/open.rs:630." },
+    { "k": 7, "name": "A snapshot taken during an active pass is a valid store", "evidence": "crates/verbatim-core/tests/snapshot.rs:111 takes the snapshot with the ingest lock held and an uncommitted BEGIN IMMEDIATE row outstanding, then verifies zero findings and the uncommitted row's absence; :160 integrity_check ok." },
+    { "k": 8, "name": "Capture modes store strictly decreasing bytes and mark elisions", "evidence": "crates/verbatim-core/tests/capture.rs:469, :499, :107, :171, :897 pass under --features testkit; mode threaded to the hook-driven pass at crates/verbatim-core/src/ingest/pass.rs:320." }
+  ],
+  "gaps": [],
+  "human_checks": []
+}

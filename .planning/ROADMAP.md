@@ -13,7 +13,7 @@ The archive is the product, so it is built first and everything else is built on
 - [x] **Phase 5: Context Injection** - the SessionStart resume brief and precision-first prompt injection
 - [x] **Phase 6: Feedback Loop** - decision logging, outcome labels, offline replay, and stats that prove precision
 - [x] **Phase 7: Observations** - mechanical facts, opt-in LLM judgment, and the egress boundary
-- [ ] **Phase 8: Retention And Lifecycle** - retention actions, capture mode, compaction, usage, snapshots, export and relocation
+- [x] **Phase 8: Retention And Lifecycle** - retention actions, capture mode, compaction, usage, snapshots, export and relocation
 
 ## Phase Details
 
