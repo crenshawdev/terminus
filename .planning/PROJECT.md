@@ -16,7 +16,9 @@ The verbatim transcript is the record: every session archived losslessly and per
 
 ### Active
 
-No cycle open.
+**v0.1.1 — opened 2026-08-23.**
+
+One phase: the `SessionStart` resume brief quotes a turn the user typed, not the tool result Claude Code writes as a `user` record. A defect in shipped v0.1.0 behaviour, not new scope.
 
 **Shipped: v0.1.0 — closed 2026-08-23.**
 
