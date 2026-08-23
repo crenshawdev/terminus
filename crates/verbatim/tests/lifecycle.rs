@@ -71,6 +71,12 @@ impl Bench {
         dest.canonicalize().unwrap()
     }
 
+    /// Write `verbatim.toml` into the config directory this bench points the
+    /// binary at.
+    fn config(&self, text: &str) {
+        std::fs::write(self.config_dir.join("verbatim.toml"), text).unwrap();
+    }
+
     fn ingest(&self) {
         let out = self.run(&["ingest"]);
         assert!(out.status.success(), "ingest: {}", stderr(&out));
@@ -307,5 +313,222 @@ fn compact_against_no_store_is_an_answer_and_creates_nothing() {
     assert!(
         !bench.data_dir.exists(),
         "compact created the data directory it was asked about"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `usage` (RET-05, AC4)
+// ---------------------------------------------------------------------------
+
+/// Every session's archived bytes as SQLite reports them, over the whole store.
+///
+/// The reconciliation target `usage` documents, computed the one way that is
+/// not a second implementation of the report: one `sum()` over one column.
+fn archived_bytes(bench: &Bench) -> i64 {
+    bench
+        .conn()
+        .query_row(
+            "SELECT coalesce(sum(length(blob)), 0) FROM sessions",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// The bytes in one of the two archive tables, added up by the reader.
+fn table_total(rows: &serde_json::Value) -> i64 {
+    rows.as_array()
+        .unwrap_or_else(|| panic!("an archive table is an array: {rows}"))
+        .iter()
+        .map(|row| row["bytes"].as_i64().expect("bytes is a number"))
+        .sum()
+}
+
+/// AC4's second half: both archive tables reconcile to
+/// `sum(length(sessions.blob))`, the footprint reconciles to the database file,
+/// and the two nulls the live store actually has are inside those totals rather
+/// than dropped out of them (D-09, D-18).
+///
+/// The null rows are what make this more than an arithmetic identity. A
+/// `GROUP BY` that silently discards them still produces two tables that look
+/// right and a total that no longer adds up, and the live store has exactly one
+/// session with no `project` and one with no `first_turn_at`.
+///
+/// Two sessions are deleted first so the freelist is not empty. On a store
+/// nothing has ever deleted from, `freelist_count` is zero and the footprint
+/// reconciles whether or not the freelist has a row at all - which would make
+/// this pass for the wrong reason and leave `compact`'s own number unproven.
+#[test]
+fn both_archive_tables_and_the_footprint_each_reconcile_to_their_own_total() {
+    let (bench, keys) = stocked();
+    let freed: Vec<&Path> = keys[(SESSIONS - 2) as usize..]
+        .iter()
+        .map(PathBuf::as_path)
+        .collect();
+    bench.delete(&freed);
+    {
+        let conn = bench.conn();
+        conn.execute(
+            "UPDATE session_meta SET project = NULL WHERE session_key = ?1",
+            [keys[0].to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_meta SET first_turn_at = NULL WHERE session_key = ?1",
+            [keys[1].to_string_lossy()],
+        )
+        .unwrap();
+    }
+    let expected = archived_bytes(&bench);
+    assert!(
+        expected > 0,
+        "this test needs archived bytes to account for"
+    );
+
+    let out = bench.run(&["usage", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "", "the document already carries the report");
+    let value = document(&out);
+    let data = &value["data"];
+
+    assert_eq!(data["sessions"], (SESSIONS - 2) as i64, "{value}");
+    assert_eq!(data["archive_bytes"], expected, "{value}");
+    assert_eq!(
+        table_total(&data["by_project"]),
+        expected,
+        "the per-project bytes do not add up to the archive: {value}"
+    );
+    assert_eq!(
+        table_total(&data["by_month"]),
+        expected,
+        "the per-month bytes do not add up to the archive: {value}"
+    );
+
+    // The two nulls each have a bucket of their own, and their bytes are in it.
+    let unnamed = |rows: &serde_json::Value, field: &str| -> serde_json::Value {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row[field].is_null())
+            .unwrap_or_else(|| panic!("no bucket for the null {field}: {rows}"))
+            .clone()
+    };
+    for (table, field) in [("by_project", "project"), ("by_month", "month")] {
+        let bucket = unnamed(&data[table], field);
+        assert_eq!(bucket["sessions"], 1, "{table}: {bucket}");
+        assert!(
+            bucket["bytes"].as_i64().unwrap() > 0,
+            "the null bucket carries no bytes, so it is not in the total: {bucket}"
+        );
+    }
+
+    // The footprint is the other table, and it reconciles to the other total.
+    let conn = bench.conn();
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
+    let page_count: i64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(data["file_bytes"], page_count * page_size, "{value}");
+    let footprint: i64 = data["footprint"]
+        .as_array()
+        .expect("the footprint is an array")
+        .iter()
+        .map(|row| row["bytes"].as_i64().unwrap())
+        .sum();
+    assert_eq!(
+        footprint,
+        page_count * page_size,
+        "the footprint rows do not add up to the database file: {value}"
+    );
+    let freelist = data["footprint"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "(free pages)")
+        .unwrap_or_else(|| panic!("the freelist has no row, so `compact` has no number: {value}"))
+        .clone();
+    assert!(
+        freelist["bytes"].as_i64().unwrap() > 0,
+        "the delete freed no pages, so this store cannot prove the freelist row \
+         is inside the total: {value}"
+    );
+
+    // And the two tables really are independent: the archive is a fraction of
+    // the file, never the same number.
+    assert!(
+        data["archive_bytes"].as_i64().unwrap() < data["file_bytes"].as_i64().unwrap(),
+        "{value}"
+    );
+}
+
+/// AC4 and ING-08: a project excluded after its sessions were archived is in
+/// neither archive total.
+///
+/// Exclusion is retroactive and binds every read path alike, so a report of
+/// what the store holds is not the one place a user's "never look at this" gets
+/// an exception. The month total is the half that catches a project filter
+/// written in only one of the two groupings.
+#[test]
+fn an_excluded_project_is_in_neither_archive_total() {
+    let (bench, keys) = stocked();
+    const HIDDEN: &str = "/data/projects/excluded-from-usage";
+
+    bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET project = ?2 WHERE session_key = ?1",
+            rusqlite::params![keys[0].to_string_lossy(), HIDDEN],
+        )
+        .unwrap();
+    let everything = archived_bytes(&bench);
+    bench.config(&format!("exclude = [\"{HIDDEN}\"]\n"));
+
+    let out = bench.run(&["usage", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let value = document(&out);
+    let data = &value["data"];
+
+    assert_eq!(data["sessions"], (SESSIONS - 1) as i64, "{value}");
+    let visible = data["archive_bytes"].as_i64().unwrap();
+    assert!(
+        visible < everything,
+        "the excluded session's bytes are still in the total: {visible} of {everything}"
+    );
+    assert_eq!(table_total(&data["by_project"]), visible, "{value}");
+    assert_eq!(table_total(&data["by_month"]), visible, "{value}");
+    assert!(
+        !data["by_project"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["project"] == HIDDEN),
+        "the excluded project is named in the report: {value}"
+    );
+}
+
+/// A machine that has never ingested: an answer, exit 0, and no store created
+/// by the asking.
+#[test]
+fn usage_against_no_store_is_a_reason_and_creates_nothing() {
+    let bench = bench();
+
+    let out = bench.run(&["usage", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let value = document(&out);
+    assert_eq!(value["ok"], true, "{value}");
+    assert!(
+        value["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("no verbatim store")),
+        "{value}"
+    );
+    assert_eq!(value["data"]["archive_bytes"], 0, "{value}");
+    assert_eq!(value["data"]["file_bytes"], 0, "{value}");
+
+    assert!(
+        !bench.data_dir.exists(),
+        "a read created the data directory"
     );
 }

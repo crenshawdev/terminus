@@ -23,6 +23,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        reindex               rebuild the derived tables from the blobs\n  \
                        status                sizes, counts, watermarks and the last ingest run\n  \
                        compact               reclaim the space retention freed, then truncate the wal\n  \
+                       usage                 where the bytes went: by project, by month, by table\n  \
                        stats                 whether injection is helping: precision, misses, chars\n  \
                        observations          what happened in every session that has closed\n  \
                        observations regenerate   recompute those facts for a selected set\n  \
@@ -119,6 +120,11 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         // the ingest lock, because a plain `VACUUM` fails outright while a pass
         // holds a write transaction.
         "compact" => cmd::compact::run(cmd::json_flag(parser)?),
+        // RET-05. Two tables that each reconcile to their own total (D-09):
+        // archived blob bytes by project and by month, and the database file's
+        // pages by table. Never one number for both - the file is 2.4x the
+        // archive, and the difference is the derived tables.
+        "usage" => cmd::usage::run(cmd::json_flag(parser)?),
         // FEED-04. A CLI data command and never an MCP tool (D-14): every
         // tool description sits in every session's context forever.
         "stats" => cmd::stats::run(cmd::json_flag(parser)?),

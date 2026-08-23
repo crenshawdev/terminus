@@ -1,5 +1,5 @@
 //! The subcommands: `ingest`, `backfill`, `search`, `show`, `sessions`, `verify`,
-//! `reindex`, `status`, `compact`, `doctor`, `mcp`.
+//! `reindex`, `status`, `compact`, `usage`, `doctor`, `mcp`.
 //!
 //! `mcp` is the one that keeps none of what follows. It is not a data command
 //! typed at a terminal: it is a JSON-RPC server spawned by Claude Code, its
@@ -53,6 +53,7 @@ pub mod spawn;
 pub mod stats;
 pub mod status;
 pub mod uninstall;
+pub mod usage;
 pub mod verify;
 
 use std::path::{Path, PathBuf};
