@@ -106,7 +106,7 @@
 - [ ] (phase 4) AC3's Windows half - no console window, no handle inherited from the hook - is unrunnable on Linux and stays a human-verify on a Windows machine.
 - [ ] (phase 4) npm's os/cpu selection of an optionalDependency cannot be exercised locally, only the shim's resolution of an already-placed platform package. AC9's remaining risk lives in the publish step (D-21).
 - [ ] (phase 4) Four of the five npm platform packages carry no binary; they arrive with cross-compilation in a later shipping step. pack-local.sh fails with a named message on any host it cannot stage.
-- [ ] (phase 4) The npm name 'verbatim' and the '@verbatim' scope have not been checked for availability, and crates.io's 'verbatim' is already taken. Publish-step question for the human.
+- [ ] (phase 4) npm name checked 2026-08-23: 'verbatim' is TAKEN (dormant - 0.0.1, last published 2022-06-28, "Record and replay error first callbacks in a deterministic order"), so npm/verbatim/package.json's current name cannot publish. 'verbatim-cli' is free on npm. The '@verbatim' scope owner is still unresolved (npmjs.com answers 403 to anonymous org/user probes). crates.io is moot - both crates are now publish = false (0f18d04). Naming decision deferred to the publish milestone; see Seeds.
 - [ ] (phase 4) ingest::backfill deliberately does not honour fault::pass_fails_after (the 'a pass that died still leaves its runs row' fault). The sequential walk still has it; add it if a later task wants to kill a backfill's walk rather than its process.
 - [ ] (phase 4) cargo fmt --check reports two pre-existing diffs in crates/verbatim/tests/hook.rs, both on lines committed in plan 1 and neither in code any later pass wrote. cargo fmt closes them whenever the file is next edited for its own reasons.
 - [ ] (phase 4) Declined an engines.node field on the thin npm package - nothing in the Verify exercises a Node floor and the shim uses only long-present APIs. Add one when a task states a minimum.
@@ -151,6 +151,104 @@
 
 
 ## Seeds
+
+### Publish milestone (discussed 2026-08-23, not yet a roadmap milestone)
+
+Scope note: v0.1.1 stays the hardening cycle (phases 1-4). Publishing is its own
+later milestone. Nothing below is planned work yet.
+
+**Decided**
+
+- Canonical code home is Forgejo, `git.jcrenshaw.dev/crenshawdev/verbatim`.
+  Issues, PRs and releases live there. Both it and its issue tracker already
+  answer 200 anonymously, so strangers can read without an account.
+- GitHub is a discovery mirror and nothing else: Issues off in settings, a PR
+  template and CONTRIBUTING routing contributors to Forgejo, and a first line in
+  the README marking it read-only. GitHub cannot fully disable PRs, so the
+  template is what keeps an opened PR from being a silent void.
+- Builds run on GitHub Actions, all five targets on native runners (ubuntu,
+  ubuntu arm64, windows-latest, macos-latest). The droplet builds nothing, which
+  retires the capacity question and the whole cross-compilation problem
+  (cargo-zigbuild, cargo-xwin, osxcross) unopened.
+- npm publish uses trusted publishing (OIDC). No long-lived npm token exists
+  anywhere. This was the deciding factor: an npm publish token can push
+  arbitrary code to every user of a tool that reads every transcript and holds
+  provider credentials, so the best outcome is for it not to exist.
+- Accepted consequence: `npm/verbatim/package.json`'s `repository.url` MUST
+  point at `github.com/crenshawdev/verbatim`, because trusted publishing
+  verifies an exact match. The public provenance attestation will therefore name
+  the GitHub mirror as the build source. That is accurate rather than
+  misleading - it records where the bytes were built, which is a different claim
+  from where the code lives. `Cargo.toml`'s `repository` is unconstrained and
+  moves to Forgejo; both READMEs lead with the canonical home.
+- Neither crate goes to crates.io. `publish = false` landed in 0f18d04. Verbatim
+  is a binary application, not a library: `cargo install` would make users
+  compile bundled SQLite under LTO on their own machine, needs a Rust toolchain
+  most Claude Code users do not have, and produces no provenance.
+- `win32-x64` stays in the platform matrix.
+
+**Constraints measured or verified 2026-08-23**
+
+- npm trusted publishing supports GitHub Actions, GitLab CI and CircleCI cloud
+  only. **Self-hosted runners are not supported**, which is what killed the
+  earlier idea of publishing from a Forgejo runner on the droplet - that path
+  would need a classic long-lived token, the exact thing being designed out.
+- Requires `id-token: write` in the workflow and npm CLI >= 11.5.1. Provenance
+  needs a public repo AND a public package, and is silently skipped otherwise.
+- The npmjs.com trusted-publisher config needs org/user, repository, workflow
+  filename and environment name, all case-sensitive and exact. Configurations
+  created after 2026-05-20 must also explicitly select the allowed actions.
+- Provenance is automatic under OIDC (no `--provenance` flag) and yields a SLSA
+  Build Level 3 attestation naming repository, commit and workflow.
+- Apple's SDK licence permits use only on Apple hardware, so cross-compiling the
+  two darwin targets on a Linux droplet would mean knowingly violating an EULA.
+  GitHub's macos runners are Apple hardware and legal, which is a second
+  independent reason builds sit there.
+- npm does not set `com.apple.quarantine`, so an unsigned darwin binary
+  installed through the npm shim generally runs without a Gatekeeper prompt. A
+  release tarball downloaded in a browser does get quarantined. Codesigning and
+  notarization therefore matter for the release channel, not the npm one.
+
+**Open, needs a decision before anything publishes**
+
+- The npm package name. `verbatim` is taken (see the phase 4 todo above), and
+  `package.json` currently claims it. Whatever replaces it moves through the
+  package name, the `bin` entry, both READMEs, the install docs and every
+  platform package under the scope.
+- Whether the `@verbatim` scope is claimable - anonymous probes return 403.
+- SECURITY.md and a private disclosure channel. Forgejo has no GitHub-style
+  private vulnerability reporting, so this is an email address. Key
+  `693AB15F91734B0C` already signs the commits and could both sign releases and
+  receive reports, one identity to verify.
+- What compatibility promise the archive format makes across 0.x, once people
+  other than John hold archives and schema migration stops being private.
+- Whether a tag arriving at GitHub via Forgejo's push mirror triggers Actions.
+  It should - mirror pushes authenticate with a PAT, and only pushes made by a
+  workflow's own `GITHUB_TOKEN` are suppressed - but it is load-bearing and
+  unverified. Fallback is `workflow_dispatch`.
+- Release CI does not exist at all: neither `.github/workflows` nor
+  `.forgejo/workflows` is present in the tree.
+- The version bump. Workspace `Cargo.toml` and `npm/verbatim/package.json` both
+  still say 0.1.0 while the branch is `cadence/v0.1.1`.
+
+**Proposed amendment to Phase 3 (v0.1.1, awaiting John's yes)**
+
+Phase 3 currently says Windows ACL handling stays deferred per D-15 with a
+`doctor` caveat. Replace that with an effective-DACL **check** - not
+enforcement - on the data directory, the database and `verbatim.toml`: refuse or
+warn when access extends beyond owner, SYSTEM and Administrators, and have
+`doctor` print the `icacls` fix the way it prints `chmod`.
+
+Reasoning, which reverses an earlier framing of mine that Windows was the weak
+platform: default ACL inheritance under `%LOCALAPPDATA%` already grants only the
+owning user, SYSTEM and Administrators, which is tighter than what umask 022
+gives on Linux. Writing explicit DACLs is therefore mostly redundant with
+inheritance. The actual gap is that verbatim asserts and verifies nothing, so it
+cannot distinguish that safe default from roaming or redirected profiles, folder
+redirection onto a network share, a relocated data dir, or an export written to
+a shared drive. A check is the honest analogue of the Unix mode test, is a read
+rather than a write, and closes D-15 instead of deferring it again. WSL users
+hit the Unix arm unchanged and need none of it.
 
 ## Notes
 
