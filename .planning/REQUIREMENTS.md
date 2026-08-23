@@ -13,7 +13,7 @@ all 64 ids with the phase that delivered each.
 
 ### Injection (INJ)
 
-- **INJ-07**: The resume brief's quoted prompt is a turn the user typed. A `user` record carrying a tool result is not eligible to be quoted under "It last asked", the typed/tool-result discriminator is stored at ingest rather than derived by decompressing turns on the cold-start path, and a store written before this build acquires it by backfill from blobs alone. Closes the gap between `DESIGN-BRIEF.md:230`'s "last prompt" and `inject/brief.rs`'s `record_type = 'user'`, which is the transcript's own `type` field and therefore matches both.
+- **INJ-07**: The resume brief's quoted prompt is a turn the user typed. A `user` record not authored by the person - a tool result, an `isMeta` record, or a harness envelope - is not eligible to be quoted under "It last asked", the typed/not-typed discriminator is stored at ingest rather than derived by decompressing turns on the cold-start path, and a store written before this build acquires it by backfill from blobs alone. Closes the gap between `DESIGN-BRIEF.md:230`'s "last prompt" and `inject/brief.rs`'s `record_type = 'user'`, which is the transcript's own `type` field and therefore matches both.
 
 ## Shipped
 
