@@ -377,6 +377,10 @@ fn a_corrupt_blob_is_skipped_and_named_rather_than_stopping_the_rebuild() {
         reindex::reindex(&mut store).expect("one damaged session must not fail the rebuild");
 
     assert_eq!(
+        rebuilt.preserved, 0,
+        "a store with no evicted session must take the drop-and-recreate path"
+    );
+    assert_eq!(
         rebuilt.failed.len(),
         1,
         "expected exactly one skipped session"
@@ -460,4 +464,272 @@ fn a_reindex_leaves_every_observation_row_untouched() {
         "the rebuild moved an observation"
     );
     assert_eq!(count(&bench.conn(), "observations"), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 D-03: the one case where the blob cannot answer.
+//
+// An evicted session has no blob and its `turns_fts` row cannot be
+// reconstructed by any other means - the table is `content=''`, so the
+// projected body is not readable back out of it, and the record bytes
+// `index::project` built it from are gone. Dropping the table destroys them
+// with nothing anywhere able to reproduce them, and `open_up_to_date` runs at
+// the top of every pass, so it would happen unattended inside the ingest lock.
+// ---------------------------------------------------------------------------
+
+/// How many derived rows one session owns, per table.
+fn derived_rows(conn: &Connection, key: &str) -> Vec<(&'static str, i64)> {
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [key], |r| r.get(0)).unwrap() };
+    vec![
+        (
+            "turns",
+            count("SELECT count(*) FROM turns WHERE session_key = ?1"),
+        ),
+        (
+            "entities",
+            count(
+                "SELECT count(*) FROM entities WHERE turn_id IN
+                 (SELECT id FROM turns WHERE session_key = ?1)",
+            ),
+        ),
+        (
+            "paths",
+            count(
+                "SELECT count(*) FROM paths WHERE turn_id IN
+                 (SELECT id FROM turns WHERE session_key = ?1)",
+            ),
+        ),
+        (
+            "turns_fts",
+            count(
+                "SELECT count(*) FROM turns_fts WHERE rowid IN
+                 (SELECT id FROM turns WHERE session_key = ?1)",
+            ),
+        ),
+    ]
+}
+
+/// Every turn id one session owns, in order. Ids and not counts: a rebuild that
+/// renumbered would return the same number of rows pointing at other records.
+fn turn_ids(conn: &Connection, key: &str) -> Vec<i64> {
+    conn.prepare("SELECT id FROM turns WHERE session_key = ?1 ORDER BY id")
+        .unwrap()
+        .query_map([key], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// The turn ids one FTS query returns for one session.
+fn fts_hits(conn: &Connection, key: &str, query: &str) -> Vec<i64> {
+    conn.prepare(
+        "SELECT f.rowid FROM turns_fts f JOIN turns t ON t.id = f.rowid
+         WHERE turns_fts MATCH ?2 AND t.session_key = ?1 ORDER BY f.rowid",
+    )
+    .unwrap()
+    .query_map(rusqlite::params![key, query], |r| r.get(0))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+impl Bench {
+    /// The session key of an ingested fixture, by the file name it landed under.
+    fn key_ending(&self, suffix: &str) -> String {
+        self.conn()
+            .query_row(
+                "SELECT session_key FROM sessions WHERE session_key LIKE '%' || ?1",
+                [suffix],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("no session ending in {suffix}: {e}"))
+    }
+
+    /// Empty a session's blob and mark it, exactly as `retention::apply` does.
+    fn evict(&self, key: &str) {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE sessions SET blob = x'' WHERE session_key = ?1",
+            [key],
+        )
+        .unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE session_meta SET is_evicted = 1 WHERE session_key = ?1",
+                [key],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "no session_meta row for {key}");
+    }
+}
+
+/// The evicted sessions' rows are carried across, every other session is
+/// rebuilt from its blob exactly as before, and the whole fixed query set comes
+/// back byte-identical.
+///
+/// Two sessions are evicted rather than one: the fixture carrying
+/// `FIXED_QUERIES`' own token is what makes the FTS claim concrete, and the one
+/// holding `paths` rows is what makes the claim cover all four tables.
+#[test]
+fn a_reindex_carries_an_evicted_session_across_rather_than_losing_its_index() {
+    let bench = bench();
+    let before = testkit::query_set_json(&bench.conn());
+
+    let basic = bench.key_ending("session-basic.jsonl");
+    let with_paths: String = bench
+        .conn()
+        .query_row(
+            "SELECT t.session_key FROM paths p JOIN turns t ON t.id = p.turn_id
+             GROUP BY t.session_key ORDER BY count(*) DESC, t.session_key LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the corpus has to produce a path row somewhere");
+    let mut evicted: Vec<String> = vec![basic.clone(), with_paths.clone()];
+    evicted.sort();
+    evicted.dedup();
+
+    // The premise, stated per table: there is something to lose in each of them.
+    let rows_before: Vec<(String, Vec<(&str, i64)>)> = evicted
+        .iter()
+        .map(|key| (key.clone(), derived_rows(&bench.conn(), key)))
+        .collect();
+    let ids_before: Vec<Vec<i64>> = evicted
+        .iter()
+        .map(|key| turn_ids(&bench.conn(), key))
+        .collect();
+    let brillig_before = fts_hits(&bench.conn(), &basic, testkit::UNIQUE_TOKEN);
+    assert!(
+        !brillig_before.is_empty(),
+        "the evicted session has to be searchable to start with"
+    );
+    for (table, count) in derived_rows(&bench.conn(), &with_paths) {
+        assert!(count > 0, "{table} has nothing to preserve");
+    }
+
+    for key in &evicted {
+        bench.evict(key);
+    }
+    // Taken AFTER the eviction: emptying a blob is a change to the archive and
+    // this comparison is about what the REBUILD does to it.
+    let archive_before = testkit::archive_digest(&bench.conn());
+
+    let mut store = bench.store();
+    let rebuilt = reindex::reindex(&mut store).unwrap();
+    drop(store);
+
+    assert_eq!(rebuilt.preserved, evicted.len());
+    assert_eq!(
+        rebuilt.sessions,
+        testkit::TRANSCRIPT_FIXTURES.len() - evicted.len(),
+        "an evicted session must not be counted as one this build rebuilt"
+    );
+    assert!(
+        rebuilt.failed.is_empty(),
+        "an emptied blob is not a damaged one: {:?}",
+        rebuilt.failed
+    );
+
+    // (a): the evicted sessions' own rows, table by table and id by id.
+    for (index, key) in evicted.iter().enumerate() {
+        assert_eq!(
+            derived_rows(&bench.conn(), key),
+            rows_before[index].1,
+            "a derived row of the evicted session {key} was lost"
+        );
+        assert_eq!(turn_ids(&bench.conn(), key), ids_before[index]);
+    }
+    assert_eq!(
+        fts_hits(&bench.conn(), &basic, testkit::UNIQUE_TOKEN),
+        brillig_before,
+        "a search that matched the evicted session's turn no longer does"
+    );
+
+    // (b): and every other session is exactly what it was, which the fixed
+    // query set says across the whole store at once.
+    assert_eq!(testkit::query_set_json(&bench.conn()), before);
+    assert_eq!(
+        testkit::archive_digest(&bench.conn()),
+        archive_before,
+        "the rebuild touched the archive"
+    );
+}
+
+/// The preserving path is still a rebuild: it drops nothing it must not, and it
+/// still reads every other blob. A corrupt session beside an evicted one lands
+/// on `failed` and the evicted one does not, which is the distinction the two
+/// counts exist for.
+#[test]
+fn the_preserving_path_still_names_a_corrupt_blob_and_does_not_confuse_the_two() {
+    let bench = bench();
+    let evicted = bench.key_ending("session-basic.jsonl");
+    let corrupt = bench.key_ending("session-recall.jsonl");
+    let preserved_ids = turn_ids(&bench.conn(), &evicted);
+    assert!(!preserved_ids.is_empty());
+
+    bench.evict(&evicted);
+    {
+        let conn = bench.conn();
+        let mut blob: Vec<u8> = conn
+            .query_row(
+                "SELECT blob FROM sessions WHERE session_key = ?1",
+                [&corrupt],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for byte in blob.iter_mut().skip(60).take(150) {
+            *byte = 0;
+        }
+        conn.execute(
+            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
+            rusqlite::params![blob, &corrupt],
+        )
+        .unwrap();
+    }
+
+    let mut store = bench.store();
+    let rebuilt = reindex::reindex(&mut store).unwrap();
+    drop(store);
+
+    assert_eq!(rebuilt.preserved, 1);
+    assert_eq!(rebuilt.failed.len(), 1, "{:?}", rebuilt.failed);
+    assert_eq!(rebuilt.failed[0].0, corrupt);
+    assert_eq!(
+        turn_ids(&bench.conn(), &evicted),
+        preserved_ids,
+        "the evicted session lost its index on the path that preserves it"
+    );
+    assert_eq!(
+        turn_ids(&bench.conn(), &corrupt),
+        Vec::<i64>::new(),
+        "a blob that will not decompress cannot have rebuilt anything"
+    );
+    // And every session that was neither is back.
+    assert!(count(&bench.conn(), "turns") > 0);
+    assert_eq!(
+        count(&bench.conn(), "sessions") as usize,
+        testkit::TRANSCRIPT_FIXTURES.len(),
+        "the rebuild removed a session row"
+    );
+}
+
+/// The preserving path is idempotent too: running it twice changes nothing, so
+/// a store that acquires an evicted session does not drift a little on every
+/// upgrade.
+#[test]
+fn rebuilding_twice_with_an_evicted_session_changes_nothing() {
+    let bench = bench();
+    bench.evict(&bench.key_ending("session-basic.jsonl"));
+
+    let mut store = bench.store();
+    reindex::reindex(&mut store).unwrap();
+    drop(store);
+    let after_one = testkit::query_set_json(&bench.conn());
+
+    let mut store = bench.store();
+    let twice = reindex::reindex(&mut store).unwrap();
+    drop(store);
+
+    assert_eq!(twice.preserved, 1);
+    assert_eq!(testkit::query_set_json(&bench.conn()), after_one);
 }
