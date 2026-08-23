@@ -393,6 +393,130 @@ Empty is the ordinary answer and always exit 0, with `reason` saying which
 empty: no store yet, no `[retention]` table selecting anything, or a configured
 policy with nothing due. Retention is off by default.
 
+### `compact`
+
+```json
+{"before": {"db": 15065088, "wal": 0, "shm": 32768, "total": 15097856},
+ "after": {"db": 7540736, "wal": 0, "shm": 32768, "total": 7573504},
+ "reclaimed_bytes": 7524352}
+```
+
+`verbatim compact` reclaims the space retention already freed. It deletes
+nothing and has no opinion about what should be kept: what to keep is
+retention's decision, made inside the ingest pass, and this is the command that
+gives the pages back to the filesystem afterwards.
+
+- `before` and `after` are **the same three files `status` reports as
+  `size_bytes`** - `verbatim.db`, `verbatim.db-wal` and `verbatim.db-shm` - each
+  measured with the connection open, so the two are the same measurement of the
+  same store in two states. `total` is their sum.
+- The three components are carried apart because the total alone cannot be read.
+  `compact` is `VACUUM` followed by `PRAGMA wal_checkpoint(TRUNCATE)`, and both
+  halves are load-bearing: a bare `VACUUM` on a WAL store writes the whole
+  rebuilt database THROUGH the WAL, so `verbatim.db` shrinks while the WAL grows
+  by as much or more and the store on disk gets *bigger*. An `after` whose `wal`
+  is not 0 is that failure, visible.
+- `reclaimed_bytes` is `before.total - after.total` and is **signed**. A
+  compaction that reclaimed nothing and left the store fractionally larger
+  reports a negative number rather than a floor of zero.
+- **Exit 1 when the ingest lock is held**, with the document still written and
+  `ok` false. This is the one place the "0 including an empty result" rule does
+  not apply, and deliberately: a contended `ingest` exits 0 because the next
+  hook spawn catches what it skipped, but a compaction was asked for explicitly
+  and one that did not happen is an operational failure. `before` and `after`
+  are the same unchanged measurement in that document, because nothing moved.
+- A machine with no store is an ordinary empty answer: exit 0, a `reason`, all
+  numbers zero, and no data directory created by the asking.
+
+### `usage`
+
+```json
+{"sessions": 3416, "archive_bytes": 465985120,
+ "by_project": [{"project": "/data/code/verbatim", "sessions": 812, "bytes": 141203456},
+                {"project": null, "sessions": 1, "bytes": 4096}],
+ "by_month": [{"month": "2026-08", "sessions": 3415, "bytes": 465981024},
+              {"month": null, "sessions": 1, "bytes": 4096}],
+ "file_bytes": 1103396864,
+ "footprint": [{"name": "sessions", "bytes": 469413888},
+               {"name": "turns_fts_data", "bytes": 350846976},
+               {"name": "(free pages)", "bytes": 1126400},
+               {"name": "(lock page)", "bytes": 4096}]}
+```
+
+**Two independent tables, and they never mix.** Each reconciles to its own total
+and to nothing else. That is the whole design, and reading one against the
+other's total is the mistake it exists to prevent.
+
+- The ARCHIVE table is `by_project` and `by_month`. The bytes in each add up to
+  `archive_bytes`, which is `sum(length(sessions.blob))` over the sessions a
+  read path may see - and **not** to `file_bytes`. On the live store measured
+  2026-08-22 the file is 1,103,396,864 bytes against 465,985,120 of archive,
+  2.4x everything the projects account for; the rest is the derived tables, and
+  attributing them to projects pro-rata would make every per-project number an
+  estimate rather than a measurement.
+- A session with no `project` and a session with no `first_turn_at` each get a
+  bucket whose key is `null`. They are counted and their bytes are inside the
+  totals: a null quietly dropped is a total that no longer reconciles, and the
+  live store has exactly one of each. Buckets are biggest first, with the `null`
+  one last whatever its size.
+- A session is filed under one month, by `substr(first_turn_at, 1, 7)`.
+  `first_turn_at` is established by byte order and never revised by a tail pass,
+  and 0 of 3,416 live sessions have a `last_turn_at` in a different month.
+- The FOOTPRINT table is `footprint`, per-table bytes out of SQLite's own
+  `dbstat`. Its rows add up **exactly** to `file_bytes`, which is
+  `page_count * page_size`. Two rows are not tables: `(free pages)` is
+  `freelist_count * page_size`, which is the space `compact` is about to
+  reclaim, and `(lock page)` is the single page SQLite reserves at byte
+  `0x40000000` and uses for nothing, present only on a database that has grown
+  past 1 GiB. Without those two the sum is short and the reconciliation is a
+  claim rather than a property.
+- Exclusion is retroactive (ING-08), so a project excluded after its sessions
+  were archived appears in neither archive total. `footprint` is a property of
+  the database file and is not filtered by anything.
+- `usage` is a read: it opens read-only and creates no store.
+
+### `export`
+
+```json
+{"destination": "/home/you/verbatim-export",
+ "manifest": "/home/you/verbatim-export/manifest.json",
+ "sessions": 3416, "turns": 432242, "evicted": 2, "bytes": 1556598685,
+ "notice": "This export is the verbatim, unredacted transcripts: ..."}
+```
+
+`verbatim export <dir>` writes one `.jsonl` file per session, holding that
+session's uncompressed stream exactly as the archive stores it, plus a
+`manifest.json` beside them. The transcript is the portable form for this
+product: it is the form the data arrived in, the form any future importer would
+read, and it opens without a verbatim build. A copy of the store file is a
+snapshot, not an export.
+
+- **`export`'s output is the unredacted transcripts.** Nothing is filtered on
+  the way out. Redaction is keyed on destination and never on operation
+  (PRIV-01), and a directory the user named is not egress - so `notice` is the
+  answer instead: the same words go into the manifest, onto the terminal ahead
+  of the counts, and into this document, because a caller scripting an export is
+  the one most likely to be writing somewhere shared.
+- `bytes` is the total uncompressed stream written, which is what the files add
+  up to - not the compressed size in the archive and not the size of the
+  database.
+- `evicted` counts sessions retention has emptied. Each is written as a
+  **present, empty file** and named in the manifest with `"evicted": true`, so
+  an export never silently drops a session it could not fill.
+- A project the config excludes is in neither the manifest nor the directory.
+  Export is a read path and ING-08 binds every read path alike.
+- **A destination that already holds anything is refused**, exit 1, with nothing
+  written - not merely one that already holds an export. A file this command did
+  not write is never overwritten, and every refusal lands before the first byte.
+  A missing destination on the command line is misuse (exit 2): there is no
+  default place to put an unredacted copy of every transcript.
+- The manifest carries `notice`, `archive_format` as the store itself reports
+  it, the session / turn / evicted counts, the total bytes, the distinct
+  projects, the `first_turn_at`..`last_turn_at` range, and a `files` array with
+  one entry per session naming its file, session key, session id, project, turn
+  count, bytes and evicted flag. It is pretty-printed, unlike the one-line
+  `--json` envelope: an envelope is piped, a manifest is opened and read.
+
 ### `doctor`
 
 ```json

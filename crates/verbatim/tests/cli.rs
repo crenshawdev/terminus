@@ -822,6 +822,46 @@ const DATA_COMMANDS: &[(&str, &[&str], &[&str])] = &[
         &["--dry-run"],
         &["cutoff", "evict", "delete", "over", "excluded"],
     ),
+    // RET-04, RET-05 and PRIV-04 join on the same one line each (D-17). All
+    // three write as well as report - `compact` rewrites the database file,
+    // `export` writes a directory - and that changes nothing about the contract
+    // they keep: the envelope, the stream split, the exit codes, the
+    // empty-result rule and the documented shape.
+    //
+    // `compact` has one exit code this table cannot see: a held ingest lock is
+    // exit 1, not 0, because a compaction that did not happen is an operational
+    // failure rather than an empty answer. The sweep never holds the lock, so
+    // what it checks here is the ordinary path; `tests/lifecycle.rs` holds the
+    // contended one.
+    ("compact", &[], &["before", "after", "reclaimed_bytes"]),
+    (
+        "usage",
+        &[],
+        &[
+            "sessions",
+            "archive_bytes",
+            "by_project",
+            "by_month",
+            "file_bytes",
+            "footprint",
+        ],
+    ),
+    (
+        "export",
+        // The destination is filled in by `sweep_args`: it has to be inside the
+        // bench's own temporary tree, and a `&'static str` here could only be a
+        // fixed path on the developer's machine.
+        &[],
+        &[
+            "destination",
+            "manifest",
+            "sessions",
+            "turns",
+            "evicted",
+            "bytes",
+            "notice",
+        ],
+    ),
 ];
 
 /// A bench with the whole fixture corpus in it and one known turn id, which is
@@ -838,20 +878,44 @@ fn swept() -> (Bench, String) {
     (bench, id.to_string())
 }
 
-/// The command line for one swept command, with `show`'s id appended.
+/// The command line for one swept command, with `show`'s id and `export`'s
+/// destination appended.
 ///
 /// A command NAME may be two words (`observations regenerate`, D-18). The name
 /// is one string because that is what `value["command"]` reports and what
 /// `docs/json-shapes.md` heads its section with; the split into command-line
 /// words lives here, so a second column no one-word command would use never has
 /// to exist.
-fn sweep_args<'a>(command: &'a str, args: &'a [&'a str], id: &'a str) -> Vec<&'a str> {
+fn sweep_args<'a>(
+    command: &'a str,
+    args: &'a [&'a str],
+    id: &'a str,
+    dest: &'a str,
+) -> Vec<&'a str> {
     let mut out: Vec<&str> = command.split_whitespace().collect();
     out.extend_from_slice(args);
     if command == "show" {
         out.push(id);
     }
+    if command == "export" {
+        out.push(dest);
+    }
     out
+}
+
+/// Where the swept `export` writes, inside the bench's own temporary tree.
+///
+/// One per bench and never reused: each sweep test builds its own bench, and
+/// `export` refuses a destination that already holds anything - which is the
+/// behaviour under test in `tests/lifecycle.rs` and would be a spurious failure
+/// here.
+fn sweep_dest(bench: &Bench) -> String {
+    bench
+        .work
+        .join("export-sweep")
+        .to_str()
+        .expect("a temporary path is utf-8")
+        .to_owned()
 }
 
 /// Property 1: `--json` output parses and matches the documented shape field for
@@ -859,9 +923,10 @@ fn sweep_args<'a>(command: &'a str, args: &'a [&'a str], id: &'a str) -> Vec<&'a
 #[test]
 fn every_data_command_emits_the_documented_shape() {
     let (bench, id) = swept();
+    let dest = sweep_dest(&bench);
 
     for (command, args, fields) in DATA_COMMANDS {
-        let mut argv = sweep_args(command, args, &id);
+        let mut argv = sweep_args(command, args, &id, &dest);
         argv.push("--json");
         let out = bench.run(&argv);
         assert_eq!(
@@ -909,9 +974,10 @@ fn every_data_command_emits_the_documented_shape() {
 #[test]
 fn json_mode_keeps_stdout_pure_and_warnings_on_stderr() {
     let (bench, id) = swept();
+    let dest = sweep_dest(&bench);
 
     for (command, args, _) in DATA_COMMANDS {
-        let mut argv = sweep_args(command, args, &id);
+        let mut argv = sweep_args(command, args, &id, &dest);
         argv.push("--json");
         let out = bench.run(&argv);
 
@@ -944,7 +1010,7 @@ fn json_mode_keeps_stdout_pure_and_warnings_on_stderr() {
         .unwrap();
 
     for (command, args, _) in DATA_COMMANDS.iter().take(3) {
-        let mut argv = sweep_args(command, args, &id);
+        let mut argv = sweep_args(command, args, &id, &dest);
         argv.push("--json");
         let out = bench.run(&argv);
 
@@ -970,9 +1036,10 @@ fn json_mode_keeps_stdout_pure_and_warnings_on_stderr() {
 #[test]
 fn success_and_an_empty_result_both_exit_zero() {
     let (bench, id) = swept();
+    let dest = sweep_dest(&bench);
 
     for (command, args, _) in DATA_COMMANDS {
-        let argv = sweep_args(command, args, &id);
+        let argv = sweep_args(command, args, &id, &dest);
         let out = bench.run(&argv);
         assert_eq!(
             out.status.code(),
@@ -1020,9 +1087,10 @@ fn success_and_an_empty_result_both_exit_zero() {
 #[test]
 fn an_unknown_flag_and_an_unknown_subcommand_both_exit_two() {
     let (bench, id) = swept();
+    let dest = sweep_dest(&bench);
 
     for (command, args, _) in DATA_COMMANDS {
-        let mut argv = sweep_args(command, args, &id);
+        let mut argv = sweep_args(command, args, &id, &dest);
         argv.push("--definitely-not-a-flag");
         let out = bench.run(&argv);
         assert_eq!(
