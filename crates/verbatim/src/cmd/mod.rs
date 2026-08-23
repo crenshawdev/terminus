@@ -44,6 +44,7 @@ pub mod observations;
 pub mod read;
 pub mod reindex;
 pub mod replay;
+pub mod retention;
 pub mod search;
 pub mod sessions;
 pub mod show;

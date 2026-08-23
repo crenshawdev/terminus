@@ -26,6 +26,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        observations          what happened in every session that has closed\n  \
                        observations regenerate   recompute those facts for a selected set\n  \
                        replay                re-score the logged prompts under other thresholds\n  \
+                       retention --dry-run   what the next ingest pass would evict and delete\n  \
                        doctor                report what is wired into Claude Code and what is not\n  \
                        mcp                   serve the three recall tools over stdio (for Claude Code)\n  \
                        install               wire verbatim into Claude Code's hooks and mcp servers\n  \
@@ -123,6 +124,10 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         // flags move the injection thresholds - for this report and nothing
         // else: the live path compiles them in (D-08).
         "replay" => cmd::replay::run(cmd::replay::parse(parser)?),
+        // RET-03. A report and never an action: retention acts inside the
+        // ingest pass and nowhere else (D-04, D-10), so this shares that one
+        // evaluation function and applies nothing it names.
+        "retention" => cmd::retention::run(cmd::retention::parse(parser)?),
         // D-26: the MCP server is this binary, not a second artifact to place
         // and keep in version lockstep. It takes no arguments - a client spawns
         // it, nobody types it - and it writes JSON-RPC on stdout rather than
