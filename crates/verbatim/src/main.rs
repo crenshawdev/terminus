@@ -22,6 +22,7 @@ const USAGE: &str = "usage: verbatim [--version] <command>\n\
                        verify                check every blob against its checksum\n  \
                        reindex               rebuild the derived tables from the blobs\n  \
                        status                sizes, counts, watermarks and the last ingest run\n  \
+                       compact               reclaim the space retention freed, then truncate the wal\n  \
                        stats                 whether injection is helping: precision, misses, chars\n  \
                        observations          what happened in every session that has closed\n  \
                        observations regenerate   recompute those facts for a selected set\n  \
@@ -113,6 +114,11 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         "verify" => cmd::verify::run(cmd::json_flag(parser)?),
         "reindex" => cmd::reindex::run(cmd::json_flag(parser)?),
         "status" => cmd::status::run(cmd::json_flag(parser)?),
+        // RET-04. Reclaims what retention already freed and deletes nothing
+        // itself: `VACUUM` then `PRAGMA wal_checkpoint(TRUNCATE)` (D-08), under
+        // the ingest lock, because a plain `VACUUM` fails outright while a pass
+        // holds a write transaction.
+        "compact" => cmd::compact::run(cmd::json_flag(parser)?),
         // FEED-04. A CLI data command and never an MCP tool (D-14): every
         // tool description sits in every session's context forever.
         "stats" => cmd::stats::run(cmd::json_flag(parser)?),

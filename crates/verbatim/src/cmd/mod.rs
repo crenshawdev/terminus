@@ -1,5 +1,5 @@
 //! The subcommands: `ingest`, `backfill`, `search`, `show`, `sessions`, `verify`,
-//! `reindex`, `status`, `doctor`, `mcp`.
+//! `reindex`, `status`, `compact`, `doctor`, `mcp`.
 //!
 //! `mcp` is the one that keeps none of what follows. It is not a data command
 //! typed at a terminal: it is a JSON-RPC server spawned by Claude Code, its
@@ -34,6 +34,7 @@
 //! command is one line rather than a new file.
 
 pub mod backfill;
+pub mod compact;
 pub mod doctor;
 pub mod hook;
 pub mod ingest;
@@ -54,7 +55,7 @@ pub mod status;
 pub mod uninstall;
 pub mod verify;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// How a command ended.
 ///
@@ -85,6 +86,85 @@ impl From<verbatim_core::Error> for Failure {
 /// re-derived at each use (`DESIGN-BRIEF.md:404`).
 pub fn data_dir() -> Result<PathBuf, Failure> {
     Ok(verbatim_core::data_dir()?)
+}
+
+/// The store's footprint on disk: `verbatim.db` and its two WAL sidecars.
+///
+/// Three files and not one. SQLite in WAL mode holds recently written pages in
+/// `-wal` until something checkpoints them, so the database file alone can be
+/// half the truth - and a bare `VACUUM` on a WAL store moves the pages it frees
+/// INTO the WAL, which makes `verbatim.db` shrink while the store on disk grows
+/// (D-08). `cmd::status` reports this same sum as `size_bytes`, so this is the
+/// number the product itself calls the store's size and the one `compact` has to
+/// move.
+///
+/// A file that is not there counts zero rather than failing: `-wal` and `-shm`
+/// exist only for the life of a connection, so their absence is the ordinary
+/// state of a store nothing has open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Footprint {
+    pub db: u64,
+    pub wal: u64,
+    pub shm: u64,
+}
+
+impl Footprint {
+    pub fn total(self) -> u64 {
+        self.db + self.wal + self.shm
+    }
+
+    /// The same three numbers and their sum, as a `--json` value.
+    ///
+    /// The components travel with the total because the total on its own cannot
+    /// be read: "the store got bigger" and "the WAL has not been checkpointed
+    /// yet" are the same number, and only the split tells them apart.
+    pub fn to_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "db": self.db,
+            "wal": self.wal,
+            "shm": self.shm,
+            "total": self.total(),
+        })
+    }
+}
+
+/// Measure that footprint now.
+///
+/// `cmd::status` and `cmd::uninstall` each keep a private copy of this rule.
+/// They are not folded in here: both are shipped human outputs with their own
+/// doc blocks about when the sidecars exist, and rewriting two working commands
+/// is not part of adding a third caller.
+pub fn footprint(data_dir: &Path) -> Footprint {
+    let of = |name: String| {
+        std::fs::metadata(data_dir.join(name))
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+    };
+    let db = verbatim_core::store::DB_FILE_NAME;
+    Footprint {
+        db: of(db.to_owned()),
+        wal: of(format!("{db}-wal")),
+        shm: of(format!("{db}-shm")),
+    }
+}
+
+/// A byte count as a person reads it, for the non-`--json` output.
+///
+/// Never in the document: a consumer that wants "3.2 MiB" can render it, and
+/// one comparing two runs cannot parse it back out of prose.
+pub fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[0])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// The `--json` flag as spelled on every command line.
