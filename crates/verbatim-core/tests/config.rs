@@ -9,7 +9,8 @@ use std::sync::Mutex;
 
 use verbatim_core::config::{
     Config, ResponseFormat, RetentionAction, Secret, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME,
-    DEFAULT_BRIEF_CHARS, DEFAULT_CLAUDE_DIR, DEFAULT_PROMPT_CHARS, PROJECTS_SUBDIR, REDACTED,
+    DEFAULT_BRIEF_CHARS, DEFAULT_CLAUDE_DIR, DEFAULT_PROMPT_CHARS, DEFAULT_SNAPSHOTS_KEPT,
+    DEFAULT_SNAPSHOT_INTERVAL_HOURS, PROJECTS_SUBDIR, REDACTED,
 };
 use verbatim_core::Error;
 
@@ -865,4 +866,90 @@ fn a_project_key_is_normalized_the_way_an_exclusion_is() {
             .selects_nothing(),
         "a relative key matches no absolute project key and must not become one that matches all"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The `[snapshot]` table (STOR-06, D-15)
+
+fn snapshot_config(body: &str) -> Config {
+    let dir = config_dir_holding(&[(CONFIG_FILE_NAME, body)]);
+    with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).expect("a snapshot table is not a parse failure")
+    })
+}
+
+/// The state every user starts in, and the one place in this file where that
+/// state is ON. Every other block here - judgment, retention - defaults to off,
+/// so this default is the one worth an assertion of its own.
+#[test]
+fn a_config_with_no_snapshot_table_still_takes_snapshots_daily() {
+    let missing = config_dir_holding(&[]);
+    let resolved = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(missing.path()).unwrap()
+    });
+
+    for (name, config) in [
+        ("no verbatim.toml at all", resolved),
+        (
+            "a file with no [snapshot] table",
+            snapshot_config("exclude = []\n"),
+        ),
+        ("a config built with no file", Config::default()),
+    ] {
+        assert!(config.snapshots_enabled(), "{name}: snapshots are off");
+        assert_eq!(
+            config.snapshot_interval_hours(),
+            DEFAULT_SNAPSHOT_INTERVAL_HOURS,
+            "{name}"
+        );
+        assert_eq!(config.snapshots_kept(), DEFAULT_SNAPSHOTS_KEPT, "{name}");
+    }
+}
+
+/// Every key present: the file's numbers, not the defaults.
+#[test]
+fn a_snapshot_table_resolves_to_the_numbers_it_names() {
+    let config = snapshot_config("[snapshot]\nenabled = false\ninterval_hours = 6\nkeep = 10\n");
+
+    assert!(!config.snapshots_enabled());
+    assert_eq!(config.snapshot_interval_hours(), 6);
+    assert_eq!(config.snapshots_kept(), 10);
+}
+
+/// One key configured leaves the others where STOR-06 put them, which is why
+/// each is an `Option` on the way in rather than a `#[serde(default)]` zero.
+#[test]
+fn one_configured_snapshot_key_does_not_take_the_others_with_it() {
+    let config = snapshot_config("[snapshot]\nkeep = 1\n");
+
+    assert!(config.snapshots_enabled());
+    assert_eq!(
+        config.snapshot_interval_hours(),
+        DEFAULT_SNAPSHOT_INTERVAL_HOURS
+    );
+    assert_eq!(config.snapshots_kept(), 1);
+}
+
+/// Neither zero is taken literally, because both spell a disk filling up.
+/// `interval_hours = 0` means a snapshot on every prompt, and `keep = 0` means
+/// writing an archive-sized file and deleting it in the same step - so both
+/// fall back, and turning snapshots off is the `enabled` key.
+#[test]
+fn a_zero_interval_or_a_zero_keep_falls_back_rather_than_writing_per_prompt() {
+    let config = snapshot_config("[snapshot]\ninterval_hours = 0\nkeep = 0\n");
+
+    assert_eq!(
+        config.snapshot_interval_hours(),
+        DEFAULT_SNAPSHOT_INTERVAL_HOURS
+    );
+    assert_eq!(config.snapshots_kept(), 1);
+}
+
+/// The documented rule holds one level down here too.
+#[test]
+fn an_unknown_key_inside_the_snapshot_table_is_ignored_rather_than_rejected() {
+    let config = snapshot_config("[snapshot]\nkeep = 5\nsomething_phase_9_writes = true\n");
+
+    assert_eq!(config.snapshots_kept(), 5);
+    assert!(config.snapshots_enabled());
 }

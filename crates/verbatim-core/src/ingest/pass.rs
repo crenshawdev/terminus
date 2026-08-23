@@ -70,7 +70,35 @@ pub struct Summary {
     /// NOT reach `runs.error`: this step runs after that row is written, so the
     /// caller prints them on stderr instead.
     pub judgment: crate::observe::Judged,
+    /// What the rolling snapshot step did, after the lock dropped (STOR-06,
+    /// D-15).
+    ///
+    /// Its notes do NOT reach `runs.error` either, and for the same reason
+    /// [`Summary::judgment`] states: the row has already committed by the time
+    /// this runs.
+    pub snapshot: Snapshotted,
     pub duration: Duration,
+}
+
+/// `meta` key holding when the last rolling snapshot was taken, as unix seconds
+/// (D-15).
+///
+/// A row in `meta` rather than the newest file's name, because the gate has to
+/// be answerable without listing a directory - and because a user who copies
+/// their snapshots elsewhere has not thereby asked for a new one on the next
+/// prompt.
+pub const META_LAST_SNAPSHOT: &str = "last_snapshot_at";
+
+/// What one pass's snapshot step did (STOR-06, D-15).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Snapshotted {
+    /// Where the copy landed, when the interval had elapsed and it worked.
+    pub taken: Option<PathBuf>,
+    /// Older snapshots the prune removed.
+    pub pruned: usize,
+    /// Whatever could not be done, said rather than raised. These reach stderr
+    /// and not `runs.error`: this step runs AFTER that row commits.
+    pub notes: Vec<String>,
 }
 
 impl Summary {
@@ -126,7 +154,111 @@ pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
     // the pass happened. Nothing below can fail the pass: the archive is
     // already committed and this step only ever returns notes (OBS-04).
     summary.judgment = crate::observe::judge_new(data_dir, config);
+
+    // STOR-06 and D-15, in the same position and for the same reason: the guard
+    // and the store handle are gone, the `runs` row has committed, and nothing
+    // below can fail the pass. A snapshot is a copy of what is already safely
+    // archived, so a snapshot that could not be written is a note - failing the
+    // pass over it would stop archiving the transcripts the copy exists to
+    // protect.
+    summary.snapshot = roll(data_dir, config);
     Ok(PassOutcome::Ran(summary))
+}
+
+/// Take a rolling snapshot, if one is due (STOR-06, D-15).
+///
+/// **The gate is answered before any expensive work.** The hook spawn is the
+/// scheduler and fires on every prompt; a snapshot of the real store is 1.087 GB
+/// and 0.56 s, so an ungated step writes a gigabyte per prompt and the first
+/// user to notice is one whose disk fills. The interval is what makes STOR-06's
+/// "on by default" affordable, and this is where it is enforced.
+///
+/// **One clock.** `now` comes from SQLite, the same source every stored
+/// timestamp and every snapshot file name comes from, so the comparison is
+/// between two readings of one clock rather than between SQLite's and the
+/// process's.
+///
+/// **Nothing here raises.** Every failure is a note; see [`Snapshotted`].
+fn roll(data_dir: &Path, config: &Config) -> Snapshotted {
+    let mut out = Snapshotted::default();
+    if !config.snapshots_enabled() {
+        return out;
+    }
+
+    // Its own handle, because the pass's is gone - the same shape
+    // `observe::judge_new` has, and for the same D-07 reason.
+    let store = match crate::store::Store::open(data_dir) {
+        Ok(store) => store,
+        Err(e) => {
+            out.notes.push(format!("no snapshot was taken: {e}"));
+            return out;
+        }
+    };
+
+    let now: i64 = match store
+        .conn()
+        .query_row("SELECT strftime('%s', 'now')", [], |r| {
+            r.get::<_, String>(0)
+        }) {
+        Ok(text) => match text.parse() {
+            Ok(seconds) => seconds,
+            Err(e) => {
+                out.notes.push(format!("no snapshot was taken: {e}"));
+                return out;
+            }
+        },
+        Err(e) => {
+            out.notes.push(format!("no snapshot was taken: {e}"));
+            return out;
+        }
+    };
+
+    match store.meta_int(META_LAST_SNAPSHOT) {
+        // Not yet due. The common case by a wide margin - a machine that fires
+        // a hook on every prompt reaches here dozens of times between two
+        // snapshots - so it costs one `meta` read and returns silent.
+        Ok(Some(last))
+            if now.saturating_sub(last)
+                < (config.snapshot_interval_hours().saturating_mul(3_600) as i64) =>
+        {
+            return out
+        }
+        // Never taken one, or the interval has elapsed.
+        Ok(_) => {}
+        Err(e) => {
+            out.notes.push(format!("no snapshot was taken: {e}"));
+            return out;
+        }
+    }
+
+    match crate::store::snapshot::take(data_dir) {
+        Ok(path) => out.taken = Some(path),
+        Err(e) => {
+            out.notes
+                .push(format!("the store could not be snapshotted: {e}"));
+            return out;
+        }
+    }
+
+    match crate::store::snapshot::prune(
+        &data_dir.join(crate::store::snapshot::DIR_NAME),
+        config.snapshots_kept(),
+    ) {
+        Ok(pruned) => out.pruned = pruned,
+        Err(e) => out
+            .notes
+            .push(format!("older snapshots could not be pruned: {e}")),
+    }
+
+    // Last, and only after a copy actually landed: a stamp written ahead of a
+    // failed snapshot would buy the failure a whole interval of silence.
+    if let Err(e) = store.set_meta_int(META_LAST_SNAPSHOT, now) {
+        out.notes.push(format!(
+            "the snapshot was taken and its timestamp could not be recorded, so the next \
+             ingest will take another: {e}"
+        ));
+    }
+    out
 }
 
 /// Everything the ingest lock covers, from taking it to the `runs` row.

@@ -102,6 +102,29 @@ struct FileConfig {
     /// How much of each project's history to keep (RET-01, D-01).
     #[serde(default)]
     retention: FileRetention,
+    /// How often the store copies itself, and how many copies it keeps
+    /// (STOR-06, D-15).
+    #[serde(default)]
+    snapshot: FileSnapshot,
+}
+
+/// The `[snapshot]` table of `verbatim.toml` (STOR-06, D-15).
+///
+/// **The one table in this file whose default is ON.** Every other block here
+/// defaults to off - judgment is opt-in (OBS-02), retention is opt-in (RET-01) -
+/// and this one is not, because STOR-06 says rolling snapshots run by default.
+/// What makes that affordable is the interval rather than a flag: the hook spawn
+/// is the scheduler and fires on every prompt, a snapshot of the real 1.10 GB
+/// store is 1.087 GB and 0.56 s, so an ungated step would write a gigabyte per
+/// prompt and the first user to notice is one whose disk fills.
+///
+/// Every key optional, an unrecognized key ignored under the same rule as one at
+/// the top level, and a missing table meaning the three defaults below.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FileSnapshot {
+    enabled: Option<bool>,
+    interval_hours: Option<u64>,
+    keep: Option<usize>,
 }
 
 /// The `[retention]` table of `verbatim.toml` (RET-01, D-01).
@@ -191,6 +214,22 @@ pub const DEFAULT_BRIEF_CHARS: usize = 6_000;
 /// Smaller than [`DEFAULT_BRIEF_CHARS`] because it is paid on every prompt
 /// rather than once a session, and because INJ-03 caps it at three turns.
 pub const DEFAULT_PROMPT_CHARS: usize = 4_000;
+
+/// How long a store waits between rolling snapshots when nothing configures it
+/// (STOR-06, D-15).
+///
+/// Hours, and 24 of them, which is `DESIGN-BRIEF.md:100`'s whole specification.
+/// The number is what makes "on by default" affordable: the hook spawn is the
+/// scheduler and fires on every prompt, so the interval - not a flag - is what
+/// stands between the default and an archive-sized file per prompt.
+pub const DEFAULT_SNAPSHOT_INTERVAL_HOURS: u64 = 24;
+
+/// How many rolling snapshots are kept when nothing configures it (STOR-06).
+///
+/// Three, so the data directory's ceiling is four archives rather than one - a
+/// bound a user can predict from the store's own size, which is what
+/// `verbatim usage` already reports.
+pub const DEFAULT_SNAPSHOTS_KEPT: usize = 3;
 
 /// What a [`Secret`] renders as, everywhere, under every formatter.
 ///
@@ -379,6 +418,27 @@ struct Retention {
     projects: Vec<(String, RetentionPolicy)>,
 }
 
+/// The resolved `[snapshot]` block (STOR-06, D-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Snapshot {
+    enabled: bool,
+    interval_hours: u64,
+    keep: usize,
+}
+
+/// On, daily, three kept. Derived `Default` would give `false, 0, 0`, which is
+/// snapshots off - the opposite of what STOR-06 specifies - so the defaults are
+/// spelled here the way the injection budgets are and for the same reason.
+impl Default for Snapshot {
+    fn default() -> Snapshot {
+        Snapshot {
+            enabled: true,
+            interval_hours: DEFAULT_SNAPSHOT_INTERVAL_HOURS,
+            keep: DEFAULT_SNAPSHOTS_KEPT,
+        }
+    }
+}
+
 /// The resolved config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -392,6 +452,7 @@ pub struct Config {
     prompt_chars: usize,
     provider: Provider,
     retention: Retention,
+    snapshot: Snapshot,
 }
 
 /// The defaults, spelled once. Derived `Default` would give both budgets zero,
@@ -414,6 +475,11 @@ impl Default for Config {
             // `Keep` with no age selects nothing, so a user who never wrote a
             // `[retention]` table has retention off (RET-01).
             retention: Retention::default(),
+            // The one block here whose zero value is the WRONG default, which is
+            // why `Snapshot` writes its own: STOR-06 says rolling snapshots run
+            // by default, so a user who never wrote a `[snapshot]` table has
+            // them on, daily, three kept.
+            snapshot: Snapshot::default(),
         }
     }
 }
@@ -495,6 +561,25 @@ impl Config {
                 .unwrap_or_default(),
         };
         config.retention = resolve_retention(file.retention);
+        // Key by key against the defaults, not a wholesale replacement: a table
+        // that names only `keep` leaves the interval and the enabled flag where
+        // STOR-06 put them, which is the rule every other table here follows.
+        let defaults = Snapshot::default();
+        config.snapshot = Snapshot {
+            enabled: file.snapshot.enabled.unwrap_or(defaults.enabled),
+            // Zero would mean "snapshot on every prompt", which is the failure
+            // D-15 exists to prevent, so it falls back to the default rather
+            // than being taken literally. Turning snapshots off is `enabled`.
+            interval_hours: file
+                .snapshot
+                .interval_hours
+                .filter(|hours| *hours > 0)
+                .unwrap_or(defaults.interval_hours),
+            // At least one, because the prune runs immediately after the copy:
+            // `keep = 0` would write an archive-sized file and delete it in the
+            // same step, every interval, forever. Keeping none is `enabled`.
+            keep: file.snapshot.keep.unwrap_or(defaults.keep).max(1),
+        };
         Ok(config)
     }
 
@@ -632,6 +717,26 @@ impl Config {
                 .projects
                 .iter()
                 .all(|(_, policy)| policy.selects_nothing())
+    }
+
+    /// Does this store copy itself on a rolling schedule (STOR-06)?
+    ///
+    /// **True unless the config says otherwise**, which is the opposite of
+    /// every other feature flag in this file and is STOR-06 itself. What keeps
+    /// that from costing an archive per prompt is
+    /// [`Config::snapshot_interval_hours`], not this flag.
+    pub fn snapshots_enabled(&self) -> bool {
+        self.snapshot.enabled
+    }
+
+    /// How long the store waits between snapshots (D-15).
+    pub fn snapshot_interval_hours(&self) -> u64 {
+        self.snapshot.interval_hours
+    }
+
+    /// How many of the most recent snapshots survive the prune (D-15).
+    pub fn snapshots_kept(&self) -> usize {
+        self.snapshot.keep
     }
 
     /// The Claude config directories, in the order they were configured.

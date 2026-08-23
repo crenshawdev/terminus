@@ -64,6 +64,15 @@ fn tree(data_dir: &std::path::Path) -> Result<(), Failure> {
     for note in &summary.judgment.notes {
         eprintln!("{note}");
     }
+
+    // The snapshot step's notes, on the same channel and for the same reason:
+    // it runs after the lock drops and after the `runs` row commits (D-15), so
+    // stderr is all it has. Silent when the copy worked or was not due - a
+    // snapshot is a copy of what is already archived, so there is nothing to
+    // report unless it did not happen.
+    for note in &summary.snapshot.notes {
+        eprintln!("{note}");
+    }
     Ok(())
 }
 

@@ -13,7 +13,9 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
+use verbatim_core::config::{Config, DEFAULT_SNAPSHOT_INTERVAL_HOURS};
 use verbatim_core::ingest::lock::{self, Attempt};
+use verbatim_core::ingest::pass::{self, PassOutcome, Summary};
 use verbatim_core::store::{snapshot, DB_FILE_NAME};
 use verbatim_core::{ingest, testkit, verify, Store};
 
@@ -235,5 +237,249 @@ fn snapshots_land_inside_the_data_directory() {
     assert!(
         name.starts_with("verbatim-") && name.ends_with(".db") && name.len() == 32,
         "unexpected snapshot name {name}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The schedule: on by default, at most once per interval, outside the lock
+// (STOR-06, D-15)
+
+/// A data directory plus a Claude tree for the pass to walk, so the snapshot
+/// step is reached the way a hook reaches it rather than by being called.
+struct PassBench {
+    _dir: tempfile::TempDir,
+    data_dir: PathBuf,
+    claude_dir: PathBuf,
+}
+
+fn pass_bench() -> PassBench {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let claude_dir = dir.path().join("claude");
+    let project = claude_dir.join("projects").join("-data-projects-cadence");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::copy(
+        testkit::fixture_path("session-basic.jsonl"),
+        project.join("11111111-1111-4111-8111-111111111111.jsonl"),
+    )
+    .unwrap();
+
+    PassBench {
+        _dir: dir,
+        data_dir,
+        claude_dir,
+    }
+}
+
+impl PassBench {
+    fn config(&self) -> Config {
+        Config::from_parts(vec![self.claude_dir.clone()], Vec::new())
+    }
+
+    fn pass(&self) -> Summary {
+        match pass::run_with(&self.data_dir, &self.config()).unwrap() {
+            PassOutcome::Ran(summary) => summary,
+            PassOutcome::LockHeld => panic!("nothing else holds the lock"),
+        }
+    }
+
+    fn snapshots(&self) -> Vec<String> {
+        let dir = self.data_dir.join(snapshot::DIR_NAME);
+        if dir.is_dir() {
+            listed(&dir)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn store(&self) -> Store {
+        Store::open(&self.data_dir).unwrap()
+    }
+
+    fn stamp(&self) -> Option<i64> {
+        self.store().meta_int(pass::META_LAST_SNAPSHOT).unwrap()
+    }
+
+    fn runs(&self) -> i64 {
+        self.store()
+            .conn()
+            .query_row("SELECT count(*) FROM runs", [], |r| r.get(0))
+            .unwrap()
+    }
+}
+
+/// Two claims that are only worth anything together: the first pass takes a
+/// snapshot with nothing configuring it, and the second one immediately after
+/// does not. Without the second, "on by default" is a machine that writes an
+/// archive-sized file on every prompt.
+#[test]
+fn the_first_pass_snapshots_and_the_next_one_inside_the_interval_does_not() {
+    let bench = pass_bench();
+
+    let first = bench.pass();
+    assert!(first.snapshot.notes.is_empty(), "{:?}", first.snapshot);
+    assert!(first.snapshot.taken.is_some());
+    let after_first = bench.snapshots();
+    assert_eq!(after_first.len(), 1, "{after_first:?}");
+    let stamped = bench.stamp().expect("the pass stamped `meta`");
+
+    let second = bench.pass();
+    assert!(second.snapshot.notes.is_empty(), "{:?}", second.snapshot);
+    assert_eq!(
+        second.snapshot.taken, None,
+        "a second pass inside the interval took another snapshot"
+    );
+    assert_eq!(bench.snapshots(), after_first);
+    assert_eq!(
+        bench.stamp(),
+        Some(stamped),
+        "an undue pass moved the timestamp forward, which would slide the interval"
+    );
+}
+
+/// The gate is the timestamp and nothing else: backdate it past the interval
+/// and the next pass copies again.
+#[test]
+fn a_pass_past_the_interval_takes_the_next_snapshot() {
+    let bench = pass_bench();
+    bench.pass();
+    let first = bench.snapshots();
+    assert_eq!(first.len(), 1);
+
+    let stamped = bench.stamp().unwrap();
+    // One second past 24 hours, so the boundary itself is exercised rather than
+    // a week-old timestamp that any comparison would pass.
+    let backdated = stamped - (DEFAULT_SNAPSHOT_INTERVAL_HOURS as i64 * 3_600) - 1;
+    let store = bench.store();
+    store
+        .set_meta_int(pass::META_LAST_SNAPSHOT, backdated)
+        .unwrap();
+    drop(store);
+
+    let summary = bench.pass();
+
+    assert!(summary.snapshot.taken.is_some(), "{:?}", summary.snapshot);
+    let both = bench.snapshots();
+    assert_eq!(both.len(), 2, "{both:?}");
+    assert_eq!(both[0], first[0], "the older snapshot was not kept");
+    // Against the backdated value and not against `stamped`: the stamp is unix
+    // SECONDS and two passes in one test land inside the same second, so
+    // "moved forward from a day ago" is the claim and "moved forward from the
+    // first pass" is a statement about the clock's resolution.
+    assert!(
+        bench.stamp().unwrap() > backdated,
+        "the interval was not restamped"
+    );
+}
+
+/// The retained count is a config key and the prune runs in the pass, so a
+/// store configured to keep one keeps one however many intervals elapse.
+#[test]
+fn the_pass_prunes_to_the_configured_count() {
+    let bench = pass_bench();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(verbatim_core::config::CONFIG_FILE_NAME),
+        format!(
+            "roots = ['{}']\n[snapshot]\nkeep = 1\n",
+            bench.claude_dir.display()
+        ),
+    )
+    .unwrap();
+    let config = Config::load_from(dir.path()).unwrap();
+
+    let mut taken = 0;
+    for _ in 0..3 {
+        match pass::run_with(&bench.data_dir, &config).unwrap() {
+            PassOutcome::Ran(summary) => {
+                if summary.snapshot.taken.is_some() {
+                    taken += 1;
+                }
+            }
+            PassOutcome::LockHeld => panic!("nothing else holds the lock"),
+        }
+        // Age the stamp out, so each pass is due.
+        let store = bench.store();
+        store.set_meta_int(pass::META_LAST_SNAPSHOT, 0).unwrap();
+    }
+
+    assert_eq!(taken, 3, "a due pass declined to snapshot");
+    assert_eq!(
+        bench.snapshots().len(),
+        1,
+        "the prune left more than the configured count"
+    );
+}
+
+/// `enabled = false` is the off switch, and it costs nothing: no directory, no
+/// copy, no `meta` row.
+#[test]
+fn snapshots_turned_off_write_nothing_at_all() {
+    let bench = pass_bench();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(verbatim_core::config::CONFIG_FILE_NAME),
+        format!(
+            "roots = ['{}']\n[snapshot]\nenabled = false\n",
+            bench.claude_dir.display()
+        ),
+    )
+    .unwrap();
+    let config = Config::load_from(dir.path()).unwrap();
+
+    let summary = match pass::run_with(&bench.data_dir, &config).unwrap() {
+        PassOutcome::Ran(summary) => summary,
+        PassOutcome::LockHeld => panic!("nothing else holds the lock"),
+    };
+
+    assert_eq!(summary.snapshot, Default::default());
+    assert!(!bench.data_dir.join(snapshot::DIR_NAME).exists());
+    assert_eq!(bench.stamp(), None);
+}
+
+/// A snapshot that cannot be written is a NOTE. The archive is the work: the
+/// pass still ran, still committed, still wrote its `runs` row, and the copy of
+/// what is already safely stored is the only thing missing.
+#[cfg(unix)]
+#[test]
+fn a_snapshot_that_cannot_be_written_is_a_note_and_not_a_failed_pass() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bench = pass_bench();
+    let snapshots = bench.data_dir.join(snapshot::DIR_NAME);
+    std::fs::create_dir_all(&snapshots).unwrap();
+    std::fs::set_permissions(&snapshots, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let outcome = pass::run_with(&bench.data_dir, &bench.config()).unwrap();
+    std::fs::set_permissions(&snapshots, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let summary = match outcome {
+        PassOutcome::Ran(summary) => summary,
+        PassOutcome::LockHeld => panic!("nothing else holds the lock"),
+    };
+
+    if summary.snapshot.taken.is_some() {
+        // Running as root defeats the mode bits; the assertions below would
+        // then be about nothing.
+        println!("skipped: this process can write into a 0500 directory");
+        return;
+    }
+    assert_eq!(summary.files_committed, 1, "the pass did not do its work");
+    assert_eq!(bench.runs(), 1, "the pass wrote no `runs` row");
+    assert_eq!(
+        summary.snapshot.notes.len(),
+        1,
+        "{:?}",
+        summary.snapshot.notes
+    );
+    assert!(
+        summary.snapshot.notes[0].contains("could not be snapshotted"),
+        "{:?}",
+        summary.snapshot.notes
+    );
+    assert_eq!(
+        bench.stamp(),
+        None,
+        "a failed snapshot stamped the interval, buying itself a day of silence"
     );
 }

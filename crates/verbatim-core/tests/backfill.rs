@@ -38,18 +38,25 @@ const WORKERS: usize = 4;
 /// `backfill::run_with` IS the walk and nothing more. `pass::run_with` runs the
 /// same walk and then `feedback::drain` and `feedback::outcomes` after it - and
 /// `outcomes` is what sets `session_meta.is_final`, which is the gate
-/// `observe::observe_new` gets its sessions through. So these three tables are
+/// `observe::observe_new` gets its sessions through. So these tables are
 /// written by a step backfill deliberately does not take, and comparing their
 /// row counts compares that deliberate asymmetry rather than the walk the two
 /// implementations share.
 ///
-/// All three, not just the one that fired. `decisions` and `labels` both read 0
+/// `meta` is here for the same asymmetry one step further out: `pass::run_with`
+/// runs the rolling snapshot step after `locked` returns (STOR-06, D-15) and
+/// stamps `last_snapshot_at`, which backfill never writes. Only the row COUNT
+/// was ever compared for this table - `archive_format` and `derived_schema` are
+/// asserted where they are set, not here - so excluding it drops one count and
+/// no value.
+///
+/// All of them, not just the one that fired. `decisions` and `labels` both read 0
 /// against this fixture tree today, which is the only reason they never sprang
 /// the trap `observations` just sprang; excluding `observations` alone would
 /// move the trap to whichever of them a fixture change populates first. Every
 /// other table, the checksums, the watermarks and the archive digest stay in
 /// the comparison unchanged.
-const POST_WALK_TABLES: &[&str] = &["observations", "decisions", "labels"];
+const POST_WALK_TABLES: &[&str] = &["observations", "decisions", "labels", "meta"];
 
 /// How many copies of the fixture set the tree holds.
 ///
