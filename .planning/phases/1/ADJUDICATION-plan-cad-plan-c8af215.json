@@ -1,0 +1,20 @@
+{
+  "phase": "1",
+  "trigger": "plan",
+  "discriminator": "cad-plan-c8af215",
+  "round": 1,
+  "base": "c8af215",
+  "head": "c8af215",
+  "base_id": "c8af215380cf2b6cec3c42ec7524dea4e9490f03",
+  "head_id": "c8af215380cf2b6cec3c42ec7524dea4e9490f03",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": []
+}
