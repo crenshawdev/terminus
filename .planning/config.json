@@ -1,18 +1,33 @@
 {
   "granularity": "standard",
   "stakes": "shipped",
-  "model": { "escalate_on_failure": false },
+  "model": {
+    "escalate_on_failure": false,
+    "effort": {
+      "cad-planner": "xhigh"
+    }
+  },
   "workflow": {
-    "research": false, "plan_check": false, "verifier": true, "skip_discuss": false,
-    "inline_plan_threshold": 3, "max_plan_tasks": 8,
-    "test_command": null, "lint_command": null
+    "research": false,
+    "plan_check": false,
+    "verifier": true,
+    "skip_discuss": false,
+    "inline_plan_threshold": 3,
+    "max_plan_tasks": 4,
+    "test_command": null,
+    "lint_command": null
   },
   "parallelization": {
-    "enabled": true, "max_concurrent_agents": 3, "min_plans_for_parallel": 2,
+    "enabled": true,
+    "max_concurrent_agents": 3,
+    "min_plans_for_parallel": 2,
     "use_worktrees": true
   },
   "git": {
-    "protected_branches": ["main", "master"],
+    "protected_branches": [
+      "main",
+      "master"
+    ],
     "on_protected": "ask",
     "integration_branch": "milestone",
     "auto_branch": "ask",
@@ -21,18 +36,64 @@
     "on_land_cleanup": true,
     "auto_close": false
   },
-  "planning": { "commit_docs": true },
-  "memory": { "backend": "builtin" },
+  "planning": {
+    "commit_docs": true
+  },
+  "memory": {
+    "backend": "builtin"
+  },
   "review": {
     "mode": "adjudicated",
-    "reviewers": ["claude-subagent"],
+    "reviewers": [
+      "openai"
+    ],
     "key_file": null,
     "providers": {
-      "openai": { "tiers": { "flagship": null, "balanced": null, "cheap": null } },
-      "gemini": { "tiers": { "flagship": null, "balanced": null, "cheap": null } },
-      "deepseek": { "tiers": { "flagship": null, "balanced": null, "cheap": null } }
+      "openai": {
+        "tiers": {
+          "flagship": "gpt-5.5",
+          "balanced": "gpt-5.4-mini",
+          "cheap": "gpt-5.4-nano"
+        }
+      },
+      "gemini": {
+        "tiers": {
+          "flagship": null,
+          "balanced": null,
+          "cheap": null
+        }
+      },
+      "deepseek": {
+        "tiers": {
+          "flagship": null,
+          "balanced": null,
+          "cheap": null
+        }
+      }
     },
-    "consult": { "enabled": false, "tier": "flagship", "effort": "high", "attempt_threshold": 3 },
-    "decision_review": { "tier": "flagship", "effort": "high" }
+    "consult": {
+      "enabled": false,
+      "tier": "flagship",
+      "effort": "high",
+      "attempt_threshold": 3
+    },
+    "decision_review": {
+      "tier": "flagship",
+      "effort": "high"
+    },
+    "triggers": {
+      "risk_surface": {
+        "surfaces": [
+          "auth",
+          "migrations",
+          "billing",
+          "concurrency",
+          "destructive",
+          "secrets",
+          "api_contract",
+          "untrusted_input"
+        ]
+      }
+    }
   }
 }
