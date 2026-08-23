@@ -810,6 +810,18 @@ const DATA_COMMANDS: &[(&str, &[&str], &[&str])] = &[
             "notes",
         ],
     ),
+    // RET-03 and D-17, on exactly the terms this table's own comment states: a
+    // report of what the NEXT ingest pass would evict and delete is a data
+    // command, so it joins on one line and the five swept properties hold it -
+    // the envelope, the stream split, the exit codes, the empty-result rule and
+    // the documented shape. The bench's config directory holds no
+    // `verbatim.toml`, so retention is off here and the sweep sees the empty
+    // result every user starts in.
+    (
+        "retention",
+        &["--dry-run"],
+        &["cutoff", "evict", "delete", "over", "excluded"],
+    ),
 ];
 
 /// A bench with the whole fixture corpus in it and one known turn id, which is

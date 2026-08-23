@@ -343,6 +343,56 @@ and unchanged.
   released, because an HTTP call held inside the ingest lock would make every
   hook-spawned pass in that window archive nothing.
 
+### `retention`
+
+```json
+{"cutoff": "2026-08-22T22:33:40.115Z",
+ "evict": ["/home/you/.claude/projects/-data-code-app/9f2c....jsonl"],
+ "delete": ["/home/you/.claude/projects/-data-code-app/1a04....jsonl"],
+ "over": 0, "excluded": 3}
+```
+
+`verbatim retention --dry-run` describes what the **next ingest pass** would do
+under the current `verbatim.toml`. It never applies anything: retention runs as
+a bounded step at the end of every pass, that is the only place it acts, and
+this command and that step share one evaluation function so the two cannot
+disagree about a `'now'`-relative rule.
+
+- `cutoff` is the instant every age in this report was measured from, in the
+  same ISO-8601 UTC spelling every stored timestamp uses - **not** `now` less
+  some number of days. There is no single such number: the age is configured per
+  project, so what one report can honestly state is the one clock reading all of
+  them were measured against. It is null only when there is no store to read a
+  clock from. A pass running later reads its own instant, so a session sitting
+  on an age boundary can legitimately fall the other side of it; that is why the
+  instant is reported rather than implied.
+- `evict` and `delete` are session keys - the canonical transcript paths - oldest
+  first, and capped at what one pass will act on per action.
+- `over` is how many more eligible sessions that cap left for the pass after
+  next. The hook spawn is the scheduler, so "the next pass" is the next prompt.
+- `excluded` counts sessions in projects the config excludes, which retention
+  passed over and did not name. Exclusion means never read, on the ingest and
+  the read paths both, and a delete is the most extreme thing that could be done
+  to bytes a user said not to look at.
+
+What the two verbs mean for everything else you can ask this store:
+
+- An **evicted** session keeps its row, its metadata and every derived row; only
+  its archived bytes go. It is still listed by `verbatim sessions` (with
+  `evicted: true`), a search that matched one of its turns still returns that
+  turn, and `verbatim show` reports `body_evicted: true` with a null `body`. Its
+  `excerpt` in a search hit is empty, because the bytes an excerpt is cut from
+  are the ones that were reclaimed.
+- A **deleted** session is gone from both: no listing, no search hit, no turn.
+  `delete` acts only on sessions whose transcript file Claude Code's own
+  `cleanupPeriodDays` has already removed, so a session still on disk is never
+  deleted however old it is - it would simply be re-ingested on the next hook
+  spawn.
+
+Empty is the ordinary answer and always exit 0, with `reason` saying which
+empty: no store yet, no `[retention]` table selecting anything, or a configured
+policy with nothing due. Retention is off by default.
+
 ### `doctor`
 
 ```json
