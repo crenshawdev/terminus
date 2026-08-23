@@ -6,6 +6,14 @@
 //! value comes from a stored row, so two runs against an unchanged store render
 //! the same bytes (INJ-02).
 //!
+//! **The quoted prompt is a turn the person typed (INJ-07).** "The last thing
+//! said" in the user's direction is not the last `user` record: the harness
+//! writes tool results, `isMeta` command caveats and `<task-notification>`
+//! envelopes as `user` records as well, and 12.3% of measured sessions end on
+//! one. The discriminator is `turns.is_typed`, written at ingest by
+//! `parse::record` and rebuilt from blobs alone, and the brief spends exactly
+//! one `AND` on it - see [`last_turn`].
+//!
 //! The counts are read the way D-09 requires: the project-only projection
 //! `scope::resolve` has already run, plus one targeted `count(*)` per number,
 //! and never `config::visible::sessions`. Measured on a store shaped like the
@@ -443,7 +451,16 @@ fn day(ts: &str) -> &str {
     ts.get(..10).unwrap_or(ts)
 }
 
-/// The last user turn and the last assistant turn of one session, as text.
+/// The last turn the person TYPED and the last assistant turn of one session,
+/// as text.
+///
+/// The prompt side is not the last `user` record (INJ-07): Claude Code writes
+/// tool results, `isMeta` command caveats and `<task-notification>` envelopes as
+/// `user` records too, and one session in eight ends on one of them. Quoting
+/// that back is a brief that opens by telling the model a file listing was the
+/// last thing it was asked. [`last_turn`] carries the rule; a session with no
+/// typed `user` record at all renders no "It last asked" line, because the
+/// lookup returns nothing and [`Continuity::text`] omits what it has not got.
 ///
 /// **One blob read for the pair.** Both turns are in the same session and
 /// rusqlite's incremental blob I/O is behind a feature this workspace does not
@@ -495,16 +512,32 @@ fn last_exchange(conn: &Connection, session_key: &str) -> (Option<Quote>, Option
     (cut(prompt), cut(reply))
 }
 
-/// `(id, stream_offset, byte_len)` of one session's last turn of a record type.
+/// `(id, stream_offset, byte_len)` of one session's last turn of a record type,
+/// skipping the `user` records nobody typed (INJ-07).
 ///
 /// D-04: both offsets address the UNCOMPRESSED session stream, never the blob.
 /// `UNIQUE (session_key, turn_seq)` covers the lookup. The id comes back too
 /// because INJ-04 suppresses a turn the brief quoted and cannot recognize one
 /// from its text.
+///
+/// **`is_typed IS NOT 0` and not `is_typed = 1`**, which is what lets one
+/// statement serve all three callers. `IS NOT` is SQLite's null-safe
+/// comparison, so a null passes: an `assistant` row carries null by
+/// construction (`parse::record` classifies `user` records and nothing else),
+/// and a preserved evicted session's rows keep null because `reindex` skips
+/// them (v0.1.1 phase 1 D-04). For an evicted session the choice is
+/// unobservable anyway - `retention::apply` empties the blob, so
+/// [`last_exchange`] finds no reader and renders no quote either way.
+///
+/// One `AND` and no new index. Measured against the live 1.16 GB store
+/// (450,834 turns), the lookup costs 0.002 ms and a variant forced to scan a
+/// 2,465-turn session backwards without matching costs 0.362 ms, both planned
+/// as `SEARCH turns USING INDEX sqlite_autoindex_turns_1`, against a 10 ms
+/// wall; real scan depth is p50 27, p90 181, p99 404, max 520 rows (D-11).
 fn last_turn(conn: &Connection, session_key: &str, record_type: &str) -> Option<(i64, i64, i64)> {
     conn.query_row(
         "SELECT id, stream_offset, byte_len FROM turns \
-         WHERE session_key = ?1 AND record_type = ?2 \
+         WHERE session_key = ?1 AND record_type = ?2 AND is_typed IS NOT 0 \
          ORDER BY turn_seq DESC LIMIT 1",
         rusqlite::params![session_key, record_type],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),

@@ -53,34 +53,65 @@ struct Session<'a> {
     reply: &'a str,
 }
 
+/// One record carrying a single `text` block, which is what a person typing a
+/// prompt and a model answering in prose both produce.
+fn text_record(kind: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": kind,
+        "message": {
+            "role": kind,
+            "content": [{"type": "text", "text": text}],
+        },
+    })
+}
+
 impl Bench {
     fn project(&self, name: &str) -> PathBuf {
         self.root.join(name)
     }
 
-    /// Archive one session through the ordinary ingest path.
+    /// Archive one session through the ordinary ingest path: the prompt, then
+    /// the reply, both plain text blocks.
     fn archive(&self, session: &Session<'_>) {
+        self.archive_records(
+            session,
+            &[
+                text_record("user", session.prompt),
+                text_record("assistant", session.reply),
+            ],
+        );
+    }
+
+    /// Archive one session whose records are spelled out rather than being the
+    /// prompt-and-reply pair [`Bench::archive`] writes.
+    ///
+    /// INJ-07 is about `user` records the person did not write - a
+    /// `tool_result` block, an `isMeta` caveat, a `<task-notification>`
+    /// envelope - and none of the three is a `text` block with a `prompt` in
+    /// it. Each entry carries only what is particular to its record; this fills
+    /// in the envelope every record of one session shares.
+    ///
+    /// At most nine records: the timestamps are `T1{n}:00:00`, which is the
+    /// same one-digit hour [`Bench::archive`] has always used to keep them
+    /// ascending without a date library.
+    fn archive_records(&self, session: &Session<'_>, records: &[serde_json::Value]) {
+        assert!(records.len() < 10, "the hour in the timestamp is one digit");
         let cwd = self.project(session.project);
         let mut body = String::new();
-        for (n, (kind, text)) in [("user", session.prompt), ("assistant", session.reply)]
-            .into_iter()
-            .enumerate()
-        {
+        for (n, particular) in records.iter().enumerate() {
             let mut record = serde_json::json!({
                 "parentUuid": null,
                 "isSidechain": false,
                 "cwd": cwd.to_string_lossy(),
                 "sessionId": session.id,
-                "type": kind,
                 "uuid": format!("{}-{n}", session.id),
                 "timestamp": format!("{}T1{n}:00:00.000Z", session.day),
-                "message": {
-                    "role": kind,
-                    "content": [{"type": "text", "text": text}],
-                },
             });
             if let Some(branch) = session.branch {
                 record["gitBranch"] = serde_json::Value::String(branch.to_owned());
+            }
+            for (key, value) in particular.as_object().expect("a record is an object") {
+                record[key] = value.clone();
             }
             body.push_str(&record.to_string());
             body.push('\n');
@@ -92,6 +123,18 @@ impl Bench {
         match ingest::run(&self.data_dir, &path).unwrap() {
             ingest::Outcome::Committed(_) => {}
             other => panic!("{}: {other:?}", session.file),
+        }
+    }
+
+    /// Archive one rooted fixture verbatim, under this bench's own root.
+    ///
+    /// The fixtures carry `{{ROOT}}` where a real transcript carries an
+    /// absolute `cwd`, so the project key is one this test built.
+    fn archive_fixture(&self, fixture: &str) {
+        let path = verbatim_core::testkit::copy_rooted_fixture_into(fixture, &self.work, &self.root);
+        match ingest::run(&self.data_dir, &path).unwrap() {
+            ingest::Outcome::Committed(_) => {}
+            other => panic!("{fixture}: {other:?}"),
         }
     }
 
@@ -268,6 +311,196 @@ fn a_session_with_no_branch_still_renders_the_rest() {
         !brief.contains("branch"),
         "the brief names a branch for a session that has none: {brief}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// INJ-07: the quoted prompt is a turn the person typed
+
+/// The prompt every case below has to end up quoting, and the reply beside it.
+const TYPED: &str = "the prompt somebody actually typed, about sprockets";
+const ANSWER: &str = "the reply, about sprockets";
+
+/// The `user` record Claude Code writes when a tool returns: a `tool_result`
+/// block in `message.content`, and the result again at the top level.
+///
+/// Both halves, because the classifier reads only the first (v0.1.1 phase 1
+/// D-01) and a record carrying only the top-level key would let a rule that
+/// read the wrong one pass.
+fn tool_result_record(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_inj07",
+                "content": text,
+            }],
+        },
+        "toolUseResult": {"stdout": text},
+    })
+}
+
+/// The assistant turn that asked for it.
+fn tool_use_record() -> serde_json::Value {
+    serde_json::json!({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_inj07",
+                "name": "Glob",
+                "input": {"pattern": "*.csv"},
+            }],
+        },
+    })
+}
+
+impl Bench {
+    /// `is_typed` of the last `user` turn in the store, by `turn_seq`.
+    ///
+    /// The falsifying half of the three cases below: each seeds ONE session,
+    /// and each is only about anything if that session's last `user` record
+    /// really did archive as one nobody typed. Without this a test would pass
+    /// just as happily against a transcript whose last record was the prompt.
+    fn last_user_is_typed(&self) -> Option<i64> {
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(verbatim_core::store::DB_FILE_NAME))
+                .unwrap();
+        conn.query_row(
+            "SELECT is_typed FROM turns WHERE record_type = 'user' \
+             ORDER BY turn_seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+}
+
+/// A session whose last `user` record is a tool result: the brief quotes the
+/// prompt before it, and carries none of the result.
+#[test]
+fn a_session_ending_in_a_tool_result_quotes_the_last_typed_prompt() {
+    const LISTING: &str = "flange-inventory.csv freight-manifest.csv";
+
+    let bench = bench();
+    bench.archive_records(
+        &Session {
+            file: "tool-result.jsonl",
+            id: "55555555-5555-4555-8555-555555555555",
+            project: "project-tools",
+            ..LATE
+        },
+        &[
+            text_record("user", TYPED),
+            tool_use_record(),
+            tool_result_record(LISTING),
+            text_record("assistant", ANSWER),
+        ],
+    );
+    assert_eq!(
+        bench.last_user_is_typed(),
+        Some(0),
+        "the last user record archived as one the person typed"
+    );
+
+    let brief = bench.brief("project-tools").expect("a brief");
+    assert!(
+        brief.contains(TYPED) && brief.contains(ANSWER),
+        "the brief lost a side of the exchange: {brief}"
+    );
+    for token in ["flange-inventory", "freight-manifest", "toolUseResult"] {
+        assert!(
+            !brief.contains(token),
+            "the brief carries the tool result's {token:?}: {brief}"
+        );
+    }
+}
+
+/// D-02's other two shapes: a `<task-notification>` envelope and an
+/// `isMeta: true` caveat are `user` records nobody typed either, and 12.3% of
+/// measured sessions end on one of them.
+///
+/// A bench each, because [`Bench::last_user_is_typed`] reads the one session in
+/// the store and two sessions in one store would order across sessions.
+#[test]
+fn a_session_ending_in_a_harness_record_quotes_the_prompt_before_it() {
+    const ENVELOPE: &str = "<task-notification>the flange audit finished</task-notification>";
+    const CAVEAT: &str = "Caveat: the messages below were generated while running /flanges";
+
+    for (shape, last) in [
+        ("envelope", text_record("user", ENVELOPE)),
+        ("isMeta", {
+            let mut record = text_record("user", CAVEAT);
+            record["isMeta"] = serde_json::Value::Bool(true);
+            record
+        }),
+    ] {
+        let bench = bench();
+        bench.archive_records(
+            &Session {
+                file: "harness.jsonl",
+                id: "66666666-6666-4666-8666-666666666666",
+                project: "project-harness",
+                ..LATE
+            },
+            &[
+                text_record("user", TYPED),
+                text_record("assistant", ANSWER),
+                last,
+            ],
+        );
+        assert_eq!(
+            bench.last_user_is_typed(),
+            Some(0),
+            "{shape}: the last user record archived as one the person typed"
+        );
+
+        let brief = bench.brief("project-harness").expect("a brief");
+        assert!(
+            brief.contains(TYPED) && brief.contains(ANSWER),
+            "{shape}: the brief lost a side of the exchange: {brief}"
+        );
+        for token in ["task-notification", "flange audit", "Caveat"] {
+            assert!(
+                !brief.contains(token),
+                "{shape}: the brief carries the harness record's {token:?}: {brief}"
+            );
+        }
+    }
+}
+
+/// A session with no typed `user` record at all: no "It last asked" line, and
+/// every other block still rendered.
+///
+/// Fixture-only, and deliberately so: 0 of 700 sampled real transcripts have
+/// zero person-authored `user` records (D-13). `session-errors-a.jsonl` is
+/// three `Bash` calls and their three `tool_result` records and nothing else,
+/// which is exactly that session.
+#[test]
+fn a_session_with_no_typed_prompt_renders_no_asked_line() {
+    let bench = bench();
+    bench.archive_fixture("session-errors-a.jsonl");
+    assert_eq!(
+        bench.last_user_is_typed(),
+        Some(0),
+        "the fixture archived a typed user record after all"
+    );
+
+    let brief = bench.brief("project-beta").expect("a brief");
+    assert!(
+        !brief.contains("It last asked"),
+        "the brief quotes a prompt in a session that has none: {brief}"
+    );
+    // The rest of the brief is untouched: this is a missing quotation, not a
+    // missing block.
+    for kept in ["It last answered", "2026-08-12", "phase-3", "recall_search"] {
+        assert!(
+            brief.contains(kept),
+            "the brief dropped {kept:?} along with the prompt line: {brief}"
+        );
+    }
 }
 
 /// D-10 and D-18, asserted against the source rather than against behaviour.
