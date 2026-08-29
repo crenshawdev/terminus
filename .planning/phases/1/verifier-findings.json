@@ -1,0 +1,112 @@
+{
+  "status": "gaps",
+  "score": "7/8",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "A cold start against an empty data dir creates the store at DERIVED_SCHEMA 4, ingests without error, and a primary query returns real data",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "Ran live in a scratch tree (VERBATIM_DATA_DIR/VERBATIM_CONFIG_DIR/CLAUDE_CONFIG_DIR all temporary, real store untouched): `verbatim ingest` exit 0, `select key,value from meta` -> derived_schema|4, archive_format|1; `verbatim hook SessionStart` on stdin returned a full additionalContext brief with 'It last asked: wire up the quince exporter...', 'It last answered: ...' and the index pointer '1 session and 5 turns archived'"
+    },
+    {
+      "n": 2,
+      "truth": "In a freshly ingested store every record_type='user' turn carries is_typed and nothing else does",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "Live cold-start store: `select count(*) from turns where record_type='user' and is_typed is null` -> 0; group-by -> is_typed 0:2, 1:1; `record_type<>'user' and is_typed is not null` -> 0. Also crates/verbatim-core/tests/derive.rs:441-453 `every_user_row_of_a_fresh_store_is_classified_and_nothing_else_is` (--test derive 10 passed). Written at parse/record.rs:174 `is_typed: (kind == \"user\").then(|| is_typed(&value))`, carried through the single seam derive.rs:70-99"
+    },
+    {
+      "n": 3,
+      "truth": "The brief's last_turn query differs from the previous version by exactly one AND, with no additional blob opened",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "git show 4af66ab -- crates/verbatim-core/src/inject/brief.rs: the only non-doc change is `WHERE session_key = ?1 AND record_type = ?2 \\` -> `... AND is_typed IS NOT 0 \\` at brief.rs:540. No new statement, no new index, no change to last_exchange's single BlobReader::open (brief.rs:500-513)"
+    },
+    {
+      "n": 4,
+      "truth": "A session whose last user record is a tool result quotes the earlier typed prompt, and a session with no typed prompt renders no 'It last asked' line",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "crates/verbatim-core/tests/inject_brief.rs:383 `a_session_ending_in_a_tool_result_quotes_the_last_typed_prompt` (asserts the listing tokens and 'toolUseResult' are absent) and :479 `a_session_with_no_typed_prompt_renders_no_asked_line`, seeded from session-errors-a.jsonl on project-beta exactly as AC2 words it - both pass in `--test inject_brief` (9 passed)"
+    },
+    {
+      "n": 5,
+      "truth": "A session ending in a task-notification envelope or an isMeta:true record quotes the preceding typed prompt, not the envelope",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "crates/verbatim-core/tests/inject_brief.rs:425 `a_session_ending_in_a_harness_record_quotes_the_prompt_before_it` loops both shapes and asserts 'task-notification', 'flange audit' and 'Caveat' are absent - passes. Observed end to end too: the live cold-start hook run above was seeded from tests/fixtures/session-envelope.jsonl, whose last user record is `<task-notification>`, and the emitted brief quoted the typed prompt and carried no envelope text. Classifier: parse/record.rs:341-392 (isMeta, tool_result block anywhere, leading tag from HARNESS_ENVELOPE_TAGS; toolUseResult never read)"
+    },
+    {
+      "n": 6,
+      "truth": "A store written by the previous build gains is_typed on open, is filled from sessions.blob with no transcript on disk, still ingests with an evicted session present, and verify passes",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "crates/verbatim-core/tests/reindex.rs:775 `a_previous_builds_store_gains_is_typed_and_is_filled_from_the_blobs` drops the column, ages meta to DERIVED_SCHEMA-1, deletes the whole source tree, then asserts the column returns, non-evicted user rows are all classified, evicted rows stay NULL, a further ingest::run commits, and verify::verify reports ok - passes (--test reindex 12 passed). Mechanism: schema.rs:458 BRING_FORWARD_COLUMNS (\"turns\", is_typed INTEGER), schema.rs:291, store/open.rs:34 DERIVED_SCHEMA = 4"
+    },
+    {
+      "n": 7,
+      "truth": "Two SessionStart renders against an unchanged store are byte-identical, on a rooted fixture whose quoted turn moves under the new rule",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "crates/verbatim/tests/brief.rs:191 `two_session_starts_against_an_unchanged_store_are_byte_identical` seeded from MOVED_FIXTURE = session-envelope.jsonl (brief.rs:47), which is rooted at project-gamma via testkit.rs:69 ROOTED_FIXTURES; asserts identical stdout at the process boundary plus the typed prompt present and the not-typed records absent - run by name, passed"
+    },
+    {
+      "n": 8,
+      "truth": "The 10 ms p99 hook budget holds over 100 runs of every event against a store built from the real corpus",
+      "status": "FAILED",
+      "uat_item": 5,
+      "evidence": "crates/verbatim/tests/corpus.rs:422 asserts a profile-aware wall - `if cfg!(debug_assertions) { (\"debug\", 20.0) } else { (\"release\", 10.0) }` - and the assert at :493 compares p99 against that budget. `cargo test` builds debug by default, so the number actually enforced by a normal run is 20 ms, not the flat 10 ms AC4 and this item state. SUMMARY.md:71-76 records the debug measurement at p50 18.48 ms / p99 19.72 ms against that 20.0 ms wall (1.4% margin) and rising with corpus growth; release measured p99 4.26 ms. Not re-run here: the arm is gated on VERBATIM_TEST_CORPUS and a corpus ingest costs ~355 s"
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "Cold start from scratch",
+      "evidence": "Live run in a temporary data/config/Claude tree: ingest exit 0, meta derived_schema=4, and `verbatim hook SessionStart` returned a real brief (last asked / last answered / index pointer) for the seeded project"
+    },
+    {
+      "k": 2,
+      "name": "is_typed is written for every user turn, and the brief costs one extra AND",
+      "evidence": "Live store: user rows with NULL is_typed = 0, non-user rows with a value = 0. git show 4af66ab shows the sole production change is `AND is_typed IS NOT 0` in brief.rs:540, no second query and no second blob open. tests/derive.rs 10 passed"
+    },
+    {
+      "k": 3,
+      "name": "A tool-result-last session quotes the earlier typed prompt",
+      "evidence": "inject_brief.rs:383 and :479 both pass; the second is seeded from session-errors-a.jsonl and asserts no 'It last asked' line while the rest of the brief is intact"
+    },
+    {
+      "k": 4,
+      "name": "Harness envelopes are not quoted as prompts",
+      "evidence": "inject_brief.rs:425 covers both the `<task-notification>` envelope and the isMeta:true caveat and passes; the same behaviour was observed end to end in the live hook output from the session-envelope fixture"
+    },
+    {
+      "k": 6,
+      "name": "A previous build's store comes forward without a re-ingest",
+      "evidence": "reindex.rs:775 passes: column dropped, schema aged, source tree deleted, then column restored and backfilled from blobs, evicted rows preserved NULL, further ingest commits, verify::verify ok"
+    },
+    {
+      "k": 7,
+      "name": "Two renders against an unchanged store are byte-identical",
+      "evidence": "crates/verbatim/tests/brief.rs:191 run by name and passed, on the rooted session-envelope.jsonl whose quoted turn moved under the new rule"
+    }
+  ],
+  "gaps": [
+    {
+      "k": 5,
+      "name": "The 10 ms p99 cold-start budget over the real corpus",
+      "reason": "behavior wrong - the criterion as written is not what the code asserts. corpus.rs asserts 10 ms only in release; in the debug profile `cargo test` builds by default it asserts 20 ms, and the recorded debug measurement is 19.72 ms p99 against that wall (1.4% margin), on a number that grows with the corpus",
+      "evidence": "crates/verbatim/tests/corpus.rs:422 `let (profile, budget) = if cfg!(debug_assertions) { (\"debug\", 20.0_f64) } else { (\"release\", 10.0_f64) };` and the assertion at corpus.rs:493-496. SUMMARY.md deviation 2 and 3 and the first open item record the 18.48/19.72 ms debug figures and attribute the cost to v0.1.0's INJ-01 index pointer at crates/verbatim-core/src/inject/brief.rs:580, not to this phase's AND (debug p50 10.24 ms with the AND reverted vs 10.38 ms with it)",
+      "severity": "major",
+      "missing": "Adjudicate AC4: either reword it to the shipped profile-aware wall (10 ms release, headroom-only debug arm), or fix the INJ-01 index pointer count so a single 10 ms wall holds in both profiles. Whichever way it goes, the 20 ms debug wall has 1.4% margin against a measurement that climbs every time this project is worked on, so leaving it as an asserting wall queues a failure that is not a regression"
+    },
+    {
+      "name": "cargo fmt --check fails on files this phase committed",
+      "reason": "behavior wrong - the workspace is not rustfmt-clean; 16 diffs across 8 test files, 5 of them files phase 1 touched",
+      "evidence": "`cargo fmt --check` reports diffs in crates/verbatim-core/tests/{inject_brief.rs:131, parse.rs:477/506/560/593/642, reindex.rs:833/861, retention.rs, verify.rs} and crates/verbatim/tests/{hook.rs, retention.rs}. All line-wrapping of assert!/format! plus one import order; no production file is affected. Already carried as SUMMARY.md open item 2",
+      "severity": "minor",
+      "missing": "Run `cargo fmt` over the workspace and commit, and decide whether rustfmt joins the project's lint gate - neither the detected lint nor typecheck command runs it, which is why this reached the verifier"
+    }
+  ],
+  "human_checks": []
+}
