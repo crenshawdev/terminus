@@ -477,7 +477,10 @@ fn line(fields: serde_json::Value) -> Vec<u8> {
         .entry("type")
         .or_insert_with(|| serde_json::json!("user"));
     object.insert("uuid".into(), serde_json::json!("u-1"));
-    object.insert("timestamp".into(), serde_json::json!("2026-08-23T00:00:00Z"));
+    object.insert(
+        "timestamp".into(),
+        serde_json::json!("2026-08-23T00:00:00Z"),
+    );
     serde_json::to_vec(&serde_json::Value::Object(object)).unwrap()
 }
 
@@ -506,7 +509,9 @@ fn a_typed_prompt_reads_typed_and_a_tool_result_does_not() {
     // The other content shape a real prompt takes: 1,097 of 7,933 sampled
     // `user` records carry a bare string rather than a block list.
     assert_eq!(
-        classify(&user(serde_json::json!("run the build and show me the stderr"))),
+        classify(&user(serde_json::json!(
+            "run the build and show me the stderr"
+        ))),
         Some(true)
     );
     assert_eq!(
@@ -560,9 +565,7 @@ fn every_harness_envelope_tag_is_not_typed() {
             "<{tag}> as a string content"
         );
         assert_eq!(
-            classify(&user(
-                serde_json::json!([{ "type": "text", "text": text }])
-            )),
+            classify(&user(serde_json::json!([{ "type": "text", "text": text }]))),
             Some(false),
             "<{tag}> as a text block"
         );
@@ -593,7 +596,11 @@ fn a_prompt_that_merely_contains_a_tag_is_still_typed() {
         "read this and tell me why <command-name>/cad-plan</command-name> shows up in it",
         "<command-message-of-my-own>not upstream's tag</command-message-of-my-own>",
     ] {
-        assert_eq!(classify(&user(serde_json::json!(text))), Some(true), "{text}");
+        assert_eq!(
+            classify(&user(serde_json::json!(text))),
+            Some(true),
+            "{text}"
+        );
     }
 }
 
@@ -642,7 +649,10 @@ fn only_a_user_record_carries_a_classification() {
     for (_, turn) in scan.turns() {
         if turn.record_type == "user" {
             users += 1;
-            assert!(turn.is_typed.is_some(), "a user turn with no classification");
+            assert!(
+                turn.is_typed.is_some(),
+                "a user turn with no classification"
+            );
         } else {
             assert_eq!(turn.is_typed, None, "{} carries one", turn.record_type);
         }

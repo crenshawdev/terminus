@@ -833,7 +833,10 @@ fn a_previous_builds_store_gains_is_typed_and_is_filled_from_the_blobs() {
     drop(store);
 
     let conn = bench.conn();
-    assert!(has_column(&conn, "turns", "is_typed"), "the column is missing");
+    assert!(
+        has_column(&conn, "turns", "is_typed"),
+        "the column is missing"
+    );
 
     // Every rebuilt session's user rows are classified, and nothing else is.
     assert_eq!(
@@ -861,7 +864,10 @@ fn a_previous_builds_store_gains_is_typed_and_is_filled_from_the_blobs() {
     assert_eq!(derived_rows(&conn, &evicted), rows_before);
     assert_eq!(turn_ids(&conn, &evicted), ids_before);
     assert_eq!(
-        count_where(&conn, &format!("session_key = '{evicted}' AND is_typed IS NOT NULL")),
+        count_where(
+            &conn,
+            &format!("session_key = '{evicted}' AND is_typed IS NOT NULL")
+        ),
         0,
         "a preserved evicted row was given a classification nothing derived"
     );

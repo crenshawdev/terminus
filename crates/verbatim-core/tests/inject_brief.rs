@@ -131,7 +131,8 @@ impl Bench {
     /// The fixtures carry `{{ROOT}}` where a real transcript carries an
     /// absolute `cwd`, so the project key is one this test built.
     fn archive_fixture(&self, fixture: &str) {
-        let path = verbatim_core::testkit::copy_rooted_fixture_into(fixture, &self.work, &self.root);
+        let path =
+            verbatim_core::testkit::copy_rooted_fixture_into(fixture, &self.work, &self.root);
         match ingest::run(&self.data_dir, &path).unwrap() {
             ingest::Outcome::Committed(_) => {}
             other => panic!("{fixture}: {other:?}"),
