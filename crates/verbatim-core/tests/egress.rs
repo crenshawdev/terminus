@@ -249,3 +249,346 @@ fn nothing_in_the_ingest_path_names_the_egress_filter() {
     }
     assert!(checked >= 3, "only {checked} files in {}", dir.display());
 }
+
+// ---------------------------------------------------------------------------
+// What is actually sent (PRIV-01, PRIV-03, D-01, D-14, D-15, D-16)
+
+/// The bytes `provider::complete` hands `net::post`, read off a loopback stub.
+///
+/// Everything above this line is the filter answering about a string a test
+/// wrote. Everything below it is the filter answering about the request the
+/// product really builds: a secret planted in a transcript turn, ingested
+/// through the real `ingest::run`, projected by the real `text::project`, and
+/// carried into a real `judgment::judge` call whose socket a stub is on the
+/// other end of. That distinction is the whole of this phase - the whole-body
+/// call these tests replaced passed on a sample and did nothing on the wire.
+///
+/// Gated per item and NOT with a file-level `#![cfg(feature = "testkit")]`
+/// (D-16): a file-level gate makes `cargo test --test egress` compile an empty
+/// binary and report green, which would retire
+/// `nothing_in_the_ingest_path_names_the_egress_filter` silently.
+#[cfg(feature = "testkit")]
+mod wire {
+    use std::path::PathBuf;
+
+    use rusqlite::Connection;
+    use verbatim_core::config::{Config, CONFIG_FILE_NAME};
+    use verbatim_core::observe::cost;
+    use verbatim_core::observe::judgment::{self, Verdict};
+    use verbatim_core::store::DB_FILE_NAME;
+    use verbatim_core::testkit::{self, HttpStub};
+    use verbatim_core::{ingest, observe};
+
+    /// The transcript every test here sends: one turn per credential shape.
+    const FIXTURE: &str = "session-secrets.jsonl";
+
+    /// What the model is told it is, so the stub's one answer is enough.
+    const MODEL: &str = "wire-stub";
+
+    /// One archived, observed session, ready to be judged.
+    struct Wire {
+        _dir: tempfile::TempDir,
+        data_dir: PathBuf,
+        config_dir: PathBuf,
+        session_key: String,
+    }
+
+    /// Archive [`FIXTURE`] through the real ingest path, close it, and give it
+    /// the mechanical row the judgment half fills in.
+    ///
+    /// The idle rule is short-circuited the way `tests/judgment.rs` does it, so
+    /// the fixture's own old timestamps do not have to be rewritten.
+    fn wire() -> Wire {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let work = dir.path().join("work");
+        let config_dir = dir.path().join("config");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let path = testkit::copy_rooted_fixture_into(FIXTURE, &work, &root);
+        match ingest::run(&data_dir, &path).unwrap() {
+            ingest::Outcome::Committed(_) => {}
+            other => panic!("{FIXTURE}: {other:?}"),
+        }
+        let session_key = path.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+        conn.execute("UPDATE session_meta SET is_final = 1", [])
+            .unwrap();
+        let observed = observe::observe_new(&conn, &Config::default());
+        assert_eq!(observed.written, 1, "{observed:?}");
+
+        Wire {
+            _dir: dir,
+            data_dir,
+            config_dir,
+            session_key,
+        }
+    }
+
+    impl Wire {
+        fn conn(&self) -> Connection {
+            Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
+        }
+
+        /// Every `turns.id` of the session, which is what a `turn_id=` anchor
+        /// in the prompt has to be one of.
+        fn turn_ids(&self) -> Vec<i64> {
+            self.conn()
+                .prepare("SELECT id FROM turns WHERE session_key = ?1 ORDER BY turn_seq")
+                .unwrap()
+                .query_map([self.session_key.as_str()], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        }
+
+        /// A config pointing judgment at `stub`, differing ONLY in the `local`
+        /// key.
+        ///
+        /// `None` writes no `local` line at all, which is the arm a forgotten
+        /// declaration reaches and the one AC1 is about. It is deliberately not
+        /// spelled `false` here: what has to be true is that the absence itself
+        /// filters.
+        fn config(&self, stub: &HttpStub, local: Option<bool>) -> Config {
+            let declaration = match local {
+                Some(value) => format!("local = {value}\n"),
+                None => String::new(),
+            };
+            std::fs::write(
+                self.config_dir.join(CONFIG_FILE_NAME),
+                format!(
+                    "[provider]\nenabled = true\nbase_url = \"{}\"\n\
+                     model = \"{MODEL}\"\n{declaration}",
+                    stub.base_url()
+                ),
+            )
+            .unwrap();
+            Config::load_from(&self.config_dir).unwrap()
+        }
+
+        /// Drive one real judgment call and answer with the body the stub
+        /// recorded.
+        ///
+        /// No body-building helper is exported for this (D-14): a body the
+        /// product does not build is the same failure this phase exists to fix.
+        fn recorded_body(&self, local: Option<bool>, again: bool) -> String {
+            let stub = HttpStub::serving(&[testkit::chat_completion(&answer(), 1, 1)]);
+            let config = self.config(&stub, local);
+            let conn = self.conn();
+            let verdict = if again {
+                judgment::judge_again(&conn, &config, None, &self.session_key)
+            } else {
+                judgment::judge(&conn, &config, None, &self.session_key)
+            };
+            assert!(
+                matches!(verdict, Verdict::Stored { .. }),
+                "the call the body is read off did not happen: {verdict:?}"
+            );
+            let sent = stub.requests().remove(0);
+            sent.split("\r\n\r\n")
+                .nth(1)
+                .expect("a request body")
+                .to_owned()
+        }
+
+        /// Both bodies from ONE store, so the two differ in the `local` key and
+        /// in nothing else - not in the turn ids the prompt is written around.
+        fn both_bodies(&self) -> (String, String) {
+            let filtered = self.recorded_body(None, false);
+            let whole = self.recorded_body(Some(true), true);
+            (filtered, whole)
+        }
+    }
+
+    /// A valid judgment with no claims in it: three empty arrays anchor to
+    /// nothing, so one request is enough and the stub is never asked for a
+    /// retry it has no response for.
+    fn answer() -> String {
+        serde_json::json!({
+            "topic": "a sync run that pasted its credentials into the transcript",
+            "outcome": judgment::OUTCOMES[0],
+            "decisions": [],
+            "learned": [],
+            "unresolved": [],
+        })
+        .to_string()
+    }
+
+    /// The top-level object's keys, in the order the body TEXT states them.
+    ///
+    /// Read off the text and not off a parsed map on purpose: `serde_json`'s
+    /// map here is a `BTreeMap`, so parsing both sides would sort them into
+    /// agreement and the assertion would hold whatever the bodies said.
+    fn top_level_keys(body: &str) -> Vec<String> {
+        let bytes = body.as_bytes();
+        let mut keys = Vec::new();
+        let mut depth = 0usize;
+        let mut at = 0usize;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'{' | b'[' => {
+                    depth += 1;
+                    at += 1;
+                }
+                b'}' | b']' => {
+                    depth = depth.saturating_sub(1);
+                    at += 1;
+                }
+                b'"' => {
+                    let start = at + 1;
+                    let mut end = start;
+                    while end < bytes.len() && bytes[end] != b'"' {
+                        end += if bytes[end] == b'\\' { 2 } else { 1 };
+                    }
+                    if depth == 1 && bytes.get(end + 1) == Some(&b':') {
+                        keys.push(body[start..end].to_owned());
+                    }
+                    at = end + 1;
+                }
+                _ => at += 1,
+            }
+        }
+        keys
+    }
+
+    /// The `messages` array's `role` values, in order.
+    fn roles(body: &serde_json::Value) -> Vec<String> {
+        body["messages"]
+            .as_array()
+            .expect("a messages array")
+            .iter()
+            .map(|m| m["role"].as_str().expect("a role").to_owned())
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // AC1: the secret does not leave
+
+    /// The claim the phase exists for: a secret typed into a session does not
+    /// reach a remote endpoint, and the undeclared destination is remote.
+    ///
+    /// The shape is chosen so the *placement* is what is under test. A JSON
+    /// `"password"` pair is invisible to the assignment rule and invisible to
+    /// the whole-body scan this replaced - in a serialized body its quotes are
+    /// `\"` and the pair rule walks straight past them - so the only reason it
+    /// can be gone here is that the filter ran on the content string.
+    #[test]
+    fn a_secret_in_an_ingested_turn_does_not_reach_an_undeclared_destination() {
+        let wire = wire();
+        let (filtered, whole) = wire.both_bodies();
+
+        assert!(
+            !filtered.contains("pw-VBEGRESS-mash-4d1"),
+            "the planted password went out to an undeclared destination: {filtered}"
+        );
+        assert!(
+            !filtered.contains("sk-VBEGRESS-authz-9f2"),
+            "the planted Authorization value went out: {filtered}"
+        );
+        // The falsifying half: the same call with the destination declared
+        // local sends both, so the assertion above is about the filter and not
+        // about a fixture that failed to plant anything.
+        assert!(
+            whole.contains("pw-VBEGRESS-mash-4d1") && whole.contains("sk-VBEGRESS-authz-9f2"),
+            "the fixture planted nothing, so nothing was proven: {whole}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC3: still the same document
+
+    /// Filtering changes values and nothing else about the request.
+    ///
+    /// A filter that came back with a document the endpoint cannot read, or one
+    /// message short, would fail the remote path in a way no local run could
+    /// ever show.
+    #[test]
+    fn the_filtered_body_is_the_same_document_with_different_values() {
+        let wire = wire();
+        let (filtered, whole) = wire.both_bodies();
+
+        let parsed: serde_json::Value = serde_json::from_str(&filtered)
+            .unwrap_or_else(|e| panic!("the filtered body is not JSON ({e}): {filtered}"));
+        let unfiltered: serde_json::Value = serde_json::from_str(&whole).unwrap();
+
+        assert_eq!(
+            parsed["messages"].as_array().map(Vec::len),
+            unfiltered["messages"].as_array().map(Vec::len),
+            "the filter changed how many messages were sent"
+        );
+        assert_eq!(
+            roles(&parsed),
+            roles(&unfiltered),
+            "the filter changed the roles or their order"
+        );
+
+        let keys = top_level_keys(&filtered);
+        assert!(
+            keys.contains(&"messages".to_owned()) && keys.contains(&"model".to_owned()),
+            "the key reader found no request shape at all: {keys:?}"
+        );
+        assert_eq!(
+            keys,
+            top_level_keys(&whole),
+            "the filter changed the top-level key sequence"
+        );
+    }
+
+    /// D-08: the instruction turn goes through the filter too, and today's
+    /// instructions come out of it byte for byte.
+    ///
+    /// It is redacted rather than skipped because a prompt is text like any
+    /// other and an exemption would be a hole. This is the test that says a
+    /// later prompt edit introducing a matching word - a `--key` example, a
+    /// `name: value` line - changed what the model was asked, and says it at
+    /// the moment the edit lands rather than after a model starts answering the
+    /// wrong schema.
+    #[test]
+    fn the_instruction_turn_survives_the_filter_byte_for_byte() {
+        let wire = wire();
+        let (filtered, whole) = wire.both_bodies();
+
+        let parsed: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+        let unfiltered: serde_json::Value = serde_json::from_str(&whole).unwrap();
+
+        let system = parsed["messages"][0]["content"]
+            .as_str()
+            .expect("a system turn");
+        assert_eq!(
+            parsed["messages"][0]["role"], "system",
+            "the first message is not the instruction turn"
+        );
+        assert_eq!(
+            system,
+            unfiltered["messages"][0]["content"]
+                .as_str()
+                .expect("a system turn"),
+            "the filter changed the instructions"
+        );
+        assert!(
+            system.contains("turn_id"),
+            "the instructions are not the ones under test: {system}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC6's other half: the fixture is really what is being judged
+
+    /// The premise every assertion above rests on: the session reached the
+    /// provider at all, rather than being skipped for being too short.
+    #[test]
+    fn the_fixture_carries_enough_turns_to_be_judged() {
+        let wire = wire();
+        let ids = wire.turn_ids();
+
+        assert!(
+            ids.len() >= cost::MIN_TURNS,
+            "{FIXTURE} has {} turns, fewer than the {} a judgment is bought for",
+            ids.len(),
+            cost::MIN_TURNS
+        );
+    }
+}
