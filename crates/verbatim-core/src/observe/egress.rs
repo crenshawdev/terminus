@@ -78,6 +78,18 @@
 //! guessed: over the 60 most recent real transcripts, 21 MB, runs carrying a
 //! GitHub prefix occurred 0 times and bare `eyJ`-prefixed runs 4 times.
 //!
+//! Over-matching is the direction to be wrong in; it is NOT a licence for a
+//! rule to hand a shape off to another rule that does not take it. Rule 4 did
+//! exactly that until 2026-08-30: it deferred every header name preceded by a
+//! double quote to rule 5, and rule 5 fires only once the quoted run CLOSES
+//! before the colon, so the ordinary curl spelling `-H "Authorization: Bearer
+//! <v>"` was caught by neither and went out whole. Measured on the same corpus
+//! D-03 used, 347 of 1333 `Authorization:` occurrences sat immediately behind a
+//! double quote. A hand-off is only a hand-off when the receiving rule's own
+//! predicate is known to hold; anything else is an under-match wearing a
+//! comment. The same defect in the quoted-VALUE direction is why the value span
+//! is taken with [`flag_value_span`].
+//!
 //! # Egress only, never ingest
 //!
 //! `.planning/PROJECT.md` bars ingest-time redaction outright - it makes the
@@ -322,9 +334,21 @@ fn is_userinfo_byte(b: u8) -> bool {
 /// `=`. A rule that could only ever test that colon was inert on exactly the
 /// text this filter exists to guard.
 ///
-/// A name whose preceding byte is a double quote is left to rule 5:
-/// `  "api_key": "x",` is a JSON pair, and taking it here would swallow the
-/// line's trailing comma and hand the endpoint a document that is not JSON.
+/// A JSON pair is left to rule 5 without needing a test for it here: `"x": "y"`
+/// puts a closing quote immediately before the colon, that quote is not a name
+/// byte, and the walk-back therefore yields an EMPTY name run, which the empty
+/// check below already skips. A test on the byte preceding the name is a
+/// different test entirely - it also matches a name whose quote has not closed
+/// yet, which is the ordinary curl spelling `-H "Authorization: Bearer <v>"`,
+/// and that shape is a header this rule owns rather than a pair rule 5 will
+/// take. Rule 5 requires the run to close before the colon, so deferring the
+/// curl spelling to it deferred it to nothing at all.
+///
+/// A value may be quoted (`Cookie: "<v>"`), so the value span is taken with
+/// [`flag_value_span`] rather than [`value_run_end`], which stops ON an opening
+/// quote and would leave an empty span - the same under-match rule 7 was
+/// carrying until it was fixed. The opening quote is re-emitted before the
+/// marker, so the redacted line stays balanced.
 ///
 /// What goes is BOUNDED - an optional auth scheme word plus one value run -
 /// rather than the rest of the line. A whole turn is one line, so running to
@@ -366,17 +390,15 @@ fn redact_header_spans(line: &str, out: &mut String) {
         while name_start > copied && is_name_byte(bytes[name_start - 1]) {
             name_start -= 1;
         }
-        // An empty run, a quoted name (rule 5's case) or an ordinary word: not
-        // a header, and the colon is just punctuation.
-        if name_start == colon
-            || (name_start > 0 && bytes[name_start - 1] == b'"')
-            || !is_secret_name(&line[name_start..colon])
-        {
+        // An empty run (rule 5's `"name": "value"`, whose closing quote ends the
+        // run before it starts) or an ordinary word: not a header, and the colon
+        // is just punctuation.
+        if name_start == colon || !is_secret_name(&line[name_start..colon]) {
             at = colon + 1;
             continue;
         }
-        let span_start = skip_blanks(bytes, colon + 1);
-        let first_end = value_run_end(bytes, span_start);
+        let value_at = skip_blanks(bytes, colon + 1);
+        let (span_start, first_end) = flag_value_span(bytes, value_at);
         // `Authorization: Bearer <value>` has to lose the scheme word and the
         // value together, or the shape is still legible enough to say what kind
         // of credential was sent and where the rest of it went.
@@ -397,6 +419,9 @@ fn redact_header_spans(line: &str, out: &mut String) {
         }
         out.push_str(&line[copied..=colon]);
         out.push(' ');
+        // Empty for an unquoted value; the opening `"`, `'` or `\"` for a quoted
+        // one, which `flag_value_span` stepped over to find the value itself.
+        out.push_str(&line[value_at..span_start]);
         out.push_str(REDACTED);
         copied = span_end;
         at = span_end;
@@ -754,6 +779,139 @@ fn is_secret_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The curl spelling. The header name opens inside a double-quoted string,
+    /// so the quoted run does NOT close before the colon and rule 5 never fires
+    /// on it - rule 4 has to take it or nothing does.
+    #[test]
+    fn a_double_quoted_header_name_is_still_a_header() {
+        let turn =
+            "turn_id=11 user: ran curl -H \"Authorization: Bearer sk-PLANTED-Q1\" https://api.example.com and got 200";
+
+        let scrubbed = scrub(None, turn);
+
+        assert!(
+            !scrubbed.contains("sk-PLANTED-Q1"),
+            "the curl spelling shipped its value whole: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("Bearer"),
+            "the scheme word survived without its value: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("Authorization: [redacted]"),
+            "the header went without saying so: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("and got 200"),
+            "the rest of the turn went with the header value: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("turn_id=11"),
+            "the turn lost the anchor a claim is made against: {scrubbed}"
+        );
+    }
+
+    /// Same shape, `Cookie`, and the span stays bounded to the quoted run.
+    #[test]
+    fn a_double_quoted_cookie_header_is_still_a_header() {
+        let turn = "turn_id=12 user: curl -H \"Cookie: sid-PLANTED-Q2\" -X GET then retried";
+
+        let scrubbed = scrub(None, turn);
+
+        assert!(
+            !scrubbed.contains("sid-PLANTED-Q2"),
+            "the quoted cookie shipped whole: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("-X GET then retried"),
+            "the rule ran past the closing quote and ate the turn: {scrubbed}"
+        );
+    }
+
+    /// A quoted VALUE, the other half of the same under-match: `value_run_end`
+    /// stops ON the opening quote, which used to make the span empty and skip
+    /// the header entirely.
+    #[test]
+    fn a_quoted_header_value_is_taken_from_inside_its_quotes() {
+        let turn = "turn_id=13 user: set Cookie: \"sid-PLANTED-Q3\" and the rest of the turn";
+
+        let scrubbed = scrub(None, turn);
+
+        assert!(
+            !scrubbed.contains("sid-PLANTED-Q3"),
+            "a quoted header value shipped whole: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("and the rest of the turn"),
+            "the rest of the turn went with the value: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("\"[redacted]\""),
+            "the quotes came back unbalanced: {scrubbed}"
+        );
+    }
+
+    /// An UNTERMINATED quoted value stays bounded. `flag_value_span` falls back
+    /// to [`value_run_end`] when it finds no closer before the line ends, and
+    /// that stops at the first blank - so a truncated line loses its credential
+    /// and keeps everything after it, rather than running to end of line.
+    #[test]
+    fn an_unterminated_quoted_header_value_stays_bounded() {
+        let turn = "turn_id=14 user: Cookie: \"sid-PLANTED-Q5 and the rest of the turn";
+
+        let scrubbed = scrub(None, turn);
+
+        assert!(
+            !scrubbed.contains("sid-PLANTED-Q5"),
+            "the unterminated value survived: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("and the rest of the turn"),
+            "the span ran to end of line and ate the turn: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("turn_id=14"),
+            "the turn lost its anchor: {scrubbed}"
+        );
+    }
+
+    /// The same shape one level in, where the byte after the value is the
+    /// enclosing JSON string's own closing quote and a comma follows it.
+    #[test]
+    fn a_header_inside_a_json_string_keeps_the_documents_punctuation() {
+        let body = "{\"note\": \"ran with Cookie: sid-PLANTED-Q6 today\", \"n\": 1}";
+
+        let scrubbed = scrub(None, body);
+
+        assert!(
+            !scrubbed.contains("sid-PLANTED-Q6"),
+            "the value inside a JSON string survived: {scrubbed}"
+        );
+        assert!(
+            scrubbed.ends_with("today\", \"n\": 1}"),
+            "the scan ran past the string and took the document's punctuation: {scrubbed}"
+        );
+    }
+
+    /// The hand-off rule 4 makes to rule 5 has to keep working: a real JSON
+    /// pair closes its quoted run BEFORE the colon, and rule 5 must be the one
+    /// that takes it, comma and document structure intact.
+    #[test]
+    fn a_json_pair_is_still_rule_5s_and_keeps_its_comma() {
+        let body = "{\"api_key\": \"sk-PLANTED-Q4\", \"model\": \"m\"}";
+
+        let scrubbed = scrub(None, body);
+
+        assert!(
+            !scrubbed.contains("sk-PLANTED-Q4"),
+            "the JSON pair value survived: {scrubbed}"
+        );
+        assert_eq!(
+            scrubbed, "{\"api_key\": \"[redacted]\", \"model\": \"m\"}",
+            "rule 4 took a pair rule 5 owns and reshaped the document"
+        );
+    }
 
     /// A turn as `judgment::transcript` writes it: one line, prefixed
     /// `turn_id=<id> <record_type>: `, with the header shape sitting mid-line

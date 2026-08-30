@@ -285,12 +285,17 @@ mod wire {
     /// What the model is told it is, so the stub's one answer is enough.
     const MODEL: &str = "wire-stub";
 
-    /// The seven planted sentinels, each with the marker of the rule that is
+    /// The nine planted sentinels, each with the marker of the rule that is
     /// the only thing able to catch it, and a name for the failure message.
     ///
-    /// One table rather than seven tests: the claim is about the SET - every
+    /// One table rather than nine tests: the claim is about the SET - every
     /// shape gone, each one accounted for by a named rule - and a table makes a
     /// shape that quietly stopped being planted impossible to miss.
+    ///
+    /// The last two are the DOUBLE-QUOTED spellings of the first and fourth.
+    /// They are separate rows rather than a rewrite of those rows because they
+    /// were caught by nothing until 2026-08-30: rule 4 handed a quoted name to
+    /// rule 5, which only fires once the quoted run closes before the colon.
     const PLANTED: &[(&str, &str, &str)] = &[
         (
             "an Authorization: Bearer header",
@@ -318,6 +323,16 @@ mod wire {
             "a connection URL's userinfo",
             "dsn-VBEGRESS-pg-8a4",
             egress::REDACTED_URL_USERINFO,
+        ),
+        (
+            "a double-quoted Authorization header, the curl spelling",
+            "sk-VBEGRESS-curlz-5e6",
+            REDACTED,
+        ),
+        (
+            "a double-quoted Cookie header, the curl spelling",
+            "sid-VBEGRESS-qcrumb-1f9",
+            REDACTED,
         ),
     ];
 
