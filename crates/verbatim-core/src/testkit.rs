@@ -26,6 +26,7 @@ pub const TRANSCRIPT_FIXTURES: &[&str] = &[
     "subagents/agent-echo.jsonl",
     "session-edits.jsonl",
     "session-envelope.jsonl",
+    "session-secrets.jsonl",
 ];
 
 /// The token the rooted fixtures carry where a real transcript carries an
@@ -42,7 +43,7 @@ pub const FIXTURE_ROOT_TOKEN: &str = "{{ROOT}}";
 /// The fixtures carrying [`FIXTURE_ROOT_TOKEN`], and the project directory each
 /// one's `cwd` names beneath the substituted root.
 ///
-/// Three distinct projects across them, which is what lets a scoped search have
+/// Four distinct projects across them, which is what lets a scoped search have
 /// something to be both true and false about.
 ///
 /// `project-gamma` has exactly one member and that is deliberate.
@@ -52,6 +53,13 @@ pub const FIXTURE_ROOT_TOKEN: &str = "{{ROOT}}";
 /// move. Every project-scoped assertion in the repository is written against
 /// `project-alpha` or `project-beta`, so a third key is what keeps this fixture
 /// inert for all of them.
+///
+/// `project-delta` has exactly one member for that same reason.
+/// `session-secrets.jsonl` is the v0.1.1 phase 2 one: its turns carry the seven
+/// credential shapes the egress filter is asked to catch, so a test can drive
+/// the real judgment request against a loopback stub and read the wire. Its
+/// vocabulary shares none of the corpus's counted tokens, so no existing
+/// assertion moves when it joins the set.
 ///
 /// `session-edits.jsonl` is the phase 5 one, and it needs the root for a second
 /// reason the others do not: the path its `Edit` call stores is ABSOLUTE
@@ -67,6 +75,7 @@ pub const ROOTED_FIXTURES: &[(&str, &str)] = &[
     ("session-errors-b.jsonl", "project-beta"),
     ("session-edits.jsonl", "project-alpha"),
     ("session-envelope.jsonl", "project-gamma"),
+    ("session-secrets.jsonl", "project-delta"),
 ];
 
 /// The project directory one rooted fixture's `cwd` names beneath `root`.
