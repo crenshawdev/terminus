@@ -632,6 +632,15 @@ fn is_flag_name_byte(b: u8) -> bool {
 /// a `\"` pair, which is how a command line spells a quote once it is sitting
 /// inside a JSON string. The text comes back the document it went in as.
 ///
+/// A closer the value ESCAPES is not the value's end - `--token "ab\"cd"` ends
+/// at the last quote, not the middle one - because taking the first match put
+/// everything after the inner quote outside the span and on the wire. A closer
+/// carrying a `\` in front of it is therefore skipped: `\"` inside a raw `"`
+/// value, `\\\"` inside the `\"` spelling the same command line takes on inside
+/// a JSON string. The cost of reading an escaped BACKSLASH before a real closer
+/// as an escaped quote is one over-long span, which is this module's tolerated
+/// direction.
+///
 /// The closing quote is looked for on the SAME line only, and an unterminated
 /// one falls back to the unquoted run: `--token "tok` still loses `tok`, and no
 /// stray apostrophe in prose can hand this rule the rest of the text.
@@ -647,13 +656,15 @@ fn flag_value_span(bytes: &[u8], from: usize) -> (usize, usize) {
         .position(|&b| b == b'\n')
         .map(|offset| inner_start + offset)
         .unwrap_or(bytes.len());
-    match bytes[inner_start..line_end]
-        .windows(closer.len())
-        .position(|window| window == closer)
-    {
-        Some(offset) => (inner_start, inner_start + offset),
-        None => (inner_start, value_run_end(bytes, inner_start)),
+    let mut at = inner_start;
+    while at + closer.len() <= line_end {
+        if &bytes[at..at + closer.len()] == closer && !(at > inner_start && bytes[at - 1] == b'\\')
+        {
+            return (inner_start, at);
+        }
+        at += 1;
     }
+    (inner_start, value_run_end(bytes, inner_start))
 }
 
 /// Rule 8: a bare JSON Web Token, with no name beside it to catch it by.
@@ -945,6 +956,55 @@ mod tests {
             assert!(
                 scrubbed.contains(survives),
                 "the rule took `{survives}` with the value: {scrubbed}"
+            );
+            assert_eq!(
+                scrub(None, &scrubbed),
+                scrubbed,
+                "a second scrub re-consumed the marker the first one left"
+            );
+        }
+    }
+
+    /// A quote INSIDE a quoted value is not the value's end. The closer search
+    /// took the first one it saw, so `--token "ab\"cd"` lost `ab\` and put the
+    /// rest of the secret on the wire: everything after the escaped quote was
+    /// outside the span and went out unredacted.
+    #[test]
+    fn an_escaped_quote_inside_a_flag_value_does_not_end_it() {
+        for (turn, planted) in [
+            // The raw command line, one quote character each.
+            (
+                r#"turn_id=16 user: gh auth login --token "ab\"tok-PLANTED-9" --scopes repo"#,
+                "tok-PLANTED-9",
+            ),
+            (
+                r#"turn_id=17 user: gh auth login --token 'ab\'tok-PLANTED-10' --scopes repo"#,
+                "tok-PLANTED-10",
+            ),
+            // The same two after they landed inside a JSON string, where the
+            // value's own delimiters are `\"` and its inner quote is `\\\"`.
+            (
+                r#"{"content":"gh auth login --token \"ab\\\"tok-PLANTED-11\" --scopes repo"}"#,
+                "tok-PLANTED-11",
+            ),
+            (
+                r#"{"content":"gh auth login --token 'ab\\'tok-PLANTED-12' --scopes repo"}"#,
+                "tok-PLANTED-12",
+            ),
+        ] {
+            let scrubbed = scrub(None, turn);
+
+            assert!(
+                !scrubbed.contains(planted),
+                "the tail of a flag value survived its escaped quote: {scrubbed}"
+            );
+            assert!(
+                scrubbed.contains(REDACTED_FLAG_VALUE),
+                "the flag value went into an unlabelled hole: {scrubbed}"
+            );
+            assert!(
+                scrubbed.contains("--scopes repo"),
+                "the rule ran past the value's closing quote: {scrubbed}"
             );
             assert_eq!(
                 scrub(None, &scrubbed),
