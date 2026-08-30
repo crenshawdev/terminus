@@ -89,6 +89,16 @@ pub const REDACTED_JWT: &str = "[redacted:a-json-web-token]";
 /// [`REDACTED_JWT`]'s reason.
 pub const REDACTED_GITHUB_TOKEN: &str = "[redacted:a-github-token]";
 
+/// What replaces the userinfo a connection URL carries before its `@`. One
+/// whitespace-free token, for [`REDACTED_JWT`]'s reason.
+pub const REDACTED_URL_USERINFO: &str = "[redacted:connection-url-userinfo]";
+
+/// What replaces the value of a space-separated secret flag. One
+/// whitespace-free token, for [`REDACTED_JWT`]'s reason - and here that is not
+/// a nicety: the value this rule takes IS the next whitespace-delimited run, so
+/// a marker holding a space would be re-consumed and grown on every scrub.
+pub const REDACTED_FLAG_VALUE: &str = "[redacted:a-command-line-flag-value]";
+
 /// The prefixes GitHub issues its credentials under.
 ///
 /// A PINNED list and a 2026-08-30 snapshot with no in-repo source of truth: it
@@ -152,9 +162,15 @@ pub fn scrub(credential: Option<&Secret>, text: &str) -> String {
 fn redact(credential: Option<&Secret>, text: &str) -> String {
     let text = replace_credential(text, credential);
     let text = redact_pem_blocks(&text);
+    // Before the header rule, not after: a userinfo username matching
+    // `SECRET_NAMES` (`postgres://apiuser:pw@host/db`) is a `name: value` shape
+    // to rule 4, which would take the host along with the password and leave a
+    // reader unable to see which machine was reached.
+    let text = redact_url_userinfo(&text);
     let text = redact_header_lines(&text);
     let text = redact_json_pairs(&text);
     let text = redact_assignments(&text);
+    let text = redact_flag_values(&text);
     let text = redact_jwts(&text);
     redact_github_tokens(&text)
 }
@@ -216,7 +232,46 @@ fn redact_pem_blocks(text: &str) -> String {
     out
 }
 
-/// Rule 3: a header shape ANYWHERE on a line, whose name is a secret name.
+/// Rule 3: the userinfo a connection URL carries before its `@`.
+///
+/// The scheme and everything from the `@` onward stay, so a reader can still
+/// see which host was reached - which is the whole reason this is its own rule
+/// rather than a header match. Nothing here assumes the surrounding text is a
+/// request body.
+fn redact_url_userinfo(text: &str) -> String {
+    const SEP: &str = "://";
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while let Some(offset) = text[at..].find(SEP) {
+        let start = at + offset + SEP.len();
+        let mut scan = start;
+        while scan < bytes.len() && bytes[scan] != b'@' && is_userinfo_byte(bytes[scan]) {
+            scan += 1;
+        }
+        if scan > start && bytes.get(scan) == Some(&b'@') {
+            out.push_str(&text[copied..start]);
+            out.push_str(REDACTED_URL_USERINFO);
+            copied = scan;
+        }
+        at = scan.max(start);
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Can this byte appear in a URL's userinfo?
+///
+/// The `@` that closes the userinfo is the caller's own stop. These are the
+/// others, and they are what make this a rule rather than a wildcard: an
+/// authority ends at `/`, `?`, `#`, whitespace or a quote, and a scan that ran
+/// past them would read `https://example.com/path@thing` as a credential.
+fn is_userinfo_byte(b: u8) -> bool {
+    !(b.is_ascii_whitespace() || matches!(b, b'/' | b'?' | b'#' | b'"' | b'\'' | b'`' | b'\\'))
+}
+
+/// Rule 4: a header shape ANYWHERE on a line, whose name is a secret name.
 ///
 /// The name is the run of ASCII letters, digits, `-` and `_` that ends at a
 /// colon, and every colon on the line is tested rather than only the first.
@@ -226,7 +281,7 @@ fn redact_pem_blocks(text: &str) -> String {
 /// `=`. A rule that could only ever test that colon was inert on exactly the
 /// text this filter exists to guard.
 ///
-/// A name whose preceding byte is a double quote is left to rule 4:
+/// A name whose preceding byte is a double quote is left to rule 5:
 /// `  "api_key": "x",` is a JSON pair, and taking it here would swallow the
 /// line's trailing comma and hand the endpoint a document that is not JSON.
 ///
@@ -270,7 +325,7 @@ fn redact_header_spans(line: &str, out: &mut String) {
         while name_start > copied && is_name_byte(bytes[name_start - 1]) {
             name_start -= 1;
         }
-        // An empty run, a quoted name (rule 4's case) or an ordinary word: not
+        // An empty run, a quoted name (rule 5's case) or an ordinary word: not
         // a header, and the colon is just punctuation.
         if name_start == colon
             || (name_start > 0 && bytes[name_start - 1] == b'"')
@@ -328,7 +383,7 @@ fn skip_blanks(bytes: &[u8], from: usize) -> usize {
 
 /// The end of an unquoted value run starting at `from`.
 ///
-/// It stops at whitespace, at a quote and at a backslash for rule 5's reason:
+/// It stops at whitespace, at a quote and at a backslash for rule 6's reason:
 /// this filter runs over text that may sit INSIDE a JSON string, where the byte
 /// after the value is the string's closing quote, and running past it would
 /// hand the endpoint a document that is not JSON.
@@ -352,7 +407,7 @@ fn is_auth_scheme(word: &str) -> bool {
         .any(|scheme| word.eq_ignore_ascii_case(scheme))
 }
 
-/// Rule 4: `"name": "value"` where the name is a secret name.
+/// Rule 5: `"name": "value"` where the name is a secret name.
 ///
 /// Byte indices throughout, and every slice boundary is an ASCII quote or a
 /// position already copied from, so a payload holding multi-byte text is cut in
@@ -417,7 +472,7 @@ fn quoted_end(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-/// Rule 5: `NAME=value` where the name is a secret name.
+/// Rule 6: `NAME=value` where the name is a secret name.
 ///
 /// The value runs to the closing quote when it is quoted and to the next
 /// whitespace when it is not - which is how a shell export, a `.env` line and a
@@ -475,7 +530,58 @@ fn redact_assignments(text: &str) -> String {
     out
 }
 
-/// Rule 6: a bare JSON Web Token, with no name beside it to catch it by.
+/// Rule 7: `--name value` where the flag's name is a secret name.
+///
+/// Rule 6 scans for `=` and its name run admits `-`, so `--token=x` is already
+/// its case; the space-separated spelling is not, and it was measured 5 times
+/// over the 60 most recent real transcripts, 21 MB. The value stops at the same
+/// quote and backslash bytes rule 6 stops at, for the reason stated there: this
+/// text may sit inside a JSON string, and running to the next space would
+/// swallow the string's closing quote and the comma after it.
+fn redact_flag_values(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        // A flag begins at a `-` that begins a token, so `x--token` is not one.
+        if bytes[at] != b'-' || (at > 0 && is_flag_name_byte(bytes[at - 1])) {
+            at += 1;
+            continue;
+        }
+        let mut name_end = at;
+        while name_end < bytes.len() && is_flag_name_byte(bytes[name_end]) {
+            name_end += 1;
+        }
+        let name = &text[at..name_end];
+        // A bare `--` names nothing, and a name run followed by anything but a
+        // blank is either rule 6's `--token=x` or not a flag at all.
+        if !name.trim_start_matches('-').is_empty()
+            && is_secret_name(name)
+            && matches!(bytes.get(name_end), Some(b' ' | b'\t'))
+        {
+            let value_start = skip_blanks(bytes, name_end);
+            let value_end = value_run_end(bytes, value_start);
+            if value_end > value_start {
+                out.push_str(&text[copied..value_start]);
+                out.push_str(REDACTED_FLAG_VALUE);
+                copied = value_end;
+                at = value_end;
+                continue;
+            }
+        }
+        at = name_end.max(at + 1);
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Is this byte part of a flag's name? The same run rule 6 reads a name by.
+fn is_flag_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
+}
+
+/// Rule 8: a bare JSON Web Token, with no name beside it to catch it by.
 ///
 /// A JWT says what it is: `eyJ` is `{"` in base64url, so a run opening with it
 /// is a serialized JSON header and very little else. Nothing here assumes the
@@ -494,7 +600,7 @@ fn is_jwt(run: &str) -> bool {
     run.len() >= MIN_JWT_CHARS && run.starts_with("eyJ")
 }
 
-/// Rule 7: a GitHub token, keyed on [`GITHUB_TOKEN_PREFIXES`].
+/// Rule 9: a GitHub token, keyed on [`GITHUB_TOKEN_PREFIXES`].
 ///
 /// Also nameless in the wild: a token pasted into a turn arrives on its own.
 /// Nothing here assumes the surrounding text is a request body.
@@ -653,6 +759,68 @@ mod tests {
             scrub(None, &scrubbed),
             scrubbed,
             "a second scrub changed the markers the first one left"
+        );
+    }
+
+    /// The host has to survive: a reader who cannot see which machine was
+    /// reached cannot tell a leak from a typo.
+    #[test]
+    fn a_connection_url_loses_its_userinfo_and_keeps_its_host() {
+        let turn =
+            "turn_id=11 user: it connects to postgres://user:pw-PLANTED-3@db.example.invalid/app";
+
+        let scrubbed = scrub(None, turn);
+
+        assert!(
+            !scrubbed.contains("pw-PLANTED-3"),
+            "the userinfo password survived: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("db.example.invalid/app"),
+            "the rule took the host with the credential: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains(REDACTED_URL_USERINFO),
+            "the userinfo went into an unlabelled hole: {scrubbed}"
+        );
+    }
+
+    /// An `@` in a path is not a credential, and a URL with no userinfo at all
+    /// is the shape this rule sees most often.
+    #[test]
+    fn an_at_sign_in_a_url_path_is_not_userinfo() {
+        for plain in [
+            "https://example.com/path@thing",
+            "https://example.invalid/keys",
+        ] {
+            assert_eq!(scrub(None, plain), plain, "changed: {plain}");
+        }
+    }
+
+    /// Rule 6 catches `--token=x` already. The space-separated spelling is this
+    /// rule's, and what follows the value has to still be there.
+    #[test]
+    fn a_space_separated_secret_flag_loses_its_value_and_nothing_else() {
+        let turn = "turn_id=12 user: gh auth login --token tok-PLANTED-4 --scopes repo";
+
+        let scrubbed = scrub(None, turn);
+
+        assert!(
+            !scrubbed.contains("tok-PLANTED-4"),
+            "the flag value survived: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("--scopes repo"),
+            "the rule ran past the value: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains(REDACTED_FLAG_VALUE),
+            "the flag value went into an unlabelled hole: {scrubbed}"
+        );
+        assert_eq!(
+            scrub(None, &scrubbed),
+            scrubbed,
+            "a second scrub re-consumed the marker the first one left"
         );
     }
 
