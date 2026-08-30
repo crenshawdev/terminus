@@ -75,6 +75,44 @@ pub const REDACTED_CREDENTIAL: &str = "[redacted: the configured provider creden
 /// What replaces a PEM private key block.
 pub const REDACTED_PRIVATE_KEY: &str = "[redacted: a PEM private key block]";
 
+/// What replaces a bare JSON Web Token.
+///
+/// Every marker the value-shape rules leave is ONE whitespace-free token,
+/// deliberately: a marker can land exactly where a later rule looks for a
+/// value, every value run in this file stops at whitespace, and a marker that
+/// holds no whitespace is therefore replaced by itself. That is what makes
+/// scrubbing twice the same as scrubbing once, so a test can attribute a catch
+/// to the rule that made it.
+pub const REDACTED_JWT: &str = "[redacted:a-json-web-token]";
+
+/// What replaces a GitHub token. One whitespace-free token, for
+/// [`REDACTED_JWT`]'s reason.
+pub const REDACTED_GITHUB_TOKEN: &str = "[redacted:a-github-token]";
+
+/// The prefixes GitHub issues its credentials under.
+///
+/// A PINNED list and a 2026-08-30 snapshot with no in-repo source of truth: it
+/// WILL go stale, and a prefix GitHub invents after that date is missed until
+/// someone edits this array. A generic `gh?_` shape was rejected because it
+/// matches unrelated text.
+pub const GITHUB_TOKEN_PREFIXES: &[&str] = &["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
+
+/// How many bytes a run needs after a [`GITHUB_TOKEN_PREFIXES`] prefix.
+///
+/// Loose on purpose. This repo's fixtures are short unrealistic sentinels
+/// (`ghp_abc123XYZ`) because realistic-length values in a public repo risk
+/// GitHub push protection, so the floor is sized against a sentinel rather than
+/// against a real token. What the looseness costs is measured rather than
+/// guessed: over the 60 most recent real transcripts, 21 MB, a run carrying one
+/// of these prefixes occurred 0 times.
+const MIN_GITHUB_TOKEN_BODY: usize = 6;
+
+/// A bare `eyJ`-prefixed run shorter than this is not treated as a JWT.
+///
+/// Sized against sentinels for [`MIN_GITHUB_TOKEN_BODY`]'s reason. Measured
+/// cost over the same sample: 4 bare `eyJ`-prefixed runs.
+const MIN_JWT_CHARS: usize = 12;
+
 /// A credential shorter than this is not replaced by rule 1.
 ///
 /// The rule is a plain substring replacement, so a two-character credential
@@ -116,7 +154,9 @@ fn redact(credential: Option<&Secret>, text: &str) -> String {
     let text = redact_pem_blocks(&text);
     let text = redact_header_lines(&text);
     let text = redact_json_pairs(&text);
-    redact_assignments(&text)
+    let text = redact_assignments(&text);
+    let text = redact_jwts(&text);
+    redact_github_tokens(&text)
 }
 
 /// Rule 1: the exact value, wherever it is.
@@ -435,6 +475,84 @@ fn redact_assignments(text: &str) -> String {
     out
 }
 
+/// Rule 6: a bare JSON Web Token, with no name beside it to catch it by.
+///
+/// A JWT says what it is: `eyJ` is `{"` in base64url, so a run opening with it
+/// is a serialized JSON header and very little else. Nothing here assumes the
+/// surrounding text is a request body - phase 4 runs this same set over recall
+/// excerpts and brief windows.
+fn redact_jwts(text: &str) -> String {
+    redact_runs(text, is_jwt_byte, is_jwt, REDACTED_JWT)
+}
+
+/// Is this byte part of a base64url run, dotted segments included?
+fn is_jwt_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
+}
+
+fn is_jwt(run: &str) -> bool {
+    run.len() >= MIN_JWT_CHARS && run.starts_with("eyJ")
+}
+
+/// Rule 7: a GitHub token, keyed on [`GITHUB_TOKEN_PREFIXES`].
+///
+/// Also nameless in the wild: a token pasted into a turn arrives on its own.
+/// Nothing here assumes the surrounding text is a request body.
+fn redact_github_tokens(text: &str) -> String {
+    redact_runs(
+        text,
+        is_credential_byte,
+        is_github_token,
+        REDACTED_GITHUB_TOKEN,
+    )
+}
+
+/// Is this byte part of an opaque credential run?
+fn is_credential_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
+fn is_github_token(run: &str) -> bool {
+    GITHUB_TOKEN_PREFIXES
+        .iter()
+        .any(|prefix| run.starts_with(prefix) && run.len() >= prefix.len() + MIN_GITHUB_TOKEN_BODY)
+}
+
+/// Replace every maximal run of `in_run` bytes that `is_secret` accepts.
+///
+/// The run has to be WHOLE: it begins where a byte that is not part of one
+/// ends, so a prefix that turns up mid-word is not a match. `in_run` accepts
+/// ASCII only, which is what makes every slice boundary here a character
+/// boundary in text holding multi-byte prose.
+fn redact_runs(
+    text: &str,
+    in_run: fn(u8) -> bool,
+    is_secret: fn(&str) -> bool,
+    marker: &str,
+) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if !in_run(bytes[at]) || (at > 0 && in_run(bytes[at - 1])) {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < bytes.len() && in_run(bytes[at]) {
+            at += 1;
+        }
+        if is_secret(&text[start..at]) {
+            out.push_str(&text[copied..start]);
+            out.push_str(marker);
+            copied = at;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
 /// Does this name mark its value as a secret?
 fn is_secret_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
@@ -495,6 +613,46 @@ mod tests {
         assert!(
             scrubbed.contains("turn_id=7"),
             "the turn lost its anchor: {scrubbed}"
+        );
+    }
+
+    /// Neither shape carries a name, so neither is catchable by rules 3, 4 or
+    /// 5. Both sentinels sit in plain prose with no `:`, no `=` and no quoted
+    /// pair anywhere near them, so the rule under test is the only thing that
+    /// can be what caught them.
+    #[test]
+    fn a_bare_jwt_and_a_bare_github_token_each_go_under_their_own_marker() {
+        let prose =
+            "the log line read eyJQTEFOVEVEXzMz then stopped, and ghp_abc123XYZ sat beside it";
+
+        let scrubbed = scrub(None, prose);
+
+        assert!(
+            !scrubbed.contains("eyJQTEFOVEVEXzMz"),
+            "the bare JWT survived: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("ghp_abc123XYZ"),
+            "the bare GitHub token survived: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains(REDACTED_JWT),
+            "the JWT went into an unlabelled hole: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains(REDACTED_GITHUB_TOKEN),
+            "the GitHub token went into an unlabelled hole: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("sat beside it"),
+            "the rules took the prose around the values: {scrubbed}"
+        );
+        // Both markers are inert against the whole set, which is what lets a
+        // test say which rule made a catch.
+        assert_eq!(
+            scrub(None, &scrubbed),
+            scrubbed,
+            "a second scrub changed the markers the first one left"
         );
     }
 
