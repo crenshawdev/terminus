@@ -12,10 +12,23 @@
 //!
 //! # Two boundaries every request crosses
 //!
-//! The body goes through [`egress::for_destination`] on the DECLARED
-//! destination before it is handed over (D-13), and the request itself goes
-//! through [`net::post`] and through nothing else, so it lands in the attempt
-//! log (PRIV-03).
+//! Each [`Message`]'s `content` goes through [`egress::for_destination`] on the
+//! DECLARED destination before `json!` builds the document (D-13), and the
+//! request itself goes through [`net::post`] and through nothing else, so it
+//! lands in the attempt log (PRIV-03).
+//!
+//! The filter runs on the content strings and not on the finished body, and the
+//! difference is the whole of whether it works. In a serialized body every
+//! quote in the transcript is `\"` and the whole thing is one line with no
+//! `\n`, so the header rule sees a single unbounded line and the JSON-pair rule
+//! walks past every escaped quote and reads the entire transcript as one
+//! candidate name: two of the rule set's nine rules are inert there. On a
+//! content string they are reading the text as the session actually wrote it.
+//!
+//! What crosses that boundary is message content and only message content
+//! (D-07). `model`, `response_format` and the caller's `json_schema` payload
+//! are the request's own scaffolding rather than session text, and a schema
+//! property name coming back `[redacted]` is a 400 from a strict endpoint.
 //!
 //! # Reading the answer: `choices[0].message.content`, specifically (D-08)
 //!
@@ -252,11 +265,33 @@ pub fn complete(
     };
 
     let url = endpoint(base_url);
+    // D-13: the declaration decides, not the address. `local` absent or false
+    // filters, so a user who forgot the key pays the filter rather than sending
+    // unfiltered session text offsite.
+    let local = config.provider_local();
     let mut request = json!({
         "model": model,
+        // D-01: each message's content goes through the filter HERE, before
+        // `json!` builds the document, and the finished body does not go
+        // through it again. Applied to the serialized body the filter is
+        // reading text where every `"` is `\"` and the whole transcript is one
+        // line with no `\n` in it, which is precisely what stops the header
+        // rule and the JSON-pair rule from seeing anything - so a second scan
+        // there is not defence in depth, it is the inert scan this ran to
+        // replace, and it would fire the assignment rule a second time over
+        // content already carrying a marker.
+        //
+        // EVERY message, the `system` instruction turn included (D-08), and
+        // nothing but messages (D-07): `model`, `response_format` and the
+        // caller's `json_schema` are not transcript text, and a schema
+        // property name coming back `[redacted]` inside `response_format` is
+        // the 400 the 2026-08-21 DeepSeek probe recorded above.
         "messages": messages
             .iter()
-            .map(|m| json!({ "role": m.role, "content": m.content }))
+            .map(|m| json!({
+                "role": m.role,
+                "content": egress::for_destination(local, credential, &m.content),
+            }))
             .collect::<Vec<_>>(),
     });
     if let (Some(format), Some(object)) = (
@@ -265,11 +300,12 @@ pub fn complete(
     ) {
         object.insert("response_format".to_owned(), format);
     }
+    // Serialized once, and never parsed and re-serialized (D-02): re-encoding
+    // would put the whole document back through the escaping-sensitive path
+    // for nothing, since `serde_json` here has no `preserve_order` feature and
+    // the object map is a `BTreeMap` whose key order is alphabetical whatever
+    // happens.
     let body = request.to_string();
-    // D-13: the declaration decides, not the address. `local` absent or false
-    // filters, so a user who forgot the key pays the filter rather than sending
-    // unfiltered session text offsite.
-    let body = egress::for_destination(config.provider_local(), credential, &body);
 
     let mut headers: Vec<(&str, String)> = vec![("content-type", "application/json".to_owned())];
     if let Some(secret) = credential {
