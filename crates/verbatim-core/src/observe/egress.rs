@@ -3,10 +3,15 @@
 //!
 //! # Two entry points, one rule set
 //!
-//! [`for_destination`] is the request body's gate. `local = true` hands the
-//! text back untouched, because a local provider is not egress at all and
-//! filtering it would destroy detail for nothing; anything else - including a
-//! `local` key the user forgot to write - hands back a filtered copy.
+//! [`for_destination`] is the gate for whatever text its caller hands it: a
+//! whole request body, one message's content on its way into one, a recall
+//! excerpt on its way into an injected brief. It parses nothing and reads no
+//! structure, so it has no opinion about which of those it was given, and every
+//! rule below is written to hold on plain prose as well as on a document.
+//! `local = true` hands the text back untouched, because a local provider is
+//! not egress at all and filtering it would destroy detail for nothing;
+//! anything else - including a `local` key the user forgot to write - hands
+//! back a filtered copy.
 //!
 //! [`scrub`] is the error boundary, and it runs whatever the destination is.
 //! That is the half of D-16 that survives the `local` distinction, and it
@@ -20,22 +25,57 @@
 //!
 //! # The rules, and why each one is here
 //!
+//! In the order the one rule set runs them, each with the marker it leaves.
+//!
 //! 1. **The credential this run resolved**, wherever it appears. The only exact
 //!    rule; everything below it is a guess at shape.
-//! 2. **PEM private key blocks**, whole.
-//! 3. **Header-shaped lines** - a bare `name: value` line whose name matches
-//!    [`SECRET_NAMES`]. `Authorization: Bearer ...` is the case this exists for.
-//! 4. **JSON string pairs** whose name matches [`SECRET_NAMES`].
-//! 5. **Assignment-shaped text** - `NAME=value` whose name matches
-//!    [`SECRET_NAMES`].
+//!    Marker: [`REDACTED_CREDENTIAL`].
+//! 2. **PEM private key blocks**, whole. Marker: [`REDACTED_PRIVATE_KEY`].
+//! 3. **A connection URL's userinfo** - the span between `://` and the `@` that
+//!    closes it, with the scheme and the host left standing so a reader can see
+//!    which machine was reached. Ahead of rule 4 deliberately: a userinfo name
+//!    matching [`SECRET_NAMES`] is a `name: value` shape, and rule 4 would take
+//!    the host away with the password. Marker: [`REDACTED_URL_USERINFO`].
+//! 4. **Header shapes, ANYWHERE on a line** - `name: value` whose name matches
+//!    [`SECRET_NAMES`]. `Authorization: Bearer ...` is the case this exists for,
+//!    and "anywhere" is what makes it fire on a transcript turn, which arrives
+//!    as one line behind a `turn_id=` prefix rather than as a bare header line.
+//!    What it takes is bounded, so the rest of that turn survives.
+//!    Marker: [`REDACTED`].
+//! 5. **JSON string pairs** whose name matches [`SECRET_NAMES`].
+//!    Marker: [`REDACTED`].
+//! 6. **Assignment-shaped text** - `NAME=value` whose name matches
+//!    [`SECRET_NAMES`]. Marker: [`REDACTED`].
+//! 7. **Space-separated secret flags** - `--name value`, which rule 6 cannot see
+//!    because it scans for `=`. Marker: [`REDACTED_FLAG_VALUE`].
+//! 8. **Bare JSON Web Tokens** - an `eyJ`-prefixed base64url run. Nothing names
+//!    it, so rules 4 to 7 have nothing to catch it by; it names itself instead,
+//!    because `eyJ` is `{"` in base64url. Marker: [`REDACTED_JWT`].
+//! 9. **GitHub tokens** - a run opening with one of [`GITHUB_TOKEN_PREFIXES`],
+//!    also nameless in the wild. That list is a pinned 2026-08-30 snapshot with
+//!    no in-repo source of truth and it will go stale: a prefix GitHub invents
+//!    after that date is missed until someone edits the array.
+//!    Marker: [`REDACTED_GITHUB_TOKEN`].
 //!
 //! Every one of them leaves a marker naming what went. A payload that came back
 //! silently shorter would leave a reader unable to tell filtering from a
 //! provider that returned less.
 //!
-//! The name test is a substring match and therefore over-matches: `monkey`
-//! contains `key`. That is the direction to be wrong in. Over-redaction costs a
-//! caller some detail in a message; under-redaction costs a key rotation.
+//! # The direction to be wrong in
+//!
+//! The name test is a substring match and therefore OVER-matches: `monkey`
+//! contains `key`. That is the tolerated failure, stated as one: a
+//! name-substring false positive costs a caller some detail in one message,
+//! while under-redaction costs a key rotation.
+//!
+//! Rules 8 and 9 over-match for a second reason and in the same direction.
+//! Their length floors are set against this repo's short unrealistic sentinels
+//! (`ghp_abc123XYZ`) rather than against real credentials, because
+//! realistic-length values in a public repo trip GitHub push protection - and a
+//! floor low enough to fire on a sentinel fires on more ordinary text than one
+//! sized to a real token would. What that costs is measured rather than
+//! guessed: over the 60 most recent real transcripts, 21 MB, runs carrying a
+//! GitHub prefix occurred 0 times and bare `eyJ`-prefixed runs 4 times.
 //!
 //! # Egress only, never ingest
 //!
@@ -131,7 +171,7 @@ const MIN_JWT_CHARS: usize = 12;
 /// shape rules below still catch it wherever it is labelled.
 const MIN_CREDENTIAL_CHARS: usize = 4;
 
-/// Filter a request body for its declared destination (D-13).
+/// Filter text for its declared destination (D-13).
 ///
 /// `local = true` is the only thing that returns the text unchanged, and it is
 /// a DECLARATION about where the bytes end up rather than an observation about
@@ -507,11 +547,11 @@ fn redact_assignments(text: &str) -> String {
             }
             // Whitespace ends an unquoted value, and so does a quote or a
             // backslash. That second half is load-bearing rather than tidy:
-            // this filter runs over a JSON request body, where an assignment
-            // sits INSIDE a string and the next character after the value is
-            // the string's closing quote. Running to the next space there
-            // would swallow the quote and the comma after it and hand the
-            // endpoint a document that is not JSON.
+            // this filter MAY be handed text that sits inside a JSON string,
+            // where the character after the value is the string's closing
+            // quote. Running to the next space there would swallow the quote
+            // and the comma after it and hand the endpoint a document that is
+            // not JSON.
             _ => text[value_start..]
                 .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\')
                 .map(|offset| value_start + offset)
