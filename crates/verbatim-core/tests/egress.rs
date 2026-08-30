@@ -272,9 +272,9 @@ mod wire {
     use std::path::PathBuf;
 
     use rusqlite::Connection;
-    use verbatim_core::config::{Config, CONFIG_FILE_NAME};
-    use verbatim_core::observe::cost;
+    use verbatim_core::config::{Config, CONFIG_FILE_NAME, REDACTED};
     use verbatim_core::observe::judgment::{self, Verdict};
+    use verbatim_core::observe::{cost, egress};
     use verbatim_core::store::DB_FILE_NAME;
     use verbatim_core::testkit::{self, HttpStub};
     use verbatim_core::{ingest, observe};
@@ -284,6 +284,45 @@ mod wire {
 
     /// What the model is told it is, so the stub's one answer is enough.
     const MODEL: &str = "wire-stub";
+
+    /// The seven planted sentinels, each with the marker of the rule that is
+    /// the only thing able to catch it, and a name for the failure message.
+    ///
+    /// One table rather than seven tests: the claim is about the SET - every
+    /// shape gone, each one accounted for by a named rule - and a table makes a
+    /// shape that quietly stopped being planted impossible to miss.
+    const PLANTED: &[(&str, &str, &str)] = &[
+        (
+            "an Authorization: Bearer header",
+            "sk-VBEGRESS-authz-9f2",
+            REDACTED,
+        ),
+        ("a JSON \"password\" pair", "pw-VBEGRESS-mash-4d1", REDACTED),
+        (
+            "a space-separated --token flag",
+            "tk-VBEGRESS-flagv-7c3",
+            egress::REDACTED_FLAG_VALUE,
+        ),
+        ("a Cookie header", "sid-VBEGRESS-crumb-2b8", REDACTED),
+        (
+            "a bare JWT",
+            "eyJhbGciOiJIUzI1NiJ9.VBEGRESSjwt3e7",
+            egress::REDACTED_JWT,
+        ),
+        (
+            "a GitHub token",
+            "ghp_VBEGRESSgh0zq",
+            egress::REDACTED_GITHUB_TOKEN,
+        ),
+        (
+            "a connection URL's userinfo",
+            "dsn-VBEGRESS-pg-8a4",
+            egress::REDACTED_URL_USERINFO,
+        ),
+    ];
+
+    /// The `Cookie` turn's prose, which follows the value on the SAME line.
+    const AFTER_THE_COOKIE: &str = "the retry after that answered 204 with an empty body";
 
     /// One archived, observed session, ready to be judged.
     struct Wire {
@@ -590,5 +629,81 @@ mod wire {
             ids.len(),
             cost::MIN_TURNS
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC2 and AC5: every shape, and what is left standing
+
+    /// Each of the seven planted shapes is gone, and the rule that took it said
+    /// so by name.
+    ///
+    /// Four of the seven sit in the fixture with no name-keyed text beside
+    /// them, which is what makes this an assertion about a rule rather than
+    /// about the assignment rule catching a `NAME=` that happened to be
+    /// nearby.
+    #[test]
+    fn every_planted_shape_is_gone_and_its_rule_named_itself() {
+        let wire = wire();
+        let (filtered, whole) = wire.both_bodies();
+
+        for (what, sentinel, marker) in PLANTED {
+            assert!(
+                !filtered.contains(sentinel),
+                "{what} went out on the wire ({sentinel}): {filtered}"
+            );
+            assert!(
+                filtered.contains(marker),
+                "{what} went without {marker}, so a reader cannot tell what was taken: {filtered}"
+            );
+            // Loudly, rather than as a pass: a shape the fixture stopped
+            // planting would satisfy the absence above for the wrong reason.
+            assert!(
+                whole.contains(sentinel),
+                "{what} is not planted in {FIXTURE} ({sentinel}), so its absence proves nothing"
+            );
+        }
+    }
+
+    /// AC5: a bounded match. The `Cookie` value goes and the rest of that turn
+    /// does not.
+    ///
+    /// The anchor is the reason this matters. A rule running to end of line
+    /// would erase the rest of the turn while leaving its `turn_id=` standing,
+    /// so the model would be shown a fragment and could still hang a claim on
+    /// it - a claim the store would accept, because the id is real.
+    #[test]
+    fn a_mid_line_cookie_takes_its_value_and_leaves_the_turn_standing() {
+        let wire = wire();
+        let filtered = wire.recorded_body(None, false);
+        let shown: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+        let shown = shown["messages"][1]["content"]
+            .as_str()
+            .expect("a user turn");
+
+        assert!(
+            !shown.contains("sid-VBEGRESS-crumb-2b8"),
+            "the cookie went out: {shown}"
+        );
+        assert!(
+            shown.contains(AFTER_THE_COOKIE),
+            "the match ran past the value and took the rest of the turn: {shown}"
+        );
+        // Read off the store rather than hardcoded: an anchor a test invented
+        // is not the anchor the model was given.
+        let anchors: Vec<String> = wire
+            .turn_ids()
+            .iter()
+            .map(|id| format!("turn_id={id}"))
+            .collect();
+        assert!(
+            anchors.len() >= 6,
+            "too few anchors to assert on: {anchors:?}"
+        );
+        for anchor in &anchors {
+            assert!(
+                shown.contains(anchor.as_str()),
+                "{anchor} was not shown to the model: {shown}"
+            );
+        }
     }
 }
