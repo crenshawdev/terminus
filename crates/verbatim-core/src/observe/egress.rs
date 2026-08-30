@@ -46,8 +46,9 @@
 //!    Marker: [`REDACTED`].
 //! 6. **Assignment-shaped text** - `NAME=value` whose name matches
 //!    [`SECRET_NAMES`]. Marker: [`REDACTED`].
-//! 7. **Space-separated secret flags** - `--name value`, which rule 6 cannot see
-//!    because it scans for `=`. Marker: [`REDACTED_FLAG_VALUE`].
+//! 7. **Space-separated secret flags** - `--name value`, quoted or bare, which
+//!    rule 6 cannot see because it scans for `=`.
+//!    Marker: [`REDACTED_FLAG_VALUE`].
 //! 8. **Bare JSON Web Tokens** - an `eyJ`-prefixed base64url run. Nothing names
 //!    it, so rules 4 to 7 have nothing to catch it by; it names itself instead,
 //!    because `eyJ` is `{"` in base64url. Marker: [`REDACTED_JWT`].
@@ -574,10 +575,12 @@ fn redact_assignments(text: &str) -> String {
 ///
 /// Rule 6 scans for `=` and its name run admits `-`, so `--token=x` is already
 /// its case; the space-separated spelling is not, and it was measured 5 times
-/// over the 60 most recent real transcripts, 21 MB. The value stops at the same
-/// quote and backslash bytes rule 6 stops at, for the reason stated there: this
-/// text may sit inside a JSON string, and running to the next space would
-/// swallow the string's closing quote and the comma after it.
+/// over the 60 most recent real transcripts, 21 MB. An unquoted value stops at
+/// the same quote and backslash bytes rule 6 stops at, for the reason stated
+/// there: this text may sit inside a JSON string, and running to the next space
+/// would swallow the string's closing quote and the comma after it. A QUOTED
+/// value is [`flag_value_span`]'s case, because those same stop bytes are what
+/// made `--token "x"` read as an empty value and pass through untouched.
 fn redact_flag_values(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -600,8 +603,7 @@ fn redact_flag_values(text: &str) -> String {
             && is_secret_name(name)
             && matches!(bytes.get(name_end), Some(b' ' | b'\t'))
         {
-            let value_start = skip_blanks(bytes, name_end);
-            let value_end = value_run_end(bytes, value_start);
+            let (value_start, value_end) = flag_value_span(bytes, skip_blanks(bytes, name_end));
             if value_end > value_start {
                 out.push_str(&text[copied..value_start]);
                 out.push_str(REDACTED_FLAG_VALUE);
@@ -619,6 +621,39 @@ fn redact_flag_values(text: &str) -> String {
 /// Is this byte part of a flag's name? The same run rule 6 reads a name by.
 fn is_flag_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
+}
+
+/// The span a flag's value occupies, as `(start, end)` byte indices.
+///
+/// [`value_run_end`] alone cannot read a QUOTED value: it stops ON the opening
+/// quote and reports an empty run, which is how `--token "tok"` passed through
+/// this rule unredacted. What a quoted value spans is the text INSIDE its
+/// delimiters, so the quotes stay where they are - and so do the backslashes of
+/// a `\"` pair, which is how a command line spells a quote once it is sitting
+/// inside a JSON string. The text comes back the document it went in as.
+///
+/// The closing quote is looked for on the SAME line only, and an unterminated
+/// one falls back to the unquoted run: `--token "tok` still loses `tok`, and no
+/// stray apostrophe in prose can hand this rule the rest of the text.
+fn flag_value_span(bytes: &[u8], from: usize) -> (usize, usize) {
+    let (inner_start, closer): (usize, &[u8]) = match (bytes.get(from), bytes.get(from + 1)) {
+        (Some(b'\\'), Some(b'"')) => (from + 2, b"\\\""),
+        (Some(b'"'), _) => (from + 1, b"\""),
+        (Some(b'\''), _) => (from + 1, b"'"),
+        _ => return (from, value_run_end(bytes, from)),
+    };
+    let line_end = bytes[inner_start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|offset| inner_start + offset)
+        .unwrap_or(bytes.len());
+    match bytes[inner_start..line_end]
+        .windows(closer.len())
+        .position(|window| window == closer)
+    {
+        Some(offset) => (inner_start, inner_start + offset),
+        None => (inner_start, value_run_end(bytes, inner_start)),
+    }
 }
 
 /// Rule 8: a bare JSON Web Token, with no name beside it to catch it by.
@@ -862,6 +897,61 @@ mod tests {
             scrubbed,
             "a second scrub re-consumed the marker the first one left"
         );
+    }
+
+    /// The stop bytes that keep an unquoted value inside its JSON string are
+    /// the same bytes that made a QUOTED value read as an EMPTY value, and an
+    /// empty value is one this rule skips - so `--token "tok"` used to go out
+    /// whole. Its delimiters have to survive, quoted or escaped: the text is
+    /// still whatever document it arrived as.
+    #[test]
+    fn a_quoted_secret_flag_value_goes_and_its_delimiters_stay() {
+        let escaped_pair = format!("\\\"{REDACTED_FLAG_VALUE}\\\"");
+        for (turn, planted, survives) in [
+            (
+                "turn_id=13 user: gh auth login --token \"tok-PLANTED-5\" --scopes repo",
+                "tok-PLANTED-5",
+                "--scopes repo",
+            ),
+            (
+                "turn_id=14 user: gh auth login --token 'tok-PLANTED-6' --scopes repo",
+                "tok-PLANTED-6",
+                "--scopes repo",
+            ),
+            // The same command line after it landed inside a JSON string.
+            (
+                "{\"content\":\"gh auth login --token \\\"tok-PLANTED-7\\\" --scopes repo\"}",
+                "tok-PLANTED-7",
+                escaped_pair.as_str(),
+            ),
+            // Unterminated: the value still goes and the prose after it stays,
+            // because one stray quote may not hand this rule the rest of a turn.
+            (
+                "turn_id=15 user: gh auth login --token \"tok-PLANTED-8 and it worked",
+                "tok-PLANTED-8",
+                "and it worked",
+            ),
+        ] {
+            let scrubbed = scrub(None, turn);
+
+            assert!(
+                !scrubbed.contains(planted),
+                "a quoted flag value survived: {scrubbed}"
+            );
+            assert!(
+                scrubbed.contains(REDACTED_FLAG_VALUE),
+                "the flag value went into an unlabelled hole: {scrubbed}"
+            );
+            assert!(
+                scrubbed.contains(survives),
+                "the rule took `{survives}` with the value: {scrubbed}"
+            );
+            assert_eq!(
+                scrub(None, &scrubbed),
+                scrubbed,
+                "a second scrub re-consumed the marker the first one left"
+            );
+        }
     }
 
     /// The prefix `judgment::transcript` writes is itself a `name: value` shape
