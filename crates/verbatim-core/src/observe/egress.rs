@@ -59,6 +59,10 @@ pub const SECRET_NAMES: &[&str] = &[
     "key",
     "api",
     "bearer",
+    // The header a session pastes verbatim more often than any other secret
+    // shape after `Authorization` - measured 7 times over the 60 most recent
+    // real transcripts, 21 MB, on 2026-08-30.
+    "cookie",
     // Not in the phase plan's list and here anyway: it is the exact header the
     // one request this phase makes carries its credential in, and matching it
     // by the `bearer` in its value would depend on the scheme's spelling.
@@ -172,13 +176,25 @@ fn redact_pem_blocks(text: &str) -> String {
     out
 }
 
-/// Rule 3: a header-shaped line whose name is a secret name.
+/// Rule 3: a header shape ANYWHERE on a line, whose name is a secret name.
 ///
-/// "Header-shaped" is deliberately narrow - the name before the colon must be a
-/// bare token of letters, digits and hyphens. A pretty-printed JSON line
-/// (`  "api_key": "x",`) has quotes in that position and is left to rule 4,
-/// which can replace the value without taking the line's trailing comma with
-/// it.
+/// The name is the run of ASCII letters, digits, `-` and `_` that ends at a
+/// colon, and every colon on the line is tested rather than only the first.
+/// Transcript text is why: `judgment::transcript` writes each turn as
+/// `turn_id=<id> <record_type>: <said>` and collapses the turn to one line, so
+/// the first colon on every line sits behind a prefix carrying a space and an
+/// `=`. A rule that could only ever test that colon was inert on exactly the
+/// text this filter exists to guard.
+///
+/// A name whose preceding byte is a double quote is left to rule 4:
+/// `  "api_key": "x",` is a JSON pair, and taking it here would swallow the
+/// line's trailing comma and hand the endpoint a document that is not JSON.
+///
+/// What goes is BOUNDED - an optional auth scheme word plus one value run -
+/// rather than the rest of the line. A whole turn is one line, so running to
+/// end of line would erase the rest of that turn from the prompt while leaving
+/// its `turn_id=` anchor standing, and the model can still anchor a claim to a
+/// turn it was shown a fragment of.
 fn redact_header_lines(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     // `split_inclusive` keeps each line's own newline on it, so nothing has to
@@ -193,28 +209,107 @@ fn redact_header_lines(text: &str) -> String {
             usize::from(line.ends_with('\n'))
         };
         let (body, ending) = line.split_at(line.len() - ending_len);
-        match header_name(body) {
-            Some(name_end) if is_secret_name(body[..name_end].trim()) => {
-                out.push_str(&body[..=name_end]);
-                out.push(' ');
-                out.push_str(REDACTED);
-                out.push_str(ending);
-            }
-            _ => out.push_str(line),
-        }
+        redact_header_spans(body, &mut out);
+        out.push_str(ending);
     }
     out
 }
 
-/// The index of the colon, if this line is `token: value`.
-fn header_name(line: &str) -> Option<usize> {
-    let colon = line.find(':')?;
-    let name = line[..colon].trim();
-    (!name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-    .then_some(colon)
+/// Every `name: value` shape on one line's body, appended to `out`.
+fn redact_header_spans(line: &str, out: &mut String) {
+    let bytes = line.as_bytes();
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b':' {
+            at += 1;
+            continue;
+        }
+        let colon = at;
+        let mut name_start = colon;
+        while name_start > copied && is_name_byte(bytes[name_start - 1]) {
+            name_start -= 1;
+        }
+        // An empty run, a quoted name (rule 4's case) or an ordinary word: not
+        // a header, and the colon is just punctuation.
+        if name_start == colon
+            || (name_start > 0 && bytes[name_start - 1] == b'"')
+            || !is_secret_name(&line[name_start..colon])
+        {
+            at = colon + 1;
+            continue;
+        }
+        let span_start = skip_blanks(bytes, colon + 1);
+        let first_end = value_run_end(bytes, span_start);
+        // `Authorization: Bearer <value>` has to lose the scheme word and the
+        // value together, or the shape is still legible enough to say what kind
+        // of credential was sent and where the rest of it went.
+        let span_end = if first_end > span_start && is_auth_scheme(&line[span_start..first_end]) {
+            let next_start = skip_blanks(bytes, first_end);
+            let next_end = value_run_end(bytes, next_start);
+            if next_end > next_start {
+                next_end
+            } else {
+                first_end
+            }
+        } else {
+            first_end
+        };
+        if span_end == span_start {
+            at = colon + 1;
+            continue;
+        }
+        out.push_str(&line[copied..=colon]);
+        out.push(' ');
+        out.push_str(REDACTED);
+        copied = span_end;
+        at = span_end;
+    }
+    out.push_str(&line[copied..]);
+}
+
+/// Is this byte part of a header name?
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
+/// The first index at or after `from` that is not a space or a tab.
+///
+/// Spaces and tabs only, never the whole whitespace class: a caller has already
+/// split the line and holds its ending back, and a lone `\r` in the middle of a
+/// body is content rather than a separator.
+fn skip_blanks(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < bytes.len() && (bytes[at] == b' ' || bytes[at] == b'\t') {
+        at += 1;
+    }
+    at
+}
+
+/// The end of an unquoted value run starting at `from`.
+///
+/// It stops at whitespace, at a quote and at a backslash for rule 5's reason:
+/// this filter runs over text that may sit INSIDE a JSON string, where the byte
+/// after the value is the string's closing quote, and running past it would
+/// hand the endpoint a document that is not JSON.
+fn value_run_end(bytes: &[u8], from: usize) -> usize {
+    let mut at = from;
+    while at < bytes.len() {
+        let b = bytes[at];
+        if b.is_ascii_whitespace() || b == b'"' || b == b'\'' || b == b'\\' {
+            break;
+        }
+        at += 1;
+    }
+    at
+}
+
+/// Is this word an auth scheme, and therefore part of the value that follows?
+fn is_auth_scheme(word: &str) -> bool {
+    const SCHEMES: &[&str] = &["bearer", "basic", "digest", "token", "negotiate", "ntlm"];
+    SCHEMES
+        .iter()
+        .any(|scheme| word.eq_ignore_ascii_case(scheme))
 }
 
 /// Rule 4: `"name": "value"` where the name is a secret name.
@@ -344,4 +439,75 @@ fn redact_assignments(text: &str) -> String {
 fn is_secret_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     SECRET_NAMES.iter().any(|fragment| name.contains(fragment))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A turn as `judgment::transcript` writes it: one line, prefixed
+    /// `turn_id=<id> <record_type>: `, with the header shape sitting mid-line
+    /// behind that prefix.
+    #[test]
+    fn a_header_shape_mid_line_loses_its_scheme_and_its_value() {
+        let turn = "turn_id=42 user: I set Authorization: Bearer sk-PLANTED-1 and it worked";
+
+        let scrubbed = scrub(None, turn);
+
+        assert!(
+            !scrubbed.contains("sk-PLANTED-1"),
+            "the value survived a mid-line header: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("Bearer"),
+            "the scheme word survived without its value: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("Authorization: [redacted]"),
+            "the header went without saying so: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("turn_id=42"),
+            "the turn lost the anchor a claim is made against: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("and it worked"),
+            "the rest of the turn went with the header value: {scrubbed}"
+        );
+    }
+
+    /// `cookie` is a secret name, and the span taken is bounded: a turn is one
+    /// line, so everything after the cookie value has to still be there.
+    #[test]
+    fn a_cookie_header_takes_its_value_and_leaves_the_rest_of_the_turn() {
+        let turn = "turn_id=7 user: Cookie: sid-PLANTED-2; the rest of the turn";
+
+        let scrubbed = scrub(None, turn);
+
+        assert!(
+            !scrubbed.contains("sid-PLANTED-2"),
+            "the cookie value survived: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("the rest of the turn"),
+            "the rule ran to end of line and ate the turn: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("turn_id=7"),
+            "the turn lost its anchor: {scrubbed}"
+        );
+    }
+
+    /// The prefix `judgment::transcript` writes is itself a `name: value` shape
+    /// (`user: ...`), and it must not be one this rule takes.
+    #[test]
+    fn an_ordinary_turn_prefix_and_ordinary_prose_come_back_unchanged() {
+        for plain in [
+            "turn_id=3 assistant: the ratio was 3:1 and the build passed",
+            "a line with a colon: and an = sign",
+            "{\"model\":\"qwen3:8b\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+        ] {
+            assert_eq!(scrub(None, plain), plain, "changed: {plain}");
+        }
+    }
 }
