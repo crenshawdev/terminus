@@ -1,6 +1,6 @@
 # State
 
-Phase: 1 of 4 (Prompt-True Resume Brief)
-Status: phase complete
-Next: /cad-context 2
-Updated: 2026-08-29
+Phase: 2 of 4 (Egress Filter Sees What Is Sent)
+Status: context gathered
+Next: /cad-plan 2
+Updated: 2026-08-30
