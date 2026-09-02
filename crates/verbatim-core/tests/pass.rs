@@ -383,6 +383,51 @@ fn a_pass_reports_the_lock_rather_than_waiting_for_it() {
     assert_eq!(summary.files_committed, 1);
 }
 
+/// PRIV-02, PRIV-04: taking the lock is what creates the data directory on a
+/// machine that has never ingested, so it is where the directory and `LOCK`
+/// get their owner-only mode.
+///
+/// `parent` is the falsifying half. verbatim narrows the directory it owns and
+/// nothing above it (D-04), so a run that left `~/.local/share` at 0700 would
+/// make every other tool's data under it unreachable from the user's own
+/// group-shared workflows - which is a different bug, not a stricter version of
+/// this one. The lock is held across the assertions so the file under test is
+/// the one a real pass is holding.
+#[cfg(unix)]
+#[test]
+fn the_data_directory_and_the_lock_are_owner_only_from_the_first_acquire() {
+    use std::os::unix::fs::PermissionsExt;
+    use verbatim_core::ingest::lock::LOCK_FILE_NAME;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("parent");
+    let data_dir = parent.join("data");
+    assert!(!parent.exists(), "neither directory exists yet");
+
+    let guard = match verbatim_core::ingest::lock::try_acquire(&data_dir).unwrap() {
+        verbatim_core::ingest::Attempt::Acquired(guard) => guard,
+        other => panic!("the lock should have been free: {other:?}"),
+    };
+
+    assert_eq!(mode(&data_dir), 0o700, "the data directory is not owner-only");
+    assert_eq!(
+        mode(&parent),
+        0o755,
+        "a parent created on the way was narrowed, which is not verbatim's to do"
+    );
+    assert_eq!(
+        mode(&data_dir.join(LOCK_FILE_NAME)),
+        0o600,
+        "LOCK is not owner-only"
+    );
+
+    drop(guard);
+}
+
 fn runs(conn: &Connection) -> Vec<(i64, i64, i64, i64, Option<String>)> {
     conn.prepare(
         "SELECT files_seen, files_committed, files_failed, turns_added, error

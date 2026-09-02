@@ -18,7 +18,7 @@
 //! hazard (pre-copy-up shared inodes) cannot arise for a file this process
 //! creates in its own data directory.
 
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -64,13 +64,20 @@ pub enum Attempt {
 /// Called **before** the store is opened, so a contended run costs one file
 /// open and one lock syscall and touches no database at all.
 pub fn try_acquire(data_dir: &Path) -> Result<Attempt> {
-    std::fs::create_dir_all(data_dir).map_err(|e| Error::io(data_dir, e))?;
+    // This is the FIRST thing to create the data directory on a machine that
+    // has never ingested - `ingest` and `data move` both take the lock before
+    // they open the store - so it is where the directory gets its owner-only
+    // mode (PRIV-02, PRIV-04). The leaf alone: `~/.local/share` above it keeps
+    // whatever mode the user's own umask gives it (D-04).
+    crate::owner_only::create_dir_all(data_dir).map_err(|e| Error::io(data_dir, e))?;
     let path = data_dir.join(LOCK_FILE_NAME);
 
     // Created if missing and never truncated: the file's *contents* carry no
     // meaning, only the lock the OS attaches to it. Truncating would rewrite a
-    // file another process is holding.
-    let file = OpenOptions::new()
+    // file another process is holding. Owner-only from the moment it exists,
+    // like everything else in this directory - the mode rides the creating
+    // syscall, so there is no instant at which it is wider.
+    let file = crate::owner_only::options()
         .read(true)
         .write(true)
         .create(true)
