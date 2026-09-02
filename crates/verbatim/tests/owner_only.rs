@@ -34,6 +34,18 @@ const PROJECT: &str = "-data-projects-cadence";
 /// transcript.
 const MANIFEST: &str = "manifest.json";
 
+/// How a spawn is told where its store is.
+enum Located {
+    /// `VERBATIM_DATA_DIR` names it outright, which is what every other bench
+    /// in this crate does and what the export and end-to-end tests want.
+    Explicitly,
+    /// The PLATFORM data directory, with `VERBATIM_DATA_DIR` removed. `data
+    /// move` writes a location pointer and the environment override outranks it
+    /// (D-06), so a bench that set the variable would pass whether the move
+    /// worked or not - the reason `tests/datamove.rs` gives for the same shape.
+    ByPlatform,
+}
+
 /// Every directory a spawned `verbatim` may touch, all of them temporary.
 ///
 /// The same isolation `tests/lifecycle.rs` uses: a spawn that set only
@@ -41,15 +53,20 @@ const MANIFEST: &str = "manifest.json";
 /// live `~/.claude` tree.
 struct Bench {
     _dir: tempfile::TempDir,
-    /// The temporary root, which is where an export destination goes.
+    /// The temporary root, which is where an export or a move destination goes.
     root: PathBuf,
     data_dir: PathBuf,
     config_dir: PathBuf,
     claude_dir: PathBuf,
     work: PathBuf,
+    located: Located,
 }
 
 fn bench() -> Bench {
+    bench_located(Located::Explicitly)
+}
+
+fn bench_located(located: Located) -> Bench {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let config_dir = root.join("config");
@@ -58,13 +75,23 @@ fn bench() -> Bench {
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
     std::fs::create_dir_all(&work).unwrap();
+    let data_dir = match located {
+        Located::Explicitly => root.join("data"),
+        // `store::open::platform_data_dir`'s own answer on this target.
+        Located::ByPlatform if cfg!(target_os = "macos") => root
+            .join("Library")
+            .join("Application Support")
+            .join("verbatim"),
+        Located::ByPlatform => root.join("share").join("verbatim"),
+    };
     Bench {
         _dir: dir,
-        data_dir: root.join("data"),
+        data_dir,
         config_dir,
         claude_dir,
         work,
         root,
+        located,
     }
 }
 
@@ -84,9 +111,21 @@ impl Bench {
             .arg(env!("CARGO_BIN_EXE_verbatim"))
             .args(args)
             .current_dir(&self.work)
-            .env("VERBATIM_DATA_DIR", &self.data_dir)
             .env("VERBATIM_CONFIG_DIR", &self.config_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir);
+        match self.located {
+            Located::Explicitly => {
+                command.env("VERBATIM_DATA_DIR", &self.data_dir);
+            }
+            // Removed rather than merely unset by the bench: the developer
+            // running the suite may have it exported.
+            Located::ByPlatform => {
+                command
+                    .env_remove("VERBATIM_DATA_DIR")
+                    .env("XDG_DATA_HOME", self.root.join("share"))
+                    .env("HOME", &self.root);
+            }
+        }
         command
     }
 
@@ -189,4 +228,81 @@ fn an_export_directory_and_every_file_in_it_are_owner_only() {
     for file in &files {
         owner_only(file, 0o600);
     }
+}
+
+/// What a build before this phase left on disk: every directory 0755, every
+/// file 0644.
+///
+/// The source is widened DELIBERATELY, because `std::fs::copy` reproduces the
+/// mode it reads and a source that was already owner-only would let the old
+/// code pass. This is the falsifying half of the test below.
+fn widen(dir: &Path) {
+    set(dir, 0o755);
+    for path in contents(dir) {
+        match path.is_dir() {
+            true => widen(&path),
+            false => set(&path, 0o644),
+        }
+    }
+}
+
+fn set(path: &Path, bits: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits))
+        .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+}
+
+/// Every directory 0700 and every file 0600, all the way down.
+///
+/// Its own `read_dir` rather than [`contents`]: a subdirectory that happens to
+/// be empty is a fine thing to find in a moved tree, and the non-emptiness the
+/// tests care about is asserted where it means something.
+fn assert_tree_is_owner_only(dir: &Path) {
+    owner_only(dir, 0o700);
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        match path.is_dir() {
+            true => assert_tree_is_owner_only(&path),
+            false => owner_only(&path, 0o600),
+        }
+    }
+}
+
+/// AC1's move clause: `verbatim data move` writes the modes this build states
+/// rather than the modes it found (D-10).
+///
+/// The one command that reads a mode off one place and writes it to another.
+/// Left as `std::fs::copy`, it is the single path that can undo the whole
+/// phase: a store carried off an older build, or restored out of a tar, would
+/// arrive at its new home exactly as wide as it left. So the source here is
+/// deliberately made 755/644 first and the destination is asserted owner-only
+/// anyway - and the `LOCK` the move creates fresh at the destination is on the
+/// list, because it is the one file in the new directory that was not copied.
+#[test]
+fn a_data_move_writes_an_owner_only_tree_however_wide_the_source_was() {
+    let bench = bench_located(Located::ByPlatform);
+    bench.place("session-basic.jsonl");
+    bench.ok(&["ingest"]);
+
+    let source = bench.data_dir.clone();
+    // The first pass takes a snapshot (STOR-06), which is what puts a
+    // SUBDIRECTORY in the tree about to move - `contents` refuses an empty one,
+    // so a pass that took none fails here rather than leaving the recursive
+    // half of `copy_tree` untested.
+    contents(&source.join("snapshots"));
+    widen(&source);
+
+    let destination = bench.root.join("elsewhere").join("verbatim");
+    bench.ok(&["data", "move", destination.to_str().unwrap(), "--yes"]);
+
+    // Named one by one first, so a failure says which site is wrong, and then
+    // the whole tree, so a file this test did not think of is covered too.
+    owner_only(&destination, 0o700);
+    owner_only(&destination.join("verbatim.db"), 0o600);
+    owner_only(&destination.join("LOCK"), 0o600);
+    let moved_snapshots = destination.join("snapshots");
+    owner_only(&moved_snapshots, 0o700);
+    for snapshot in contents(&moved_snapshots) {
+        owner_only(&snapshot, 0o600);
+    }
+    assert_tree_is_owner_only(&destination);
 }
