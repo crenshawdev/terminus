@@ -1,6 +1,6 @@
 # State
 
 Phase: 3 of 4 (Owner-Only On Disk)
-Status: context gathered
-Next: /cad-plan 3
-Updated: 2026-08-30
+Status: planned
+Next: /cad-execute 3
+Updated: 2026-09-02
