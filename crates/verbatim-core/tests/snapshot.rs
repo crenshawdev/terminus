@@ -240,6 +240,45 @@ fn snapshots_land_inside_the_data_directory() {
     );
 }
 
+/// PRIV-02, PRIV-04: the snapshots directory and the copy inside it are
+/// owner-only, and there was no wider moment in between.
+///
+/// A snapshot is the whole archive in one file - the largest single thing this
+/// build writes and the one a group-readable mode would leak wholesale. The
+/// mode is read off the RETURNED path, not the temporary: the temporary is
+/// created empty at 0600, `VACUUM INTO` writes into a file that already has its
+/// mode, and the rename carries that mode to the name that stays. Nothing here
+/// chmods anything, which is why the source file contains no `set_permissions`
+/// (AC2).
+#[cfg(unix)]
+#[test]
+fn a_snapshot_and_its_directory_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    let bench = bench();
+    let file = snapshot::take(&bench.data_dir).unwrap();
+
+    assert_eq!(
+        mode(&bench.snapshots()),
+        0o700,
+        "the snapshots directory is readable by someone else"
+    );
+    assert_eq!(
+        mode(&file),
+        0o600,
+        "the snapshot - a copy of the whole archive - is readable by someone else"
+    );
+    assert_eq!(
+        bench.listed(),
+        vec![file.file_name().unwrap().to_string_lossy().into_owned()],
+        "the temporary was left behind"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The schedule: on by default, at most once per interval, outside the lock
 // (STOR-06, D-15)

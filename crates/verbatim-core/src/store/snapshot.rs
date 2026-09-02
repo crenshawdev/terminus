@@ -20,8 +20,8 @@
 //!
 //! **The name carries the instant, so ordering by name is ordering by time.**
 //! The prune therefore needs no filesystem mtime - which a copy, a restore or a
-//! `tar -x` would each have rewritten - and `VACUUM INTO` refusing to overwrite
-//! an existing file becomes a property rather than a hazard. The instant is
+//! `tar -x` would each have rewritten - and `VACUUM INTO` refusing a non-empty
+//! destination becomes a property rather than a hazard. The instant is
 //! read from SQLite, the same clock every stored timestamp in this store comes
 //! from, in ISO-8601 **basic** format: `:` is not a legal filename character on
 //! Windows, which is a first-class target, so the extended form every column
@@ -65,7 +65,10 @@ pub fn take(data_dir: &Path) -> Result<PathBuf> {
     }
 
     let dir = data_dir.join(DIR_NAME);
-    std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+    // Owner-only at creation, like every directory verbatim makes: a snapshot is
+    // a copy of the whole archive and must not be readable by group or world for
+    // even an instant (PRIV-02, PRIV-04).
+    crate::owner_only::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
 
     let conn = Connection::open(&db).map_err(Error::Sqlite)?;
 
@@ -79,11 +82,29 @@ pub fn take(data_dir: &Path) -> Result<PathBuf> {
     // A leading dot and a `.tmp` tail, so it matches neither the snapshot name
     // nor anything the prune counts.
     let temp = dir.join(format!(".{PREFIX}{stamp}{SUFFIX}.tmp"));
-    // `VACUUM INTO` refuses a file that already exists, and a previous kill can
-    // have left this one behind. The real name is never removed here.
+    // `VACUUM INTO` refuses a destination that already holds bytes - measured
+    // 2026-08-30, it fails with `file is not a database` - and a previous kill
+    // can have left this one behind holding a partial copy. The real name is
+    // never removed here.
     if temp.exists() {
         std::fs::remove_file(&temp).map_err(|e| Error::io(&temp, e))?;
     }
+
+    // The destination is created here, EMPTY and 0600, and `VACUUM INTO` writes
+    // into it rather than making it itself (D-03). A file SQLite creates lands
+    // at the umask - 0644 on a stock machine - and the only way to narrow it
+    // afterwards would be a chmod over a file that already holds the whole
+    // archive, which is the window AC2 bars. Measured 2026-08-30: `VACUUM INTO`
+    // onto a pre-created zero-length file succeeds and keeps the mode it finds,
+    // and the rename below carries that mode to the real name. The handle is
+    // closed immediately: what is wanted from it is the inode and its mode, not
+    // a writer.
+    let reserved = crate::owner_only::options()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| Error::io(&temp, e))?;
+    drop(reserved);
 
     // Bound, not interpolated: the destination is a path, and a path that
     // cannot be a UTF-8 SQL string literal must fail rather than be mangled
