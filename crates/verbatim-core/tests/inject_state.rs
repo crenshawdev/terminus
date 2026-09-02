@@ -266,3 +266,53 @@ fn a_write_replaces_the_target_rather_than_rewriting_it_in_place() {
         "a temporary was left beside the state file"
     );
 }
+
+/// PRIV-02, PRIV-04: the injection scratch is quoted prompt text keyed by
+/// session id, and none of it - nor the directory holding it, nor the data
+/// directory the hook had to create to get there - is readable by group or
+/// world.
+///
+/// The data directory does not exist when this starts, which is the case that
+/// matters: a `SessionStart` hook on a machine that has installed verbatim and
+/// never ingested is the first thing to create it, so the mode it lands with is
+/// this write's to get right. That the directories ABOVE it keep the user's own
+/// default is D-04, asserted where it can be seen -
+/// `tests/pass.rs::the_data_directory_and_the_lock_are_owner_only_from_the_first_acquire`
+/// - since a `tempfile` root is already 0700 and would prove nothing here.
+#[cfg(unix)]
+#[test]
+fn the_scratch_the_hook_writes_is_owner_only_and_so_is_what_holds_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = data_dir(&dir);
+    assert!(!data_dir.exists(), "the data directory exists already");
+
+    assert!(populated().save(&data_dir, Some(SESSION)));
+
+    assert_eq!(mode(&data_dir), 0o700, "the data directory is not owner-only");
+    assert_eq!(
+        mode(&injection_dir(&data_dir)),
+        0o700,
+        "the injection directory is not owner-only"
+    );
+    assert_eq!(
+        mode(&file_of(&data_dir, SESSION)),
+        0o600,
+        "the session's state file is not owner-only"
+    );
+
+    // The temporary is 0600 for its whole life too - it holds the same text -
+    // and it is not left behind for a mode to be asserted on afterwards, which
+    // is why the shape that proves it is `create_new` on the primitive's
+    // options rather than a stat here.
+    let entries: Vec<String> = std::fs::read_dir(injection_dir(&data_dir))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries, vec![format!("{SESSION}.json")]);
+}
