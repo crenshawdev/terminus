@@ -1133,3 +1133,106 @@ fn the_windows_acl_deferral_is_stated_on_every_platform_in_both_outputs() {
     );
     assert_eq!(check["fix"], serde_json::Value::Null, "{check}");
 }
+
+// ---------------------------------------------------------------------------
+// The provider_local check (D-13, D-15, D-16)
+// ---------------------------------------------------------------------------
+
+/// A `[provider]` block declaring itself local against a chosen address.
+fn local_provider(base_url: &str) -> String {
+    format!("[provider]\nlocal = true\nbase_url = \"{base_url}\"\n")
+}
+
+/// D-13's mistake, named: `local = true` is what turns the egress filter off,
+/// and it is believed whatever the address says - so an address that is not on
+/// this machine is worth a line. A note and not a problem, because doctor does
+/// not overrule the declaration and a CI health check must not read this as a
+/// broken install.
+#[test]
+fn a_local_provider_that_is_not_on_loopback_is_a_note_and_still_exits_zero() {
+    let fixture = fixture();
+    fixture.install();
+
+    for (base_url, host) in [
+        ("http://example.invalid:11434", "example.invalid"),
+        // The one a user could be fooled by: the loopback address is USERINFO
+        // here and the host is not local at all.
+        ("http://127.0.0.1:11434@evil.example/", "evil.example"),
+        ("https://10.0.0.5/v1", "10.0.0.5"),
+    ] {
+        fixture.write_config(&local_provider(base_url), 0o600);
+
+        let (code, report) = fixture.doctor();
+
+        assert_eq!(
+            report.state("provider_local"),
+            "note",
+            "{base_url}:\n{}",
+            report.whole
+        );
+        assert_eq!(code, Some(0), "{base_url} made doctor exit non-zero");
+        let finding = &report.check("provider_local").finding;
+        assert!(finding.contains(host), "{base_url}: {finding}");
+        assert!(
+            finding.contains("unfiltered"),
+            "{base_url}: the note does not say what it costs: {finding}"
+        );
+        // The configured URL is never echoed: it may carry userinfo.
+        assert!(
+            !finding.contains(base_url),
+            "{base_url} was printed back: {finding}"
+        );
+    }
+}
+
+/// The falsifying half: a local provider that really is on this machine, in
+/// each of the four spellings a host is written in, says nothing.
+#[test]
+fn a_local_provider_on_loopback_is_ok() {
+    let fixture = fixture();
+    fixture.install();
+
+    for base_url in [
+        "http://localhost:11434",
+        "http://127.0.0.1:11434/",
+        "http://[::1]:11434",
+        "HTTP://LOCALHOST/",
+    ] {
+        fixture.write_config(&local_provider(base_url), 0o600);
+
+        let (code, report) = fixture.doctor();
+
+        assert_eq!(
+            report.state("provider_local"),
+            "ok",
+            "{base_url}:\n{}",
+            report.whole
+        );
+        assert_eq!(code, Some(0), "{base_url}");
+        assert!(
+            !report
+                .check("provider_local")
+                .finding
+                .contains("unfiltered"),
+            "{base_url} was warned about: {}",
+            report.check("provider_local").finding
+        );
+    }
+}
+
+/// Absent means remote and therefore filtered, which is the default and is not
+/// a finding about anything.
+#[test]
+fn a_remote_provider_that_never_declared_itself_local_is_ok() {
+    let fixture = fixture();
+    fixture.install();
+    fixture.write_config(
+        "[provider]\nbase_url = \"https://openrouter.ai/api/v1\"\n",
+        0o600,
+    );
+
+    let (code, report) = fixture.doctor();
+
+    assert_eq!(report.state("provider_local"), "ok", "{}", report.whole);
+    assert_eq!(code, Some(0));
+}

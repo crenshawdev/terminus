@@ -668,6 +668,7 @@ impl Doctor {
         let config = match Config::load() {
             Ok(config) => {
                 self.roots(&config);
+                self.provider_local(&config);
                 Some(config)
             }
             Err(error) => {
@@ -676,6 +677,7 @@ impl Doctor {
                     State::Problem,
                     format!("verbatim's own config could not be read: {error}"),
                 ));
+                self.unknown("provider_local", "verbatim's config could not be read");
                 None
             }
         };
@@ -773,6 +775,61 @@ impl Doctor {
                 State::Problem,
                 format!("{where_it_is} could not be read: {detail}"),
             ),
+        };
+        self.push(check);
+    }
+
+    /// A provider declared local whose address is not one (D-13, D-15).
+    ///
+    /// **A note, never a problem, and nothing here changes where a byte goes.**
+    /// `provider.local` describes the DESTINATION and is declared rather than
+    /// inferred: the egress filter reads that key and not the host, exactly as
+    /// `Config::provider_local` documents, because deciding from the address
+    /// would mean resolving a name and a resolution is a connection PRIV-03
+    /// bars. So this is a mistake worth naming - `local = true` against a
+    /// remote address sends session text there unfiltered - and it is not
+    /// doctor's to overrule, which is why `verbatim doctor` still exits 0.
+    ///
+    /// The host is named and the configured URL is not: a `base_url` may carry
+    /// userinfo, and the one thing this report may not do is print a
+    /// credential.
+    fn provider_local(&mut self, config: &Config) {
+        let check = match (config.provider_local(), config.provider_base_url()) {
+            (false, _) => Check::new(
+                "provider_local",
+                State::Ok,
+                "the provider is not declared local, so every request is filtered at egress",
+            ),
+            (true, None) => Check::new(
+                "provider_local",
+                State::Unknown,
+                "the provider is declared local and no base_url is configured, so there is \
+                 no host to check it against",
+            ),
+            (true, Some(base_url)) => {
+                let host = host_of(base_url);
+                if is_loopback(host) {
+                    Check::new(
+                        "provider_local",
+                        State::Ok,
+                        format!(
+                            "the provider is declared local and its base_url is on {host}, \
+                             so nothing leaves this machine"
+                        ),
+                    )
+                } else {
+                    Check::new(
+                        "provider_local",
+                        State::Note,
+                        format!(
+                            "the provider is declared local but its base_url names {host}, \
+                             which is not a loopback address; the declaration decides what \
+                             is filtered and the address does not, so session text is sent \
+                             there unfiltered"
+                        ),
+                    )
+                }
+            }
         };
         self.push(check);
     }
@@ -1442,6 +1499,67 @@ fn precedes(version: &str, floor: &str) -> bool {
         }
     }
     false
+}
+
+/// The host out of a configured `base_url`, by hand (D-16).
+///
+/// No `url` crate and no regex crate: this workspace adds neither, `base_url`
+/// is already treated as a string everywhere else it is used
+/// (`observe::provider::endpoint`), and the whole question here is which of
+/// four shapes a host is written in.
+///
+/// The userinfo rule is the one that earns its keep.
+/// `http://127.0.0.1:11434@evil.example/` is a URL whose host is
+/// `evil.example`, and a scan that stopped at the first `:` or the first `@`
+/// would call it loopback and stay quiet about the one address a user could be
+/// fooled by.
+fn host_of(base_url: &str) -> &str {
+    let rest = match base_url.find("://") {
+        Some(at) => &base_url[at + 3..],
+        None => base_url,
+    };
+    // The authority ends where the path, the query or the fragment begins.
+    let authority = match rest.find(['/', '?', '#']) {
+        Some(at) => &rest[..at],
+        None => rest,
+    };
+    // Everything up to and including the LAST `@` is userinfo, which may itself
+    // contain an `@`.
+    let authority = match authority.rfind('@') {
+        Some(at) => &authority[at + 1..],
+        None => authority,
+    };
+    if let Some(inside) = authority.strip_prefix('[') {
+        // A bracketed IPv6 literal: `[::1]:11434`. The colons are the address.
+        return match inside.find(']') {
+            Some(at) => &inside[..at],
+            None => inside,
+        };
+    }
+    match authority.rfind(':') {
+        // A port, and only when what follows one could be: an unbracketed
+        // address full of colons is not a host with a port.
+        Some(at) if authority[at + 1..].bytes().all(|b| b.is_ascii_digit()) => &authority[..at],
+        _ => authority,
+    }
+}
+
+/// Is this host on this machine?
+///
+/// Exactly three shapes, and no name resolution: `localhost` however it is
+/// cased, any `127.x.x.x`, and the IPv6 loopback. Anything else is remote for
+/// the purposes of the note - including a name that happens to resolve to
+/// `127.0.0.1`, because looking that up would be the connection PRIV-03 bars.
+fn is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    let octets: Vec<&str> = host.split('.').collect();
+    octets.len() == 4
+        && octets[0] == "127"
+        && octets
+            .iter()
+            .all(|octet| !octet.is_empty() && octet.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// The command that removes a file, on the shell the user is at.
