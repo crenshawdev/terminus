@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use verbatim_core::config::visible;
+use verbatim_core::config::{config_dir, visible, CONFIG_FILE_NAME};
 use verbatim_core::credentials::{self, Permissions};
 use verbatim_core::Config;
 
@@ -141,6 +141,8 @@ pub fn run(json: bool) -> Result<(), Failure> {
     doctor.wiring();
     doctor.archive();
     doctor.credentials();
+    doctor.config_mode();
+    doctor.mode_checks();
     doctor.claude_settings();
     let checks = doctor.checks;
 
@@ -773,6 +775,130 @@ impl Doctor {
             ),
         };
         self.push(check);
+    }
+
+    /// `verbatim.toml`'s own mode, on the same test and through the same
+    /// function the refusal uses (PRIV-02, D-14).
+    ///
+    /// A config file carrying `provider.api_key` is a credentials file whatever
+    /// else is in it, and `credentials::resolve` refuses to read a key out of
+    /// one anybody else can read. So this reports what that refusal would say,
+    /// through `credentials::permissions` rather than a second mode test of its
+    /// own: a report that disagreed with the refusal would be worse than no
+    /// report.
+    ///
+    /// **Whether there is a key decides the state, not the mode alone.** A wide
+    /// `verbatim.toml` holding no key is a file of preferences and nothing is
+    /// refused over it, so calling it a problem would tell most users to fix
+    /// something that is not broken. A file that did not parse is the one case
+    /// where the answer is unknowable, and it says so and still prints the
+    /// chmod.
+    ///
+    /// Reads a path, a mode, and whether one key is present. It never renders
+    /// the file, and it creates nothing.
+    fn config_mode(&mut self) {
+        // Loaded again rather than carried from `archive`: this check needs the
+        // path the values came from and whether a key is among them, and a
+        // second read of one small file is cheaper than a field threaded
+        // through the store checks. A load failure is not fatal here - it is
+        // the `Unknown` arm below.
+        let loaded = Config::load();
+        let (path, key) = match &loaded {
+            Ok(config) => (
+                config.source_path().map(Path::to_path_buf),
+                Some(config.provider_api_key().is_some()),
+            ),
+            // The file is there and did not parse, or the directory did not
+            // resolve. Either way the mode is still reportable and whether a
+            // key is in it is not.
+            Err(_) => (
+                config_dir().ok().map(|dir| dir.join(CONFIG_FILE_NAME)),
+                None,
+            ),
+        };
+        let Some(path) = path else {
+            self.push(Check::new(
+                "config_mode",
+                State::Unknown,
+                "no config directory resolved, so there is no verbatim.toml to look at",
+            ));
+            return;
+        };
+        let where_it_is = path.display().to_string();
+        let fix = format!("chmod 600 '{where_it_is}'");
+        let check = match credentials::permissions(&path) {
+            Permissions::Absent => Check::new(
+                "config_mode",
+                State::Note,
+                format!("nothing at {where_it_is}; verbatim is running on its defaults"),
+            ),
+            Permissions::Owner { mode } => Check::new(
+                "config_mode",
+                State::Ok,
+                format!("{where_it_is} is mode {mode:03o}"),
+            ),
+            Permissions::TooOpen { mode } => match key {
+                Some(true) => Check::new(
+                    "config_mode",
+                    State::Problem,
+                    format!(
+                        "{where_it_is} is mode {mode:03o}, so the provider key in it is \
+                         readable beyond its owner and verbatim refuses to use it"
+                    ),
+                )
+                .with_fix(fix),
+                Some(false) => Check::new(
+                    "config_mode",
+                    State::Ok,
+                    format!(
+                        "{where_it_is} is mode {mode:03o} and holds no provider key, so \
+                         there is no credential in it to refuse"
+                    ),
+                ),
+                None => Check::new(
+                    "config_mode",
+                    State::Unknown,
+                    format!(
+                        "{where_it_is} is mode {mode:03o} and could not be parsed, so \
+                         whether it holds a provider key is unknown"
+                    ),
+                )
+                .with_fix(fix),
+            },
+            // D-15's deferral again. `mode_checks` is where it is said in
+            // words, so that a Unix user reads it too.
+            Permissions::Unchecked => Check::new(
+                "config_mode",
+                State::Unknown,
+                format!(
+                    "{where_it_is} is there; this build does not check Windows ACLs, so \
+                     whether anyone else can read it is unverified"
+                ),
+            ),
+            Permissions::Unreadable { detail } => Check::new(
+                "config_mode",
+                State::Problem,
+                format!("{where_it_is} could not be read: {detail}"),
+            ),
+        };
+        self.push(check);
+    }
+
+    /// What the two mode checks above actually examined (D-15, D-17).
+    ///
+    /// Its own check rather than a sentence inside either of them, because a
+    /// check line is the only thing the printed report and the `--json`
+    /// document share - and saying it inside both mode checks would say it
+    /// twice. Stated on every platform, so a Unix user reads the same caveat a
+    /// Windows user does rather than finding it only in an arm their machine
+    /// never reaches.
+    fn mode_checks(&mut self) {
+        self.push(Check::new(
+            "mode_checks",
+            State::Note,
+            "the credentials and config_mode checks read Unix mode bits; this build \
+             examines no Windows ACL, so on Windows either file is accepted unverified",
+        ));
     }
 
     /// Which Claude config roots resolved, and how many.
