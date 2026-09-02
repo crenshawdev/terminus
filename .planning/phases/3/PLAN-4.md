@@ -11,6 +11,7 @@ files:
   - crates/verbatim-core/tests/credentials.rs
   - crates/verbatim/tests/doctor.rs
   - crates/verbatim/tests/config_mode.rs
+  - crates/verbatim/tests/hook.rs
 ---
 
 # Phase 3: Owner-Only On Disk - Plan 4

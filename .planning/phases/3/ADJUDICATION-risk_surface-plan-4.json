@@ -1,0 +1,39 @@
+{
+  "phase": "3",
+  "trigger": "risk_surface",
+  "discriminator": "plan-4",
+  "round": 1,
+  "base": "671b54f",
+  "head": "b43e5c0",
+  "base_id": "671b54f26c35c007aaa672c727d88e3e991717e2",
+  "head_id": "b43e5c0d4e07f6a519b84586b662c66298cc2581",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.4-mini",
+      "file": "crates/verbatim-core/src/config.rs",
+      "line": 617,
+      "severity": "high",
+      "claim": "`Config::load_from` stores the directory argument in `source` instead of the actual `verbatim.toml` file path, so `source_path()` points at the wrong object.",
+      "failure_scenario": "Loading a config from `<dir>/verbatim.toml` via `Config::load_from(<dir>)` will later make `credentials::resolve` and `doctor config_mode` name or chmod `<dir>` rather than `<dir>/verbatim.toml`. The refusal then targets the wrong path, and the new test that expects the file path fails.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/verbatim-core/src/config.rs",
+        "line": 598,
+        "note": "`let path = config_dir.join(CONFIG_FILE_NAME);` then line 616 `config.source = Some(path);` - the stored value is the verbatim.toml FILE path, not the directory argument, so source_path() names <dir>/verbatim.toml"
+      },
+      "base_id": "671b54f26c35c007aaa672c727d88e3e991717e2",
+      "head_id": "b43e5c0d4e07f6a519b84586b662c66298cc2581"
+    }
+  ]
+}
