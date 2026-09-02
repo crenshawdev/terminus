@@ -108,9 +108,33 @@ impl Store {
     /// read-only is what makes that true at the SQLite level rather than by
     /// discipline. A writable connection would checkpoint the WAL when the last
     /// one closes, which rewrites both files without a single statement of ours.
+    ///
+    /// Everything this creates is owner-only from the syscall that creates it
+    /// (PRIV-02): the data directory 0700 and `verbatim.db` 0600, the latter
+    /// created empty by us BEFORE rusqlite ever sees the path. `-wal` and
+    /// `-shm` are then SQLite's to make, and it `fchmod`s a fresh sidecar to
+    /// the main database's mode after opening it, which is why 0600 on the one
+    /// file covers all three and why there is no `chmod` after the fact here -
+    /// that would be a window with session text already on disk at 0644.
     pub fn open(data_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(data_dir).map_err(|e| Error::io(data_dir, e))?;
+        crate::owner_only::create_dir_all(data_dir).map_err(|e| Error::io(data_dir, e))?;
         let path = data_dir.join(DB_FILE_NAME);
+
+        // A zero-length file is exactly what `inspect` reads as
+        // `StoreState::Fresh`, so this changes nothing about what happens next
+        // on a store that does not exist yet: `initialize` still runs, and
+        // SQLite's `journal_mode` stamp lands in a file that is already 0600.
+        // `create_new`, so an existing store is never truncated - its
+        // `AlreadyExists` is the ordinary case, not a failure.
+        match crate::owner_only::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(Error::io(&path, e)),
+        }
 
         let state = inspect(&path)?;
 

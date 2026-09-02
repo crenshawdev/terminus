@@ -635,3 +635,57 @@ fn a_foreign_sqlite_database_is_refused_rather_than_initialized_over() {
         .expect("the refused open destroyed the foreign table");
     assert_eq!(rows, 1, "the refused open wrote over somebody else's data");
 }
+
+/// Owner-only from creation (PRIV-02), asserted path by path under the umask a
+/// default install actually runs at.
+///
+/// The parent assertion is D-04: a directory verbatim had to create on the way
+/// to its own is NOT narrowed - a user whose `~/.local/share` did not exist
+/// must not find it 0700 after the first ingest.
+///
+/// The sidecar assertion is the flagged assumption stated outright rather than
+/// trusted. Nothing here chmods `-wal` or `-shm`; SQLite creates both and gives
+/// them the main database's mode itself, so if a SQLite the `bundled` feature
+/// resolves to ever stops doing that, this test fails loudly on whatever
+/// platform ran it instead of shipping 0644 files holding uncommitted session
+/// text.
+#[cfg(unix)]
+#[test]
+fn a_fresh_store_and_its_sidecars_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("{} is not there: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("parent");
+    let data = parent.join("data");
+
+    let store = Store::open(&data).expect("a store two directories deep opens");
+    // One write, so SQLite has a reason to have a WAL at all.
+    store.set_meta_int("owner_only_probe", 1).unwrap();
+
+    assert_eq!(mode(&data), 0o700, "the data directory verbatim owns");
+    assert_eq!(
+        mode(&parent),
+        0o755,
+        "a parent created on the way keeps the umask's default (D-04)"
+    );
+
+    let db = data.join(DB_FILE_NAME);
+    assert_eq!(mode(&db), 0o600, "verbatim.db");
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = data.join(format!("{DB_FILE_NAME}{suffix}"));
+        assert!(
+            sidecar.is_file(),
+            "{} was never created, so its mode proves nothing",
+            sidecar.display()
+        );
+        assert_eq!(mode(&sidecar), 0o600, "{}", sidecar.display());
+    }
+}
