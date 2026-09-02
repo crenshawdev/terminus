@@ -21,10 +21,12 @@
 
 #![cfg(unix)]
 
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+use serde_json::{json, Value};
 use verbatim_core::testkit;
 
 /// The encoded project directory a fixture is placed under.
@@ -156,30 +158,93 @@ impl Bench {
         std::fs::copy(testkit::fixture_path(fixture), &dest).unwrap();
         dest
     }
+
+    /// One hook invocation: the payload on stdin, then EOF, the way Claude Code
+    /// writes it - and under the same umask as everything else here, because
+    /// the files a hook writes are the point.
+    fn hook(&self, event: &str, payload: &Value) -> Output {
+        let mut child = self
+            .command(&["hook", event])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("sh runs the hook");
+        let line = format!("{payload}\n");
+        child
+            .stdin
+            .take()
+            .expect("the hook's stdin")
+            .write_all(line.as_bytes())
+            .expect("write the payload");
+        let out = child.wait_with_output().expect("wait for the hook");
+        assert!(
+            out.status.success(),
+            "hook {event} exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
 }
 
-fn mode(path: &Path) -> u32 {
-    std::fs::symlink_metadata(path)
-        .unwrap_or_else(|e| panic!("{} is not there: {e}", path.display()))
-        .permissions()
-        .mode()
-        & 0o777
+/// What is wrong with one path's mode, or nothing.
+///
+/// A path that is not there at all is wrong rather than a panic: `-wal` and
+/// `-shm` exist only while a connection is open, and a run that lost one should
+/// say so beside the modes rather than instead of them.
+fn wrong(path: &Path, want: u32) -> Option<String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) => Some(format!("{} is not there: {e}", path.display())),
+        Ok(meta) => {
+            let found = meta.permissions().mode() & 0o777;
+            (found != want).then(|| format!("{} is {found:o}, want {want:o}", path.display()))
+        }
+    }
 }
 
 /// One path, one assertion, and the path in the message.
-///
-/// Deliberately not the batched `wrong_modes` shape `tests/tighten.rs` uses.
-/// That file is about a repair which either ran or did not, so naming every
-/// offender at once is what its reader needs; here each path is set by a
-/// different creation site, and the first failure should say which site.
 #[track_caller]
 fn owner_only(path: &Path, want: u32) {
-    let found = mode(path);
-    assert!(
-        found == want,
-        "{} is {found:o}, want {want:o}",
-        path.display()
-    );
+    if let Some(complaint) = wrong(path, want) {
+        panic!("{complaint}");
+    }
+}
+
+/// Every path checked one at a time, and every offender named in ONE failure.
+///
+/// The end-to-end test needs this and the two single-command tests above do
+/// not: it covers nine creation sites in different modules, and a fail-fast
+/// assertion there would always stop at the data directory - leaving the reader
+/// of a failing run with no idea whether `verbatim.db` and the export were
+/// repaired or not, which is the most useful fact in the message. Each path is
+/// still its own check with its own path in its own line.
+#[derive(Default)]
+struct Wrong(Vec<String>);
+
+impl Wrong {
+    fn check(&mut self, path: &Path, want: u32) {
+        self.0.extend(wrong(path, want));
+    }
+
+    /// A directory at `DIR_MODE` and every file directly inside it at
+    /// `FILE_MODE`. [`contents`] refuses an empty one, so a hook that wrote
+    /// nothing fails here rather than passing over an empty loop.
+    fn directory(&mut self, dir: &Path, want_dir: u32, want_file: u32) {
+        self.check(dir, want_dir);
+        for path in contents(dir) {
+            self.check(&path, want_file);
+        }
+    }
+
+    #[track_caller]
+    fn none(&self) {
+        assert!(
+            self.0.is_empty(),
+            "readable by group or world:\n  {}",
+            self.0.join("\n  ")
+        );
+    }
 }
 
 /// Everything directly inside a directory, sorted, and never empty.
@@ -305,4 +370,101 @@ fn a_data_move_writes_an_owner_only_tree_however_wide_the_source_was() {
         owner_only(&snapshot, 0o600);
     }
     assert_tree_is_owner_only(&destination);
+}
+
+/// The session one payload names, long enough and plain enough to be allowed to
+/// name a file (`inject::state`'s allow-list, mirrored in `inject::decision`).
+const SESSION_ID: &str = "0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55";
+
+/// AC1 whole: one fresh ingest, one `SessionStart`, one `UserPromptSubmit`, one
+/// export, and then every path the phase claims, asserted one at a time.
+///
+/// Three things this test has to arrange for, none of them incidental:
+///
+/// **The ingest lock is held by the test process** for everything after the
+/// first ingest. Every hook spawns a detached `verbatim ingest` of its own, and
+/// one that won the lock would drain `decisions/` out of existence between the
+/// hook that wrote it and the stat that reads it. With the lock held, a spawned
+/// pass exits 0 having written nothing - `ingest/pass.rs`'s
+/// `a_pass_reports_the_lock_rather_than_waiting_for_it` is that claim.
+///
+/// **A read transaction is held open on `verbatim.db`** for the same span.
+/// SQLite deletes `-wal` and `-shm` when the last connection closes, which is
+/// why CONTEXT D-02's umask-022 baseline lists neither: a test that looked for
+/// them after the ingest process exited would find nothing to stat. A held
+/// reader keeps both on disk. Their mode is SQLite's own doing - it takes it
+/// from the main database rather than from the umask of whatever process
+/// created them (D-02) - so these two assertions test that flagged assumption
+/// directly, and the fact that this process made them is not a hole in the
+/// test.
+///
+/// **The `SessionStart` says `source: "compact"`**, which
+/// `inject::brief::owe_compaction` answers by saving the session's state file
+/// before it looks at the store at all, so `injection/` is populated whether
+/// the brief renders or not. The `UserPromptSubmit` needs no such arrangement:
+/// every prompt writes a decision record, including the ones that inject
+/// nothing (D-11).
+#[test]
+fn everything_a_fresh_install_writes_is_owner_only_under_umask_022() {
+    let bench = bench();
+    bench.place("session-basic.jsonl");
+    bench.ok(&["ingest"]);
+
+    let data = bench.data_dir.clone();
+
+    // Held for the rest of the test. Both are dropped at the end of the
+    // function, after every assertion has run.
+    let _held = match verbatim_core::ingest::lock::try_acquire(&data).unwrap() {
+        verbatim_core::ingest::lock::Attempt::Acquired(held) => held,
+        verbatim_core::ingest::lock::Attempt::Held => panic!("the ingest lock is already taken"),
+    };
+    let conn = rusqlite::Connection::open(data.join("verbatim.db")).unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    let sessions: i64 = conn
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sessions, 1, "the ingest archived nothing to hold open");
+
+    bench.hook(
+        "SessionStart",
+        &json!({
+            "session_id": SESSION_ID,
+            "transcript_path": "/home/user/.claude/projects/-p/session.jsonl",
+            "cwd": bench.work.to_str().unwrap(),
+            "hook_event_name": "SessionStart",
+            "source": "compact",
+        }),
+    );
+    bench.hook(
+        "UserPromptSubmit",
+        &json!({
+            "session_id": SESSION_ID,
+            "transcript_path": "/home/user/.claude/projects/-p/session.jsonl",
+            "cwd": bench.work.to_str().unwrap(),
+            "prompt_id": "7c1d4b90-33af-4e05-9a6c-2f8e5b71c0a4",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "where did we settle the detached spawn's kill behaviour",
+            "session_title": "phase 3: owner-only on disk",
+        }),
+    );
+
+    let destination = bench.root.join("export");
+    bench.ok(&["export", destination.to_str().unwrap(), "--json"]);
+
+    let mut wrong = Wrong::default();
+
+    // The data directory itself, and the four files that sit directly in it.
+    wrong.check(&data, 0o700);
+    wrong.check(&data.join("verbatim.db"), 0o600);
+    wrong.check(&data.join("verbatim.db-wal"), 0o600);
+    wrong.check(&data.join("verbatim.db-shm"), 0o600);
+    wrong.check(&data.join("LOCK"), 0o600);
+
+    // Every directory below it, each one required to hold something.
+    for name in ["snapshots", "injection", "decisions"] {
+        wrong.directory(&data.join(name), 0o700, 0o600);
+    }
+
+    wrong.directory(&destination, 0o700, 0o600);
+    wrong.none();
 }
