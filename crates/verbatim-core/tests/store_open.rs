@@ -689,3 +689,140 @@ fn a_fresh_store_and_its_sidecars_are_owner_only() {
         assert_eq!(mode(&sidecar), 0o600, "{}", sidecar.display());
     }
 }
+
+/// AC3 and AC4 at the library boundary: a store an earlier build left wide is
+/// narrowed by one writable open, is not narrowed twice, and is not touched at
+/// all by a read-only one (D-05, D-06).
+///
+/// The symlink is the case the repair must refuse. `set_permissions` follows
+/// one, so a link left in `snapshots/` would otherwise hand a chmod to a file
+/// that is none of verbatim's business.
+#[cfg(unix)]
+#[test]
+fn a_wide_store_is_tightened_by_a_writable_open_and_by_nothing_else() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap_or_else(|e| panic!("{} is not there: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    fn set(path: &std::path::Path, bits: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let elsewhere = root.path().join("somebody-elses-file");
+    std::fs::write(&elsewhere, b"not verbatim's").unwrap();
+    set(&elsewhere, 0o644);
+
+    // The store, held open so its `-wal` and `-shm` are on disk for the whole
+    // test rather than checkpointed away by the last connection closing.
+    let held = Store::open(&data).unwrap();
+    held.set_meta_int("tighten_probe", 1).unwrap();
+
+    // The rest of what a real data directory carries, by the names the repair
+    // knows. The `LOCK` file is written directly: taking the real ingest lock
+    // is `verbatim`'s business, not this crate's open path.
+    std::fs::write(data.join("LOCK"), b"").unwrap();
+    for name in ["snapshots", "injection", "decisions"] {
+        let dir = data.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("one-file"), b"{}").unwrap();
+    }
+    let link = data.join("snapshots").join("a-link");
+    std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+    let directories: Vec<std::path::PathBuf> = [".", "snapshots", "injection", "decisions"]
+        .iter()
+        .map(|n| {
+            if *n == "." {
+                data.clone()
+            } else {
+                data.join(n)
+            }
+        })
+        .collect();
+    let files: Vec<std::path::PathBuf> = [
+        DB_FILE_NAME.to_string(),
+        format!("{DB_FILE_NAME}-wal"),
+        format!("{DB_FILE_NAME}-shm"),
+        "LOCK".to_string(),
+        "snapshots/one-file".to_string(),
+        "injection/one-file".to_string(),
+        "decisions/one-file".to_string(),
+    ]
+    .iter()
+    .map(|n| data.join(n))
+    .collect();
+
+    let widen = || {
+        for dir in &directories {
+            set(dir, 0o755);
+        }
+        for file in &files {
+            assert!(file.is_file(), "{} is missing", file.display());
+            set(file, 0o644);
+        }
+    };
+
+    widen();
+    drop(Store::open(&data).expect("a wide store still opens"));
+
+    for dir in &directories {
+        assert_eq!(mode(dir), 0o700, "{}", dir.display());
+    }
+    for file in &files {
+        assert_eq!(mode(file), 0o600, "{}", file.display());
+    }
+    assert!(
+        std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+        "the link itself was replaced"
+    );
+    assert_eq!(
+        mode(&elsewhere),
+        0o644,
+        "the repair followed a symlink out of the data directory"
+    );
+
+    // D-06: the second open finds every bit already right and issues no chmod,
+    // which is what leaves ctime alone. A chmod to the mode a file already has
+    // would move it.
+    let before: Vec<(std::path::PathBuf, i64, i64)> = files
+        .iter()
+        .chain(directories.iter())
+        .map(|p| {
+            let m = std::fs::symlink_metadata(p).unwrap();
+            (p.clone(), m.ctime(), m.ctime_nsec())
+        })
+        .collect();
+    drop(Store::open(&data).expect("a second open"));
+    for (path, ctime, nsec) in &before {
+        let m = std::fs::symlink_metadata(path).unwrap();
+        assert_eq!(
+            (m.ctime(), m.ctime_nsec()),
+            (*ctime, *nsec),
+            "{} was chmod'd a second time",
+            path.display()
+        );
+    }
+
+    // D-05: a read-only open repairs nothing at all.
+    widen();
+    drop(Store::open_read_only(&data).expect("a read-only open of a wide store"));
+    for dir in &directories {
+        assert_eq!(mode(dir), 0o755, "{} was narrowed by a read", dir.display());
+    }
+    for file in &files {
+        assert_eq!(
+            mode(file),
+            0o644,
+            "{} was narrowed by a read",
+            file.display()
+        );
+    }
+}
