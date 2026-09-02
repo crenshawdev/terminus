@@ -525,6 +525,13 @@ impl Default for Snapshot {
 /// The resolved config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// The file these values came from, when they came from one (D-13).
+    ///
+    /// Set by [`Config::load_from`] and by nothing else, because that is the
+    /// one place the path exists: `config_dir()` re-resolved later can name a
+    /// different file than the one that was read, which is exactly wrong under
+    /// `VERBATIM_CONFIG_DIR` and for any caller that named its own directory.
+    source: Option<PathBuf>,
     roots: Vec<PathBuf>,
     exclusions: Vec<String>,
     /// D-07's encoding of each exclusion, case-folded where the platform is,
@@ -545,6 +552,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Config {
         Config {
+            // No file, so nothing to name: a config built in memory must not
+            // claim a path a refusal would then print (D-13).
+            source: None,
             roots: Vec::new(),
             exclusions: Vec::new(),
             encoded_exclusions: Vec::new(),
@@ -599,7 +609,12 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
             Err(e) => return Err(Error::io(&path, e)),
         };
-        Config::resolve(file)
+        let mut config = Config::resolve(file)?;
+        // Whether or not the file was there. An absent file resolves to the
+        // defaults and still records where they would have come from, which is
+        // what `verbatim doctor` prints when it says where it looked.
+        config.source = Some(path);
+        Ok(config)
     }
 
     /// A config built in memory, for callers that have no file. Test support
@@ -714,6 +729,21 @@ impl Config {
     /// Behind [`Secret`], so a `{:?}` of the whole config cannot render it.
     pub fn provider_api_key(&self) -> Option<&Secret> {
         self.provider.api_key.as_ref()
+    }
+
+    /// The `verbatim.toml` these values were read from (D-13).
+    ///
+    /// `None` for a config built in memory - [`Config::from_parts`] and
+    /// [`Config::default`] - and `Some` for every config
+    /// [`Config::load_from`] produced, including one whose file was not there:
+    /// the path is where the values would have come from, not proof that they
+    /// did.
+    ///
+    /// It exists so that a refusal over this file's MODE can name the file it
+    /// refused. `crate::credentials::resolve` is its one caller in this
+    /// workspace, with `verbatim doctor` the second.
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source.as_deref()
     }
 
     /// Is the configured provider on this machine (D-13)?

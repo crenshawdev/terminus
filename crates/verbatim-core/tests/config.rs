@@ -63,6 +63,46 @@ fn a_missing_config_file_yields_the_default_single_root() {
     assert!(config.exclusions().is_empty());
 }
 
+/// D-13: the refusal over this file's mode has to name the file the values came
+/// from, so a loaded config carries that path and an in-memory one carries
+/// nothing to name.
+///
+/// The absent-file half is the one that matters for `verbatim doctor`: the path
+/// is where the loader LOOKED, not a claim that it read anything.
+#[test]
+fn a_loaded_config_carries_its_file_and_an_in_memory_one_carries_none() {
+    let holding = config_dir_holding(&[(CONFIG_FILE_NAME, "exclude = []\n")]);
+    let loaded = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(holding.path()).unwrap()
+    });
+    assert_eq!(
+        loaded.source_path(),
+        Some(holding.path().join(CONFIG_FILE_NAME).as_path()),
+        "a config loaded from a file does not name it"
+    );
+
+    let empty = config_dir_holding(&[]);
+    let defaulted = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(empty.path()).unwrap()
+    });
+    assert_eq!(
+        defaulted.source_path(),
+        Some(empty.path().join(CONFIG_FILE_NAME).as_path()),
+        "a load with no file there does not name where it looked"
+    );
+
+    assert_eq!(
+        Config::from_parts(Vec::new(), Vec::new()).source_path(),
+        None,
+        "a config built from parts claims a file it never read"
+    );
+    assert_eq!(
+        Config::default().source_path(),
+        None,
+        "the default config claims a file it never read"
+    );
+}
+
 /// D-15: `CLAUDE_CONFIG_DIR` is read as a single directory, and it replaces the
 /// default. An empty value is not a directory and must not become one.
 #[test]
