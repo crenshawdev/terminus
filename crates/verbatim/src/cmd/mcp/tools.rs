@@ -502,6 +502,13 @@ fn run_context(args: &Map<String, Value>) -> Result<Value, Refused> {
 /// own archived bytes, and each session's blob is decompressed once per request
 /// however many of its turns were asked for (D-20).
 ///
+/// **Unless `[privacy] redact_recall` is set**, and then `body` is that line
+/// with the egress filter run over it, because an MCP result is the model's
+/// context and phase 4 makes that its own egress boundary. The archive is
+/// untouched either way - the filter is applied to the copy this answer carries,
+/// in `recall::get::records` and not here, so the terminal `body` and this one
+/// cannot disagree.
+///
 /// **The id list is bounded here and nowhere else.** `recall::get::records`
 /// binds one SQL placeholder per id, so a client-supplied list of thousands is
 /// an operational failure rather than an answer; the terminal path is bounded by

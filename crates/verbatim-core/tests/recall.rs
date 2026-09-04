@@ -1871,6 +1871,95 @@ fn the_returned_bytes_are_the_records_own_line() {
     assert!(!fetched.records[0].body_evicted);
 }
 
+/// The one turn of `session-secrets.jsonl` that quotes an `Authorization`
+/// header, paired with the fixture's own line for it - rooted the way the bench
+/// ingested it, so the comparison is against the bytes that were archived.
+fn authz_turn(bench: &Bench, conn: &Connection) -> (i64, String) {
+    let ids = turns_whose_record_contains(conn, AUTHZ_SENTINEL);
+    assert_eq!(ids.len(), 1, "one planted authz turn: {ids:?}");
+
+    let text = String::from_utf8(testkit::fixture_bytes("session-secrets.jsonl")).unwrap();
+    let line = text
+        .replace(
+            testkit::FIXTURE_ROOT_TOKEN,
+            &bench.root.to_string_lossy().replace('\\', "\\\\"),
+        )
+        .lines()
+        .find(|line| line.contains(AUTHZ_SENTINEL))
+        .expect("the fixture plants an Authorization header")
+        .to_owned();
+
+    (ids[0], line)
+}
+
+/// One id's body, read under a config that has been through a real
+/// `verbatim.toml`.
+fn body_under(bench: &Bench, conn: &Connection, id: i64, on: bool) -> Vec<u8> {
+    get::records(conn, &bench.redacting(on), &Scope::Everything, &[id])
+        .unwrap()
+        .records
+        .first()
+        .and_then(|record| record.body.clone())
+        .expect("an archived turn has a body")
+}
+
+/// AC2's byte-exactness, restated against the knob: absent, this read is still
+/// the archived line and nothing else.
+///
+/// Separate from `the_returned_bytes_are_the_records_own_line` on purpose. That
+/// test reads through a `Config::from_parts`; this one reads through a config
+/// loaded from a `verbatim.toml` that spells the key out as `false`, which is
+/// the shape a user who once turned the knob on and then off again leaves
+/// behind.
+#[test]
+fn an_unfiltered_get_returns_the_archived_line_byte_for_byte() {
+    let bench = bench();
+    let conn = bench.conn();
+    let (id, line) = authz_turn(&bench, &conn);
+
+    assert_eq!(body_under(&bench, &conn, id, false), line.as_bytes());
+}
+
+/// PRIV-03 over `recall_get`: the body is model-facing too, so the knob filters
+/// it - and filters the copy, never the archive (phase 4 D-04).
+///
+/// The `"uuid"` and `"type"` assertions are what separate a filtered line from a
+/// stub: this is still the archived record with its JSON scaffolding intact, and
+/// only the credential inside it went.
+#[test]
+fn the_knob_filters_the_body_and_leaves_the_archived_line_alone() {
+    let bench = bench();
+    let conn = bench.conn();
+    let (id, line) = authz_turn(&bench, &conn);
+
+    let filtered = String::from_utf8(body_under(&bench, &conn, id, true)).unwrap();
+
+    // The premise: the line really does carry the credential, so what follows is
+    // about the filter and not about a turn that moved.
+    assert!(line.contains(AUTHZ_SENTINEL), "{line}");
+
+    assert!(
+        filtered.contains(REDACTED),
+        "a filtered body names what went:\n{filtered}"
+    );
+    for absent in [AUTHZ_SENTINEL, SENTINEL_MARK, "authz"] {
+        assert!(
+            !filtered.contains(absent),
+            "{absent:?} survived into the body:\n{filtered}"
+        );
+    }
+    for present in ["\"uuid\"", "\"type\""] {
+        assert!(
+            filtered.contains(present),
+            "the body is no longer the archived line, it is a stub:\n{filtered}"
+        );
+    }
+
+    // And the archive is untouched: the same id read again with the knob absent
+    // is the fixture's own line, byte for byte.
+    assert_eq!(body_under(&bench, &conn, id, false), line.as_bytes());
+}
+
 /// D-08: `body_evicted` comes off `session_meta.is_evicted` and nowhere else,
 /// and the record still comes back.
 ///

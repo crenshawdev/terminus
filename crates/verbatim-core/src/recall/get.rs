@@ -5,7 +5,8 @@
 //! returns projections of its neighbours; this returns the record's **own
 //! bytes**, read at the `stream_offset` and `byte_len` stored on the turn row.
 //! The blob is truth (`.planning/PROJECT.md`, D-13) and this is the one path
-//! that hands the truth back unaltered.
+//! that hands the truth back unaltered - unless `[privacy] redact_recall` says
+//! otherwise, and then only for this answer: see [`Record::body`].
 //!
 //! **One blob per session per request (D-20).** rusqlite's incremental blob I/O
 //! sits behind a `blob` feature this workspace does not enable, so reading one
@@ -30,6 +31,7 @@ use rusqlite::Connection;
 use crate::blob::BlobReader;
 use crate::config::{visible, Config};
 use crate::error::Result;
+use crate::observe::egress::Redaction;
 use crate::recall::excerpt::Reads;
 use crate::recall::scope::{self, Reason, Scope};
 
@@ -53,6 +55,12 @@ pub struct Record {
     /// between what was written and what is shown. The caller decides how to
     /// render it - a terminal takes the bytes, a JSON document takes a lossy
     /// string - and says so where it does.
+    ///
+    /// With `[privacy] redact_recall` set these bytes are the archived line put
+    /// through the egress filter, so the byte-for-byte promise above is what the
+    /// default answers and not what every answer does; the archive itself is
+    /// never touched, and the same read with the knob absent still returns the
+    /// stored line unchanged (phase 4 D-04).
     ///
     /// `None` when the body was not read: the session is evicted, or the blob
     /// would not give the range up.
@@ -201,6 +209,14 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
         }
     }
 
+    // Resolved once for the whole request, at the entry point that holds the
+    // `Config` (phase 4 D-01). `recall_get`'s body is hook and MCP output like
+    // every other projection, so the knob reaches it too - and the conversion it
+    // needs happens HERE and not per renderer, because `verbatim show` writes
+    // these bytes with `write_all` while the MCP tool renders them lossily, and
+    // a filter applied separately in each would let the two `body` values
+    // diverge (D-04).
+    let redaction = Redaction::of(config);
     for (session_key, ranges) in by_session {
         let blob: Option<Vec<u8>> = conn
             .query_row(
@@ -218,7 +234,19 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
         };
         for (index, offset, len) in ranges {
             if let Ok(bytes) = reader.read_range(offset as u64, len as u64) {
-                fetched.records[index].body = Some(bytes);
+                // The knob-off arm is the blob's own bytes with no conversion at
+                // all, not a round trip that happens to be lossless: this is the
+                // read whose whole claim is byte-exactness, and a `String` step
+                // taken unconditionally would make that claim depend on the
+                // corpus rather than on the code.
+                fetched.records[index].body = Some(if redaction.is_on() {
+                    redaction
+                        .apply(&String::from_utf8_lossy(&bytes))
+                        .into_owned()
+                        .into_bytes()
+                } else {
+                    bytes
+                });
             }
         }
     }
