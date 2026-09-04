@@ -781,3 +781,60 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
     assert_eq!(files as usize, TREE, "the runs row is short of the tree");
     assert_eq!(error, None, "the pass recorded an error: {error:?}");
 }
+
+/// PRIV-03's knob, written the only way anything can turn it on.
+const KNOB_ON: &str = "[privacy]\nredact_recall = true\n";
+
+/// AC7: the same four events, the same hundred runs, the same budget, with
+/// `[privacy] redact_recall = true` on the config the hook loads.
+///
+/// The knob puts the egress rule set on the `SessionStart` path, between the
+/// projection and the budget, and D-06 measured that at roughly 1.1 ms worst
+/// case for the brief's two quotes. That is a claim about a cost, so it is
+/// asserted where the cost is paid: the wall clock of a spawn the harness
+/// waits on, against the same 10 ms the run without the knob is held to.
+///
+/// It lives in this file rather than in one of its own because [`COPYING`] is
+/// what keeps ETXTBSY out of a fully parallel suite - the lock is held between
+/// this file's binary copy and every spawn made from it, and a second file
+/// copying the binary would sit outside it.
+#[test]
+fn every_event_stays_inside_the_budget_with_the_redaction_knob_on() {
+    const RUNS: usize = 100;
+    const BUDGET: f64 = 10.0;
+
+    let hook = hook();
+    std::fs::write(hook.config_dir.join("verbatim.toml"), KNOB_ON).unwrap();
+
+    for (event, fixture) in FIXTURES {
+        let payload = testkit::fixture_bytes(fixture);
+        let mut millis = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let started = Instant::now();
+            let output = feed(&hook, event, &payload);
+            millis.push(started.elapsed().as_secs_f64() * 1000.0);
+
+            assert!(
+                output.status.success(),
+                "{event} with the knob on exited {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "{event} with the knob on wrote to stdout: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        millis.sort_by(f64::total_cmp);
+        let p50 = millis[RUNS / 2 - 1];
+        let p99 = millis[(RUNS * 99) / 100 - 1];
+        println!("{event} (redact_recall): p50 {p50:.2} ms, p99 {p99:.2} ms over {RUNS} runs");
+        assert!(
+            p99 < BUDGET,
+            "{event} with the knob on: p99 {p99:.2} ms is over {BUDGET} ms"
+        );
+    }
+    drain(&hook.ingest_argv());
+}
