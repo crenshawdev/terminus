@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use rusqlite::Connection;
 use verbatim_core::config::{Config, REDACTED};
+use verbatim_core::inject::{prompt, Payload};
 use verbatim_core::recall::{search, Query, Request, Response, Scope, EXCERPT_CHARS};
 use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::{ingest, testkit};
@@ -389,4 +390,163 @@ fn an_ordinary_claim_reads_back_the_same_under_both_settings() {
 
     assert_eq!(ask(&bench.config(true)).hits, ask(&bench.config(false)).hits);
     assert_eq!(ask(&bench.config(true)).hits[0].excerpt, claim);
+}
+
+// ---------------------------------------------------------------------------
+// The per-prompt injection (INJ-03), which is the fifth model-facing surface
+
+/// The credential planted on the turn a prompt fires on.
+///
+/// Its own value rather than the fixture's, because this store is built by this
+/// test and the turn has to carry the secret and the entity the prompt matches
+/// on at once - which no transcript fixture does.
+const PROMPT_SENTINEL: &str = "sk-VBEGRESS-prompt-8d3";
+
+/// Archive one turn that stored a path and quoted a credential, and return the
+/// project directory a payload has to carry to reach it.
+///
+/// An `Edit`'s `file_path` is what makes the turn structurally eligible:
+/// `inject::prompt` never injects on a text score, so a turn holding the secret
+/// and nothing else would prove nothing about the filter because nothing would
+/// ever be injected.
+fn archive_a_prompt_target(bench: &Bench) -> (String, String) {
+    let cwd = bench.root.join("project-injected");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let file = cwd.join("crates/vault/rotate.rs");
+    let record = serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "cwd": cwd.to_string_lossy(),
+        "sessionId": "bbbbbbbb-2222-4222-8222-222222222222",
+        "type": "assistant",
+        "uuid": "bbbbbbbb-0000-4000-8000-000000000001",
+        "timestamp": "2026-09-04T11:00:00.000Z",
+        "requestId": "req_0",
+        "message": {"role": "assistant", "model": "claude-opus-5", "content": [{
+            "type": "tool_use",
+            "id": "toolu_inject01",
+            "name": "Edit",
+            "input": {
+                "file_path": file.to_string_lossy(),
+                "old_string": format!("    let call = get(\"Authorization: Bearer {PROMPT_SENTINEL}\");"),
+                "new_string": "    let call = get(&header_from_env());",
+            },
+        }]},
+    });
+    bench.archive("session-injected.jsonl", &format!("{record}\n"));
+
+    (
+        cwd.to_string_lossy().into_owned(),
+        file.to_string_lossy().into_owned(),
+    )
+}
+
+/// Every excerpt one prompt would inject, joined.
+///
+/// The session id is the caller's because INJ-04 suppresses a turn the session
+/// it is asked under has already been given, and every call here asks the same
+/// question of the same turn.
+fn injected(bench: &Bench, config: &Config, session: &str, cwd: &str, prompt: &str) -> String {
+    let fired = prompt::select(
+        &bench.data_dir,
+        config,
+        &Payload {
+            session_id: Some(session),
+            transcript_path: None,
+            cwd: Some(cwd),
+            prompt: Some(prompt),
+            source: None,
+        },
+    );
+    assert!(
+        !fired.hits.is_empty(),
+        "nothing fired, so there is no injection to be filtered: {fired:?}"
+    );
+    fired
+        .hits
+        .iter()
+        .map(|hit| hit.excerpt.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The knob governs the per-prompt injection too.
+///
+/// This is the fifth model-facing surface and the one phase 4's four acceptance
+/// criteria never name. It reaches the model the same way the others do - hook
+/// stdout, as the next prompt's context - so a knob that left it raw would hand
+/// the secret straight back to the model while the four filtered surfaces made
+/// it look as though the setting had held.
+///
+/// The two calls differ in one token of one config file and in the session id
+/// they are asked under, which INJ-04 requires: the same session asking twice is
+/// asking about suppression instead.
+#[test]
+fn the_knob_takes_the_credential_out_of_the_per_prompt_injection() {
+    let bench = bench();
+    let (cwd, file) = archive_a_prompt_target(&bench);
+
+    let raw = injected(
+        &bench,
+        &bench.config(false),
+        "cccccccc-0000-4000-8000-000000000001",
+        &cwd,
+        &file,
+    );
+    let filtered = injected(
+        &bench,
+        &bench.config(true),
+        "cccccccc-0000-4000-8000-000000000002",
+        &cwd,
+        &file,
+    );
+
+    // The premise: the turn that fires really does carry the credential, so the
+    // assertion below is about the filter and not about a prompt that stopped
+    // matching.
+    assert!(
+        raw.contains(PROMPT_SENTINEL),
+        "the default must not filter the injection:\n{raw}"
+    );
+
+    assert!(
+        filtered.contains(REDACTED),
+        "a filtered injection names what went:\n{filtered}"
+    );
+    for absent in [PROMPT_SENTINEL, SENTINEL_MARK, "prompt-8d3"] {
+        assert!(
+            !filtered.contains(absent),
+            "{absent:?} survived into the injected excerpt:\n{filtered}"
+        );
+    }
+}
+
+/// With the knob off the injection is byte-identical to what it always was.
+///
+/// The other half of the criterion the fix reversed: filtering this surface is
+/// what the knob does when it is set, and doing nothing at all is what it does
+/// when it is not. `Redaction::of` collapses to `Redaction::none` there, so the
+/// default path still borrows the projection rather than copying it.
+#[test]
+fn the_default_leaves_the_per_prompt_injection_exactly_as_it_was() {
+    let bench = bench();
+    let (cwd, file) = archive_a_prompt_target(&bench);
+
+    let from_file = injected(
+        &bench,
+        &bench.config(false),
+        "dddddddd-0000-4000-8000-000000000001",
+        &cwd,
+        &file,
+    );
+    let from_default = injected(
+        &bench,
+        &Config::default(),
+        "dddddddd-0000-4000-8000-000000000002",
+        &cwd,
+        &file,
+    );
+
+    assert_eq!(from_file, from_default);
+    assert!(from_default.contains(PROMPT_SENTINEL), "{from_default}");
 }

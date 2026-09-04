@@ -248,15 +248,21 @@ pub fn for_model_context(credential: Option<&Secret>, text: &str) -> String {
 /// shared: `recall::excerpt` cuts the text for a search hit, a context window, a
 /// brief's quotation and the per-prompt injection alike, and only its callers
 /// know which of those are model-facing. Phase 4 D-01 turns on exactly that -
-/// the knob is read at the four entry points that already carry a `&Config`,
-/// and `excerpt::of_record`/`excerpt::attach` read no config at all - so a
-/// fifth surface cannot start filtering by accident because it happens to share
-/// a projection with the four that do.
+/// the knob is read at the entry points that already carry a `&Config`, and
+/// `excerpt::of_record`/`excerpt::attach` read no config at all - so which
+/// surfaces filter is a property of the call sites and stays reviewable at
+/// them, rather than being decided once inside a projection all of them share.
+///
+/// Five call sites resolve one today and every one of them passes
+/// [`Redaction::of`]: the four projections PRIV-03 names, and
+/// `inject::prompt`'s per-prompt injection, whose excerpts go onto hook stdout
+/// as the model's next context exactly like the other four.
 ///
 /// [`Redaction::none`] is not a degenerate case to be tidied away later. It is
-/// what the per-prompt injection path passes, and passing it is a statement:
-/// that surface is out of this phase's scope and must stay byte-identical in
-/// both settings.
+/// the value the shared projection is handed by a caller with no config to ask,
+/// such as a test or a projection that is not going to a model, and it is also
+/// what [`Redaction::of`] resolves to when the knob is off - which is what
+/// keeps the default path a borrow rather than a copy per turn.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Redaction<'a> {
     /// Rule 1's exact value, when there is one to give it. `None` on the common

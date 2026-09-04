@@ -67,10 +67,11 @@ pub struct Reads {
 /// corrupt would hide the results that are fine.
 ///
 /// `redaction` is the CALLER's (phase 4 D-01). Nothing here reads a `Config`,
-/// so a surface that shares this projection cannot start filtering because
-/// another one did: `search::run` passes what its config asks for, and
-/// `inject::prompt` passes [`Redaction::none`] because the per-prompt path is
-/// out of scope and must stay byte-identical in both settings.
+/// so whether a surface filters stays a property of its own call site and is
+/// reviewable there: both of this function's callers - `search::run` and
+/// `inject::prompt` - resolve `Redaction::of` from the config they already
+/// hold, and each could be changed without the other moving. That is the point
+/// of the parameter, not an accident of them currently agreeing.
 pub fn attach(
     conn: &Connection,
     query: &Query,

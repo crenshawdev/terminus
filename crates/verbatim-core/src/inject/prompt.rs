@@ -425,16 +425,23 @@ fn selected(
     let fired = if hits.is_empty() {
         None
     } else {
-        // [`Redaction::none`], and that is a statement rather than a default
-        // taken for want of a better one. The per-prompt injection is the fifth
-        // surface phase 4 D-01 names and its criteria cover four; it must stay
-        // byte-identical whatever `[privacy] redact_recall` says, so the value
-        // is spelled here rather than derived from the `Config` two frames up.
-        // The other half of that is upstream: this path and `feedback::replay`
-        // both build their `Request` with `.excerpts(false)`, so `search::run`
-        // never attaches for either of them and this is the one call that needs
-        // saying.
-        match excerpt::attach(conn, &request.query, &mut hits, &Redaction::none()) {
+        // The knob governs this surface too. The per-prompt injection is the
+        // fifth surface phase 4 D-01 names, and D-01's PLACEMENT half is what
+        // is honoured here rather than its scope half: the decision is resolved
+        // at this entry point, which already holds the `&Config`, and never
+        // inside `excerpt::of_record`/`attach`, which read no config at all.
+        // Filtering it is not optional. What this path writes goes onto hook
+        // stdout as the model's next context, which is exactly the destination
+        // `egress::for_model_context` exists for; leaving it raw would mean a
+        // user who set `[privacy] redact_recall` still has every secret in a
+        // matched turn copied verbatim into the model on the next prompt, with
+        // the four filtered surfaces making it look as though the knob held.
+        // The other half is upstream: this path and `feedback::replay` both
+        // build their `Request` with `.excerpts(false)`, so `search::run` never
+        // attaches for either of them and this call is the only one that can.
+        // With the knob off `Redaction::of` is `Redaction::none`, so the
+        // default path is byte-identical to what it was and still borrows.
+        match excerpt::attach(conn, &request.query, &mut hits, &Redaction::of(config)) {
             Ok(reads) => {
                 for hit in &hits {
                     state.record_injected(hit.turn_id);
