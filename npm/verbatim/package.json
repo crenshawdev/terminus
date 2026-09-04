@@ -1,6 +1,6 @@
 {
   "name": "verbatim",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Persistent, cross-session memory for Claude Code. The session transcript is the record.",
   "license": "Apache-2.0",
   "author": "John Crenshaw <john@jcrenshaw.dev>",
@@ -24,10 +24,10 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "@verbatim/linux-x64": "0.1.0",
-    "@verbatim/linux-arm64": "0.1.0",
-    "@verbatim/darwin-arm64": "0.1.0",
-    "@verbatim/darwin-x64": "0.1.0",
-    "@verbatim/win32-x64": "0.1.0"
+    "@verbatim/linux-x64": "0.1.1",
+    "@verbatim/linux-arm64": "0.1.1",
+    "@verbatim/darwin-arm64": "0.1.1",
+    "@verbatim/darwin-x64": "0.1.1",
+    "@verbatim/win32-x64": "0.1.1"
   }
 }
