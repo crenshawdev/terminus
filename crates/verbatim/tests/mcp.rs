@@ -20,6 +20,7 @@ use std::process::{Child, Command, Stdio};
 
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use verbatim_core::config::REDACTED;
 use verbatim_core::store::DB_FILE_NAME;
 use verbatim_core::testkit;
 
@@ -1664,5 +1665,287 @@ fn recall_search_reaches_observations_through_the_kind_it_already_has() {
     assert!(
         kind.contains("observation"),
         "the model is never told the value exists: {kind}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The redaction knob at the process boundary (PRIV-03, AC1, AC4)
+// ---------------------------------------------------------------------------
+
+impl Bench {
+    /// `talk`, with extra environment variables set on the spawn.
+    ///
+    /// Written as its own method rather than as a parameter on `talk` because
+    /// every other test's claim is that the *ambient* environment is the one
+    /// `command` builds - a spawn carrying anything else is the exception being
+    /// tested here, and it should read like one.
+    fn talk_with_env(&self, dir: &Path, env: &[(&str, &str)], messages: &[Value]) -> Conversation {
+        let mut command = self.command(dir, &["mcp"]);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn verbatim mcp");
+        {
+            let stdin = child.stdin.as_mut().expect("stdin is piped");
+            for message in messages {
+                writeln!(stdin, "{message}").expect("write a request");
+            }
+        }
+        drop(child.stdin.take());
+
+        let out = child.wait_with_output().expect("the server exits");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let responses = stdout
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|e| {
+                    panic!("stdout carried something that is not JSON-RPC ({e}): {line}")
+                })
+            })
+            .collect();
+        Conversation {
+            responses,
+            code: out.status.code(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
+    /// One `tools/call` through a spawn carrying extra environment variables.
+    fn call_with_env(
+        &self,
+        dir: &Path,
+        env: &[(&str, &str)],
+        tool: &str,
+        arguments: Value,
+    ) -> Value {
+        let conversation = self.talk_with_env(
+            dir,
+            env,
+            &[
+                initialize(),
+                initialized(),
+                json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": tool, "arguments": arguments},
+                }),
+            ],
+        );
+        conversation.expect_ok();
+        assert_eq!(
+            conversation.responses.len(),
+            2,
+            "one response for initialize and one for the call: {:?}",
+            conversation.responses
+        );
+        content(&conversation.responses[1])
+    }
+}
+
+/// The `Authorization: Bearer` value planted in `session-secrets.jsonl`.
+const AUTHZ_SENTINEL: &str = "sk-VBEGRESS-authz-9f2";
+
+/// The fragment every planted sentinel in that fixture shares.
+///
+/// Asserted on rather than the one value under test because all three tools
+/// reach several of that session's turns at once: one surviving sentinel of any
+/// shape is a leak, and naming only the `Authorization` one would miss it.
+const SENTINEL_MARK: &str = "VBEGRESS";
+
+/// PRIV-03's knob, written the only way anything can turn it on.
+///
+/// A file in the config directory the spawn points at, and no environment
+/// variable (D-07): there is nothing a process could inherit that turns this
+/// on, which is the same property that stops anything inherited turning it off.
+const KNOB_ON: &str = "[privacy]\nredact_recall = true\n";
+
+/// The turn of `session-secrets.jsonl` that pastes an `Authorization` header.
+///
+/// Found by the record's own `uuid` rather than by searching for it: a query
+/// would be answered through the very projection under test, so with the knob
+/// on the test would be picking its subject out of filtered text.
+fn authz_turn(bench: &Bench) -> i64 {
+    bench
+        .conn()
+        .query_row(
+            "SELECT id FROM turns WHERE uuid = 'eeeeeeee-0000-4000-8000-000000001003'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the fixture's Authorization turn is archived")
+}
+
+/// Every `excerpt` a `recall_search` document carries, joined.
+fn excerpts(document: &Value) -> String {
+    let hits = hits(document);
+    assert!(
+        !hits.is_empty(),
+        "no hits, so no projection to filter: {document}"
+    );
+    hits.iter()
+        .map(|hit| hit["excerpt"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// Every `text` a `recall_context` window carries, joined.
+fn window_text(document: &Value) -> String {
+    let turns = document["turns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a context result carries a turns array: {document}"));
+    assert!(
+        !turns.is_empty(),
+        "an empty window filters nothing: {document}"
+    );
+    turns
+        .iter()
+        .map(|turn| turn["text"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// AC1 through the surface that puts text into the model's context: all three
+/// tools over one store, once with no `verbatim.toml` and once with the knob on.
+///
+/// The pair is the whole assertion. Either half alone is satisfiable by a broken
+/// build - a server that filtered nothing passes the first, and one that
+/// returned an empty string passes the second - so each tool is asked the same
+/// question twice with nothing changed between the runs but a file on disk.
+#[test]
+fn the_three_tools_answer_the_planted_secret_until_the_knob_is_turned_on() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let project = bench.project("session-secrets.jsonl");
+    let anchor = authz_turn(&bench);
+
+    // With no config file at all: the default this phase must not move.
+    let search = bench.call(&project, "recall_search", json!({"query": "gateway"}));
+    let found = excerpts(&search);
+    assert!(
+        found.contains(AUTHZ_SENTINEL),
+        "the premise: this query really does return credential-bearing text:\n{found}"
+    );
+
+    let context = bench.call(
+        &project,
+        "recall_context",
+        json!({"turn_id": anchor, "before": 1, "after": 1}),
+    );
+    let around = window_text(&context);
+    assert!(
+        around.contains(AUTHZ_SENTINEL),
+        "the anchor's own text is in the window unfiltered:\n{around}"
+    );
+
+    let get = bench.call(&project, "recall_get", json!({"turn_ids": [anchor]}));
+    let body = records(&get)[0]["body"]
+        .as_str()
+        .expect("a body")
+        .to_owned();
+    assert!(body.contains(AUTHZ_SENTINEL), "{body}");
+
+    // Nothing changes but this file.
+    bench.config(KNOB_ON);
+
+    let search = bench.call(&project, "recall_search", json!({"query": "gateway"}));
+    let found = excerpts(&search);
+    assert!(
+        found.contains(REDACTED),
+        "the marker names what went:\n{found}"
+    );
+    assert!(
+        !found.contains(SENTINEL_MARK),
+        "a sentinel survived into recall_search:\n{found}"
+    );
+
+    let context = bench.call(
+        &project,
+        "recall_context",
+        json!({"turn_id": anchor, "before": 1, "after": 1}),
+    );
+    let around = window_text(&context);
+    assert!(
+        around.contains(REDACTED),
+        "the marker names what went:\n{around}"
+    );
+    assert!(
+        !around.contains(SENTINEL_MARK),
+        "a sentinel survived into recall_context:\n{around}"
+    );
+
+    let get = bench.call(&project, "recall_get", json!({"turn_ids": [anchor]}));
+    let record = records(&get)[0].clone();
+    let body = record["body"].as_str().expect("a body").to_owned();
+    assert!(
+        body.contains(REDACTED),
+        "the marker names what went:\n{body}"
+    );
+    assert!(
+        !body.contains(SENTINEL_MARK),
+        "a sentinel survived into recall_get:\n{body}"
+    );
+    assert_eq!(
+        record["body_evicted"], false,
+        "a filtered body is still a body: {record}"
+    );
+}
+
+/// AC4's MCP half: the escape hatch is a command-line flag this server parses
+/// none of, so no environment variable reaches it.
+///
+/// D-07 is exactly this - the hook and the server load `Config` in-process, so
+/// an environment-variable escape hatch would be inherited by both and would
+/// silently unfilter the two model-facing surfaces. The test spells the
+/// variables the way the terminal flag is spelled, bare and `VERBATIM_`-prefixed
+/// and as the config key itself, because a reader of `--raw` reaching for an
+/// environment variable would try those three.
+#[test]
+fn no_environment_variable_reaches_past_the_knob_on_the_mcp_surface() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let project = bench.project("session-secrets.jsonl");
+    let anchor = authz_turn(&bench);
+    bench.config(KNOB_ON);
+
+    let env = [
+        ("RAW", "1"),
+        ("VERBATIM_RAW", "1"),
+        ("VERBATIM_REDACT_RECALL", "false"),
+    ];
+
+    let search = bench.call_with_env(&project, &env, "recall_search", json!({"query": "gateway"}));
+    let found = excerpts(&search);
+    assert!(found.contains(REDACTED), "{found}");
+    assert!(
+        !found.contains(SENTINEL_MARK),
+        "an environment variable unfiltered recall_search:\n{found}"
+    );
+
+    let context = bench.call_with_env(
+        &project,
+        &env,
+        "recall_context",
+        json!({"turn_id": anchor, "before": 1, "after": 1}),
+    );
+    let around = window_text(&context);
+    assert!(around.contains(REDACTED), "{around}");
+    assert!(
+        !around.contains(SENTINEL_MARK),
+        "an environment variable unfiltered recall_context:\n{around}"
+    );
+
+    let get = bench.call_with_env(&project, &env, "recall_get", json!({"turn_ids": [anchor]}));
+    let body = records(&get)[0]["body"]
+        .as_str()
+        .expect("a body")
+        .to_owned();
+    assert!(body.contains(REDACTED), "{body}");
+    assert!(
+        !body.contains(SENTINEL_MARK),
+        "an environment variable unfiltered recall_get:\n{body}"
     );
 }
