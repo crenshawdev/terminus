@@ -50,7 +50,10 @@ terminal raw flag plus the golden and round-trip test harness
   criteria never name - `inject/prompt.rs:427` builds the per-prompt
   injection's excerpts through `excerpt::attach`, and `verbatim replay`
   re-scores through `search::run` - so AC2's byte-identity is asserted over
-  four outputs while a fifth changes with no test on it.
+  four outputs while a fifth changes with no test on it. [corrected by plan-1
+  deviation: the fifth surface writes to hook stdout, which is the same
+  model-context egress boundary, so it is filtered too - five entry points
+  resolve a `Redaction`, not four; the placement half of this decision stands]
 
 - D-02 (Placement): The filter runs over the FULL projection BEFORE the
   240-character excerpt window is cut, never over the window afterwards.
