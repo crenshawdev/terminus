@@ -1,17 +1,16 @@
 //! Redaction at egress, keyed on the declared destination (PRIV-03, D-13,
 //! D-16).
 //!
-//! # Two entry points, one rule set
+//! # Three entry points, one rule set
 //!
-//! [`for_destination`] is the gate for whatever text its caller hands it: a
-//! whole request body, one message's content on its way into one, a recall
-//! excerpt on its way into an injected brief. It parses nothing and reads no
-//! structure, so it has no opinion about which of those it was given, and every
-//! rule below is written to hold on plain prose as well as on a document.
-//! `local = true` hands the text back untouched, because a local provider is
-//! not egress at all and filtering it would destroy detail for nothing;
-//! anything else - including a `local` key the user forgot to write - hands
-//! back a filtered copy.
+//! [`for_destination`] is the gate for text on its way to the configured model
+//! PROVIDER: a whole request body, or one message's content on its way into
+//! one. It parses nothing and reads no structure, so it has no opinion about
+//! which of those it was given, and every rule below is written to hold on
+//! plain prose as well as on a document. `local = true` hands the text back
+//! untouched, because a local provider is not egress at all and filtering it
+//! would destroy detail for nothing; anything else - including a `local` key
+//! the user forgot to write - hands back a filtered copy.
 //!
 //! [`scrub`] is the error boundary, and it runs whatever the destination is.
 //! That is the half of D-16 that survives the `local` distinction, and it
@@ -21,7 +20,23 @@
 //! body echoing an API key would be durably stored and reprinted, which is
 //! worse than a leak that scrolls past.
 //!
-//! Both go through [`redact`], so there is one rule set and not two that drift.
+//! [`for_model_context`] is the third destination and the newest: a derived
+//! projection - a recall excerpt, a context window's turn, a `recall_get` body,
+//! a quotation in an injected brief - on its way into the MODEL's context
+//! through a hook or through the MCP server. It takes no `local` argument, and
+//! that absence is the decision (phase 4 D-03). `provider.local` is a
+//! declaration about where a REQUEST's bytes end up, and it says nothing about
+//! this destination: hook stdout and an MCP result are read by the harness's
+//! model whether or not judgment was ever configured, and routing this through
+//! [`for_destination`] would return the text unfiltered for every user who
+//! declared a local provider - leaving the knob silently inert for exactly the
+//! person who runs a local model for privacy reasons. It is also opt-in and off
+//! by default, because unlike a provider request every byte it would take out
+//! has already reached this model once, when it was typed
+//! ([`crate::config::Config::redact_recall`]).
+//!
+//! All three go through [`redact`], so there is one rule set and not three that
+//! drift.
 //!
 //! # The rules, and why each one is here
 //!
@@ -100,7 +115,7 @@
 
 use std::borrow::Cow;
 
-use crate::config::{Secret, REDACTED};
+use crate::config::{Config, Secret, REDACTED};
 
 /// The name fragments that make a value a secret, matched case-insensitively
 /// as substrings.
@@ -209,6 +224,90 @@ pub fn for_destination<'a>(
 /// keep the bytes.
 pub fn scrub(credential: Option<&Secret>, text: &str) -> String {
     redact(credential, text)
+}
+
+/// Filter a derived projection on its way into the model's context (PRIV-03,
+/// phase 4 D-03).
+///
+/// No `local` argument and no way to add one. The destination is the harness's
+/// model, reached through hook stdout or an MCP result, and `provider.local` is
+/// a declaration about a request this text is not part of - see the module doc.
+///
+/// Unconditional here and gated by the caller: whether a projection is filtered
+/// at all is [`crate::config::Config::redact_recall`], read at the entry points
+/// that hold a `Config`, and carried down as a [`Redaction`] so that the shared
+/// projection code has no config to consult and no decision to get wrong.
+pub fn for_model_context(credential: Option<&Secret>, text: &str) -> String {
+    redact(credential, text)
+}
+
+/// Whether a derived projection is filtered on its way to the model, and with
+/// which credential.
+///
+/// A value the caller resolves ONCE and passes down, because the projection is
+/// shared: `recall::excerpt` cuts the text for a search hit, a context window, a
+/// brief's quotation and the per-prompt injection alike, and only its callers
+/// know which of those are model-facing. Phase 4 D-01 turns on exactly that -
+/// the knob is read at the four entry points that already carry a `&Config`,
+/// and `excerpt::of_record`/`excerpt::attach` read no config at all - so a
+/// fifth surface cannot start filtering by accident because it happens to share
+/// a projection with the four that do.
+///
+/// [`Redaction::none`] is not a degenerate case to be tidied away later. It is
+/// what the per-prompt injection path passes, and passing it is a statement:
+/// that surface is out of this phase's scope and must stay byte-identical in
+/// both settings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Redaction<'a> {
+    /// Rule 1's exact value, when there is one to give it. `None` on the common
+    /// machine, where no provider is configured, and there the filter rests on
+    /// the eight shape rules alone (phase 4 D-10).
+    credential: Option<&'a Secret>,
+    on: bool,
+}
+
+impl<'a> Redaction<'a> {
+    /// Filter nothing: the projection is handed back exactly as it was cut.
+    pub const fn none() -> Redaction<'a> {
+        Redaction {
+            credential: None,
+            on: false,
+        }
+    }
+
+    /// What this config asks for, resolved at a call site that holds one.
+    ///
+    /// The one constructor that reads the knob, and it takes the `Config` by
+    /// reference from a caller that already had it. Nothing inside the shared
+    /// projection may call this: that is D-01, and it is why the value travels
+    /// rather than the config.
+    pub fn of(config: &'a Config) -> Redaction<'a> {
+        if config.redact_recall() {
+            Redaction {
+                credential: config.provider_api_key(),
+                on: true,
+            }
+        } else {
+            Redaction::none()
+        }
+    }
+
+    /// Is anything actually filtered?
+    pub fn is_on(&self) -> bool {
+        self.on
+    }
+
+    /// The text as this redaction leaves it.
+    ///
+    /// Borrowed when the knob is off, which is what keeps the default path free
+    /// of a copy per projected turn.
+    pub fn apply<'t>(&self, text: &'t str) -> Cow<'t, str> {
+        if self.on {
+            Cow::Owned(for_model_context(self.credential, text))
+        } else {
+            Cow::Borrowed(text)
+        }
+    }
 }
 
 /// The one rule set both entry points run.

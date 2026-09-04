@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::Result;
+use crate::observe::egress::Redaction;
 use crate::recall::excerpt;
 use crate::recall::query::EntityMatch;
 use crate::recall::scope::{self, Reason, Scope};
@@ -421,7 +422,12 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
     // session and the candidate pool is four times what the caller asked for.
     // And not at all when the caller said so - see [`Request::excerpts`].
     let reads = if request.excerpts {
-        excerpt::attach(conn, &request.query, &mut hits)?
+        // The knob is read HERE, at the entry point that already holds the
+        // config, and travels down as a value (phase 4 D-01). Rule 1 is fed
+        // this run's provider credential when there is one; on the common
+        // machine there is not, and the filter rests on the shape rules alone
+        // (D-10).
+        excerpt::attach(conn, &request.query, &mut hits, &Redaction::of(config))?
     } else {
         excerpt::Reads::default()
     };

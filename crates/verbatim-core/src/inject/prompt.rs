@@ -57,6 +57,7 @@ use super::state::{Reason, State, Suppressed};
 use super::{compaction, Payload};
 use crate::config::Config;
 use crate::index::entity::{self, normalize_path};
+use crate::observe::egress::Redaction;
 use crate::recall::search::{self, Request};
 use crate::recall::{excerpt, Hit, Query, Scope};
 
@@ -424,7 +425,16 @@ fn selected(
     let fired = if hits.is_empty() {
         None
     } else {
-        match excerpt::attach(conn, &request.query, &mut hits) {
+        // [`Redaction::none`], and that is a statement rather than a default
+        // taken for want of a better one. The per-prompt injection is the fifth
+        // surface phase 4 D-01 names and its criteria cover four; it must stay
+        // byte-identical whatever `[privacy] redact_recall` says, so the value
+        // is spelled here rather than derived from the `Config` two frames up.
+        // The other half of that is upstream: this path and `feedback::replay`
+        // both build their `Request` with `.excerpts(false)`, so `search::run`
+        // never attaches for either of them and this is the one call that needs
+        // saying.
+        match excerpt::attach(conn, &request.query, &mut hits, &Redaction::none()) {
             Ok(reads) => {
                 for hit in &hits {
                     state.record_injected(hit.turn_id);
