@@ -1358,3 +1358,81 @@ fn the_knob_filters_the_search_excerpt_and_raw_reaches_past_it() {
         "neither setting adds a key to the hit shape"
     );
 }
+
+/// Every archived session blob, by key, straight out of SQLite.
+///
+/// The bytes themselves and not a rendering of them: this is the one assertion
+/// in the file that has to be about what is ON DISK rather than about what a
+/// command printed.
+fn blobs(bench: &Bench) -> Vec<(String, Vec<u8>)> {
+    let conn = bench.conn();
+    let mut statement = conn
+        .prepare("SELECT session_key, blob FROM sessions ORDER BY session_key")
+        .unwrap();
+    let rows: Vec<(String, Vec<u8>)> = statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows
+}
+
+/// AC3: the knob filters a projection on the way out and writes nothing.
+///
+/// ONE ingest, then the same store read twice - the second time with the knob
+/// on and nothing else changed. The ingest sits ahead of both halves
+/// deliberately: re-ingesting between them would let any difference be blamed
+/// on a different store rather than on a different render, which is the only
+/// thing this test is about.
+#[test]
+fn turning_the_knob_on_leaves_the_archive_byte_for_byte_where_it_was() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let before = blobs(&bench);
+    assert!(!before.is_empty(), "the corpus archived nothing to compare");
+    let verified_before = document(&bench.run(&["verify", "--json"]));
+
+    bench.config(KNOB_ON);
+
+    let after = blobs(&bench);
+    let verified_after = document(&bench.run(&["verify", "--json"]));
+
+    assert_eq!(before.len(), after.len(), "the session count moved");
+    for ((key, blob), (key_after, blob_after)) in before.iter().zip(&after) {
+        assert_eq!(
+            key, key_after,
+            "the sessions came back in a different order"
+        );
+        // Compared rather than `assert_eq!`d on the bytes: a mismatch here would
+        // otherwise dump a whole compressed archive into the failure.
+        assert!(
+            blob == blob_after,
+            "the stored blob for {key} changed: {} bytes with the knob absent, \
+             {} with it on",
+            blob.len(),
+            blob_after.len()
+        );
+    }
+
+    assert_eq!(
+        verified_before, verified_after,
+        "`verify --json` moved under the knob"
+    );
+    // And it was a clean archive both times, so the equality above is two
+    // agreeing passes rather than two agreeing failures.
+    assert_eq!(
+        verified_before["ok"],
+        Value::from(true),
+        "{verified_before}"
+    );
+    assert_eq!(
+        verified_before["data"]["failures"],
+        serde_json::json!([]),
+        "{verified_before}"
+    );
+    assert!(
+        verified_before["data"]["checked"].as_i64().unwrap_or(0) > 0,
+        "verify checked nothing: {verified_before}"
+    );
+}
