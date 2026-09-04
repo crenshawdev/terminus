@@ -1,6 +1,6 @@
 # State
 
-Phase: 4 of 4 (Redacted Recall)
-Status: phase complete
-Next: /cad-milestone
+Phase: 1 of 0 (no active cycle)
+Status: ready to plan
+Next: /cad-phase add
 Updated: 2026-09-04

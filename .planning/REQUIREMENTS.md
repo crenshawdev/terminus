@@ -7,12 +7,16 @@ Scope comes from `DESIGN-BRIEF.md`, where every decision is settled unless marke
 
 ## Active
 
-Committed scope for the open cycle. Each maps to exactly one roadmap phase.
-Every v0.1.0 requirement shipped and was verified — see `## Shipped` below for
-all 64 ids with the phase that delivered each.
+No cycle open.
 
-### Injection (INJ)
+v0.1.1 closed 2026-09-04. Its one requirement, INJ-07, is under `## Shipped`
+below with the 64 that shipped in v0.1.0, each carrying the phase that
+delivered it. Phases 2, 3 and 4 of that cycle delivered against already-shipped
+rows (PRIV-01..04, RCL-09, OBS-03) rather than opening new ones, so no
+requirement is waiting here.
 
+Nothing is deferred. `/cad-phase add` opens the next cycle and seeds this
+section.
 
 ## Shipped
 
