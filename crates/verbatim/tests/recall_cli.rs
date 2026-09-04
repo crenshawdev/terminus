@@ -15,6 +15,7 @@ use std::process::{Command, Output};
 
 use rusqlite::Connection;
 use serde_json::Value;
+use verbatim_core::config::REDACTED;
 use verbatim_core::store::{DB_FILE_NAME, DERIVED_SCHEMA, META_DERIVED_SCHEMA};
 use verbatim_core::testkit;
 
@@ -1164,5 +1165,196 @@ fn the_raw_flag_is_accepted_by_the_two_projecting_commands_and_by_no_other() {
     assert!(
         !destination.exists(),
         "a rejected export must not have started writing"
+    );
+}
+
+/// The `Authorization: Bearer` value planted in `session-secrets.jsonl`.
+const AUTHZ_SENTINEL: &str = "sk-VBEGRESS-authz-9f2";
+
+/// The fragment every planted sentinel in that fixture shares.
+///
+/// Asserted on rather than the one value under test because a search returns
+/// several turns of that session at once: one surviving sentinel of any shape
+/// is a leak, and naming only the `Authorization` one would miss it.
+const SENTINEL_MARK: &str = "VBEGRESS";
+
+/// PRIV-03's knob, written the only way anything can turn it on.
+///
+/// A file in the config directory the spawn points at, and no environment
+/// variable: there is nothing a process could inherit that turns this on, which
+/// is the same property that stops anything inherited turning it off.
+const KNOB_ON: &str = "[privacy]\nredact_recall = true\n";
+
+/// The turn of `session-secrets.jsonl` that pastes an `Authorization` header.
+///
+/// Found by the record's own `uuid` rather than by searching for it: a query
+/// would be answered through the very projection under test, so with the knob
+/// on the test would be picking its subject out of filtered text.
+fn authz_turn(bench: &Bench) -> String {
+    let id: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT id FROM turns WHERE uuid = 'eeeeeeee-0000-4000-8000-000000001003'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("the fixture's Authorization turn is archived");
+    id.to_string()
+}
+
+/// One JSON object's keys, sorted - the shape D-08 says neither setting moves.
+fn keys(value: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .unwrap_or_else(|| panic!("not an object: {value}"))
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Every excerpt a `search --json` document carries, joined.
+fn hit_excerpts(document: &Value) -> String {
+    let hits = document["data"]["hits"].as_array().expect("hits");
+    assert!(!hits.is_empty(), "no hits, so no projection to filter");
+    hits.iter()
+        .map(|hit| hit["excerpt"].as_str().expect("an excerpt").to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// AC4's `show` half, at the process boundary rather than at a library call.
+///
+/// Three runs over ONE store: no `verbatim.toml` at all, the knob on, and the
+/// knob on with `--raw`. The first is the default this phase must not move; the
+/// third has to come back byte for byte identical to the first, which is what
+/// "the archive is untouched and the filter is a projection" means from the
+/// only place a user can see it.
+#[test]
+fn the_knob_filters_show_at_the_process_boundary_and_raw_reaches_past_it() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let project = bench.project("session-secrets.jsonl");
+    let id = authz_turn(&bench);
+
+    let default = bench.run_in(&project, &["show", &id]);
+    assert_eq!(default.status.code(), Some(0), "{}", stderr(&default));
+    assert!(
+        stdout(&default).contains(AUTHZ_SENTINEL),
+        "with no config file the archive answers what it holds:\n{}",
+        stdout(&default)
+    );
+
+    bench.config(KNOB_ON);
+
+    let filtered = bench.run_in(&project, &["show", &id]);
+    assert_eq!(filtered.status.code(), Some(0), "{}", stderr(&filtered));
+    let text = stdout(&filtered);
+    assert!(
+        text.contains(REDACTED),
+        "the marker names what went:\n{text}"
+    );
+    assert!(
+        !text.contains(SENTINEL_MARK),
+        "a sentinel survived into `show`:\n{text}"
+    );
+
+    let raw = bench.run_in(&project, &["show", "--raw", &id]);
+    assert_eq!(raw.status.code(), Some(0), "{}", stderr(&raw));
+    assert!(
+        stdout(&raw).contains(AUTHZ_SENTINEL),
+        "--raw must print the record's own bytes:\n{}",
+        stdout(&raw)
+    );
+    assert_eq!(
+        stdout(&raw),
+        stdout(&default),
+        "--raw under the knob must be what the store answers with the knob absent"
+    );
+
+    // The same pair under `--json`, where the flag changes a value and never a
+    // key (D-08).
+    let filtered_json = bench.run_in(&project, &["show", "--json", &id]);
+    let raw_json = bench.run_in(&project, &["show", "--json", "--raw", &id]);
+    let filtered_doc = document(&filtered_json);
+    let raw_doc = document(&raw_json);
+
+    let filtered_body = filtered_doc["data"]["records"][0]["body"]
+        .as_str()
+        .expect("a body")
+        .to_owned();
+    let raw_body = raw_doc["data"]["records"][0]["body"]
+        .as_str()
+        .expect("a body")
+        .to_owned();
+    assert!(filtered_body.contains(REDACTED), "{filtered_body}");
+    assert!(
+        !filtered_body.contains(SENTINEL_MARK),
+        "a sentinel survived into `show --json`:\n{filtered_body}"
+    );
+    assert!(raw_body.contains(AUTHZ_SENTINEL), "{raw_body}");
+
+    assert_eq!(keys(&filtered_doc), keys(&raw_doc));
+    assert_eq!(
+        keys(&filtered_doc["data"]["records"][0]),
+        keys(&raw_doc["data"]["records"][0]),
+        "neither setting adds a key to the record shape"
+    );
+}
+
+/// AC4's `search` half, and the same three runs over one store.
+#[test]
+fn the_knob_filters_the_search_excerpt_and_raw_reaches_past_it() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    let project = bench.project("session-secrets.jsonl");
+
+    let default = bench.run_in(&project, &["search", "gateway"]);
+    assert_eq!(default.status.code(), Some(0), "{}", stderr(&default));
+    assert!(
+        stdout(&default).contains(AUTHZ_SENTINEL),
+        "the premise: this query really does return credential-bearing text:\n{}",
+        stdout(&default)
+    );
+
+    bench.config(KNOB_ON);
+
+    let filtered = bench.run_in(&project, &["search", "gateway"]);
+    assert_eq!(filtered.status.code(), Some(0), "{}", stderr(&filtered));
+    let text = stdout(&filtered);
+    assert!(
+        text.contains(REDACTED),
+        "the marker names what went:\n{text}"
+    );
+    assert!(
+        !text.contains(SENTINEL_MARK),
+        "a sentinel survived into the excerpt:\n{text}"
+    );
+
+    let raw = bench.run_in(&project, &["search", "--raw", "gateway"]);
+    assert_eq!(raw.status.code(), Some(0), "{}", stderr(&raw));
+    assert_eq!(
+        stdout(&raw),
+        stdout(&default),
+        "--raw under the knob must be what the store answers with the knob absent"
+    );
+
+    let filtered_doc = document(&bench.run_in(&project, &["search", "--json", "gateway"]));
+    let raw_doc = document(&bench.run_in(&project, &["search", "--json", "--raw", "gateway"]));
+
+    let filtered_text = hit_excerpts(&filtered_doc);
+    assert!(filtered_text.contains(REDACTED), "{filtered_text}");
+    assert!(
+        !filtered_text.contains(SENTINEL_MARK),
+        "a sentinel survived into `search --json`:\n{filtered_text}"
+    );
+    assert!(hit_excerpts(&raw_doc).contains(AUTHZ_SENTINEL), "{raw_doc}");
+
+    assert_eq!(keys(&filtered_doc), keys(&raw_doc));
+    assert_eq!(
+        keys(&filtered_doc["data"]["hits"][0]),
+        keys(&raw_doc["data"]["hits"][0]),
+        "neither setting adds a key to the hit shape"
     );
 }
