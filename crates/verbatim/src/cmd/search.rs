@@ -12,6 +12,15 @@
 //! with `fts5: syntax error near "/"` - so the most natural command in the
 //! product is exactly the one a raw `MATCH` would refuse, and RCL-06 forbids a
 //! non-zero exit for a query that simply found nothing.
+//!
+//! **`--raw` is the owner's way back to their own archive (PRIV-03, D-07).**
+//! With `[privacy] redact_recall` set, the excerpt this prints is filtered like
+//! every other projection that reaches a model; `--raw` spends
+//! [`verbatim_core::Config::without_recall_redaction`] for this one invocation
+//! and prints what the store holds. It is a flag on this loop and not an
+//! environment variable on purpose: the hook and the MCP server load their own
+//! `Config` in-process, so a variable would be inherited by them and would
+//! unfilter the model-facing paths the knob exists to cover.
 
 use verbatim_core::recall::{search, Filters, Query, Request, MAX_RESULTS};
 use verbatim_core::Error;
@@ -58,7 +67,14 @@ pub fn run(args: Args) -> Result<(), Failure> {
         .filters(args.filters)
         .limit(args.limit);
 
-    let response = match search::run(reader.store().conn(), reader.config(), &request) {
+    // `--raw` changes which config the query layer reads and nothing else about
+    // opening the store: `search::run` takes the `&Config` as its own argument,
+    // and the forced-off copy is one direction only, so this can turn the
+    // filter off for this process and can never turn it on.
+    let unfiltered = args.raw.then(|| reader.config().without_recall_redaction());
+    let config = unfiltered.as_ref().unwrap_or_else(|| reader.config());
+
+    let response = match search::run(reader.store().conn(), config, &request) {
         Ok(response) => response,
         // A malformed `--since` is a mistake in the command line, not an empty
         // result: every string compares cleanly against every other, so the
@@ -181,6 +197,12 @@ pub struct Args {
     pub filters: Filters,
     pub limit: usize,
     pub json: bool,
+    /// `--raw`: hand back the archive unfiltered for this invocation alone.
+    ///
+    /// Governs the projection in both renderings. `--raw --json` emits the same
+    /// keys with unfiltered values, because the flag changes a value and never
+    /// a key (D-08).
+    pub raw: bool,
 }
 
 pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
@@ -191,6 +213,7 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
     let mut filters = Filters::default();
     let mut limit = DEFAULT_LIMIT;
     let mut json = false;
+    let mut raw = false;
 
     while let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
         match arg {
@@ -221,6 +244,11 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
                 limit = limit.min(MAX_RESULTS);
             }
             Long(super::JSON_FLAG) => json = true,
+            // Spelled out here rather than shared through `cmd::mod`: a
+            // parser two commands reach through is how `verify --json` came
+            // to look supported before it was, and this one belongs to
+            // exactly the commands that print a projection (D-07).
+            Long("raw") => raw = true,
             // Every remaining word is part of the query, which is what lets
             // `verbatim search cannot find module` work without quoting.
             Value(word) => words.push(word.to_string_lossy().into_owned()),
@@ -240,6 +268,7 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
         filters,
         limit,
         json,
+        raw,
     })
 }
 

@@ -6,12 +6,19 @@
 //! it. Following a hit into its context is what a reader does next, which is why
 //! the two live in one command rather than two.
 //!
-//! **The bytes are the record's, not a rendering of it.** They go to stdout
-//! through `write_all` rather than through `println!("{}")`, because the archive
-//! is verbatim and a lossy UTF-8 conversion here would make this - the one
-//! command whose whole job is fidelity - the one place a byte could change. The
-//! `--json` mode has no such option, since a JSON string is text by definition,
-//! and it says so where it converts.
+//! **The bytes are the record's, not a rendering of it - unless `[privacy]
+//! redact_recall` is on.** They go to stdout through `write_all` rather than
+//! through `println!("{}")`, because the archive is verbatim and a lossy UTF-8
+//! conversion here would make this - the one command whose whole job is
+//! fidelity - the one place a byte could change. The `--json` mode has no such
+//! option, since a JSON string is text by definition, and it says so where it
+//! converts. With PRIV-03's knob set, what those bytes carry is the archived
+//! line with each credential replaced by its marker: the store is untouched and
+//! the filter is a projection on the way out, so `--raw` is the way back to the
+//! record's own bytes for one invocation (D-07). A flag and never an
+//! environment variable - the hook and the MCP server load their own `Config`
+//! in-process and would inherit a variable, which is exactly the unfiltering
+//! the knob exists to prevent.
 //!
 //! **The window stops at the session (D-06)** and says which end it stopped at,
 //! rather than just returning a shorter list. A caller that cannot tell "there
@@ -35,7 +42,12 @@ pub fn run(args: Args) -> Result<(), Failure> {
         Opened::Nothing(reason) => return read::empty(document(&[], &[]), &reason, args.json),
     };
     let conn = reader.store().conn();
-    let config = reader.config();
+    // `--raw` changes which config the query layer reads and nothing else about
+    // opening the store: `get::records` and `context::window` both take the
+    // `&Config` as their own argument, and the forced-off copy is one direction
+    // only, so this can turn the filter off for this process and never on.
+    let unfiltered = args.raw.then(|| reader.config().without_recall_redaction());
+    let config = unfiltered.as_ref().unwrap_or_else(|| reader.config());
     let scope = read::scope(args.project.as_deref())?;
 
     let fetched = get::records(conn, config, &scope, &args.ids)?;
@@ -257,6 +269,12 @@ pub struct Args {
     pub before: usize,
     pub after: usize,
     pub json: bool,
+    /// `--raw`: hand back the archive unfiltered for this invocation alone.
+    ///
+    /// Governs the body and the window in both renderings. `--raw --json` emits
+    /// the same keys with unfiltered values, because the flag changes a value
+    /// and never a key (D-08).
+    pub raw: bool,
 }
 
 pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
@@ -267,6 +285,7 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
     let mut before = 0;
     let mut after = 0;
     let mut json = false;
+    let mut raw = false;
 
     while let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
         match arg {
@@ -274,6 +293,10 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
             Long("before") => before = count(parser, "before")?,
             Long("after") => after = count(parser, "after")?,
             Long(super::JSON_FLAG) => json = true,
+            // This command's own arm, matching `search`'s: the flag reaches
+            // exactly the two commands that print a projection, and no other
+            // command grows a way to be asked for one (D-07).
+            Long("raw") => raw = true,
             Value(word) => {
                 let raw = word.to_string_lossy().into_owned();
                 // Misuse, not an empty result: a word where an id belongs is a
@@ -302,6 +325,7 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
         before,
         after,
         json,
+        raw,
     })
 }
 

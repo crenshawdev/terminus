@@ -1102,3 +1102,67 @@ fn the_terminal_search_reaches_observations_through_the_same_kind() {
         stdout(&empty)
     );
 }
+
+// ---------------------------------------------------------------------------
+// PRIV-03's escape hatch: `--raw` on the two commands that print a projection
+// ---------------------------------------------------------------------------
+
+/// The flag reaches `search` and `show` and no other command (D-07).
+///
+/// The negative half is the load-bearing one. `sessions` prints no projection,
+/// `export` stays unfiltered by D-12 and `observations` prints whatever the
+/// column holds by D-13, so for each of those `--raw` is an argument the command
+/// was not written for: misuse and exit 2, and never a flag quietly accepted and
+/// ignored. That is the failure `verbatim verify --json` already had once.
+#[test]
+fn the_raw_flag_is_accepted_by_the_two_projecting_commands_and_by_no_other() {
+    let bench = bench();
+    bench.ingest_fixtures();
+
+    let id = one_id(&bench, "src/worker/S.ts");
+    let id_text = id.to_string();
+
+    for args in [
+        vec!["search", "--project", "*", "--raw", "cargo"],
+        vec!["search", "--project", "*", "--raw", "--json", "cargo"],
+        vec!["show", "--project", "*", "--raw", id_text.as_str()],
+        vec![
+            "show",
+            "--project",
+            "*",
+            "--raw",
+            "--json",
+            id_text.as_str(),
+        ],
+    ] {
+        let out = bench.run(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`{}` should be accepted: {}",
+            args.join(" "),
+            stderr(&out)
+        );
+    }
+
+    let destination = bench.work.join("export-raw");
+    for args in [
+        vec!["sessions", "--raw"],
+        vec!["export", "--raw", destination.to_str().unwrap()],
+        vec!["observations", "--raw"],
+    ] {
+        let out = bench.run(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{}` should be misuse: {}",
+            args.join(" "),
+            stderr(&out)
+        );
+        assert_eq!(stdout(&out), "", "misuse must print nothing to stdout");
+    }
+    assert!(
+        !destination.exists(),
+        "a rejected export must not have started writing"
+    );
+}
