@@ -30,6 +30,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::Instant;
 
 use serde_json::Value;
+use verbatim_core::config::REDACTED;
 use verbatim_core::testkit;
 
 /// The fixture whose `cwd` names `project-alpha` beneath the test's own root.
@@ -321,4 +322,167 @@ fn a_hundred_session_starts_stay_inside_the_budget_and_the_wall_clock() {
     let p99 = millis[(RUNS * 99) / 100 - 1];
     println!("SessionStart brief: p50 {p50:.2} ms, p99 {p99:.2} ms over {RUNS} runs");
     assert!(p99 < WALL_MS, "p99 {p99:.2} ms is over {WALL_MS} ms");
+}
+
+// ---------------------------------------------------------------------------
+// AC1 and AC4: the brief's quote under the redaction knob (PRIV-03)
+
+impl Bench {
+    /// `hook`, with extra environment variables set on the spawn.
+    ///
+    /// Its own method rather than a parameter on `hook` because every other
+    /// spawn's claim is about the environment `command` builds; carrying
+    /// anything else is the exception under test and should read like one.
+    fn hook_with_env(&self, event: &str, payload: &Value, env: &[(&str, &str)]) -> Output {
+        let mut command = self.command(&["hook", event]);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the hook");
+        let line = format!("{payload}\n");
+        child
+            .stdin
+            .take()
+            .expect("the hook's stdin")
+            .write_all(line.as_bytes())
+            .expect("write the payload");
+        child.wait_with_output().expect("wait for the hook")
+    }
+}
+
+/// The fixture whose `cwd` names `project-delta` and whose turns each carry one
+/// credential shape with no surrounding name-keyed context.
+const SECRETS_FIXTURE: &str = "session-secrets.jsonl";
+
+/// The `Cookie` value in the last turn of that fixture a person typed, which is
+/// the turn the brief quotes.
+const COOKIE_SENTINEL: &str = "sid-VBEGRESS-qcrumb-1f9";
+
+/// The fragment every planted sentinel in that fixture shares.
+///
+/// Asserted on rather than the one value under test: the brief quotes two turns
+/// and counts a whole session, and one surviving sentinel of any shape is a
+/// leak.
+const SENTINEL_MARK: &str = "VBEGRESS";
+
+/// PRIV-03's knob, written the only way anything can turn it on.
+///
+/// A file in the config directory the spawn points at, and no environment
+/// variable (D-07): the hook loads `Config` in-process, so a variable it could
+/// inherit would be a way to turn this off from outside the config file.
+const KNOB_ON: &str = "[privacy]\nredact_recall = true\n";
+
+/// The brief a `SessionStart` run emitted, out of the payload the harness reads.
+///
+/// Asserts the frame as it goes - exit 0, exactly one object on stdout, the
+/// event name the harness rejects a mismatch on - so a test below can be about
+/// the text alone.
+fn additional_context(output: &Output, label: &str) -> String {
+    assert!(
+        output.status.success(),
+        "{label} exited {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("{label} wrote nothing to stdout"));
+    assert_eq!(
+        lines.next(),
+        None,
+        "{label} wrote more than the one object: {text:?}"
+    );
+    let document: Value = serde_json::from_str(first)
+        .unwrap_or_else(|e| panic!("{label} is not one JSON object ({e}): {text:?}"));
+    let inner = document
+        .get("hookSpecificOutput")
+        .unwrap_or_else(|| panic!("{label} carries no hookSpecificOutput: {document}"));
+    assert_eq!(
+        inner.get("hookEventName").and_then(Value::as_str),
+        Some("SessionStart"),
+        "{label}: {document}"
+    );
+    inner
+        .get("additionalContext")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{label} carries no additionalContext: {document}"))
+        .to_owned()
+}
+
+/// AC1's fourth output, asserted where Claude Code reads it: the brief's quoted
+/// prompt carries the planted `Cookie` value with no `verbatim.toml`, and the
+/// marker instead once the knob is on.
+///
+/// Both halves are needed. A build that filtered nothing passes the first and a
+/// build that emitted an empty brief passes the second, so the same spawn is
+/// run twice over one store with nothing changed between them but a file on
+/// disk - and the second run's frame is asserted too, because a hook that
+/// crashed rather than filtered would also carry no sentinel.
+#[test]
+fn the_knob_filters_the_briefs_quoted_prompt_at_the_hook_boundary() {
+    let bench = bench();
+    bench.ingest(SECRETS_FIXTURE);
+    let payload = payload(&bench.project(SECRETS_FIXTURE));
+
+    let default = bench.hook("SessionStart", &payload);
+    let context = additional_context(&default, "the run with no verbatim.toml");
+    assert!(
+        context.contains(COOKIE_SENTINEL),
+        "the premise: the brief really does quote a turn carrying a credential:\n{context}"
+    );
+
+    std::fs::write(bench.config_dir.join("verbatim.toml"), KNOB_ON).unwrap();
+
+    let filtered = bench.hook("SessionStart", &payload);
+    let context = additional_context(&filtered, "the run with the knob on");
+    assert!(
+        context.contains(REDACTED),
+        "the marker names what went:\n{context}"
+    );
+    assert!(
+        !context.contains(SENTINEL_MARK),
+        "a sentinel survived into the brief:\n{context}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&filtered.stdout).contains(SENTINEL_MARK),
+        "a sentinel survived somewhere else in the payload:\n{}",
+        String::from_utf8_lossy(&filtered.stdout)
+    );
+}
+
+/// AC4's hook half: no environment variable reaches past the knob.
+///
+/// D-07 chose a per-invocation CLI flag over an environment variable precisely
+/// because the hook loads `Config` in-process and would inherit one. The
+/// variables spelled here are the three a reader of `--raw` would reach for:
+/// bare, `VERBATIM_`-prefixed, and the config key itself.
+#[test]
+fn no_environment_variable_reaches_past_the_knob_on_the_session_start_brief() {
+    let bench = bench();
+    bench.ingest(SECRETS_FIXTURE);
+    let payload = payload(&bench.project(SECRETS_FIXTURE));
+    std::fs::write(bench.config_dir.join("verbatim.toml"), KNOB_ON).unwrap();
+
+    let output = bench.hook_with_env(
+        "SessionStart",
+        &payload,
+        &[
+            ("RAW", "1"),
+            ("VERBATIM_RAW", "1"),
+            ("VERBATIM_REDACT_RECALL", "false"),
+        ],
+    );
+    let context = additional_context(&output, "the run carrying raw-looking variables");
+    assert!(context.contains(REDACTED), "{context}");
+    assert!(
+        !context.contains(SENTINEL_MARK),
+        "an environment variable unfiltered the brief:\n{context}"
+    );
 }
