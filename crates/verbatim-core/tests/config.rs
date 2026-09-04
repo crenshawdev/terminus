@@ -1090,3 +1090,107 @@ fn the_stored_spelling_is_a_configurable_one() {
         assert_eq!(config.capture_mode(), mode);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The `[privacy]` table (PRIV-03, phase 4 D-09)
+
+fn privacy_config(body: &str) -> Config {
+    let dir = config_dir_holding(&[(CONFIG_FILE_NAME, body)]);
+    with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(dir.path()).expect("a privacy table is not a parse failure")
+    })
+}
+
+/// The knob is opt-in, so every way of arriving with nothing configured - and
+/// the explicit `false` - has to land on off.
+///
+/// The explicit spelling is in the same list as the absences on purpose: a user
+/// who writes `redact_recall = false` to record that they considered it must
+/// get exactly what a user who never wrote the table gets.
+#[test]
+fn every_unconfigured_route_leaves_recall_unfiltered() {
+    let missing = config_dir_holding(&[]);
+    let no_file = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+        Config::load_from(missing.path()).expect("a missing config file is not an error")
+    });
+
+    for (name, config) in [
+        ("no verbatim.toml at all", no_file),
+        (
+            "a file with no [privacy] table",
+            privacy_config("exclude = []\n"),
+        ),
+        ("an empty [privacy] table", privacy_config("[privacy]\n")),
+        (
+            "the key written false",
+            privacy_config("[privacy]\nredact_recall = false\n"),
+        ),
+        ("a config built with no file", Config::default()),
+        (
+            "a config built from parts",
+            Config::from_parts(Vec::new(), Vec::new()),
+        ),
+    ] {
+        assert!(
+            !config.redact_recall(),
+            "{name}: the filter must be off unless the file turns it on"
+        );
+    }
+}
+
+/// The one thing that turns it on.
+#[test]
+fn the_privacy_table_turns_the_recall_filter_on() {
+    let config = privacy_config("[privacy]\nredact_recall = true\n");
+
+    assert!(config.redact_recall());
+}
+
+/// The documented rule holds one level down here too.
+#[test]
+fn an_unknown_key_inside_the_privacy_table_is_ignored_rather_than_rejected() {
+    let config = privacy_config(
+        "[privacy]\nredact_recall = true\nsomething_phase_9_writes = \"whatever\"\n",
+    );
+
+    assert!(config.redact_recall());
+}
+
+/// A table naming only an unknown key is still a table, and still resolves off.
+#[test]
+fn a_privacy_table_naming_nothing_recognized_stays_off() {
+    let config = privacy_config("[privacy]\nsomething_phase_9_writes = 3\n");
+
+    assert!(!config.redact_recall());
+}
+
+/// The escape hatch's raw material: a copy with the knob forced off, leaving the
+/// original alone.
+///
+/// Both halves are asserted because only the pair is the property. A copy that
+/// reported false while quietly clearing the original would pass the first
+/// assertion and hand every later caller in the process an unfiltered config.
+#[test]
+fn a_forced_off_copy_reports_false_and_leaves_the_original_on() {
+    let config = privacy_config("[privacy]\nredact_recall = true\n");
+    let raw = config.without_recall_redaction();
+
+    assert!(!raw.redact_recall());
+    assert!(config.redact_recall());
+    assert_ne!(config, raw);
+    // Nothing else moved: the copy is the same config with one boolean cleared,
+    // so a command spending the escape hatch still walks the same roots and
+    // honours the same exclusions.
+    assert_eq!(config.without_recall_redaction(), raw);
+    assert_eq!(raw.roots(), config.roots());
+    assert_eq!(raw.exclusions(), config.exclusions());
+    assert_eq!(raw.source_path(), config.source_path());
+}
+
+/// Forcing off a config that was already off changes nothing at all.
+#[test]
+fn a_forced_off_copy_of_an_unfiltered_config_is_that_config() {
+    let config = privacy_config("[privacy]\nredact_recall = false\n");
+
+    assert_eq!(config.without_recall_redaction(), config);
+}

@@ -109,6 +109,28 @@ struct FileConfig {
     /// How much of each record the archive stores (ING-07, D-05).
     #[serde(default)]
     capture: FileCapture,
+    /// Whether the derived projections are filtered on their way to the model
+    /// (PRIV-03).
+    #[serde(default)]
+    privacy: FilePrivacy,
+}
+
+/// The `[privacy]` table of `verbatim.toml` (PRIV-03).
+///
+/// One key, optional, and absent means off - see [`Config::redact_recall`] for
+/// why off is the only default that leaves a product behind.
+///
+/// **Its own table, and not a key on `[provider]`.** The same boolean also
+/// gates the judgment WRITE filter, which is not a recall path, so `[recall]`
+/// would be the wrong name for half of what it does. Under `[provider]` it
+/// would read as gated on a provider being configured - the exact confusion
+/// `provider.local` already causes on this path - and a user with judgment
+/// disabled would reasonably conclude the knob does nothing. A bare top-level
+/// key would be the third spelling of a setting in a file where every other
+/// setting is a table of optional keys.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FilePrivacy {
+    redact_recall: Option<bool>,
 }
 
 /// The `[capture]` table of `verbatim.toml` (ING-07, D-05).
@@ -544,6 +566,7 @@ pub struct Config {
     retention: Retention,
     snapshot: Snapshot,
     capture: CaptureMode,
+    redact_recall: bool,
 }
 
 /// The defaults, spelled once. Derived `Default` would give both budgets zero,
@@ -579,6 +602,13 @@ impl Default for Config {
             // two agree and it is still spelled out: the mode a store captures
             // under is not a value to leave to a derive.
             capture: CaptureMode::Full,
+            // Off, and this is the one default in this impl that would be
+            // actively harmful to get the other way round: every byte in the
+            // archive already reached the model once, when it was typed, so a
+            // filter on by default would spend the product's whole value -
+            // precise recall over what was actually said - to re-hide text the
+            // model has already seen.
+            redact_recall: false,
         }
     }
 }
@@ -688,6 +718,10 @@ impl Config {
             .as_deref()
             .map(CaptureMode::parse)
             .unwrap_or_default();
+        // Key by key against the default, like every other table here: an
+        // absent `[privacy]`, an absent key inside it and `false` all resolve to
+        // the same off.
+        config.redact_recall = file.privacy.redact_recall.unwrap_or(false);
         Ok(config)
     }
 
@@ -869,6 +903,50 @@ impl Config {
     /// Nothing in this workspace elides a byte while this is `Full`.
     pub fn capture_mode(&self) -> CaptureMode {
         self.capture
+    }
+
+    /// Are the derived recall projections filtered on their way to the model
+    /// (PRIV-03)?
+    ///
+    /// False unless `[privacy] redact_recall = true` says otherwise, including
+    /// for a config file with no `[privacy]` table and for no config file at
+    /// all. What it turns on is redaction at ONE egress boundary - the hook and
+    /// MCP output that becomes the model's context - and never anything on the
+    /// ingest side: the archive stays verbatim in both settings, and the same
+    /// store answers unfiltered again the moment this goes back to false.
+    ///
+    /// **Off by default and it has to be.** Every byte the filter would take
+    /// out already reached the model once, when it was typed, so filtering by
+    /// default would spend precise recall to re-hide text the model has already
+    /// seen. The users this is for are the ones whose transcripts hold
+    /// credentials they would rather not have quoted back into a fresh context,
+    /// and they say so.
+    ///
+    /// The file is the only thing that can set it. There is no setter and no
+    /// environment variable, so nothing a process inherits can turn the filter
+    /// on - or, which is the half that matters, off: see
+    /// [`Config::without_recall_redaction`].
+    pub fn redact_recall(&self) -> bool {
+        self.redact_recall
+    }
+
+    /// This config with [`Config::redact_recall`] forced off, for a caller that
+    /// has been told explicitly to hand back the raw archive.
+    ///
+    /// The owner's escape hatch on the terminal read commands is a
+    /// per-invocation flag, and this is what that flag spends: the command
+    /// passes a config of its own down to the query layer rather than the query
+    /// layer growing a second way to be asked. A copy and not a mutation, so
+    /// the caller's own `Config` is unchanged and the two can be compared.
+    ///
+    /// One direction only, deliberately. There is no `with_recall_redaction`:
+    /// turning the filter ON is the file's business alone, and a setter would
+    /// be a second source of truth for a privacy setting.
+    pub fn without_recall_redaction(&self) -> Config {
+        Config {
+            redact_recall: false,
+            ..self.clone()
+        }
     }
 
     /// The Claude config directories, in the order they were configured.
