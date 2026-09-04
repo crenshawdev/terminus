@@ -1,6 +1,6 @@
 # State
 
-Phase: 3 of 4 (Owner-Only On Disk)
-Status: phase complete
-Next: /cad-context 4
+Phase: 4 of 4 (Redacted Recall)
+Status: context gathered
+Next: /cad-plan 4
 Updated: 2026-09-04
