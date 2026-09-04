@@ -41,7 +41,12 @@
 //! # PRIV-02, and where it stops (D-15)
 //!
 //! On Unix a credentials file with any group or world bit set is refused, and
-//! the refusal names the file and its octal mode. On Windows the ACL is not
+//! the refusal names the file and its octal mode. The same test is applied to
+//! `verbatim.toml` when tier 2 is what answers - a file carrying a key is a
+//! credentials file whatever else is in it - as a DISTINCT refusal naming that
+//! file (D-14), and only at the point the key is consumed, so a wide config
+//! with judgment off or with the key in the environment still loads (D-07).
+//! On Windows the ACL is not
 //! checked by this build and the file is accepted with a caveat that
 //! `verbatim doctor` states in words - the deferral is D-15's, not an oversight.
 //!
@@ -94,6 +99,15 @@ pub enum Error {
     /// TOML error normally quotes the offending line back, and in this file
     /// every line is a credential.
     Unreadable { path: PathBuf, detail: String },
+    /// PRIV-02 again, over verbatim's OWN config file: `verbatim.toml` carries
+    /// a `provider.api_key` and is readable by somebody other than its owner.
+    ///
+    /// A distinct case rather than [`Error::TooOpen`] with a different path
+    /// (D-14). The two files are refused on the same test and carry the same
+    /// payload, but a user told "a credentials file" is at fault goes looking
+    /// for `~/.config/jcrenshaw/credentials.toml`, which on most machines is
+    /// not there and is not what they have to chmod.
+    ConfigTooOpen { path: PathBuf, mode: u32 },
 }
 
 impl fmt::Display for Error {
@@ -108,6 +122,16 @@ impl fmt::Display for Error {
             Error::Unreadable { path, detail } => {
                 write!(f, "{} could not be read: {detail}", path.display())
             }
+            // Names the file and nothing about its contents, and says which
+            // file it is in words the reader can act on without going looking
+            // for a shared file they may not have (D-14).
+            Error::ConfigTooOpen { path, mode } => write!(
+                f,
+                "{} is mode {:03o}; verbatim's own config file holds a provider key and is \
+                 readable beyond its owner, so it is refused",
+                path.display(),
+                mode & 0o777
+            ),
         }
     }
 }
@@ -266,6 +290,38 @@ pub fn resolve(config: &Config) -> Result<Option<Secret>, Error> {
         }
     }
     if let Some(key) = config.provider_api_key() {
+        // Tier two is a credential written in verbatim's own file, so PRIV-02
+        // applies to that file too - and it is applied HERE, where the key is
+        // consumed, and never in `Config::load_from` (D-07). A `0644`
+        // `verbatim.toml` therefore still loads for `verbatim status`, for a
+        // run with judgment off, and for a run whose key came from the
+        // environment: those never reach this line.
+        let Some(path) = config.source_path() else {
+            // No public constructor produces a key with no source path: only
+            // `load_from` sets a provider table, and it always records the
+            // file. If one ever arrives, the key was given to us deliberately
+            // and there is no file to have a mode.
+            return Ok(Some(key.clone()));
+        };
+        match permissions(path) {
+            Permissions::TooOpen { mode } => {
+                return Err(Error::ConfigTooOpen {
+                    path: path.to_path_buf(),
+                    mode,
+                })
+            }
+            Permissions::Unreadable { detail } => {
+                return Err(Error::Unreadable {
+                    path: path.to_path_buf(),
+                    detail,
+                })
+            }
+            // `Absent` is a race with the user editing their own config
+            // between the load and this line, and `Unchecked` is D-15's
+            // Windows deferral, stated by `verbatim doctor` in words. Neither
+            // is this program's failure.
+            Permissions::Owner { .. } | Permissions::Unchecked | Permissions::Absent => {}
+        }
         return Ok(Some(key.clone()));
     }
     let Some(provider) = config.provider_name() else {

@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use rusqlite::Connection;
-use verbatim_core::config::Config;
+use verbatim_core::config::{Config, REDACTED};
 use verbatim_core::recall::{
     context, get, search, EntityMatch, Filters, Hit, Query, Reason, Request, Response, Scope,
     Window, MAX_CONTEXT_SIDE, MAX_QUERY_TOKENS, MAX_RESULTS, OBSERVATION_KIND,
@@ -152,6 +152,24 @@ impl Bench {
             body.push('\n');
         }
         self.archive(name, &body)
+    }
+
+    /// A config that has been through a real `verbatim.toml`, with PRIV-03's
+    /// knob written either way.
+    ///
+    /// Loaded from a file rather than built in memory because there is no
+    /// in-memory setter for it: the only thing that can turn the knob on is a
+    /// `verbatim.toml`, and `on = false` spells the key out rather than omitting
+    /// it, so the two configs differ in one token of one file and nothing else.
+    fn redacting(&self, on: bool) -> Config {
+        let dir = self.work.join(format!("privacy-{on}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("verbatim.toml"),
+            format!("[privacy]\nredact_recall = {on}\n"),
+        )
+        .unwrap();
+        Config::load_from(&dir).unwrap()
     }
 
     fn archive(&self, name: &str, body: &str) -> PathBuf {
@@ -1630,6 +1648,137 @@ fn a_context_window_is_scoped_like_a_search_is() {
     assert_eq!(across.reason, Some(Reason::NoSuchTurn { turn_id: anchor }));
 }
 
+/// The `Authorization: Bearer` value planted in `session-secrets.jsonl`.
+const AUTHZ_SENTINEL: &str = "sk-VBEGRESS-authz-9f2";
+
+/// The fragment every planted sentinel of that fixture shares.
+///
+/// Asserted on rather than the one value under test because a window returns a
+/// run of neighbouring turns at once, several of which carry a secret of some
+/// other shape: one survivor of any shape is a leak, and naming only the
+/// `Authorization` one would miss it.
+const SENTINEL_MARK: &str = "VBEGRESS";
+
+/// The whole of `session-secrets.jsonl` as one window, anchored on the turn
+/// that quotes an `Authorization` header.
+fn secrets_window(bench: &Bench, conn: &Connection, on: bool) -> Window {
+    let anchors = turns_whose_record_contains(conn, AUTHZ_SENTINEL);
+    assert_eq!(anchors.len(), 1, "one planted authz turn: {anchors:?}");
+    context::window(
+        conn,
+        &bench.redacting(on),
+        &Scope::Everything,
+        anchors[0],
+        MAX_CONTEXT_SIDE,
+        MAX_CONTEXT_SIDE,
+    )
+    .unwrap()
+}
+
+/// Every turn's text of a window, joined - which is the whole of what the tool
+/// hands the model as prose.
+fn window_text(window: &Window) -> String {
+    assert!(!window.turns.is_empty(), "{window:?}");
+    window
+        .turns
+        .iter()
+        .map(|turn| turn.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The default, stated as an assertion: with the knob absent a window says
+/// exactly what the archive holds.
+#[test]
+fn an_unfiltered_context_window_returns_the_planted_credentials_whole() {
+    let bench = bench();
+    let conn = bench.conn();
+    let text = window_text(&secrets_window(&bench, &conn, false));
+
+    assert!(text.contains(AUTHZ_SENTINEL), "{text}");
+}
+
+/// PRIV-03 over `recall_context`: a window is hook and MCP output, so the knob
+/// filters it (phase 4 D-01, D-03).
+///
+/// The filter is applied by the same `excerpt::of_record_with` argument the
+/// search path passes, so it runs over the full projection before any window is
+/// cut - and nothing scrubs `ContextTurn::text` afterwards, which is why the
+/// marker below survives into the assertion intact rather than being re-read as
+/// a value by a second pass.
+#[test]
+fn the_knob_takes_every_planted_credential_out_of_a_context_window() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let raw = secrets_window(&bench, &conn, false);
+    let filtered = secrets_window(&bench, &conn, true);
+    let (raw_text, filtered_text) = (window_text(&raw), window_text(&filtered));
+
+    // The premise: this window really does carry credential-bearing text, so
+    // what follows is about the filter and not about a window that moved.
+    assert!(raw_text.contains(AUTHZ_SENTINEL), "{raw_text}");
+
+    assert!(
+        filtered_text.contains(REDACTED),
+        "a filtered window names what went:\n{filtered_text}"
+    );
+    for absent in [AUTHZ_SENTINEL, SENTINEL_MARK, "authz"] {
+        assert!(
+            !filtered_text.contains(absent),
+            "{absent:?} survived into the window:\n{filtered_text}"
+        );
+    }
+
+    // Only the text changes. Which turns came back, in which order, and every
+    // fact about where the window stopped are the same in both settings: this
+    // is a filter on what a turn says, never on which turns answered.
+    assert_eq!(
+        filtered
+            .turns
+            .iter()
+            .map(|turn| (turn.turn_id, turn.turn_seq, turn.is_anchor))
+            .collect::<Vec<_>>(),
+        raw.turns
+            .iter()
+            .map(|turn| (turn.turn_id, turn.turn_seq, turn.is_anchor))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(filtered.at_session_start, raw.at_session_start);
+    assert_eq!(filtered.at_session_end, raw.at_session_end);
+    assert_eq!(filtered.continues_from, raw.continues_from);
+    assert_eq!(filtered.reason, raw.reason);
+}
+
+/// The control: a window over a project with nothing credential-shaped in it is
+/// the same text in both settings.
+///
+/// Here because the tolerated failure direction of the rule set is
+/// over-matching, and this is where a length floor low enough to fire on
+/// ordinary English would show.
+#[test]
+fn the_knob_leaves_an_ordinary_context_window_exactly_as_it_was() {
+    let bench = bench();
+    let conn = bench.conn();
+    let anchor = turn_at(&conn, "session-recall.jsonl", 2);
+
+    let text = |on: bool| {
+        window_text(
+            &context::window(
+                &conn,
+                &bench.redacting(on),
+                &Scope::Everything,
+                anchor,
+                MAX_CONTEXT_SIDE,
+                MAX_CONTEXT_SIDE,
+            )
+            .unwrap(),
+        )
+    };
+
+    assert_eq!(text(true), text(false));
+}
+
 // ---------------------------------------------------------------------------
 // RCL-09: the verbatim record behind a turn id
 // ---------------------------------------------------------------------------
@@ -1720,6 +1869,95 @@ fn the_returned_bytes_are_the_records_own_line() {
     // scaffolding is in it, which is exactly what an excerpt strips.
     assert!(body.starts_with(b"{\""), "{:?}", &body[..8.min(body.len())]);
     assert!(!fetched.records[0].body_evicted);
+}
+
+/// The one turn of `session-secrets.jsonl` that quotes an `Authorization`
+/// header, paired with the fixture's own line for it - rooted the way the bench
+/// ingested it, so the comparison is against the bytes that were archived.
+fn authz_turn(bench: &Bench, conn: &Connection) -> (i64, String) {
+    let ids = turns_whose_record_contains(conn, AUTHZ_SENTINEL);
+    assert_eq!(ids.len(), 1, "one planted authz turn: {ids:?}");
+
+    let text = String::from_utf8(testkit::fixture_bytes("session-secrets.jsonl")).unwrap();
+    let line = text
+        .replace(
+            testkit::FIXTURE_ROOT_TOKEN,
+            &bench.root.to_string_lossy().replace('\\', "\\\\"),
+        )
+        .lines()
+        .find(|line| line.contains(AUTHZ_SENTINEL))
+        .expect("the fixture plants an Authorization header")
+        .to_owned();
+
+    (ids[0], line)
+}
+
+/// One id's body, read under a config that has been through a real
+/// `verbatim.toml`.
+fn body_under(bench: &Bench, conn: &Connection, id: i64, on: bool) -> Vec<u8> {
+    get::records(conn, &bench.redacting(on), &Scope::Everything, &[id])
+        .unwrap()
+        .records
+        .first()
+        .and_then(|record| record.body.clone())
+        .expect("an archived turn has a body")
+}
+
+/// AC2's byte-exactness, restated against the knob: absent, this read is still
+/// the archived line and nothing else.
+///
+/// Separate from `the_returned_bytes_are_the_records_own_line` on purpose. That
+/// test reads through a `Config::from_parts`; this one reads through a config
+/// loaded from a `verbatim.toml` that spells the key out as `false`, which is
+/// the shape a user who once turned the knob on and then off again leaves
+/// behind.
+#[test]
+fn an_unfiltered_get_returns_the_archived_line_byte_for_byte() {
+    let bench = bench();
+    let conn = bench.conn();
+    let (id, line) = authz_turn(&bench, &conn);
+
+    assert_eq!(body_under(&bench, &conn, id, false), line.as_bytes());
+}
+
+/// PRIV-03 over `recall_get`: the body is model-facing too, so the knob filters
+/// it - and filters the copy, never the archive (phase 4 D-04).
+///
+/// The `"uuid"` and `"type"` assertions are what separate a filtered line from a
+/// stub: this is still the archived record with its JSON scaffolding intact, and
+/// only the credential inside it went.
+#[test]
+fn the_knob_filters_the_body_and_leaves_the_archived_line_alone() {
+    let bench = bench();
+    let conn = bench.conn();
+    let (id, line) = authz_turn(&bench, &conn);
+
+    let filtered = String::from_utf8(body_under(&bench, &conn, id, true)).unwrap();
+
+    // The premise: the line really does carry the credential, so what follows is
+    // about the filter and not about a turn that moved.
+    assert!(line.contains(AUTHZ_SENTINEL), "{line}");
+
+    assert!(
+        filtered.contains(REDACTED),
+        "a filtered body names what went:\n{filtered}"
+    );
+    for absent in [AUTHZ_SENTINEL, SENTINEL_MARK, "authz"] {
+        assert!(
+            !filtered.contains(absent),
+            "{absent:?} survived into the body:\n{filtered}"
+        );
+    }
+    for present in ["\"uuid\"", "\"type\""] {
+        assert!(
+            filtered.contains(present),
+            "the body is no longer the archived line, it is a stub:\n{filtered}"
+        );
+    }
+
+    // And the archive is untouched: the same id read again with the knob absent
+    // is the fixture's own line, byte for byte.
+    assert_eq!(body_under(&bench, &conn, id, false), line.as_bytes());
 }
 
 /// D-08: `body_evicted` comes off `session_meta.is_evicted` and nowhere else,

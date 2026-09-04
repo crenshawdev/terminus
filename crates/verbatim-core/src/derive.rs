@@ -67,16 +67,20 @@ impl TurnRow<'_> {
 pub fn derive_turn(tx: &Connection, row: TurnRow<'_>) -> Result<i64> {
     let id = schema::turn_id(row.session_no, row.turn.turn_seq);
 
+    // `is_typed` is named in BOTH halves, like every other column: a re-derive
+    // of a turn whose classification changed - a rule this build extended, a
+    // record the previous one read differently - would otherwise keep the old
+    // value while everything around it moved (INJ-07, phase 1 D-03).
     tx.execute(
         "INSERT INTO turns (
             id, session_key, turn_seq, uuid, parent_uuid, record_type, tool_name, ts,
-            stream_offset, byte_len
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            stream_offset, byte_len, is_typed
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(id) DO UPDATE SET
             uuid = excluded.uuid, parent_uuid = excluded.parent_uuid,
             record_type = excluded.record_type, tool_name = excluded.tool_name,
             ts = excluded.ts, stream_offset = excluded.stream_offset,
-            byte_len = excluded.byte_len",
+            byte_len = excluded.byte_len, is_typed = excluded.is_typed",
         rusqlite::params![
             id,
             row.session_key,
@@ -88,6 +92,11 @@ pub fn derive_turn(tx: &Connection, row: TurnRow<'_>) -> Result<i64> {
             row.turn.timestamp,
             row.stream_offset as i64,
             row.byte_len as i64,
+            // Off the `Turn` the parser produced, never re-read out of
+            // `row.record` here - the rule `TurnRow::subtype` states above, and
+            // for the same reason: a second parse site inside the seam is a
+            // second place for ingest and rebuild to disagree.
+            row.turn.is_typed,
         ],
     )?;
 

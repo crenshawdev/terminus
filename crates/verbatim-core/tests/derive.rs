@@ -405,3 +405,144 @@ fn the_seam_owns_the_boundary_row_and_clears_it_when_the_turn_is_not_one() {
         "the boundary row outlived the turn being one"
     );
 }
+
+/// INJ-07 through the one seam: every `user` row of a freshly ingested store
+/// carries a classification and every other row carries none.
+///
+/// Two count queries and no exceptions, which is what "exactly two states and
+/// no third" has to mean if it is to mean anything - a `NOT NULL DEFAULT` would
+/// satisfy the first of them while quietly reading every underived row as one
+/// class (phase 1 D-04). The store holds every transcript fixture, so the
+/// claim covers the sidecars and the compacted session too and not one file.
+#[test]
+fn every_user_row_of_a_fresh_store_is_classified_and_nothing_else_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    for fixture in testkit::TRANSCRIPT_FIXTURES {
+        let path = testkit::copy_fixture_into(fixture, &work);
+        match ingest::run(&data_dir, &path).unwrap() {
+            Outcome::Committed(_) => {}
+            other => panic!("{fixture}: {other:?}"),
+        }
+    }
+    let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+
+    let users: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM turns WHERE record_type = 'user'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(users > 0, "the corpus has to hold a user turn to classify");
+    assert_eq!(
+        count_where(&conn, "record_type = 'user' AND is_typed IS NULL"),
+        0,
+        "a user turn with nothing derived for it"
+    );
+    assert_eq!(
+        count_where(&conn, "record_type <> 'user' AND is_typed IS NOT NULL"),
+        0,
+        "a turn that is not a user record carries a classification"
+    );
+    // Two states, and neither of them empty: a rule that answered `false`
+    // everywhere would pass both counts above.
+    assert!(count_where(&conn, "is_typed = 1") > 0);
+    assert!(count_where(&conn, "is_typed = 0") > 0);
+
+    // The two fixtures the values are known for, by name. `session-errors-a`
+    // is three tool results and nothing else - it is the "no typed prompt at
+    // all" fixture the brief's silent arm is built on (D-13) - and
+    // `session-recall` is one prompt someone typed.
+    assert_eq!(
+        classified(&conn, "session-errors-a.jsonl"),
+        vec![Some(false), Some(false), Some(false)]
+    );
+    assert_eq!(classified(&conn, "session-recall.jsonl"), vec![Some(true)]);
+}
+
+fn count_where(conn: &Connection, predicate: &str) -> i64 {
+    conn.query_row(
+        &format!("SELECT count(*) FROM turns WHERE {predicate}"),
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Every `user` row of the session ingested from one fixture, in turn order.
+fn classified(conn: &Connection, fixture: &str) -> Vec<Option<bool>> {
+    conn.prepare(
+        "SELECT is_typed FROM turns
+          WHERE record_type = 'user' AND session_key LIKE '%' || ?1
+          ORDER BY turn_seq",
+    )
+    .unwrap()
+    .query_map([fixture], |r| r.get(0))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// The seam writes the value it was HANDED, on the insert and on the re-derive
+/// both. A column named in the INSERT list and forgotten in the
+/// `ON CONFLICT DO UPDATE SET` list is the failure this catches: the first
+/// derive would look right and every rebuild afterwards would preserve a stale
+/// answer while every other column moved.
+#[test]
+fn a_re_derive_moves_the_classification_with_everything_else() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let line = br#"{"type":"user","uuid":"u-typed","timestamp":"2026-08-23T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"a prompt someone typed"}]}}"#;
+    let scan = parse::scan(&[line.as_slice(), b"\n"].concat());
+    let (_, parsed) = scan.turns().next().unwrap();
+    assert_eq!(parsed.is_typed, Some(true), "the premise");
+
+    let seq = count(&conn, "turns");
+    let typed = parse::Turn {
+        turn_seq: seq,
+        ..parsed.clone()
+    };
+    let id = schema::turn_id(bench.session_no, seq);
+    let row = TurnRow {
+        session_key: &bench.session_key,
+        session_no: bench.session_no,
+        turn: &typed,
+        stream_offset: 0,
+        byte_len: line.len() as u64,
+        record: line.as_slice(),
+        subtype: None,
+        compact_metadata: None,
+    };
+    assert_eq!(derive::derive_turn(&conn, row).unwrap(), id);
+    assert_eq!(stored_is_typed(&conn, id), Some(true));
+
+    // The same turn re-derived from a record the rule reads differently.
+    let not_typed = parse::Turn {
+        is_typed: Some(false),
+        ..typed.clone()
+    };
+    derive::derive_turn(
+        &conn,
+        TurnRow {
+            turn: &not_typed,
+            ..row
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        stored_is_typed(&conn, id),
+        Some(false),
+        "the re-derive kept the old classification"
+    );
+}
+
+fn stored_is_typed(conn: &Connection, id: i64) -> Option<bool> {
+    conn.query_row("SELECT is_typed FROM turns WHERE id = ?1", [id], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}

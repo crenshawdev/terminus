@@ -126,7 +126,7 @@ impl Bench {
     /// Write one session of assistant records into the same project and archive
     /// it, at timestamps later than the fixture's so it is the LAST session.
     fn archive(&self, name: &str, day: &str, records: Vec<Value>) -> PathBuf {
-        let session = format!("{:0>8}-0000-4000-8000-000000000000", name.len());
+        let session = session_id(name);
         let mut body = String::new();
         for (n, message) in records.into_iter().enumerate() {
             let record = serde_json::json!({
@@ -322,6 +322,16 @@ impl Bench {
     }
 }
 
+/// The session id [`Bench::archive`] writes a file's records under, and the
+/// prefix of every record uuid inside it.
+///
+/// A function rather than a `format!` inside `archive`, because a test that
+/// resolves one of those records back to its turn id has to name the same uuid
+/// the writer used, and two spellings of one formula is how they come apart.
+fn session_id(name: &str) -> String {
+    format!("{:0>8}-0000-4000-8000-000000000000", name.len())
+}
+
 /// A turn that says something and stores nothing: prose, which emits no entity.
 fn says(role: &str, text: &str) -> Value {
     serde_json::json!({
@@ -345,6 +355,24 @@ fn edits(file: &str) -> Value {
                 "old_string": "    let beam = beaconWaver(seed);",
                 "new_string": "    let beam = beaconSteady(seed);",
             },
+        }],
+    })
+}
+
+/// A `user` record the harness wrote, not the person: the result of the tool
+/// call above it, which is what a real session ends on one time in eight.
+///
+/// The `tool_result` block in `message.content` is the whole discriminator
+/// (D-01) - no top-level `toolUseResult` key, because the block rule is the one
+/// ingest reads and adding the key here would let a test pass against a build
+/// that only ever looked at the key.
+fn returns(text: &str) -> Value {
+    serde_json::json!({
+        "role": "user",
+        "content": [{
+            "type": "tool_result",
+            "tool_use_id": "toolu_supp01",
+            "content": text,
         }],
     })
 }
@@ -564,6 +592,71 @@ fn a_turn_the_brief_already_quoted_is_not_injected_again() {
     assert!(
         control.contains("beaconWaver"),
         "the prompt does not reach the edit at all: {control}"
+    );
+}
+
+/// D-12, at the process boundary: the state file names the turns the brief
+/// actually quoted, now that the quoted prompt is no longer the session's last
+/// `user` record (INJ-07).
+///
+/// The prediction D-12 makes is that this needs no production change at all -
+/// the ids travel on the `Quote` that was assembled, so INJ-04's suppression
+/// follows the new rule for free. That is only worth anything if something can
+/// falsify it, which is what this is: the session's LAST `user` record is a
+/// tool result and the typed prompt is two turns earlier, so a brief that
+/// recorded what it quoted by position rather than by the turn it assembled
+/// would write the tool result's id here.
+///
+/// The control comes first for the reason the whole file states: a brief that
+/// rendered no quotation at all would satisfy every `!contains` below.
+#[test]
+fn the_brief_records_the_typed_turn_it_quoted_and_not_the_tool_result_after_it() {
+    const SESSION: &str = "ffffffff-1111-4000-8000-000000000001";
+    const NAME: &str = "session-kettle.jsonl";
+    /// What the person typed, two records before the end of the session.
+    const TYPED: &str = "warm the kettle before the run";
+    /// Text only the harness-written record carries, so "the brief did not
+    /// quote it" is readable in the prose as well as in the id list.
+    const RESULT: &str = "kettleWarmed in 3 files";
+
+    let bench = bench();
+    bench.ingest_fixture();
+    let kettle = bench.project().join("crates/gizmo/kettle.rs");
+    bench.archive(
+        NAME,
+        "2026-08-17",
+        vec![
+            says("user", TYPED),
+            edits(kettle.to_str().unwrap()),
+            returns(RESULT),
+        ],
+    );
+    let uuid = |n: usize| format!("{}-{n}", session_id(NAME));
+    let typed = bench.turn_of(&uuid(0));
+    let harness = bench.turn_of(&uuid(2));
+
+    let brief = injected(&bench.session_start(SESSION, "resume"), "SessionStart");
+    assert!(
+        brief.contains(TYPED),
+        "the brief did not quote the typed prompt, so nothing is being \
+         recorded: {brief}"
+    );
+    assert!(
+        !brief.contains(RESULT),
+        "the brief quoted the tool result the harness wrote: {brief}"
+    );
+
+    let quoted = ids(&bench.state(SESSION), "brief");
+    assert!(
+        quoted.contains(&typed),
+        "the state file does not name the typed turn the brief quoted: \
+         {quoted:?} without {typed}"
+    );
+    assert!(
+        !quoted.contains(&harness),
+        "the state file names the tool-result turn the brief never quoted, so \
+         the next prompt would refuse to inject a turn the model never saw: \
+         {quoted:?} contains {harness}"
     );
 }
 

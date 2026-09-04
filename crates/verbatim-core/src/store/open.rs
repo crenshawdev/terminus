@@ -30,7 +30,16 @@ pub const ARCHIVE_FORMAT: i64 = 1;
 /// expansion tokens, and `entities` and `paths` are filled for the first time.
 /// Without the bump a store written by a phase 2 binary would keep an index that
 /// matches JSON keys and holds no entity at all, and no integer would say so.
-pub const DERIVED_SCHEMA: i64 = 3;
+///
+/// 4 as of v0.1.1 phase 1 (D-03): `turns` gained `is_typed`, the per-turn
+/// discriminator INJ-07's resume brief reads. The bump is what makes
+/// [`crate::reindex::reindex`] the blob-only backfill that fills the column on
+/// a store an earlier build wrote - the bring-forward `ALTER` adds it empty, and
+/// nothing else would ever populate a turn already archived. Note the naming
+/// collision: `crate::ingest::backfill` is the parallel transcript-reading pass
+/// and is NOT this mechanism; it reads the files on disk, and this reads only
+/// `sessions.blob`.
+pub const DERIVED_SCHEMA: i64 = 4;
 
 /// The store file inside the data directory.
 pub const DB_FILE_NAME: &str = "verbatim.db";
@@ -99,9 +108,38 @@ impl Store {
     /// read-only is what makes that true at the SQLite level rather than by
     /// discipline. A writable connection would checkpoint the WAL when the last
     /// one closes, which rewrites both files without a single statement of ours.
+    ///
+    /// Everything this creates is owner-only from the syscall that creates it
+    /// (PRIV-02): the data directory 0700 and `verbatim.db` 0600, the latter
+    /// created empty by us BEFORE rusqlite ever sees the path. `-wal` and
+    /// `-shm` are then SQLite's to make, and it `fchmod`s a fresh sidecar to
+    /// the main database's mode after opening it, which is why 0600 on the one
+    /// file covers all three and why there is no `chmod` after the fact here -
+    /// that would be a window with session text already on disk at 0644.
     pub fn open(data_dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(data_dir).map_err(|e| Error::io(data_dir, e))?;
+        crate::owner_only::create_dir_all(data_dir).map_err(|e| Error::io(data_dir, e))?;
         let path = data_dir.join(DB_FILE_NAME);
+
+        // A zero-length file is exactly what `inspect` reads as
+        // `StoreState::Fresh`, so this changes nothing about what happens next
+        // on a store that does not exist yet: `initialize` still runs, and
+        // SQLite's `journal_mode` stamp lands in a file that is already 0600.
+        // `create_new`, so an existing store is never truncated - its
+        // `AlreadyExists` is the ordinary case, not a failure.
+        match crate::owner_only::options()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(Error::io(&path, e)),
+        }
+
+        // Before any SQLite connection, read-only ones included: a `-shm` SQLite
+        // is about to create takes the main database's mode, so `verbatim.db`
+        // has to be narrow first or the sidecar of a wide store is born wide.
+        tighten(data_dir);
 
         let state = inspect(&path)?;
 
@@ -339,6 +377,102 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Narrow a store an earlier build left readable by group or world (PRIV-02).
+///
+/// Runs on every [`Store::open`] and on NO read-only open (D-05): `doctor`,
+/// `search`, `show` and `replay` report on a store, and reporting on something
+/// is not permission to change it. Its counterpart is that a writable open is
+/// already a write, so repairing there costs the caller nothing it was not
+/// already paying.
+///
+/// Compare, then chmod - never chmod unconditionally (D-06). A `chmod` to the
+/// mode a file already has still moves its ctime, and "the repair ran once" is
+/// exactly what a second open leaving every ctime alone is the evidence for.
+/// There is no marker key recording the repair as done, deliberately: a store
+/// widened again later - by a restore from backup, by a `data move`, by a hand
+/// `chmod` - is tightened again, where a marker or a version gate would decide
+/// it had already been handled. The cost is a handful of `stat` calls per open.
+///
+/// Every failure is ignored and the open proceeds (D-12). The alternative is an
+/// ingest that stops dead on a store whose files another account owns, or one on
+/// a read-only mount, which trades a mode this build cannot fix for a product
+/// that does not run.
+#[cfg(unix)]
+fn tighten(data_dir: &Path) {
+    narrow_directory(data_dir);
+
+    for name in [
+        DB_FILE_NAME.to_string(),
+        // SQLite's sidecars are named off the database file, and both can
+        // outlive the process that made them.
+        format!("{DB_FILE_NAME}-wal"),
+        format!("{DB_FILE_NAME}-shm"),
+        crate::ingest::lock::LOCK_FILE_NAME.to_string(),
+    ] {
+        narrow_file(&data_dir.join(name));
+    }
+
+    // Each holds one kind of thing verbatim wrote: whole-archive copies,
+    // injected brief text, per-prompt decision records. The directory and the
+    // files directly inside it, one level, because none of the three nests.
+    for name in [
+        crate::store::snapshot::DIR_NAME,
+        crate::inject::state::DIR_NAME,
+        crate::inject::decision::DIR_NAME,
+    ] {
+        let dir = data_dir.join(name);
+        narrow_directory(&dir);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            narrow_file(&entry.path());
+        }
+    }
+}
+
+/// The Windows arm (D-15): owner-only there is an ACL, and this build sets none.
+#[cfg(not(unix))]
+fn tighten(_data_dir: &Path) {}
+
+#[cfg(unix)]
+fn narrow_directory(path: &Path) {
+    narrow(path, crate::owner_only::DIR_MODE, std::fs::FileType::is_dir);
+}
+
+#[cfg(unix)]
+fn narrow_file(path: &Path) {
+    narrow(
+        path,
+        crate::owner_only::FILE_MODE,
+        std::fs::FileType::is_file,
+    );
+}
+
+/// One path: stat it, and chmod only if a bit is actually wrong.
+///
+/// `symlink_metadata`, and a file-type test that admits only the kind the
+/// caller asked for. `set_permissions` follows a symlink, so a link left in
+/// `snapshots/` would otherwise have its TARGET chmod'd - a file that may sit
+/// anywhere on the machine and be nothing of verbatim's. A path that is not
+/// there at all is the ordinary case, not a failure: most of this list is
+/// absent on most stores.
+#[cfg(unix)]
+fn narrow(path: &Path, mode: u32, wanted: fn(&std::fs::FileType) -> bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !wanted(&meta.file_type()) {
+        return;
+    }
+    if meta.permissions().mode() & 0o777 == mode {
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
 }
 
 /// Add whatever this build's schema has and the open store does not.

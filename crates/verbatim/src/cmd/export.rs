@@ -26,6 +26,7 @@
 //! written out to a directory they may hand to someone else.
 
 use std::collections::BTreeSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -157,7 +158,15 @@ fn write_export(reader: &Reader, destination: &Path) -> Result<Written, Failure>
     let conn = reader.store().conn();
     let sessions = visible::sessions(conn, reader.config()).map_err(op)?;
 
-    std::fs::create_dir_all(destination).map_err(|e| {
+    // Owner-only, and the leaf alone (D-04, D-11). An export is a directory of
+    // plaintext transcripts, so it is verbatim's own output even though the
+    // user named the path - the mode rides the `mkdir` rather than a `chmod`
+    // after it, and there is no instant at which the directory about to hold
+    // every prompt anyone typed is readable by the rest of the machine. A
+    // destination that already exists and is empty is accepted by
+    // `refuse_if_occupied` above and keeps the mode its creator gave it: this
+    // command narrows what it creates and nothing it merely found.
+    verbatim_core::owner_only::create_dir_all(destination).map_err(|e| {
         Failure::Operational(format!(
             "{} could not be created: {e}",
             destination.display()
@@ -197,7 +206,7 @@ fn write_export(reader: &Reader, destination: &Path) -> Result<Written, Failure>
             })?,
         };
         let name = file_name(session.session_no, &session.session_key);
-        std::fs::write(destination.join(&name), &stream)
+        write_owner_only(&destination.join(&name), &stream)
             .map_err(|e| Failure::Operational(format!("{name} could not be written: {e}")))?;
 
         written.sessions += 1;
@@ -247,10 +256,28 @@ fn write_export(reader: &Reader, destination: &Path) -> Result<Written, Failure>
     // envelope is one line because it is piped; a manifest is opened and read.
     let text = serde_json::to_string_pretty(&manifest)
         .map_err(|e| Failure::Operational(format!("the manifest could not be built: {e}")))?;
-    std::fs::write(&path, format!("{text}\n")).map_err(|e| {
+    write_owner_only(&path, format!("{text}\n").as_bytes()).map_err(|e| {
         Failure::Operational(format!("{} could not be written: {e}", path.display()))
     })?;
     Ok(written)
+}
+
+/// One export file, created 0600 and never overwritten.
+///
+/// `create_new` rather than the truncating create `std::fs::write` performs:
+/// [`refuse_if_occupied`] has already established that the destination was
+/// empty or absent, so a name that is already taken by the time this runs is
+/// something else writing into the directory mid-export, and truncating that
+/// file would be the one thing this command says it never does. The mode is
+/// carried by the open itself (D-01), so the file holding a whole session's
+/// unredacted transcript is never on disk at the umask's width, not even for
+/// the moment between the create and a chmod.
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = verbatim_core::owner_only::options()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)
 }
 
 /// Widen a date range by one session's bound.

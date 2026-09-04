@@ -23,7 +23,8 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
@@ -75,8 +76,13 @@ fn hook() -> Hook {
     } else {
         "verbatim"
     });
-    // `fs::copy` carries the permission bits, so the copy is executable.
-    std::fs::copy(env!("CARGO_BIN_EXE_verbatim"), &exe).unwrap();
+    // `fs::copy` carries the permission bits, so the copy is executable. The
+    // guard is what keeps a sibling test's fork out of the window where this
+    // destination is open for writing (see [`COPYING`]).
+    {
+        let _guard = COPYING.write().unwrap_or_else(PoisonError::into_inner);
+        std::fs::copy(env!("CARGO_BIN_EXE_verbatim"), &exe).unwrap();
+    }
 
     Hook {
         _dir: dir,
@@ -120,6 +126,52 @@ impl Hook {
     }
 }
 
+/// Held for writing while a binary copy is being made, and for reading across
+/// every `fork` this file performs, so the two never overlap.
+///
+/// Without it these tests fail as `ETXTBSY` ("Text file busy") on an exec, at
+/// whichever `spawn` lost the race. The mechanism is the copy above: while
+/// `fs::copy` is writing one test's binary the destination is open for writing,
+/// and a *sibling* test's `Command::spawn` on another thread forks the whole
+/// process, descriptors included. Between that child's fork and its exec it
+/// holds a write handle on a file it will never touch - close-on-exec closes it
+/// a moment later, but a moment is enough - and Linux refuses to exec a file any
+/// process holds open for writing. The copy and the fork are both blameless; it
+/// is only their overlap that is the bug, so the fix is to forbid the overlap
+/// rather than to retry the exec.
+///
+/// A read guard rather than a mutex because spawning is what this file mostly
+/// does: hook spawns still run concurrently with each other, they are only kept
+/// out of the window where a copy is in flight.
+static COPYING: RwLock<()> = RwLock::new(());
+
+/// `Command::spawn`, held off while any binary copy is in flight ([`COPYING`]).
+///
+/// Every spawn in this file goes through here or through [`output`] - including
+/// `ps` and `kill`, which fork exactly like the ones that matter and inherit
+/// exactly the same descriptors.
+///
+/// The guard is dropped when `spawn` returns, which is after the child has
+/// exec'd: both of the paths `std` takes on Unix (`posix_spawn`, and the
+/// `fork` fallback with its close-on-exec status pipe) report back only once
+/// the exec has happened or failed.
+fn spawn(command: &mut Command) -> std::io::Result<Child> {
+    let _guard = COPYING.read().unwrap_or_else(PoisonError::into_inner);
+    command.spawn()
+}
+
+/// `Command::output` over [`spawn`]: the same stdio `Command::output` sets, and
+/// the wait happens after the guard is dropped.
+fn output(command: &mut Command) -> std::io::Result<Output> {
+    let child = spawn(
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?;
+    child.wait_with_output()
+}
+
 /// Repeats of the two fixtures, ~10 MB, ~700 ms of debug-build ingest.
 const BIG: usize = 48;
 
@@ -135,13 +187,13 @@ const FIXTURES: &[(&str, &str)] = &[
 /// One hook invocation: the payload on stdin, then EOF, the way Claude Code
 /// 2.1.231 writes it (`stdin.write(payload + "\n"); stdin.end()`).
 fn feed(hook: &Hook, event: &str, payload: &[u8]) -> Output {
-    let mut child = hook
-        .command(&["hook", event])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the hook");
+    let mut child = spawn(
+        hook.command(&["hook", event])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn the hook");
     child
         .stdin
         .take()
@@ -169,12 +221,10 @@ struct Proc {
 /// `-ww` is what keeps a long temporary path in `argv` from being truncated.
 #[cfg(unix)]
 fn ps() -> Vec<Proc> {
-    let output = Command::new("ps")
-        .args(["-e", "-ww", "-o", "pid=,ppid=,pgid=,args="])
-        .output()
+    let listing = output(Command::new("ps").args(["-e", "-ww", "-o", "pid=,ppid=,pgid=,args="]))
         .expect("run ps");
-    assert!(output.status.success(), "ps failed");
-    String::from_utf8_lossy(&output.stdout)
+    assert!(listing.status.success(), "ps failed");
+    String::from_utf8_lossy(&listing.stdout)
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
@@ -226,10 +276,7 @@ fn the_working_process_leaves_the_group_and_the_parentage_of_the_process_that_sp
     let hook = hook();
     hook.big_transcript("-p", "11111111-1111-4111-8111-111111111111.jsonl", BIG);
 
-    let handoff = hook
-        .command(&[HANDOFF, "ingest"])
-        .output()
-        .expect("spawn the hand-off");
+    let handoff = output(&mut hook.command(&[HANDOFF, "ingest"])).expect("spawn the hand-off");
     assert!(handoff.status.success(), "the hand-off did not exit 0");
     assert!(handoff.stdout.is_empty(), "the hand-off wrote to stdout");
 
@@ -280,10 +327,7 @@ fn the_working_process_leaves_the_group_and_the_parentage_of_the_process_that_sp
 fn an_ambient_environment_marker_cannot_divert_an_ordinary_invocation() {
     let hook = hook();
 
-    let version = hook
-        .command(&["--version"])
-        .env(RETIRED_MARKER, "1")
-        .output()
+    let version = output(hook.command(&["--version"]).env(RETIRED_MARKER, "1"))
         .expect("run verbatim --version");
     assert!(
         version.status.success(),
@@ -297,10 +341,7 @@ fn an_ambient_environment_marker_cannot_divert_an_ordinary_invocation() {
          invocation was diverted"
     );
 
-    let unknown = hook
-        .command(&["hook", "NotAnEvent"])
-        .env(RETIRED_MARKER, "1")
-        .output()
+    let unknown = output(hook.command(&["hook", "NotAnEvent"]).env(RETIRED_MARKER, "1"))
         .expect("run verbatim hook NotAnEvent");
     assert_eq!(
         unknown.status.code(),
@@ -395,13 +436,13 @@ fn every_event_exits_zero_with_an_empty_stdout_inside_the_budget() {
 fn a_stdin_that_is_opened_and_never_closed_does_not_hold_the_hook() {
     let hook = hook();
 
-    let mut child = hook
-        .command(&["hook", "UserPromptSubmit"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the hook");
+    let mut child = spawn(
+        hook.command(&["hook", "UserPromptSubmit"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn the hook");
     // A payload that has begun and will never end: no newline, and the handle
     // stays in scope for the whole test, so the hook's stdin never sees EOF.
     let mut stdin = child.stdin.take().expect("the hook's stdin");
@@ -474,13 +515,13 @@ fn an_unterminated_line_stops_being_read_at_the_cap() {
     const CEILING: usize = 8 * 1024 * 1024;
 
     let hook = hook();
-    let mut child = hook
-        .command(&["hook", "SessionStart"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the hook");
+    let mut child = spawn(
+        hook.command(&["hook", "SessionStart"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .expect("spawn the hook");
     let mut stdin = child.stdin.take().expect("the hook's stdin");
 
     // No newline anywhere in it, so nothing but a cap can end the read.
@@ -539,12 +580,12 @@ fn reading_the_hooks_stdout_to_eof_returns_at_once_while_the_ingest_still_runs()
     let hook = hook();
     hook.big_transcript("-p", "22222222-2222-4222-8222-222222222222.jsonl", BIG);
 
-    let mut child = hook
-        .command(&["hook", "SessionStart"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn the hook");
+    let mut child = spawn(
+        hook.command(&["hook", "SessionStart"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
+    )
+    .expect("spawn the hook");
     child
         .stdin
         .take()
@@ -579,8 +620,8 @@ fn reading_the_hooks_stdout_to_eof_returns_at_once_while_the_ingest_still_runs()
 }
 
 /// The tree the kill test walks: four transcripts, one project, ~1.4 s of
-/// debug-build pass. Big enough that a kill aimed at the moment the first file
-/// commits still has three files of pass left to prove it survived.
+/// debug-build pass. Big enough that the whole of it is still ahead of the
+/// ingest when the kill lands, so finishing it is what proves the survival.
 #[cfg(unix)]
 const TREE: usize = 4;
 
@@ -624,10 +665,7 @@ fn descendants(root: u32, table: &[Proc]) -> Vec<u32> {
 
 #[cfg(unix)]
 fn sigkill(target: &str) {
-    Command::new("kill")
-        .args(["-KILL", target])
-        .output()
-        .expect("run kill");
+    output(Command::new("kill").args(["-KILL", target])).expect("run kill");
 }
 
 /// AC2 / D-03: the kill Claude Code actually performs, and an ingest that
@@ -644,6 +682,21 @@ fn sigkill(target: &str) {
 /// superset of what Claude Code kills, which is the point: the ingest has to be
 /// outside the union, not merely outside whichever snapshot happened to be
 /// taken first.
+///
+/// **Everything between the spawn and the kill is on a 500 ms clock**, and that
+/// is the whole reason this test is shaped the way it is. The hook gives a
+/// writer `cmd::hook::DRAIN_DEADLINE` - 500 ms - before it stops waiting on
+/// stdin and exits 0, so a hook that is killed late is not killed at all: the
+/// group kill reaches an empty group, nothing dies, and the survival assertions
+/// below pass over a hook that was never killed. So the kill is aimed as soon
+/// as the ingest is nameable in the process table, tens of milliseconds in,
+/// rather than after waiting for the pass to commit its first file - which cost
+/// ~400 ms of the 500 on an idle machine and ran past it under a loaded one.
+/// Nothing is lost by killing early, because `SIGKILL` cannot be handled: what
+/// decides survival is whether the ingest's pid is in the group or the sweep,
+/// which its `setsid` settled at spawn and no later instant can change. The
+/// pass being wholly unfinished at the kill is asserted rather than waited for,
+/// and the drain below then proves it ran the entire tree afterwards.
 #[cfg(unix)]
 #[test]
 fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
@@ -658,32 +711,27 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
         );
     }
 
-    let mut child = hook
-        .command(&["hook", "SessionEnd"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // Its own group, so the group kill below names the hook and nothing
-        // else. Claude Code spawns hooks this way for the same reason.
-        .process_group(0)
-        .spawn()
-        .expect("spawn the hook");
+    let mut child = spawn(
+        hook.command(&["hook", "SessionEnd"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Its own group, so the group kill below names the hook and nothing
+            // else. Claude Code spawns hooks this way for the same reason.
+            .process_group(0),
+    )
+    .expect("spawn the hook");
     // Held open and never written: the hook is now blocked in its one-line
     // read, exactly where a timed-out hook is when the harness gives up on it.
     let _stdin = child.stdin.take().expect("the hook's stdin");
     let hook_pid = child.id();
 
-    // Wait until the pass is provably mid-tree: one transcript committed, three
-    // still to walk. A kill that lands after the pass has committed everything
-    // proves nothing at all.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while committed(&hook) == 0 {
-        assert!(Instant::now() < deadline, "the pass committed nothing");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    // Nameable in the process table is all the kill needs; the pass being
+    // unfinished is read, not waited for. A kill that lands after the pass has
+    // committed everything would prove nothing at all.
+    let ingest = await_process(&hook.ingest_argv());
     let mid_pass = committed(&hook);
     assert!(mid_pass < TREE, "the pass finished before the kill: {mid_pass}");
 
-    let ingest = await_process(&hook.ingest_argv());
     let mut doomed = descendants(hook_pid, &ps());
     // The group, by its leader's negated pid - `process.kill(-pid)`.
     sigkill(&format!("-{hook_pid}"));
@@ -700,7 +748,9 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
     assert_eq!(
         status.signal(),
         Some(9),
-        "the hook did not die of the group kill: {status:?}"
+        "the hook did not die of the group kill: {status:?}. An exit of 0 here \
+         means the hook gave up on stdin and returned before the kill landed, \
+         so the group was empty and nothing below is evidence of anything"
     );
     assert!(
         !doomed.contains(&ingest.pid),
@@ -730,4 +780,61 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
         .expect("the pass wrote no runs row");
     assert_eq!(files as usize, TREE, "the runs row is short of the tree");
     assert_eq!(error, None, "the pass recorded an error: {error:?}");
+}
+
+/// PRIV-03's knob, written the only way anything can turn it on.
+const KNOB_ON: &str = "[privacy]\nredact_recall = true\n";
+
+/// AC7: the same four events, the same hundred runs, the same budget, with
+/// `[privacy] redact_recall = true` on the config the hook loads.
+///
+/// The knob puts the egress rule set on the `SessionStart` path, between the
+/// projection and the budget, and D-06 measured that at roughly 1.1 ms worst
+/// case for the brief's two quotes. That is a claim about a cost, so it is
+/// asserted where the cost is paid: the wall clock of a spawn the harness
+/// waits on, against the same 10 ms the run without the knob is held to.
+///
+/// It lives in this file rather than in one of its own because [`COPYING`] is
+/// what keeps ETXTBSY out of a fully parallel suite - the lock is held between
+/// this file's binary copy and every spawn made from it, and a second file
+/// copying the binary would sit outside it.
+#[test]
+fn every_event_stays_inside_the_budget_with_the_redaction_knob_on() {
+    const RUNS: usize = 100;
+    const BUDGET: f64 = 10.0;
+
+    let hook = hook();
+    std::fs::write(hook.config_dir.join("verbatim.toml"), KNOB_ON).unwrap();
+
+    for (event, fixture) in FIXTURES {
+        let payload = testkit::fixture_bytes(fixture);
+        let mut millis = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let started = Instant::now();
+            let output = feed(&hook, event, &payload);
+            millis.push(started.elapsed().as_secs_f64() * 1000.0);
+
+            assert!(
+                output.status.success(),
+                "{event} with the knob on exited {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stdout.is_empty(),
+                "{event} with the knob on wrote to stdout: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        millis.sort_by(f64::total_cmp);
+        let p50 = millis[RUNS / 2 - 1];
+        let p99 = millis[(RUNS * 99) / 100 - 1];
+        println!("{event} (redact_recall): p50 {p50:.2} ms, p99 {p99:.2} ms over {RUNS} runs");
+        assert!(
+            p99 < BUDGET,
+            "{event} with the knob on: p99 {p99:.2} ms is over {BUDGET} ms"
+        );
+    }
+    drain(&hook.ingest_argv());
 }

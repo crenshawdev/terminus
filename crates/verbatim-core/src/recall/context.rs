@@ -20,6 +20,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::blob::BlobReader;
 use crate::config::Config;
 use crate::error::Result;
+use crate::observe::egress::Redaction;
 use crate::recall::scope::{self, Reason, Scope};
 use crate::recall::{excerpt, Query};
 
@@ -189,7 +190,17 @@ pub fn window(
     )?;
 
     let mut turns: Vec<ContextTurn> = rows.iter().map(|(turn, _)| turn.clone()).collect();
-    fill_text(conn, &session_key, &rows, &mut turns)?;
+    // Resolved here and carried down, never read inside the projection (phase 4
+    // D-01). A context window is model-facing - `recall_context` is one of the
+    // three MCP tools - so its turns are an egress boundary in exactly the way
+    // a search excerpt is, and they go through the same argument.
+    fill_text(
+        conn,
+        &session_key,
+        &rows,
+        &mut turns,
+        &Redaction::of(config),
+    )?;
 
     let at_session_start = turns.first().is_some_and(|turn| turn.turn_seq == first);
     let at_session_end = turns.last().is_some_and(|turn| turn.turn_seq == last);
@@ -209,11 +220,19 @@ pub fn window(
 ///
 /// One `SELECT blob` for the whole window, which is free here in a way it is
 /// not for a search: a context window is one session by definition (D-06).
+///
+/// `redaction` is the caller's, and it is applied by [`excerpt::of_record_with`]
+/// to the FULL projection before the window is cut (phase 4 D-02) - the same
+/// argument on the same call the search path makes, so a turn reads the same
+/// way whichever tool asked for it. Nothing scrubs [`ContextTurn::text`]
+/// afterwards: a second pass over an already-filtered projection would run the
+/// rules across a marker this one left behind.
 fn fill_text(
     conn: &Connection,
     session_key: &str,
     rows: &[(ContextTurn, (i64, i64))],
     turns: &mut [ContextTurn],
+    redaction: &Redaction<'_>,
 ) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
@@ -238,7 +257,7 @@ fn fill_text(
         let Ok(bytes) = reader.read_range(*offset as u64, *len as u64) else {
             continue;
         };
-        turns[index].text = excerpt::of_record(&query, &bytes);
+        turns[index].text = excerpt::of_record_with(&query, &bytes, redaction);
     }
     Ok(())
 }

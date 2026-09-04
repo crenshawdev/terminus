@@ -42,6 +42,13 @@ pub struct Turn {
     pub record_type: String,
     /// The first `tool_use` name in `message.content`, when there is one.
     pub tool_name: Option<String>,
+    /// Did the PERSON type this turn, or did the harness write it (INJ-07)?
+    ///
+    /// `Some(true)` for a prompt someone typed, `Some(false)` for a tool
+    /// result, an `isMeta` caveat or a harness envelope, and `None` for every
+    /// record type that is not `user` - the question is only asked of the one
+    /// type whose records have two authors (phase 1 D-02, D-04).
+    pub is_typed: Option<bool>,
     pub timestamp: String,
 }
 
@@ -164,6 +171,7 @@ impl Record {
                     parent_uuid: string(object.get("parentUuid")),
                     record_type: kind.to_owned(),
                     tool_name: tool_name(&value),
+                    is_typed: (kind == "user").then(|| is_typed(&value)),
                     timestamp,
                 });
             }
@@ -293,6 +301,93 @@ fn skip_ws(line: &[u8], from: usize) -> usize {
         at += 1;
     }
     at
+}
+
+/// The tags a harness-written `user` record's text opens with (D-02).
+///
+/// Measured on 2026-08-23 over 400 top-level transcripts and 12,379 `user` turn
+/// records: `command-message` leads 143 of them, `command-name` 119,
+/// `local-command-caveat` 119 (every one of those also `isMeta`),
+/// `task-notification` 64, `local-command-stdout` 41 and `bash-stdout` 13. The
+/// vocabulary is Claude Code's own and can change under us, so it is one
+/// `const` and a new upstream shape is one line.
+///
+/// `bash-input` is measured (13 records) and deliberately absent: it is the
+/// command the person typed after `!`, which the harness only wrapped.
+const HARNESS_ENVELOPE_TAGS: [&str; 6] = [
+    "command-message",
+    "command-name",
+    "local-command-caveat",
+    "task-notification",
+    "local-command-stdout",
+    "bash-stdout",
+];
+
+/// Did the person type this `user` record (D-02)?
+///
+/// Read off the record's OWN `message.content` and its own `isMeta`, never the
+/// top-level `toolUseResult` (D-01, D-06): the block rule is a strict superset
+/// of the key rule - over 400 sampled transcripts the key implies the block in
+/// 12,234 of 12,234 cases and the block appears without the key in 282 more -
+/// and the key's own shape is a dict on 6,265 records, a string on 522 and a
+/// list on 35, so any test that treated it as an object would misclassify 8.2%
+/// of them. Reading message content and nothing else is also what makes the
+/// answer survive `[capture]` elision (D-07), which replaces `toolUseResult`
+/// and `attachment` and never touches `message.content`, so a `lean` or
+/// `minimal` ingest and a later blob-only rebuild agree.
+///
+/// `promptSource` is not consulted: it is present on 57 of 400 records and on
+/// no tool-result record at all, so it cannot carry the distinction.
+fn is_typed(value: &Value) -> bool {
+    // Every command caveat the harness inserts, whatever its content shape.
+    if value.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+
+    let text = match value.get("message").and_then(|m| m.get("content")) {
+        Some(Value::String(text)) => text.as_str(),
+        Some(Value::Array(blocks)) => {
+            // The tool-result test wins over the text one (D-05): a record
+            // carrying both blocks is a tool result the harness wrote, and the
+            // two real examples of it are fork boilerplate in `agent-*.jsonl`.
+            if blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            {
+                return false;
+            }
+            match blocks
+                .iter()
+                .find(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .and_then(|block| block.get("text"))
+                .and_then(Value::as_str)
+            {
+                Some(text) => text,
+                None => return true,
+            }
+        }
+        _ => return true,
+    };
+
+    !opens_with_envelope_tag(text)
+}
+
+/// Does this text OPEN with one of [`HARNESS_ENVELOPE_TAGS`]?
+///
+/// The leading tag and never "the text contains a tag": roughly 200
+/// person-typed prompts in the same 400-transcript sample carry `<objective>`,
+/// `<execution_context>` and `<process>` tags inside them, and every one of
+/// them is a prompt someone typed. The tag closes immediately - measured, all
+/// 345 leading tags in a 300-transcript sample are `<name>` with no attribute -
+/// so a `<command-message-of-my-own>` a person wrote does not match.
+fn opens_with_envelope_tag(text: &str) -> bool {
+    let Some(rest) = text.trim_start().strip_prefix('<') else {
+        return false;
+    };
+    HARNESS_ENVELOPE_TAGS.iter().any(|tag| {
+        rest.strip_prefix(tag)
+            .is_some_and(|after| after.starts_with('>'))
+    })
 }
 
 /// The first `tool_use` block's name in `message.content`.

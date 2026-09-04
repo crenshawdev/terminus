@@ -28,6 +28,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::blob::BlobReader;
 use crate::error::Result;
 use crate::index::text;
+use crate::observe::egress::Redaction;
 use crate::recall::search::Hit;
 use crate::recall::Query;
 
@@ -64,7 +65,19 @@ pub struct Reads {
 /// intact. A search is not the command that reports archive damage - `verbatim
 /// verify` is - and failing the whole search because one session of many is
 /// corrupt would hide the results that are fine.
-pub fn attach(conn: &Connection, query: &Query, hits: &mut [Hit]) -> Result<Reads> {
+///
+/// `redaction` is the CALLER's (phase 4 D-01). Nothing here reads a `Config`,
+/// so whether a surface filters stays a property of its own call site and is
+/// reviewable there: both of this function's callers - `search::run` and
+/// `inject::prompt` - resolve `Redaction::of` from the config they already
+/// hold, and each could be changed without the other moving. That is the point
+/// of the parameter, not an accident of them currently agreeing.
+pub fn attach(
+    conn: &Connection,
+    query: &Query,
+    hits: &mut [Hit],
+    redaction: &Redaction<'_>,
+) -> Result<Reads> {
     let mut reads = Reads::default();
     if hits.is_empty() {
         return Ok(reads);
@@ -103,7 +116,7 @@ pub fn attach(conn: &Connection, query: &Query, hits: &mut [Hit]) -> Result<Read
             let Ok(bytes) = reader.read_range(*offset as u64, *len as u64) else {
                 continue;
             };
-            hits[index].excerpt = of_record(query, &bytes);
+            hits[index].excerpt = of_record_with(query, &bytes, redaction);
         }
     }
 
@@ -136,17 +149,46 @@ fn coordinates(conn: &Connection, hits: &[Hit]) -> Result<BTreeMap<i64, (i64, i6
     Ok(out)
 }
 
-/// One record's bytes, as the sentence a reader should see.
+/// One record's bytes, as the sentence a reader should see - unfiltered.
 ///
 /// Public because a context window projects its turns the same way (RCL-08):
 /// one rule for what a turn said, whatever asked for it.
+///
+/// This is [`of_record_with`] under [`Redaction::none`], and it is the
+/// signature every caller had before the egress knob existed. A model-facing
+/// caller passes its own redaction through [`of_record_with`] instead.
 pub fn of_record(query: &Query, record: &[u8]) -> String {
+    of_record_with(query, record, &Redaction::none())
+}
+
+/// One record's projection, with the caller's redaction applied to it
+/// (PRIV-03).
+///
+/// **The filter runs over the FULL projection, before the window is cut**
+/// (phase 4 D-02). Every value-shape rule in `observe::egress` needs a
+/// secret's NAME and its VALUE in the same string - `Authorization: Bearer
+/// <v>`, `--token <v>`, `"password": "<v>"` - and [`EXCERPT_CHARS`] is a
+/// 240-character window centred on the first query token, so a name that falls
+/// outside the cut is a value no rule can see. Filtering the window afterwards
+/// would leave exactly the secrets whose labels were trimmed off, and would
+/// pass a test whose planted secret happened to land whole inside the window.
+///
+/// Before [`flatten`] as well as before [`window`], and that ordering is also
+/// load-bearing: the projection is newline-joined by construction and the
+/// header rule is written per line, so collapsing it to one line first would
+/// hand every rule a single line and change what "anywhere on a line" means.
+///
+/// What it costs is measured rather than argued. Over the live store on
+/// 2026-09-04, scrubbing the real projection of every turn of the 60 most
+/// recent sessions (5,412 records, 12.9 MB) changed 0.18% of projections.
+pub fn of_record_with(query: &Query, record: &[u8], redaction: &Redaction<'_>) -> String {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(record) else {
         // A line that is not JSON is archived verbatim all the same (D-13), and
         // it has no projection. Nothing to excerpt is an empty excerpt.
         return String::new();
     };
-    window(query, &flatten(&text::project(&value)))
+    let projected = text::project(&value);
+    window(query, &flatten(&redaction.apply(&projected)))
 }
 
 /// The projection as one line: runs of whitespace become single spaces.

@@ -30,10 +30,30 @@ use std::process::{Command, Output, Stdio};
 use std::time::Instant;
 
 use serde_json::Value;
+use verbatim_core::config::REDACTED;
 use verbatim_core::testkit;
 
 /// The fixture whose `cwd` names `project-alpha` beneath the test's own root.
 const FIXTURE: &str = "session-recall.jsonl";
+
+/// The fixture whose `cwd` names `project-gamma`, and whose last `user` record
+/// is a `<task-notification>` envelope rather than a prompt.
+///
+/// The byte-identity test seeds from this one and not from [`FIXTURE`] (D-15).
+/// `session-recall.jsonl`'s only `user` record is a plain text block, so the
+/// turn the brief quotes is the same one under INJ-07's rule and under the rule
+/// it replaced - a test on it cannot observe this phase's change at all, and
+/// two identical briefs of the wrong turn would satisfy byte identity just as
+/// well as two right ones.
+const MOVED_FIXTURE: &str = "session-envelope.jsonl";
+
+/// The one `user` record of [`MOVED_FIXTURE`] a person typed, which is what the
+/// brief must quote.
+const TYPED: &str = "wire up the quince exporter";
+
+/// The two it did not: the tool result's output and the envelope's text. Either
+/// one in the brief is the defect INJ-07 exists to close.
+const NOT_TYPED: [&str; 2] = ["press.toml", "background scan of the modules directory"];
 
 /// Every directory a spawned `verbatim` may touch, all of them temporary.
 struct Bench {
@@ -160,14 +180,19 @@ fn time_of_day(text: &str) -> Option<String> {
 /// it stands on its own: a brief that changes while the archive does not is a
 /// brief nobody can reason about.
 ///
-/// The time-of-day half is the falsifiable one. Dates are rounded to the day
-/// (INJ-02), so no `NN:NN` may appear anywhere in the output - not in the
-/// rendered date, not carried in from a quoted turn.
+/// Two halves are falsifiable, and both have to be: two empty briefs are
+/// byte-identical, and so are two briefs quoting the wrong turn.
+///
+/// Dates are rounded to the day (INJ-02), so no `NN:NN` may appear anywhere in
+/// the output - not in the rendered date, not carried in from a quoted turn.
+/// And the store is seeded from [`MOVED_FIXTURE`], whose last `user` record is
+/// a harness envelope, so the bytes have to carry the prompt somebody typed and
+/// neither of the two records nobody did (INJ-07).
 #[test]
 fn two_session_starts_against_an_unchanged_store_are_byte_identical() {
     let bench = bench();
-    bench.ingest(FIXTURE);
-    let payload = payload(&bench.project(FIXTURE));
+    bench.ingest(MOVED_FIXTURE);
+    let payload = payload(&bench.project(MOVED_FIXTURE));
 
     let first = bench.hook("SessionStart", &payload);
     let second = bench.hook("SessionStart", &payload);
@@ -194,6 +219,17 @@ fn two_session_starts_against_an_unchanged_store_are_byte_identical() {
         None,
         "the brief carries a time of day: {text}"
     );
+
+    assert!(
+        text.contains(TYPED),
+        "the brief does not quote the prompt somebody typed: {text}"
+    );
+    for absent in NOT_TYPED {
+        assert!(
+            !text.contains(absent),
+            "the brief carries {absent:?}, out of a user record nobody typed: {text}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +247,11 @@ fn two_session_starts_against_an_unchanged_store_are_byte_identical() {
 /// The percentiles are printed as well as asserted: a regression that says
 /// "p99 12.4 ms against 10 ms" is a number the next run can be compared
 /// against, where a bare failed assertion is not.
+///
+/// This one stays on [`FIXTURE`] while the byte-identity test above moved to
+/// [`MOVED_FIXTURE`]: the numbers printed here have been measured against
+/// `session-recall.jsonl` since phase 5, and re-pointing them at a different
+/// session would silently make every earlier reading incomparable.
 #[test]
 fn a_hundred_session_starts_stay_inside_the_budget_and_the_wall_clock() {
     const RUNS: usize = 100;
@@ -281,4 +322,167 @@ fn a_hundred_session_starts_stay_inside_the_budget_and_the_wall_clock() {
     let p99 = millis[(RUNS * 99) / 100 - 1];
     println!("SessionStart brief: p50 {p50:.2} ms, p99 {p99:.2} ms over {RUNS} runs");
     assert!(p99 < WALL_MS, "p99 {p99:.2} ms is over {WALL_MS} ms");
+}
+
+// ---------------------------------------------------------------------------
+// AC1 and AC4: the brief's quote under the redaction knob (PRIV-03)
+
+impl Bench {
+    /// `hook`, with extra environment variables set on the spawn.
+    ///
+    /// Its own method rather than a parameter on `hook` because every other
+    /// spawn's claim is about the environment `command` builds; carrying
+    /// anything else is the exception under test and should read like one.
+    fn hook_with_env(&self, event: &str, payload: &Value, env: &[(&str, &str)]) -> Output {
+        let mut command = self.command(&["hook", event]);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the hook");
+        let line = format!("{payload}\n");
+        child
+            .stdin
+            .take()
+            .expect("the hook's stdin")
+            .write_all(line.as_bytes())
+            .expect("write the payload");
+        child.wait_with_output().expect("wait for the hook")
+    }
+}
+
+/// The fixture whose `cwd` names `project-delta` and whose turns each carry one
+/// credential shape with no surrounding name-keyed context.
+const SECRETS_FIXTURE: &str = "session-secrets.jsonl";
+
+/// The `Cookie` value in the last turn of that fixture a person typed, which is
+/// the turn the brief quotes.
+const COOKIE_SENTINEL: &str = "sid-VBEGRESS-qcrumb-1f9";
+
+/// The fragment every planted sentinel in that fixture shares.
+///
+/// Asserted on rather than the one value under test: the brief quotes two turns
+/// and counts a whole session, and one surviving sentinel of any shape is a
+/// leak.
+const SENTINEL_MARK: &str = "VBEGRESS";
+
+/// PRIV-03's knob, written the only way anything can turn it on.
+///
+/// A file in the config directory the spawn points at, and no environment
+/// variable (D-07): the hook loads `Config` in-process, so a variable it could
+/// inherit would be a way to turn this off from outside the config file.
+const KNOB_ON: &str = "[privacy]\nredact_recall = true\n";
+
+/// The brief a `SessionStart` run emitted, out of the payload the harness reads.
+///
+/// Asserts the frame as it goes - exit 0, exactly one object on stdout, the
+/// event name the harness rejects a mismatch on - so a test below can be about
+/// the text alone.
+fn additional_context(output: &Output, label: &str) -> String {
+    assert!(
+        output.status.success(),
+        "{label} exited {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("{label} wrote nothing to stdout"));
+    assert_eq!(
+        lines.next(),
+        None,
+        "{label} wrote more than the one object: {text:?}"
+    );
+    let document: Value = serde_json::from_str(first)
+        .unwrap_or_else(|e| panic!("{label} is not one JSON object ({e}): {text:?}"));
+    let inner = document
+        .get("hookSpecificOutput")
+        .unwrap_or_else(|| panic!("{label} carries no hookSpecificOutput: {document}"));
+    assert_eq!(
+        inner.get("hookEventName").and_then(Value::as_str),
+        Some("SessionStart"),
+        "{label}: {document}"
+    );
+    inner
+        .get("additionalContext")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("{label} carries no additionalContext: {document}"))
+        .to_owned()
+}
+
+/// AC1's fourth output, asserted where Claude Code reads it: the brief's quoted
+/// prompt carries the planted `Cookie` value with no `verbatim.toml`, and the
+/// marker instead once the knob is on.
+///
+/// Both halves are needed. A build that filtered nothing passes the first and a
+/// build that emitted an empty brief passes the second, so the same spawn is
+/// run twice over one store with nothing changed between them but a file on
+/// disk - and the second run's frame is asserted too, because a hook that
+/// crashed rather than filtered would also carry no sentinel.
+#[test]
+fn the_knob_filters_the_briefs_quoted_prompt_at_the_hook_boundary() {
+    let bench = bench();
+    bench.ingest(SECRETS_FIXTURE);
+    let payload = payload(&bench.project(SECRETS_FIXTURE));
+
+    let default = bench.hook("SessionStart", &payload);
+    let context = additional_context(&default, "the run with no verbatim.toml");
+    assert!(
+        context.contains(COOKIE_SENTINEL),
+        "the premise: the brief really does quote a turn carrying a credential:\n{context}"
+    );
+
+    std::fs::write(bench.config_dir.join("verbatim.toml"), KNOB_ON).unwrap();
+
+    let filtered = bench.hook("SessionStart", &payload);
+    let context = additional_context(&filtered, "the run with the knob on");
+    assert!(
+        context.contains(REDACTED),
+        "the marker names what went:\n{context}"
+    );
+    assert!(
+        !context.contains(SENTINEL_MARK),
+        "a sentinel survived into the brief:\n{context}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&filtered.stdout).contains(SENTINEL_MARK),
+        "a sentinel survived somewhere else in the payload:\n{}",
+        String::from_utf8_lossy(&filtered.stdout)
+    );
+}
+
+/// AC4's hook half: no environment variable reaches past the knob.
+///
+/// D-07 chose a per-invocation CLI flag over an environment variable precisely
+/// because the hook loads `Config` in-process and would inherit one. The
+/// variables spelled here are the three a reader of `--raw` would reach for:
+/// bare, `VERBATIM_`-prefixed, and the config key itself.
+#[test]
+fn no_environment_variable_reaches_past_the_knob_on_the_session_start_brief() {
+    let bench = bench();
+    bench.ingest(SECRETS_FIXTURE);
+    let payload = payload(&bench.project(SECRETS_FIXTURE));
+    std::fs::write(bench.config_dir.join("verbatim.toml"), KNOB_ON).unwrap();
+
+    let output = bench.hook_with_env(
+        "SessionStart",
+        &payload,
+        &[
+            ("RAW", "1"),
+            ("VERBATIM_RAW", "1"),
+            ("VERBATIM_REDACT_RECALL", "false"),
+        ],
+    );
+    let context = additional_context(&output, "the run carrying raw-looking variables");
+    assert!(context.contains(REDACTED), "{context}");
+    assert!(
+        !context.contains(SENTINEL_MARK),
+        "an environment variable unfiltered the brief:\n{context}"
+    );
 }

@@ -35,6 +35,7 @@ pub mod ingest;
 pub mod inject;
 pub mod lineage;
 pub mod observe;
+pub mod owner_only;
 pub mod parse;
 pub mod project;
 pub mod recall;

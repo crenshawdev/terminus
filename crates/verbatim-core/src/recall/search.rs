@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::Result;
+use crate::observe::egress::Redaction;
 use crate::recall::excerpt;
 use crate::recall::query::EntityMatch;
 use crate::recall::scope::{self, Reason, Scope};
@@ -351,7 +352,7 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
     // [`OBSERVATION_KIND`]. Taken after the scope resolves, so an excluded or
     // unknown project answers with the same reason it would for a turn search.
     if request.filters.kind.as_deref() == Some(OBSERVATION_KIND) {
-        return observations(conn, request, &scoped);
+        return observations(conn, request, &scoped, &Redaction::of(config));
     }
 
     let Some(expression) = expression(request) else {
@@ -421,7 +422,12 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
     // session and the candidate pool is four times what the caller asked for.
     // And not at all when the caller said so - see [`Request::excerpts`].
     let reads = if request.excerpts {
-        excerpt::attach(conn, &request.query, &mut hits)?
+        // The knob is read HERE, at the entry point that already holds the
+        // config, and travels down as a value (phase 4 D-01). Rule 1 is fed
+        // this run's provider credential when there is one; on the common
+        // machine there is not, and the filter rests on the shape rules alone
+        // (D-10).
+        excerpt::attach(conn, &request.query, &mut hits, &Redaction::of(config))?
     } else {
         excerpt::Reads::default()
     };
@@ -473,11 +479,33 @@ fn expression(request: &Request) -> Option<String> {
 /// session for a hit whose `turn_id` points at a different turn from the one the
 /// claim text came out of.
 ///
+/// **Filtered on READ, not only on write** (PRIV-03, phase 4 D-05). Because
+/// this branch never calls `attach`, the redaction has to be applied here or
+/// not at all - and applied here it covers claim rows written BEFORE the knob
+/// was turned on, with no regeneration and no user action. That is the whole
+/// reason for doing it on the read side: the alternative is a `doctor` line
+/// telling the user to regenerate their observations, and until they did,
+/// `recall_search --kind observation` would hand the model raw claim text from
+/// every row that predates the flip. Filtering twice is free - every marker
+/// `observe::egress` leaves is one whitespace-free token and every value run
+/// stops at whitespace, so a marker is replaced by itself - which is what makes
+/// this safe to run over a row the write side already filtered.
+///
+/// **Nothing but the text moves.** `turn_id`, `session_key`, `ts`, `project`
+/// and the flat `relevance` are untouched: OBS-03's anchor is the only thing
+/// that makes a claim auditable, and a filter that could shift it would trade
+/// one leak for a claim nobody can check.
+///
 /// **No `before_turn_id`.** That bound is `verbatim replay`'s alone and replay
 /// never sets a `kind`, so there is nothing here to implement it for. It also
 /// could not mean the same thing: an observation is written long after the turns
 /// it anchors to.
-fn observations(conn: &Connection, request: &Request, scoped: &scope::Scoped) -> Result<Response> {
+fn observations(
+    conn: &Connection,
+    request: &Request,
+    scoped: &scope::Scoped,
+    redaction: &Redaction<'_>,
+) -> Result<Response> {
     // The table, not the row count: a store written before phase 7 has no
     // `observations` at all, and left to the query that is `no such table`
     // inside an error rather than an answer.
@@ -555,7 +583,7 @@ fn observations(conn: &Connection, request: &Request, scoped: &scope::Scoped) ->
                 // and every hit matched every token, so nothing distinguishes
                 // them. The ORDER BY below is what makes the result stable.
                 relevance: 1.0,
-                excerpt: row.get(5)?,
+                excerpt: redaction.apply(&row.get::<_, String>(5)?).into_owned(),
             })
         })?
         .collect::<rusqlite::Result<Vec<Hit>>>()?;

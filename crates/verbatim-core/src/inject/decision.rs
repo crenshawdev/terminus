@@ -275,7 +275,10 @@ fn write_file(dir: &Path, decision: &Decision) -> Option<PathBuf> {
     // value carrying a separator, a `..` or a NUL must reach no `create_dir_all`
     // and no `join` at all.
     let stem = file_stem(decision.session_id.as_deref()?)?;
-    std::fs::create_dir_all(dir).ok()?;
+    // `decisions/` alone: [`Decision::save`] refuses a data directory that does
+    // not exist (INJ-06), so the parent is never this call's to create and the
+    // leaf is the only thing here to narrow (D-04).
+    crate::owner_only::create_dir_all(dir).ok()?;
     let bytes = serde_json::to_vec(decision).ok()?;
 
     let (temporary, mut file) = create_temporary(dir)?;
@@ -291,12 +294,15 @@ fn write_file(dir: &Path, decision: &Decision) -> Option<PathBuf> {
     // One session submits many prompts, so the name has to be unique per EVENT
     // and not per session. The target is reserved with `create_new` rather than
     // probed with `exists`, so two prompts of one session landing in the same
-    // millisecond cannot both pick the same name and lose one record.
+    // millisecond cannot both pick the same name and lose one record. The
+    // reservation carries 0600 as well, because the rename below replaces the
+    // file it reserved and a reservation left behind on a failed rename would
+    // otherwise be a wide empty file in the data directory.
     let stamp = decision.at_ms;
     let pid = std::process::id();
     for attempt in 0..ATTEMPTS {
         let target = dir.join(format!("{stem}-{pid}-{stamp}-{attempt}.json"));
-        match std::fs::OpenOptions::new()
+        match crate::owner_only::options()
             .write(true)
             .create_new(true)
             .open(&target)
@@ -343,11 +349,16 @@ fn file_stem(session_id: &str) -> Option<String> {
 ///
 /// The name can never collide with a record's own: it starts with a dot and ends
 /// in `.tmp`, and [`file_stem`] admits neither character.
+///
+/// Owner-only from the moment it exists. The temporary holds the whole record -
+/// the prompt's spellings, the candidates and what was injected - under its own
+/// name for the length of the write, so the mode has to ride the create rather
+/// than follow the bytes.
 fn create_temporary(dir: &Path) -> Option<(PathBuf, std::fs::File)> {
     let pid = std::process::id();
     for attempt in 0..ATTEMPTS {
         let path = dir.join(format!(".decision-{pid}-{attempt}.tmp"));
-        match std::fs::OpenOptions::new()
+        match crate::owner_only::options()
             .write(true)
             .create_new(true)
             .open(&path)
@@ -476,6 +487,41 @@ mod tests {
         // assertions above are about is the name and not the directory.
         assert!(Decision::opened(Some(SESSION), None, "hello").save(&data_dir));
         assert!(data_dir.join(DIR_NAME).is_dir());
+    }
+
+    /// PRIV-02, PRIV-04: a decision record carries the prompt's spellings, its
+    /// candidates and what was injected, so neither the directory nor the file
+    /// is readable by group or world.
+    ///
+    /// The data directory is made by hand at the umask's own 0755 and stays
+    /// there: [`Decision::save`] refuses a data directory that does not exist,
+    /// so this call never creates one and has none to narrow. `decisions/` is
+    /// the leaf it does create, and that is the one it owns.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_and_its_directory_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        assert!(full().save(&data_dir), "the record did not land");
+
+        let decisions = data_dir.join(DIR_NAME);
+        assert_eq!(mode(&decisions), 0o700, "decisions/ is not owner-only");
+
+        let found = read_all(&data_dir);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(mode(&found[0].path), 0o600, "the record is not owner-only");
+
+        // Nothing beside it: the temporary and the reservation both carry 0600
+        // for their whole lives, and neither is left for a stat to find.
+        assert_eq!(std::fs::read_dir(&decisions).unwrap().count(), 1);
     }
 
     /// INJ-06: a machine that has installed verbatim and never ingested is left

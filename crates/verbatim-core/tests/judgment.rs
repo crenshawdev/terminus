@@ -90,16 +90,35 @@ impl Bench {
     /// A config pointing judgment at `stub`, with the destination declared
     /// local so the egress filter is not what this file is measuring.
     fn config(&self, stub: &HttpStub) -> Config {
+        self.config_with(stub, "")
+    }
+
+    /// The same config with more `verbatim.toml` after it.
+    ///
+    /// One writer for the provider table so the two helpers cannot drift: what
+    /// PRIV-03's tests need is this exact config - `local = true` included -
+    /// plus a `[privacy]` table, and a second copy of the provider block would
+    /// eventually stop being the same config the rest of the file uses.
+    fn config_with(&self, stub: &HttpStub, extra: &str) -> Config {
         std::fs::write(
             self.config_dir.join(CONFIG_FILE_NAME),
             format!(
                 "[provider]\nenabled = true\nbase_url = \"{}\"\n\
-                 model = \"{MODEL}\"\nlocal = true\n",
+                 model = \"{MODEL}\"\nlocal = true\n{extra}",
                 stub.base_url()
             ),
         )
         .unwrap();
         Config::load_from(&self.config_dir).unwrap()
+    }
+
+    /// That config with PRIV-03's knob written either way.
+    ///
+    /// A `verbatim.toml` is the only thing that can set it - there is no
+    /// in-memory setter - and `on = false` spells the key out rather than
+    /// omitting it, so the two configs differ in one token of one file.
+    fn redacting(&self, stub: &HttpStub, on: bool) -> Config {
+        self.config_with(stub, &format!("\n[privacy]\nredact_recall = {on}\n"))
     }
 
     /// Every `turns.id` of one session, which is the whole of what a claim of
@@ -685,4 +704,206 @@ fn an_abandoned_reservation_is_taken_only_once_the_lease_has_lapsed() {
         bench.row(&judged).status.as_deref(),
         Some(judgment::STATUS_OK)
     );
+}
+
+// ---------------------------------------------------------------------------
+// PRIV-03: the judgment columns, filtered before they reach SQLite
+// ---------------------------------------------------------------------------
+
+/// One distinct sentinel per column the filter has to reach, so a survivor
+/// names which column let it through.
+///
+/// Each is planted in a shape the rule set owns - a header line - because the
+/// only exact rule is fed the request's own credential and this bench sends
+/// none, exactly like the common machine with no provider key.
+const TOPIC_SENTINEL: &str = "sk-VBJUDGE-topic-7a1";
+const DECISION_SENTINEL: &str = "sk-VBJUDGE-decide-3c5";
+const LEARNED_SENTINEL: &str = "sid-VBJUDGE-learn-8e2";
+const UNRESOLVED_SENTINEL: &str = "sk-VBJUDGE-open-4b9";
+
+/// The fragment all four share: one survivor of any of them is a leak.
+const SENTINEL_MARK: &str = "VBJUDGE";
+
+/// A well-formed answer that quotes a credential in `topic` and in every one of
+/// the three claim lists.
+///
+/// `outcome` is one of the four and carries no sentinel, and it cannot: `read`
+/// refuses every other value, so an answer that put a credential there never
+/// becomes a judgment at all. That path has a test of its own below.
+fn leaky_answer(ids: &[i64]) -> String {
+    serde_json::json!({
+        "topic": format!("the sync run it kept retrying with Authorization: Bearer {TOPIC_SENTINEL}"),
+        "outcome": "partial",
+        "decisions": [{
+            "turn_id": ids[0],
+            "text": format!("kept the header Authorization: Bearer {DECISION_SENTINEL} on the retry"),
+        }],
+        "learned": [{
+            "turn_id": ids[1 % ids.len()],
+            "text": format!("the gateway echoes Cookie: {LEARNED_SENTINEL} back on a 403"),
+        }],
+        "unresolved": [{
+            "turn_id": ids[2 % ids.len()],
+            "text": format!("nobody rotated Authorization: Bearer {UNRESOLVED_SENTINEL} yet"),
+        }],
+    })
+    .to_string()
+}
+
+/// Store one leaky answer under a config the test chooses, and hand back the
+/// row and the session's real turn ids.
+fn judged_under(bench: &Bench, on: bool) -> (Row, Vec<i64>) {
+    let (judged, _other) = bench.observed();
+    let ids = bench.turn_ids(&judged);
+    assert!(ids.len() >= 3, "the fixture must carry turns: {ids:?}");
+
+    let stub = HttpStub::serving(&[testkit::chat_completion(&leaky_answer(&ids), 1, 1)]);
+    let config = bench.redacting(&stub, on);
+
+    let verdict = judgment::judge(&bench.conn(), &config, None, &judged);
+    assert_eq!(verdict, Verdict::Stored { tokens: 2 }, "{verdict:?}");
+
+    let row = bench.row(&judged);
+    assert_eq!(row.status.as_deref(), Some(judgment::STATUS_OK));
+    (row, ids)
+}
+
+/// Every text column the judgment half writes, as one string.
+fn columns(row: &Row) -> String {
+    [
+        row.topic.as_deref(),
+        row.outcome.as_deref(),
+        row.decisions.as_deref(),
+        row.learned.as_deref(),
+        row.unresolved.as_deref(),
+    ]
+    .map(|column| column.expect("a judgment column").to_owned())
+    .join("\n")
+}
+
+/// The default, stated as an assertion: with the knob absent the answer is
+/// stored exactly as the provider sent it.
+#[test]
+fn an_unfiltered_judgment_stores_the_planted_credentials_whole() {
+    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let bench = bench();
+    let (row, _ids) = judged_under(&bench, false);
+
+    for sentinel in [
+        TOPIC_SENTINEL,
+        DECISION_SENTINEL,
+        LEARNED_SENTINEL,
+        UNRESOLVED_SENTINEL,
+    ] {
+        assert!(
+            columns(&row).contains(sentinel),
+            "the default must not filter the judgment: {sentinel:?} is gone"
+        );
+    }
+}
+
+/// AC5: with the knob on, a direct SQL read of the judgment columns finds the
+/// marker and none of the planted credentials.
+///
+/// The config this runs under declares `provider.local = true`, which is what
+/// makes this a test of D-03 as well: `local` is a declaration about where the
+/// REQUEST went, and it says nothing about a column `recall_search --kind
+/// observation` hands the model. A filter routed through
+/// `egress::for_destination` returns the text untouched here and fails.
+#[test]
+fn the_knob_filters_a_judgment_before_it_reaches_sqlite() {
+    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let bench = bench();
+    let (row, ids) = judged_under(&bench, true);
+
+    for column in [&row.topic, &row.decisions, &row.learned, &row.unresolved] {
+        let column = column.as_deref().expect("a judgment column");
+        assert!(
+            column.contains(verbatim_core::config::REDACTED),
+            "a filtered column names what went: {column}"
+        );
+    }
+    for absent in [
+        TOPIC_SENTINEL,
+        DECISION_SENTINEL,
+        LEARNED_SENTINEL,
+        UNRESOLVED_SENTINEL,
+        SENTINEL_MARK,
+    ] {
+        assert!(
+            !columns(&row).contains(absent),
+            "{absent:?} survived into the observations row:\n{}",
+            columns(&row)
+        );
+    }
+
+    // OBS-03: the anchors are untouched. A claim is only auditable because it
+    // points at a real turn, and a filter that moved one would be worse than
+    // the leak it was fixing.
+    let real: BTreeSet<i64> = ids.iter().copied().collect();
+    let anchored = row.anchors();
+    assert_eq!(anchored.len(), 3, "one claim per list: {anchored:?}");
+    for anchor in anchored {
+        assert!(
+            real.contains(&anchor),
+            "{anchor} is not a turn of this session"
+        );
+    }
+
+    // `outcome` is one of the four, filtered or not: the filter runs over it and
+    // has nothing to take.
+    assert_eq!(row.outcome.as_deref(), Some("partial"));
+    assert_eq!(row.raw, None);
+}
+
+/// The column the knob cannot reach, and does not need to.
+///
+/// `read` refuses every `outcome` but the four in `OUTCOMES`, so an answer that
+/// puts a credential there never becomes a judgment and never reaches `store`.
+/// It lands on the `parse_failed` path instead, whose `raw` is scrubbed
+/// unconditionally under D-16 - which is why this is asserted with the knob
+/// ABSENT: that scrub is not the knob's to gate, and a refactor that routed it
+/// through the knob would fail here.
+#[test]
+fn an_outcome_carrying_a_credential_never_becomes_a_stored_judgment() {
+    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
+    let bench = bench();
+    let (judged, _other) = bench.observed();
+    let ids = bench.turn_ids(&judged);
+
+    let content = serde_json::json!({
+        "topic": "an outcome that is not one of the four",
+        "outcome": format!("Authorization: Bearer {TOPIC_SENTINEL}"),
+        "decisions": [{"turn_id": ids[0], "text": "a claim that never gets stored"}],
+        "learned": [], "unresolved": [],
+    })
+    .to_string();
+    let stub = HttpStub::serving(&[
+        testkit::chat_completion(&content, 1, 1),
+        testkit::chat_completion(&content, 1, 1),
+    ]);
+    let config = bench.redacting(&stub, false);
+
+    let verdict = judgment::judge(&bench.conn(), &config, None, &judged);
+    assert!(
+        matches!(verdict, Verdict::ParseFailed { .. }),
+        "an outcome outside the four was accepted: {verdict:?}"
+    );
+
+    let row = bench.row(&judged);
+    assert_eq!(
+        row.status.as_deref(),
+        Some(judgment::STATUS_PARSE_FAILED),
+        "{row:?}"
+    );
+    // No judgment columns at all, so there is nothing there to have leaked.
+    assert_eq!(row.topic, None);
+    assert_eq!(row.outcome, None);
+    assert_eq!(row.decisions, None);
+
+    // And the text that DID come back is scrubbed with the knob absent, because
+    // that half was never the knob's.
+    let raw = row.raw.as_deref().expect("the failed answer is kept");
+    assert!(raw.contains(verbatim_core::config::REDACTED), "{raw}");
+    assert!(!raw.contains(SENTINEL_MARK), "{raw}");
 }

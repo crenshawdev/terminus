@@ -19,6 +19,8 @@ by hand without re-deriving the others will fail
 | `session-compacted.jsonl` | D-21/D-08: a session ending in a `compact_boundary` record whose `compactMetadata` bytes are stored verbatim |
 | `session-recall.jsonl` | Phase 3 D-01/D-13: a `SearchManager` turn, an `src/worker/S.ts` turn, and AC3's structured-versus-prose pair - a `Read` `tool_use` naming a file against an assistant turn naming that same file in prose |
 | `session-edits.jsonl` | Phase 5 D-05: an `Edit` `tool_use` storing an **absolute** path beneath the fixture root, the spelling the real corpus almost always uses, with symbols beside it so one turn carries two independent entities - and a prose turn naming the same file structurally invisibly |
+| `session-envelope.jsonl` | v0.1.1 phase 1 D-02/D-13/D-15: a session whose **last** `user` record is a `<task-notification>` envelope and whose second-to-last is a `tool_result`, so the turn the resume brief quotes moves under INJ-07's rule |
+| `session-secrets.jsonl` | v0.1.1 phase 2 D-15: one turn for each of the seven credential shapes the egress filter must catch on the remote provider path - an `Authorization: Bearer` header, a JSON `"password"` pair, a space-separated `--token` flag, a mid-line `Cookie` with prose after it, a bare JWT, a GitHub token and a connection URL carrying userinfo |
 | `session-errors-a.jsonl` | Phase 3 D-03/D-04: `tool_result` blocks with `is_error` and a `toolUseResult` carrying `stdout`/`stderr`/`interrupted`, holding the a-half of both stderr pairs |
 | `session-errors-b.jsonl` | Phase 3 D-04, the b-half: one stderr differing from a's only in the parts normalization strips, one differing only in a bare integer it must not |
 | `subagents/agent-alpha.jsonl` | D-01: a sidecar reporting its *parent's* `sessionId` |
@@ -231,14 +233,65 @@ and emits no entity at all, so "matched structurally" and "mentions the words"
 stay two different answers about one file, the way `session-recall.jsonl`
 already does for the relative case.
 
+**`session-secrets.jsonl`** is the v0.1.1 phase 2 egress fixture: ten turns
+that exist to be *sent*, not to be found. Each of the seven shapes the widened
+egress rule set is asked to catch sits in a turn of its own, so a wire test can
+assert on one sentinel at a time and attribute the catch to one rule.
+
+Four of the seven - the bare JWT, the GitHub token, the connection URL's
+userinfo and the space-separated `--token` value - sit with **no name-keyed text
+beside them**. That is the load-bearing part: written `GITHUB_TOKEN=ghp_...`
+instead, the assignment rule would catch it and the assertion would be about
+nothing. The `Cookie` turn puts its value **mid-line** with ordinary prose after
+it on the same line, which is what makes "the rest of the turn survived the
+match" a thing a test can read.
+
+Its sentinels are short, unrealistic and distinct from one another
+(`ghp_VBEGRESSgh0zq`, `sk-VBEGRESS-authz-9f2`), following this repository's
+existing convention: a realistic-length credential in a public repository risks
+GitHub push protection, and a shared sentinel would let one rule's catch pass as
+another's.
+
+Like `session-envelope.jsonl` it is deliberately inert. Its project key is a
+**fourth** one, `project-delta`, which no assertion anywhere scopes against; it
+carries no `tool_use` and therefore emits no entity; and its vocabulary shares
+none of the corpus's counted tokens - no `brillig`, no `SearchManager`, no
+`cargo`, none of the paths the entity tests match on.
+
+**`session-envelope.jsonl`** is the v0.1.1 phase 1 brief fixture: five records
+whose last `user` record is not one a person typed. In order - a `user` text
+turn (`wire up the quince exporter and tell me what it prints`, the prompt the
+brief must end up quoting), an `assistant` turn carrying a `Glob` `tool_use`, a
+`user` turn whose `message.content` is a `tool_result` block and whose top-level
+`toolUseResult` carries a `stdout` string and nothing else, an `assistant` text
+turn, and last a `user` text turn opening with `<task-notification>`.
+
+That covers D-02's two not-typed shapes at once, and it is the *last* record
+being one of them that matters: a brief reading "the last `user` turn" quotes
+the envelope, and a brief reading "the last typed `user` turn" quotes record
+one. `session-recall.jsonl` cannot observe that difference - its only `user`
+record is a plain text block - which is why `crates/verbatim/tests/brief.rs`'s
+byte-identity test seeds from this file instead (D-15).
+
+Three things about it are deliberate. Its project key is a **third** one,
+`project-gamma`: every project-scoped assertion elsewhere in the repository is
+written against `project-alpha` or `project-beta`, so a new member of neither
+moves none of them. Its tool is `Glob`, which appears in no other fixture and
+whose `pattern` input emits no entity beyond the tool itself, so no entity count
+anywhere moves either. And its vocabulary shares nothing with the corpus's
+counted tokens - no `brillig`, no `SearchManager`, no `cargo`, none of the
+paths the entity tests match on.
+
 ## The rooted `cwd`
 
-The phase 1 and 2 fixtures hardcode `"cwd": "/data/code/verbatim"`. The five
-phase 3 and 5 fixtures carry `{{ROOT}}` instead, and
+The phase 1 and 2 fixtures hardcode `"cwd": "/data/code/verbatim"`. The seven
+rooted fixtures carry `{{ROOT}}` instead, and
 `testkit::copy_rooted_fixture_into` rewrites it to a root the test owns,
-creating the project directory it names. Two projects exist across them -
+creating the project directory it names. Four projects exist across them -
 `project-alpha` for `session-recall.jsonl`, its sidecar and `session-edits.jsonl`,
-`project-beta` for the two error sessions - so a project-scoped search has
+`project-beta` for the two error sessions, `project-gamma` for
+`session-envelope.jsonl` alone and `project-delta` for `session-secrets.jsonl`
+alone - so a project-scoped search has
 something to be both true and false about, on any checkout and without a project
 key that depends on where this repository happens to sit. `session-edits.jsonl`
 needs the root for a second reason: the absolute path it stores has to be

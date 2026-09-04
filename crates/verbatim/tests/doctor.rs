@@ -123,12 +123,32 @@ impl Fixture {
         path
     }
 
+    /// Verbatim's own config directory, and the file inside it doctor reports
+    /// the mode of. Neither is created by the fixture: an absent
+    /// `verbatim.toml` is the state of every machine that never wrote one.
+    fn config_dir(&self) -> PathBuf {
+        self.root.join("config")
+    }
+
+    fn config_file(&self) -> PathBuf {
+        self.config_dir().join("verbatim.toml")
+    }
+
+    /// Write `verbatim.toml` at `mode`, creating its directory.
+    fn write_config(&self, body: &str, mode: u32) -> PathBuf {
+        let path = self.config_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        set_mode(&path, mode);
+        path
+    }
+
     fn env(&self, command: &mut Command) {
         command
             .env("VERBATIM_BIN_DIR", &self.bin_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("VERBATIM_DATA_DIR", self.root.join("data"))
-            .env("VERBATIM_CONFIG_DIR", self.root.join("config"))
+            .env("VERBATIM_CONFIG_DIR", self.config_dir())
             .env("JCRENSHAW_CONFIG_DIR", self.shared_dir())
             .env("HOME", &self.root)
             .env("USERPROFILE", &self.root);
@@ -928,4 +948,291 @@ fn the_credentials_check_creates_nothing() {
         "doctor created {}",
         fixture.shared_dir().display()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The config_mode and mode_checks checks (PRIV-02, D-14, D-17)
+// ---------------------------------------------------------------------------
+
+/// A `verbatim.toml` carrying a provider key, which is what makes its mode
+/// matter at all.
+fn keyed_config() -> String {
+    format!("[provider]\nname = \"openrouter\"\napi_key = \"{CRED_KEY}\"\n")
+}
+
+/// The `verbatim.toml` half of PRIV-02, end to end: a group-readable file
+/// holding a key is a problem, and the command doctor prints fixes it.
+#[cfg(unix)]
+#[test]
+fn a_group_readable_config_holding_a_key_is_a_problem_whose_command_fixes_it() {
+    let fixture = fixture();
+    fixture.install();
+    let path = fixture.write_config(&keyed_config(), 0o644);
+
+    let (code, report) = fixture.doctor();
+
+    assert_eq!(report.state("config_mode"), "problem", "{}", report.whole);
+    assert_eq!(code, Some(1), "a wide config holding a key must not exit 0");
+    let finding = &report.check("config_mode").finding;
+    assert!(
+        finding.contains("644"),
+        "the check does not name the mode: {finding}"
+    );
+    assert!(
+        finding.contains(&path.display().to_string()),
+        "the check does not name the file: {finding}"
+    );
+    // The key is in that file and may not be in either output.
+    assert_no_credential_reaches_a_stream(&fixture);
+
+    let fix = report
+        .check("config_mode")
+        .fix
+        .clone()
+        .unwrap_or_else(|| panic!("the problem printed no command:\n{}", report.whole));
+    let out = fixture.shell(&fix);
+    assert!(
+        out.status.success(),
+        "`{fix}` did not succeed: {}",
+        text(&out)
+    );
+
+    let (code, report) = fixture.doctor();
+    assert_eq!(report.state("config_mode"), "ok", "{}", report.whole);
+    assert_eq!(code, Some(0));
+}
+
+/// A wide config with no key in it is not a credentials file, and nothing
+/// refuses to read it - so calling it a problem would send most users to fix
+/// something that is not broken.
+#[cfg(unix)]
+#[test]
+fn a_group_readable_config_holding_no_key_is_reported_without_being_a_problem() {
+    let fixture = fixture();
+    fixture.install();
+    fixture.write_config("exclude = []\n", 0o644);
+
+    let (code, report) = fixture.doctor();
+
+    assert_eq!(report.state("config_mode"), "ok", "{}", report.whole);
+    assert_eq!(code, Some(0));
+    assert!(
+        report.check("config_mode").finding.contains("644"),
+        "the mode is still reported: {}",
+        report.check("config_mode").finding
+    );
+}
+
+/// The ordinary state of a machine that never wrote one: reported, not a
+/// failure, and doctor still creates nothing.
+#[test]
+fn no_config_file_at_all_is_a_note() {
+    let fixture = fixture();
+    fixture.install();
+
+    let (code, report) = fixture.doctor();
+
+    assert_eq!(report.state("config_mode"), "note", "{}", report.whole);
+    assert_eq!(code, Some(0));
+    assert!(
+        report
+            .check("config_mode")
+            .finding
+            .contains(&fixture.config_file().display().to_string()),
+        "the check does not say where it looked: {}",
+        report.check("config_mode").finding
+    );
+    assert!(
+        !fixture.config_file().exists(),
+        "doctor created {}",
+        fixture.config_file().display()
+    );
+}
+
+/// AC6: both credential files wide at once print one runnable `chmod` each, and
+/// running both is what makes the next run clean.
+#[cfg(unix)]
+#[test]
+fn both_wide_credential_files_print_a_chmod_each_and_running_them_clears_the_report() {
+    let fixture = fixture();
+    fixture.install();
+    let shared = fixture.write_credentials(&credentials_file(), 0o644);
+    let own = fixture.write_config(&keyed_config(), 0o644);
+
+    let (code, report) = fixture.doctor();
+
+    assert_eq!(code, Some(1));
+    assert_eq!(report.state("credentials"), "problem", "{}", report.whole);
+    assert_eq!(report.state("config_mode"), "problem", "{}", report.whole);
+    let fixes: Vec<String> = ["credentials", "config_mode"]
+        .iter()
+        .map(|name| {
+            report
+                .check(name)
+                .fix
+                .clone()
+                .unwrap_or_else(|| panic!("{name} printed no command:\n{}", report.whole))
+        })
+        .collect();
+    assert!(
+        fixes[0].contains(&shared.display().to_string()),
+        "the shared file's fix names the wrong path: {}",
+        fixes[0]
+    );
+    assert!(
+        fixes[1].contains(&own.display().to_string()),
+        "the config's fix names the wrong path: {}",
+        fixes[1]
+    );
+    assert_ne!(fixes[0], fixes[1], "one line was printed for two files");
+    assert_no_credential_reaches_a_stream(&fixture);
+
+    for fix in &fixes {
+        let out = fixture.shell(fix);
+        assert!(
+            out.status.success(),
+            "`{fix}` did not succeed: {}",
+            text(&out)
+        );
+    }
+
+    let (code, report) = fixture.doctor();
+    assert_eq!(report.state("credentials"), "ok", "{}", report.whole);
+    assert_eq!(report.state("config_mode"), "ok", "{}", report.whole);
+    assert_eq!(code, Some(0));
+}
+
+/// D-17: the deferral is stated in words on THIS machine, not only inside an
+/// arm a Unix build never reaches - and in both outputs, because only one of
+/// them is what a script reads.
+#[test]
+fn the_windows_acl_deferral_is_stated_on_every_platform_in_both_outputs() {
+    let fixture = fixture();
+    fixture.install();
+
+    let (code, report) = fixture.doctor();
+    assert_eq!(code, Some(0));
+    assert_eq!(report.state("mode_checks"), "note", "{}", report.whole);
+    let finding = &report.check("mode_checks").finding;
+    for word in ["Windows", "ACL", "credentials", "config_mode"] {
+        assert!(
+            finding.contains(word),
+            "the deferral does not say {word:?}: {finding}"
+        );
+    }
+
+    let out = fixture.run(&["doctor", "--json"]);
+    let document: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).expect("valid JSON");
+    let check = &document["data"]["mode_checks"];
+    assert_eq!(check["state"], serde_json::Value::from("note"), "{check}");
+    let json_finding = check["finding"].as_str().expect("a finding");
+    assert!(
+        json_finding.contains("Windows") && json_finding.contains("ACL"),
+        "{json_finding}"
+    );
+    assert_eq!(check["fix"], serde_json::Value::Null, "{check}");
+}
+
+// ---------------------------------------------------------------------------
+// The provider_local check (D-13, D-15, D-16)
+// ---------------------------------------------------------------------------
+
+/// A `[provider]` block declaring itself local against a chosen address.
+fn local_provider(base_url: &str) -> String {
+    format!("[provider]\nlocal = true\nbase_url = \"{base_url}\"\n")
+}
+
+/// D-13's mistake, named: `local = true` is what turns the egress filter off,
+/// and it is believed whatever the address says - so an address that is not on
+/// this machine is worth a line. A note and not a problem, because doctor does
+/// not overrule the declaration and a CI health check must not read this as a
+/// broken install.
+#[test]
+fn a_local_provider_that_is_not_on_loopback_is_a_note_and_still_exits_zero() {
+    let fixture = fixture();
+    fixture.install();
+
+    for (base_url, host) in [
+        ("http://example.invalid:11434", "example.invalid"),
+        // The one a user could be fooled by: the loopback address is USERINFO
+        // here and the host is not local at all.
+        ("http://127.0.0.1:11434@evil.example/", "evil.example"),
+        ("https://10.0.0.5/v1", "10.0.0.5"),
+    ] {
+        fixture.write_config(&local_provider(base_url), 0o600);
+
+        let (code, report) = fixture.doctor();
+
+        assert_eq!(
+            report.state("provider_local"),
+            "note",
+            "{base_url}:\n{}",
+            report.whole
+        );
+        assert_eq!(code, Some(0), "{base_url} made doctor exit non-zero");
+        let finding = &report.check("provider_local").finding;
+        assert!(finding.contains(host), "{base_url}: {finding}");
+        assert!(
+            finding.contains("unfiltered"),
+            "{base_url}: the note does not say what it costs: {finding}"
+        );
+        // The configured URL is never echoed: it may carry userinfo.
+        assert!(
+            !finding.contains(base_url),
+            "{base_url} was printed back: {finding}"
+        );
+    }
+}
+
+/// The falsifying half: a local provider that really is on this machine, in
+/// each of the four spellings a host is written in, says nothing.
+#[test]
+fn a_local_provider_on_loopback_is_ok() {
+    let fixture = fixture();
+    fixture.install();
+
+    for base_url in [
+        "http://localhost:11434",
+        "http://127.0.0.1:11434/",
+        "http://[::1]:11434",
+        "HTTP://LOCALHOST/",
+    ] {
+        fixture.write_config(&local_provider(base_url), 0o600);
+
+        let (code, report) = fixture.doctor();
+
+        assert_eq!(
+            report.state("provider_local"),
+            "ok",
+            "{base_url}:\n{}",
+            report.whole
+        );
+        assert_eq!(code, Some(0), "{base_url}");
+        assert!(
+            !report
+                .check("provider_local")
+                .finding
+                .contains("unfiltered"),
+            "{base_url} was warned about: {}",
+            report.check("provider_local").finding
+        );
+    }
+}
+
+/// Absent means remote and therefore filtered, which is the default and is not
+/// a finding about anything.
+#[test]
+fn a_remote_provider_that_never_declared_itself_local_is_ok() {
+    let fixture = fixture();
+    fixture.install();
+    fixture.write_config(
+        "[provider]\nbase_url = \"https://openrouter.ai/api/v1\"\n",
+        0o600,
+    );
+
+    let (code, report) = fixture.doctor();
+
+    assert_eq!(report.state("provider_local"), "ok", "{}", report.whole);
+    assert_eq!(code, Some(0));
 }

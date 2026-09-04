@@ -6,6 +6,14 @@
 //! value comes from a stored row, so two runs against an unchanged store render
 //! the same bytes (INJ-02).
 //!
+//! **The quoted prompt is a turn the person typed (INJ-07).** "The last thing
+//! said" in the user's direction is not the last `user` record: the harness
+//! writes tool results, `isMeta` command caveats and `<task-notification>`
+//! envelopes as `user` records as well, and 12.3% of measured sessions end on
+//! one. The discriminator is `turns.is_typed`, written at ingest by
+//! `parse::record` and rebuilt from blobs alone, and the brief spends exactly
+//! one `AND` on it - see [`last_turn`].
+//!
 //! The counts are read the way D-09 requires: the project-only projection
 //! `scope::resolve` has already run, plus one targeted `count(*)` per number,
 //! and never `config::visible::sessions`. Measured on a store shaped like the
@@ -52,6 +60,7 @@ use rusqlite::{Connection, OptionalExtension};
 use super::Payload;
 use crate::blob::BlobReader;
 use crate::config::Config;
+use crate::observe::egress::Redaction;
 use crate::recall::scope::Scoped;
 use crate::recall::{excerpt, Query};
 
@@ -69,7 +78,16 @@ pub fn session_start(data_dir: &Path, config: &Config, payload: &Payload) -> Opt
     }
     let store = super::open(data_dir)?;
     let scoped = super::scoped(store.conn(), config, payload)?;
-    let brief = render(store.conn(), &scoped, config.brief_chars())?;
+    // Resolved at the entry point that holds the `Config` and carried down
+    // (phase 4 D-01). A brief is hook stdout, which is the model's first
+    // context of the session, so its quotations are an egress boundary in
+    // exactly the way a search excerpt is.
+    let brief = render(
+        store.conn(),
+        &scoped,
+        config.brief_chars(),
+        &Redaction::of(config),
+    )?;
     remember(data_dir, payload, &brief);
     Some(brief.text)
 }
@@ -143,9 +161,24 @@ struct Brief {
 /// The last session first and the index pointer last: continuity is what the
 /// session is resuming, and the pointer is the standing fact that outlives it.
 /// A block that cannot be rendered is dropped rather than failing the brief.
-fn render(conn: &Connection, scoped: &Scoped, budget: usize) -> Option<Brief> {
+///
+/// `redaction` reaches the quotes before this function measures anything, which
+/// is phase 4 D-06: the filter is spent out of the budget rather than applied to
+/// what the budget left. A marker consuming room a quotation would otherwise
+/// have had is the decided behaviour. Filtering after [`clip`] is what it buys
+/// out - a marker cut in half leaves a nameless partial value no shape rule can
+/// catch, and the brief would be the one output where a long turn leaks.
+///
+/// The head line, the branch and the index pointer are built here out of
+/// `session_meta` and counts, not out of archived text, and are not filtered.
+fn render(
+    conn: &Connection,
+    scoped: &Scoped,
+    budget: usize,
+    redaction: &Redaction<'_>,
+) -> Option<Brief> {
     let budget = budget.min(MAX_BRIEF_CHARS);
-    let continuity = last_session(conn, scoped);
+    let continuity = last_session(conn, scoped, redaction);
     let pointer = index_pointer(conn, scoped);
     if continuity.is_none() && pointer.is_none() {
         return None;
@@ -350,7 +383,11 @@ struct LastSession {
 
 /// INJ-01's continuity blocks: which session was last here, when it ended, on
 /// what branch, and the last thing said in each direction.
-fn last_session(conn: &Connection, scoped: &Scoped) -> Option<Continuity> {
+fn last_session(
+    conn: &Connection,
+    scoped: &Scoped,
+    redaction: &Redaction<'_>,
+) -> Option<Continuity> {
     let row = last_session_row(conn, scoped).ok()??;
     let project = project_label(scoped);
 
@@ -364,7 +401,7 @@ fn last_session(conn: &Connection, scoped: &Scoped) -> Option<Continuity> {
         (None, None) => format!("The last session in {project} is archived."),
     };
 
-    let (prompt, reply) = last_exchange(conn, &row.session_key);
+    let (prompt, reply) = last_exchange(conn, &row.session_key, redaction);
     Some(Continuity {
         head,
         prompt,
@@ -443,7 +480,16 @@ fn day(ts: &str) -> &str {
     ts.get(..10).unwrap_or(ts)
 }
 
-/// The last user turn and the last assistant turn of one session, as text.
+/// The last turn the person TYPED and the last assistant turn of one session,
+/// as text.
+///
+/// The prompt side is not the last `user` record (INJ-07): Claude Code writes
+/// tool results, `isMeta` command caveats and `<task-notification>` envelopes as
+/// `user` records too, and one session in eight ends on one of them. Quoting
+/// that back is a brief that opens by telling the model a file listing was the
+/// last thing it was asked. [`last_turn`] carries the rule; a session with no
+/// typed `user` record at all renders no "It last asked" line, because the
+/// lookup returns nothing and [`Continuity::text`] omits what it has not got.
 ///
 /// **One blob read for the pair.** Both turns are in the same session and
 /// rusqlite's incremental blob I/O is behind a feature this workspace does not
@@ -455,14 +501,19 @@ fn day(ts: &str) -> &str {
 /// carry a record whose timestamp runs backwards (phase 3 D-22), so the last
 /// turn by clock is not the last turn of the conversation.
 ///
-/// The text is cut through [`excerpt::of_record`], which is the same projection
-/// ingest indexed these turns with and the search path reads them through -
+/// The text is cut through [`excerpt::of_record_with`] under the caller's
+/// redaction, which is the same projection under the same filter that ingest
+/// indexed these turns with and the search path reads them through -
 /// `DESIGN-BRIEF.md:230` asks for the last prompt and the last assistant turn
 /// "truncated", and a second definition of what a turn said would be a second
 /// thing to keep true. The query is empty because there is no query here: the
 /// window then falls back to the head of the turn, which is what the turn
 /// opened with.
-fn last_exchange(conn: &Connection, session_key: &str) -> (Option<Quote>, Option<Quote>) {
+fn last_exchange(
+    conn: &Connection,
+    session_key: &str,
+    redaction: &Redaction<'_>,
+) -> (Option<Quote>, Option<Quote>) {
     let prompt = last_turn(conn, session_key, "user");
     let reply = last_turn(conn, session_key, "assistant");
     if prompt.is_none() && reply.is_none() {
@@ -489,22 +540,38 @@ fn last_exchange(conn: &Connection, session_key: &str) -> (Option<Quote>, Option
     let cut = |coordinates: Option<(i64, i64, i64)>| -> Option<Quote> {
         let (turn_id, offset, len) = coordinates?;
         let bytes = reader.read_range(offset as u64, len as u64).ok()?;
-        let text = excerpt::of_record(&query, &bytes);
+        let text = excerpt::of_record_with(&query, &bytes, redaction);
         (!text.trim().is_empty()).then_some(Quote { turn_id, text })
     };
     (cut(prompt), cut(reply))
 }
 
-/// `(id, stream_offset, byte_len)` of one session's last turn of a record type.
+/// `(id, stream_offset, byte_len)` of one session's last turn of a record type,
+/// skipping the `user` records nobody typed (INJ-07).
 ///
 /// D-04: both offsets address the UNCOMPRESSED session stream, never the blob.
 /// `UNIQUE (session_key, turn_seq)` covers the lookup. The id comes back too
 /// because INJ-04 suppresses a turn the brief quoted and cannot recognize one
 /// from its text.
+///
+/// **`is_typed IS NOT 0` and not `is_typed = 1`**, which is what lets one
+/// statement serve all three callers. `IS NOT` is SQLite's null-safe
+/// comparison, so a null passes: an `assistant` row carries null by
+/// construction (`parse::record` classifies `user` records and nothing else),
+/// and a preserved evicted session's rows keep null because `reindex` skips
+/// them (v0.1.1 phase 1 D-04). For an evicted session the choice is
+/// unobservable anyway - `retention::apply` empties the blob, so
+/// [`last_exchange`] finds no reader and renders no quote either way.
+///
+/// One `AND` and no new index. Measured against the live 1.16 GB store
+/// (450,834 turns), the lookup costs 0.002 ms and a variant forced to scan a
+/// 2,465-turn session backwards without matching costs 0.362 ms, both planned
+/// as `SEARCH turns USING INDEX sqlite_autoindex_turns_1`, against a 10 ms
+/// wall; real scan depth is p50 27, p90 181, p99 404, max 520 rows (D-11).
 fn last_turn(conn: &Connection, session_key: &str, record_type: &str) -> Option<(i64, i64, i64)> {
     conn.query_row(
         "SELECT id, stream_offset, byte_len FROM turns \
-         WHERE session_key = ?1 AND record_type = ?2 \
+         WHERE session_key = ?1 AND record_type = ?2 AND is_typed IS NOT 0 \
          ORDER BY turn_seq DESC LIMIT 1",
         rusqlite::params![session_key, record_type],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),

@@ -148,10 +148,20 @@ pub fn run(options: Options) -> Result<(), Failure> {
     // says only the OS lock attached to it does - so the destination gets a
     // fresh empty one rather than a copy of the file this process is holding
     // locked, which Windows would refuse to read through a second handle.
+    //
+    // Owner-only from the creating open, like the one `ingest::lock` makes at
+    // the source (PRIV-04, D-10): the lock file is short, but a `data move`
+    // that left one file in the new directory readable by the world would make
+    // the destination's mode a lie on the very first listing.
     let lock_file = destination.join(lock::LOCK_FILE_NAME);
-    std::fs::File::create(&lock_file).map_err(|e| {
-        Failure::Operational(format!("{} could not be created: {e}", lock_file.display()))
-    })?;
+    verbatim_core::owner_only::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock_file)
+        .map_err(|e| {
+            Failure::Operational(format!("{} could not be created: {e}", lock_file.display()))
+        })?;
 
     // Before the source is removed, and atomically: a crash between the copy
     // and the pointer leaves both directories intact and the store still
@@ -286,7 +296,14 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     let failed =
         |path: &Path, e: std::io::Error| format!("{} could not be copied: {e}", path.display());
 
-    std::fs::create_dir_all(to).map_err(|e| failed(to, e))?;
+    // Every directory 0700 and every file 0600, written rather than reproduced
+    // (D-10). A plain byte-for-byte copy carries the SOURCE's mode across with
+    // it, which makes this the one command that can undo the whole phase: a
+    // store the user moved off a build that predates this, or restored out of
+    // a tar, would arrive as wide as it was at the old location.
+    // What the destination gets is the mode this build writes, from the
+    // creating syscall, whatever the source happens to be.
+    verbatim_core::owner_only::create_dir_all(to).map_err(|e| failed(to, e))?;
     let entries = std::fs::read_dir(from).map_err(|e| failed(from, e))?;
     for entry in entries {
         let entry = entry.map_err(|e| failed(from, e))?;
@@ -300,9 +317,25 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
         if kind.is_dir() {
             copy_tree(&source, &destination)?;
         } else {
-            std::fs::copy(&source, &destination).map_err(|e| failed(&source, e))?;
+            copy_file(&source, &destination).map_err(|e| failed(&source, e))?;
         }
     }
+    Ok(())
+}
+
+/// One file copied into a destination this process creates at 0600.
+///
+/// `create_new`, because [`refuse_impossible_destinations`] has established
+/// that the destination directory was absent or empty: a name already taken
+/// here means something else is writing into the directory mid-move, and
+/// truncating it would destroy a file this command never wrote.
+fn copy_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let mut reader = std::fs::File::open(source)?;
+    let mut writer = verbatim_core::owner_only::options()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    std::io::copy(&mut reader, &mut writer)?;
     Ok(())
 }
 

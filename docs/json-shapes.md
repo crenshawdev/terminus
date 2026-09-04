@@ -118,7 +118,11 @@ data on stdout, the counts and the warnings on stderr.
 
 - `body` is the record's own archived line. It is the only lossy rendering
   verbatim performs: a JSON string is text by definition, so a byte that is not
-  UTF-8 is replaced here. The human mode writes the bytes themselves.
+  UTF-8 is replaced here. The human mode writes the bytes themselves. With
+  `[privacy] redact_recall = true` in `verbatim.toml` the line is put through the
+  egress filter first, so `body` carries `[redacted]` markers where a credential
+  stood; the archive itself is unchanged, and no key is added or removed in
+  either setting.
 - `body_evicted` comes from `session_meta.is_evicted` and from nothing else. A
   blob that will not decompress is archive damage, which `verbatim verify`
   reports; it leaves `body` null with `body_evicted` false.

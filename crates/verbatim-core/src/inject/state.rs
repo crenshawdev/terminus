@@ -268,7 +268,17 @@ fn file_name(session_id: &str) -> Option<String> {
 /// out of this file and the whole document is a few hundred bytes.
 fn write_atomically(path: &Path, state: &State) -> Option<()> {
     let dir = path.parent()?;
-    std::fs::create_dir_all(dir).ok()?;
+    // TWO creations, not one. `injection/`'s parent is verbatim's own data
+    // directory, and a hook that fires before any ingest ever ran is the first
+    // thing to make it - so it has to be asked for by name, because the
+    // primitive narrows only the leaf it is given and would otherwise leave the
+    // data directory at the umask (D-04). Everything above it - the user's
+    // `~/.local/share` - still keeps their own default, which is the whole
+    // reason the mode is not applied recursively.
+    if let Some(data_dir) = dir.parent() {
+        crate::owner_only::create_dir_all(data_dir).ok()?;
+    }
+    crate::owner_only::create_dir_all(dir).ok()?;
     let bytes = serde_json::to_vec_pretty(state).ok()?;
 
     let (temporary, mut file) = create_temporary(dir)?;
@@ -297,6 +307,11 @@ fn write_atomically(path: &Path, state: &State) -> Option<()> {
 ///
 /// The name can never collide with a session's own file: it starts with a dot
 /// and ends in `.tmp`, and [`file_name`] admits neither.
+///
+/// Owner-only from the moment it exists. The temporary holds the same quoted
+/// prompt text the target does, and it is on disk under its own name for the
+/// length of the write, so a mode applied after the fact would cover the target
+/// and miss the bytes.
 fn create_temporary(dir: &Path) -> Option<(PathBuf, std::fs::File)> {
     /// Enough to step over a stale name or two. Past that, something is wrong
     /// with the directory rather than with the name.
@@ -305,7 +320,7 @@ fn create_temporary(dir: &Path) -> Option<(PathBuf, std::fs::File)> {
     let pid = std::process::id();
     for attempt in 0..ATTEMPTS {
         let path = dir.join(format!(".inject-{pid}-{attempt}.tmp"));
-        match std::fs::OpenOptions::new()
+        match crate::owner_only::options()
             .write(true)
             .create_new(true)
             .open(&path)

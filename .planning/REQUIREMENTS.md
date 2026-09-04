@@ -9,9 +9,14 @@ Scope comes from `DESIGN-BRIEF.md`, where every decision is settled unless marke
 
 No cycle open.
 
-Every requirement this project has committed to has shipped and been verified — see `## Shipped` below for all 64 ids with the phase that delivered each. Nothing is deferred and nothing is carried forward.
+v0.1.1 closed 2026-09-04. Its one requirement, INJ-07, is under `## Shipped`
+below with the 64 that shipped in v0.1.0, each carrying the phase that
+delivered it. Phases 2, 3 and 4 of that cycle delivered against already-shipped
+rows (PRIV-01..04, RCL-09, OBS-03) rather than opening new ones, so no
+requirement is waiting here.
 
-`/cad-phase add` opens the next cycle's first phase; `/cad-plan` seeds new rows here from that phase's requirements.
+Nothing is deferred. `/cad-phase add` opens the next cycle and seeds this
+section.
 
 ## Shipped
 
@@ -86,6 +91,7 @@ table).
 | STOR-06 (Rolling snapshots run by default and produce a consistent copy of the store without stopping ingest.) | 8 | Complete | v0.1.0 |
 | STOR-07 (`verbatim data move <path>` relocates the store and updates the location pointer, so no component holds a hardcoded store path.) | 8 | Complete | v0.1.0 |
 | ING-07 (Capture mode (`full`, `lean`, `minimal`) controls how much of each record is stored, and every elision is marked in the stored record.) | 8 | Complete | v0.1.0 |
+| INJ-07 (The resume brief's quoted prompt is a turn the user typed. A `user` record not authored by the person - a tool result, an `isMeta` record, or a harness envelope - is not eligible to be quoted under "It last asked", the typed/not-typed discriminator is stored at ingest rather than derived by decompressing turns on the cold-start path, and a store written before this build acquires it by backfill from blobs alone. Closes the gap between `DESIGN-BRIEF.md:230`'s "last prompt" and `inject/brief.rs`'s `record_type = 'user'`, which is the transcript's own `type` field and therefore matches both.) | 1 | Complete | v0.1.1 |
 
 ## v2 Requirements
 

@@ -18,6 +18,26 @@ The verbatim transcript is the record: every session archived losslessly and per
 
 No cycle open.
 
+**Shipped: v0.1.1, closed 2026-09-04.**
+
+A privacy and correctness cycle. One new requirement, three phases of defect work against scope v0.1.0 had already shipped, and the finding that the egress filter was running two of its five rules on the wire.
+
+| | |
+|---|---|
+| Phases | 4 (Prompt-True Resume Brief, Egress Filter Sees What Is Sent, Owner-Only On Disk, Redacted Recall) |
+| Requirements | 1 new: INJ-07, Complete. Phases 2, 3 and 4 delivered against already-shipped v0.1.0 rows (PRIV-01..04, RCL-09, OBS-03) rather than opening new ones |
+| Commits | 77 on `cadence/v0.1.1` |
+| Audit | PASS, 1/1 traced requirement -> phase -> plan -> verified, 0 broken, 0 deferred; 27/27 acceptance criteria covered by a UAT item, 0 breaks |
+| Manifest | 0.1.1 (`Cargo.toml` workspace, `npm/verbatim/package.json`, five npm platform packages), bumped at close |
+
+Where it lives now: INJ-07's row under `## Shipped` in REQUIREMENTS.md; the per-phase narrative, deviations, UAT results and context decisions in `.planning/ARCHIVE.md` (86 rows added, 378 total); the release notes in `CHANGELOG.md`, which this cycle started. The phase directories were deleted rather than archived, since the release tag is their archive and git history holds them.
+
+Carried out of the close: `.planning/risk-carry/` holds 22 `risk_surface` reviews and adjudications from the four pruned phases. It is transient, never committed, and the `/cad-land` that confirms the merge deletes it.
+
+One known issue ships with it: `recall_get` runs its body through a lossy UTF-8 round trip when `redact_recall` is on, filed as [#1](https://github.com/crenshawdev/verbatim/issues/1) and recorded in `.planning/FILED.md`.
+
+Still outstanding: the merge to base and the release tag. Both are `/cad-land`'s, and the tag is cut there on the pulled base after the merge confirms, never at close.
+
 **Shipped: v0.1.0 — closed 2026-08-23.**
 
 The full feature set landed in one cycle. Every capability bullet that stood here is delivered and verified:
@@ -28,11 +48,11 @@ The full feature set landed in one cycle. Every capability bullet that stood her
 | Requirements | 64, all Complete — STOR-01..07, ING-01..11, RCL-01..11, INST-01..08, INJ-01..06, FEED-01..04, OBS-01..08, PRIV-01..04, RET-01..05 |
 | Commits | 237 on `phase-2-ingest-at-scale` |
 | Audit | PASS — 64/64 traced requirement -> phase -> plan -> verified, 0 broken, 0 deferred; 57/57 acceptance criteria covered by a UAT item, 0 breaks |
-| Manifest | 0.1.0 (`Cargo.toml` workspace, `npm/verbatim/package.json`) — unbumped, since nothing has been published yet |
+| Manifest | 0.1.0 (`Cargo.toml` workspace, `npm/verbatim/package.json`) — unbumped, since nothing had been published yet |
 
-Where it lives now: the requirement rows under `## Shipped` in REQUIREMENTS.md; the per-phase narrative, deviations, UAT results and context decisions in `.planning/ARCHIVE.md` (292 rows); the full phase directories, plans, reviews and adjudications under `.planning/_archive-v0.1.0/`.
+Where it lives now: the requirement rows under `## Shipped` in REQUIREMENTS.md; the per-phase narrative, deviations, UAT results and context decisions in `.planning/ARCHIVE.md`; the full phase directories, plans, reviews and adjudications under `.planning/_archive-v0.1.0/`.
 
-Still outstanding: the merge to base and the release tag. Both are `/cad-land`'s — the tag is cut there on the pulled base after the merge confirms, never at close.
+Merged to `main` and tagged `v0.1.0`.
 
 `/cad-phase add` opens the next cycle.
 

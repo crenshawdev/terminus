@@ -84,13 +84,33 @@ impl Bench {
         path
     }
 
+    fn config_path(&self) -> PathBuf {
+        self.config_dir.join(CONFIG_FILE_NAME)
+    }
+
     /// A config naming the provider, and optionally carrying its own key.
+    ///
+    /// Written owner-only, because a `verbatim.toml` carrying a key is refused
+    /// at `0644` the way the shared file is: the tier and precedence tests
+    /// below are about which tier answers, not about the mode of the file the
+    /// harness happened to write.
     fn config(&self, api_key: Option<&str>) -> Config {
+        self.config_at(api_key, 0o600)
+    }
+
+    /// The same, at a chosen mode.
+    fn config_at(&self, api_key: Option<&str>, mode: u32) -> Config {
         let mut body = format!("[provider]\nenabled = true\nname = \"{PROVIDER}\"\n");
         if let Some(key) = api_key {
             body.push_str(&format!("api_key = \"{key}\"\n"));
         }
-        std::fs::write(self.config_dir.join(CONFIG_FILE_NAME), body).unwrap();
+        self.write_config(&body, mode)
+    }
+
+    /// Write `verbatim.toml` with this body at this mode, and load it.
+    fn write_config(&self, body: &str, mode: u32) -> Config {
+        std::fs::write(self.config_path(), body).unwrap();
+        set_mode(&self.config_path(), mode);
         Config::load_from(&self.config_dir).unwrap()
     }
 }
@@ -201,6 +221,80 @@ fn an_owner_only_file_loads_and_renders_nothing_of_its_value() {
     assert_eq!(format!("{secret}"), REDACTED);
     assert_withholds(&format!("{secret:?}"), KEY, "the debug-formatted secret");
     assert_withholds(&format!("{secret}"), KEY, "the displayed secret");
+}
+
+/// PRIV-02 over verbatim's OWN file (D-14): a `verbatim.toml` carrying a key is
+/// refused at `0644` on the same test as the shared file, and the refusal names
+/// that file rather than sending the user off to chmod a shared one they may
+/// not have.
+#[test]
+#[cfg(unix)]
+fn a_group_readable_verbatim_toml_carrying_a_key_is_refused() {
+    let bench = bench();
+    let wide = bench.config_at(Some(KEY), 0o644);
+
+    let error = credentials::resolve(&wide).expect_err("a 0644 config carrying a key");
+
+    assert_eq!(
+        error,
+        Error::ConfigTooOpen {
+            path: bench.config_path(),
+            mode: 0o644
+        }
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains(&bench.config_path().display().to_string()),
+        "the refusal does not name the file: {rendered}"
+    );
+    assert!(
+        rendered.contains("644"),
+        "the refusal does not name the mode: {rendered}"
+    );
+    assert!(
+        !rendered.contains("credentials file"),
+        "the refusal points at the shared file instead of this one: {rendered}"
+    );
+    assert_withholds(&rendered, KEY, "the refusal");
+    assert_withholds(&format!("{error:?}"), KEY, "the debug-formatted refusal");
+
+    // The falsifying half: the same file at 0600 hands the key straight back,
+    // so the refusal above is about the mode and not about the file.
+    let tight = bench.config_at(Some(KEY), 0o600);
+    assert_eq!(
+        credentials::resolve(&tight).unwrap().unwrap().expose(),
+        KEY,
+        "a 0600 config carrying a key was not accepted"
+    );
+}
+
+/// D-07: the refusal fires where tier 2 is CONSUMED, so a wide file whose key
+/// is never the answer still loads.
+///
+/// Both halves are states a real user is in - judgment off is the default, and
+/// a key exported in the shell outranks the file - and in neither of them may a
+/// mode stop `verbatim status` from reading its own config.
+#[test]
+#[cfg(unix)]
+fn a_wide_verbatim_toml_is_not_refused_while_its_key_is_not_the_answer() {
+    let mut bench = bench();
+
+    let off = bench.write_config(
+        &format!("[provider]\nname = \"{PROVIDER}\"\napi_key = \"{KEY}\"\n"),
+        0o644,
+    );
+    assert!(
+        credentials::resolve(&off).unwrap().is_none(),
+        "a wide config was refused while judgment was off"
+    );
+
+    bench.set(PROVIDER_ENV, Some(std::ffi::OsStr::new(OTHER_KEY)));
+    let on = bench.config_at(Some(KEY), 0o644);
+    assert_eq!(
+        credentials::resolve(&on).unwrap().unwrap().expose(),
+        OTHER_KEY,
+        "a wide config was refused although the environment answered above it"
+    );
 }
 
 // ---------------------------------------------------------------------------
