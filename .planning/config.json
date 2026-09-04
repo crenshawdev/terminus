@@ -34,7 +34,9 @@
     "base_branch": null,
     "create_tag": true,
     "on_land_cleanup": true,
-    "auto_close": false
+    "auto_close": false,
+    "forge_provider": "github",
+    "forge_repo": "crenshawdev/verbatim"
   },
   "planning": {
     "commit_docs": true
