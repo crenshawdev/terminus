@@ -1,0 +1,125 @@
+{
+  "status": "delivered",
+  "score": "10/10",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "A single owner-only creation primitive exists, is substantive (leaf-only 0700 dir, 0600 OpenOptions, documented Windows no-op) and is called by every writer the phase names: store open, ingest lock, snapshot, injection scratch, decision log, export, data move.",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "crates/verbatim-core/src/owner_only.rs:48-84 (create_dir_all leaf mode via DirBuilderExt, options() via OpenOptionsExt); grep owner_only:: shows 19 call sites across store/open.rs:120,129, ingest/lock.rs:72,80, store/snapshot.rs:71,102, inject/state.rs:279,281,323, inject/decision.rs:281,305,361, cmd/export.rs:169,276, cmd/data.rs:157,306,334; `cargo test -p verbatim-core --features testkit --lib owner_only` 6 passed"
+    },
+    {
+      "n": 2,
+      "truth": "A #[cfg(unix)] process test drives the shipped binary under `sh -c 'umask 022; exec \"$0\" \"$@\"'` through ingest, hooks, snapshot and export and asserts all fourteen paths owner-only; the same test against the pre-fix build (3e09d9a) fails naming all fourteen including the data dir, verbatim.db and the export files.",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "crates/verbatim/tests/owner_only.rs:105 UMASK_022 const, :107-131 every spawn goes through sh with the binary as $0, :455-469 fourteen checks collected into one message; `cargo test -p verbatim --features testkit --test owner_only` 3 passed. Falsification: I built 3e09d9a in a throwaway git worktree with this test file copied in and it FAILED listing exactly the fourteen paths at 755/644 (data dir, verbatim.db, -wal, -shm, LOCK, snapshots + file, injection + file, decisions + file, export dir + jsonl + manifest.json); worktree removed afterwards."
+    },
+    {
+      "n": 3,
+      "truth": "No path widens then narrows: `set_permissions` appears exactly once in the shipped source outside cmd/install/ and tests, in the tighten-on-open repair, and every creation site passes its mode in the creating syscall.",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "`grep -rn set_permissions crates/*/src | grep -v cmd/install/` returns only crates/verbatim-core/src/store/open.rs:475 (plus its doc comment at :457). store/open.rs:120,129, store/snapshot.rs:71,102, inject/state.rs:279-323, inject/decision.rs:281-361, ingest/lock.rs:72,80, cmd/data.rs:157,306,334 and cmd/export.rs:169,276 all go through owner_only::* at creation."
+    },
+    {
+      "n": 4,
+      "truth": "A store chmod'd to 755/644 is tightened once by a writable open: every AC1 path is owner-only afterwards, a second writable open moves no regular file's ctime (compare-then-chmod, no marker key), and `verbatim verify` exits 0 over it.",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "crates/verbatim-core/src/store/open.rs:404-479 tighten() called from Store::open at :139, narrow() stats with symlink_metadata, type-checks, and chmods only when a bit differs (:466-475); crates/verbatim/tests/tighten.rs:186-227 widens, runs `status --json`, asserts no wrong modes, records ctime+ctime_nsec, runs `status` again and asserts every ctime unmoved, then `verify`; `cargo test -p verbatim --features testkit --test tighten` 1 passed."
+    },
+    {
+      "n": 5,
+      "truth": "Read-only commands repair nothing: doctor, search and show over the same widened store leave every mode at 755/644 and every regular file's ctime unmoved (tighten runs in Store::open only, never open_read_only).",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "tighten() is called only at crates/verbatim-core/src/store/open.rs:139 inside Store::open; open_read_only (open.rs:~190 onward) does no create_dir_all and no tighten; crates/verbatim/tests/tighten.rs:229-251 re-widens, runs `doctor --json`, `search` and `show`, then asserts every directory is still 0755, every file still 0644 and every ctime unmoved. Test passed."
+    },
+    {
+      "n": 6,
+      "truth": "A 0644 verbatim.toml carrying provider.api_key is refused where tier 2 is CONSUMED (credentials::resolve, not Config::load_from), with a distinct message naming the path and the octal mode; the key's value reaches neither stdout, stderr nor runs.error; at 0600 it is accepted, and with the key absent or in the environment a 0644 file still loads.",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "crates/verbatim-core/src/credentials.rs:279-325 - the mode test sits in `resolve` after the env tier, gated on config.provider_api_key() and config.source_path(); Error::ConfigTooOpen at :110 with its own wording at :128-135 (\"verbatim's own config file holds a provider key and is readable beyond its owner\"), distinct from Error::TooOpen; crates/verbatim/tests/config_mode.rs:136-151 asserts the key value is absent from stdout, stderr and every runs.error row, :160-186 the refusal, :190-208 the 0600 acceptance, :212-244 the two still-loads arms including `verbatim status`; `cargo test -p verbatim --features testkit --test config_mode` 3 passed."
+    },
+    {
+      "n": 7,
+      "truth": "verbatim doctor prints a runnable chmod for each of the two credential refusals (shared file and verbatim.toml) and states the Windows ACL deferral in words as its own check on every platform, in both the human report and --json.",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "crates/verbatim/src/cmd/doctor.rs:142-145 wires archive/credentials/config_mode/mode_checks; :762 and :885-923 emit `chmod 600 '<path>'` per file; :955-958 mode_checks pushes a State::Note naming Windows, ACL, credentials and config_mode unconditionally; crates/verbatim/tests/doctor.rs:1056-1101 asserts two distinct fix lines that both actually run and clear the report, plus no credential in any stream, and :1109-1135 asserts the deferral in report and --json. All 26 doctor tests passed."
+    },
+    {
+      "n": 8,
+      "truth": "With provider.local = true and a non-loopback base_url doctor prints a Note and still exits 0; a loopback base_url is ok; host extraction handles userinfo and bracketed IPv6 by hand with no new dependency, and the existing D-13 provider tests still pass.",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "crates/verbatim/src/cmd/doctor.rs:796-834 provider_local (Note branch, no Problem) wired at :671; host_of at :1504-1544 strips scheme, path, userinfo after the LAST '@', brackets and a numeric port; is_loopback at :1553-1562 (localhost, 127.x.x.x, ::1, no name resolution); tests a_local_provider_that_is_not_on_loopback_is_a_note_and_still_exits_zero, a_local_provider_on_loopback_is_ok and a_remote_provider_that_never_declared_itself_local_is_ok all passed; `cargo test -p verbatim-core --features testkit --test provider` 17 passed unchanged."
+    },
+    {
+      "n": 9,
+      "truth": "`verbatim data move` writes the destination tree owner-only regardless of the source tree's modes.",
+      "status": "VERIFIED",
+      "uat_item": 9,
+      "evidence": "crates/verbatim/src/cmd/data.rs:157 (destination LOCK), :306 (copy_tree directory) and :334 (copied file) all go through verbatim_core::owner_only; crates/verbatim/tests/owner_only.rs:346-372 widens the source to 755/644 first, moves, then asserts the destination dir 0700, verbatim.db and LOCK 0600 and recursively every path in the tree; test passed, and `--test datamove` 5 passed."
+    },
+    {
+      "n": 10,
+      "truth": "Cold start works end to end from an empty data dir under umask 022: first ingest creates the store, status succeeds, search returns real turns, and what lands on disk is owner-only.",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "I ran the shipped binary myself in a scratch bench through `sh -c 'umask 022; exec \"$0\" \"$@\"'`: ingest exit 0, `status --json` reported sessions 1 / turns 8, `search --project '*' --json Bash` returned a hit, and `ls -la` on the data dir showed drwx------ data, drwx------ snapshots, -rw------- verbatim.db, verbatim.db-wal, verbatim.db-shm and LOCK."
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "Cold start from an empty data dir",
+      "evidence": "Ran the shipped binary under `sh -c 'umask 022; ...'` against a fresh temp data dir: ingest exit 0, status --json sessions 1 / turns 8, search returned a hit, and the whole data dir landed 0700/0600 (data, snapshots, verbatim.db, -wal, -shm, LOCK)."
+    },
+    {
+      "k": 2,
+      "name": "Umask-022 process test covers all fourteen paths",
+      "evidence": "crates/verbatim/tests/owner_only.rs:105-131 sets the umask for the spawn (never in-process) and :455-469 asserts all fourteen paths in one collected message; test passes on HEAD. Falsified against the pre-fix build: 3e09d9a built in a throwaway worktree with this test copied in FAILED, naming all fourteen at 755/644 including the data dir, verbatim.db and both export files."
+    },
+    {
+      "k": 3,
+      "name": "No widen-then-narrow: set_permissions only in the repair",
+      "evidence": "`grep -rn set_permissions crates/*/src | grep -v cmd/install/` yields only store/open.rs:475 (the repair) and its doc comment at :457; all seven named creation sites pass the mode at creation through owner_only::create_dir_all / owner_only::options."
+    },
+    {
+      "k": 4,
+      "name": "Wide store tightened once on Store::open",
+      "evidence": "tighten() called only from Store::open (store/open.rs:139), compare-then-chmod with symlink_metadata at :466-475; tests/tighten.rs asserts every path owner-only after one `status`, every ctime (with nsec) unmoved on a second `status`, and `verbatim verify` exit 0. Passed."
+    },
+    {
+      "k": 5,
+      "name": "Read-only commands repair nothing",
+      "evidence": "open_read_only calls no tighten; tests/tighten.rs:229-251 re-widens then runs doctor --json, search and show and asserts every mode still 755/644 and every ctime unmoved. Passed."
+    },
+    {
+      "k": 6,
+      "name": "0644 verbatim.toml with api_key refused at consumption",
+      "evidence": "Refusal lives in credentials::resolve (credentials.rs:292-325) behind the env tier, not in Config::load_from; distinct Error::ConfigTooOpen wording names path and 3-digit octal mode; tests/config_mode.rs asserts the key value is absent from stdout, stderr and runs.error, that 0600 is accepted silently, and that a keyless or env-supplied 0644 file still loads and status succeeds. 3 tests passed."
+    },
+    {
+      "k": 7,
+      "name": "Doctor prints a chmod per credential refusal and the Windows deferral",
+      "evidence": "doctor.rs:142-145 wires credentials, config_mode and mode_checks; two distinct `chmod 600 '<path>'` fixes; mode_checks is an unconditional Note naming Windows/ACL/credentials/config_mode. tests/doctor.rs:1056-1135 runs both printed fixes through a shell and re-runs doctor to ok, and checks the deferral in report and --json. 26 doctor tests passed."
+    },
+    {
+      "k": 8,
+      "name": "Doctor notes a local provider not on loopback",
+      "evidence": "provider_local emits State::Note (never Problem) so doctor still exits 0; host_of/is_loopback are hand-written, handle userinfo and bracketed IPv6, add no dependency. Loopback, non-loopback and not-declared-local cases all covered by passing tests; core provider suite 17 passed unchanged."
+    },
+    {
+      "k": 9,
+      "name": "data move writes the destination tree owner-only",
+      "evidence": "cmd/data.rs:157/306/334 create through owner_only; tests/owner_only.rs:346-372 widens the source to 755/644, moves, and asserts the whole destination tree 0700/0600. Passed, along with the 5 datamove tests."
+    }
+  ],
+  "gaps": [],
+  "human_checks": []
+}

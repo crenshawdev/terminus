@@ -8,7 +8,7 @@ The archive is the product, so it is built first and everything else is built on
 
 - [x] **Phase 1: Prompt-True Resume Brief** - the brief's quoted prompt is a turn the user typed, not the tool result the harness wrote as a `user` record
 - [x] **Phase 2: Egress Filter Sees What Is Sent** - the redaction rules run over transcript content before it is serialized, so the shapes they name are actually caught on the wire
-- [ ] **Phase 3: Owner-Only On Disk** - nothing verbatim writes lands group- or world-readable, and `verbatim.toml` gets the mode check the shared credentials file already has
+- [x] **Phase 3: Owner-Only On Disk** - nothing verbatim writes lands group- or world-readable, and `verbatim.toml` gets the mode check the shared credentials file already has
 - [ ] **Phase 4: Redacted Recall** - an opt-in knob filters the derived recall projections, because hook and MCP output is model context and therefore an egress boundary
 
 ## Phase Details
