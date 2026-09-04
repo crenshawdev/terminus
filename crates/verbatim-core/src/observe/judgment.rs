@@ -358,6 +358,11 @@ fn ask(
 
         match read(&completion.content, anchors) {
             Ok(judgment) => {
+                // PRIV-03, at the one site that holds both halves (D-11): the
+                // knob is `config`'s and the exact-value rule is fed the
+                // `credential` this request was actually made with, rather than
+                // whatever a config accessor would have resolved.
+                let judgment = redacted(config, credential, judgment);
                 let written = store(conn, session_key, config, &judgment, tokens, reservation)
                     .map_err(|e| note(credential, e))?;
                 if !written {
@@ -790,7 +795,53 @@ fn claims(
     Ok(out)
 }
 
+/// One judgment with PRIV-03's filter run over every text column [`store`]
+/// writes, or the judgment unchanged when the knob is off.
+///
+/// Through the unconditional entry point and never `egress::for_destination`
+/// (phase 4 D-03). `provider.local` is a declaration about where the REQUEST
+/// went, and it says nothing about this: the answer lands in `observations`
+/// columns that `recall_search --kind observation` hands the model and that
+/// `verbatim observations` prints, so a provider declared local still echoes
+/// whatever it copied out of the transcript into a model-facing column.
+///
+/// `turn_id` is untouched (OBS-03). The anchor is the only thing that makes a
+/// claim auditable, and a filter that moved one would be worse than the leak it
+/// was fixing.
+///
+/// `outcome` goes through the filter for completeness rather than for effect:
+/// [`read`] has already refused every value but the four in [`OUTCOMES`], so the
+/// column cannot carry a credential in either setting - an answer that put one
+/// there never becomes a judgment at all and lands on the `parse_failed` path,
+/// whose `raw` is scrubbed unconditionally under D-16 whatever this knob says.
+fn redacted(config: &Config, credential: Option<&Secret>, judgment: Judgment) -> Judgment {
+    if !config.redact_recall() {
+        return judgment;
+    }
+    let scrub = |text: &str| crate::observe::egress::for_model_context(credential, text);
+    let claims = |claims: Vec<Claim>| -> Vec<Claim> {
+        claims
+            .into_iter()
+            .map(|claim| Claim {
+                turn_id: claim.turn_id,
+                text: scrub(&claim.text),
+            })
+            .collect()
+    };
+    Judgment {
+        topic: scrub(&judgment.topic),
+        outcome: scrub(&judgment.outcome),
+        decisions: claims(judgment.decisions),
+        learned: claims(judgment.learned),
+        unresolved: claims(judgment.unresolved),
+    }
+}
+
 /// Write the judgment columns of one row, and only those.
+///
+/// The `judgment` arrives already filtered when PRIV-03's knob is on: see
+/// [`redacted`], which runs at the call site because the `credential` this
+/// request used is in scope there and is not here.
 ///
 /// `raw` is cleared: a row that failed to parse once and answered on a later
 /// run must not keep the failed text beside a good answer. `mechanical`,
