@@ -259,3 +259,134 @@ fn a_credential_whose_name_falls_outside_the_window_is_still_taken() {
         "a credential whose name was cut away survived the filter:\n{filtered}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The observation branch, filtered on read (OBS-03, OBS-08, phase 4 D-05)
+
+/// Store one observation carrying one claim, anchored at a real turn of that
+/// session, the way `tests/recall.rs`'s own helper does.
+///
+/// Written straight into the table rather than through `judgment::store`
+/// deliberately: what this is about is a row that already exists, written when
+/// nothing was filtering, which is precisely the row a write-side filter alone
+/// would never reach.
+fn observe(conn: &Connection, fixture: &str, text: &str) -> (String, i64) {
+    let key: String = conn
+        .query_row(
+            "SELECT session_key FROM session_meta WHERE session_key LIKE '%' || ?1",
+            [fixture],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("no session for {fixture}: {e}"));
+    let anchor: i64 = conn
+        .query_row(
+            "SELECT min(id) FROM turns WHERE session_key = ?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let claims = serde_json::json!([{"turn_id": anchor, "text": text}]).to_string();
+    conn.execute(
+        "INSERT INTO observations (
+            session_key, generated_at, status, model, prompt_version, topic, outcome,
+            decisions, learned, unresolved, tokens
+         ) VALUES (?1, '2026-08-21T10:00:00.000Z', 'ok', 'stub', 'obs-judgment-1',
+                   'a topic', 'completed', ?2, '[]', '[]', 1)",
+        rusqlite::params![key, claims],
+    )
+    .unwrap();
+    (key, anchor)
+}
+
+/// AC6: a claim written while the knob was absent comes back filtered once the
+/// knob is on, with the row unchanged on disk and its anchor intact.
+///
+/// The row is inserted once and read twice. That is the whole test: the filter
+/// is on the READ path, so the same bytes in the same column answer differently
+/// under the two configs and no regeneration ever happens.
+#[test]
+fn a_claim_stored_before_the_knob_was_set_is_filtered_when_it_is_read() {
+    let bench = bench();
+    let conn = bench.conn();
+    let claim = format!("the sync run kept failing with Authorization: Bearer {AUTHZ_SENTINEL}");
+    let (key, anchor) = observe(&conn, "session-secrets.jsonl", &claim);
+
+    let ask = |config: &Config| {
+        search::run(
+            &conn,
+            config,
+            &Request::new(Query::parse("sync"), Scope::Everything).filters(
+                verbatim_core::recall::Filters {
+                    kind: Some(verbatim_core::recall::OBSERVATION_KIND.to_owned()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap()
+    };
+
+    let raw = ask(&bench.config(false));
+    let filtered = ask(&bench.config(true));
+
+    assert_eq!(raw.hits.len(), 1, "{:?}", raw.hits);
+    assert_eq!(filtered.hits.len(), 1, "{:?}", filtered.hits);
+    let (raw, filtered) = (&raw.hits[0], &filtered.hits[0]);
+
+    assert_eq!(raw.excerpt, claim, "the default returns the claim as stored");
+    assert!(
+        filtered.excerpt.contains(REDACTED),
+        "a filtered claim names what went:\n{}",
+        filtered.excerpt
+    );
+    for absent in [AUTHZ_SENTINEL, SENTINEL_MARK, "authz"] {
+        assert!(
+            !filtered.excerpt.contains(absent),
+            "{absent:?} survived into the claim:\n{}",
+            filtered.excerpt
+        );
+    }
+
+    // OBS-03's anchor is what makes a claim auditable, so it has to be the same
+    // id in both runs - and so does everything else that says which row this is.
+    assert_eq!(filtered.turn_id, anchor);
+    assert_eq!(filtered.turn_id, raw.turn_id);
+    assert_eq!(filtered.session_key, key);
+    assert_eq!(filtered.session_key, raw.session_key);
+    assert_eq!(filtered.ts, raw.ts);
+    assert_eq!(filtered.project, raw.project);
+    assert_eq!(filtered.relevance, raw.relevance);
+
+    // And the row on disk is untouched: this is a read filter, so the archive
+    // and the derived table both still hold exactly what was written.
+    let stored: String = conn
+        .query_row("SELECT decisions FROM observations", [], |r| r.get(0))
+        .unwrap();
+    assert!(stored.contains(AUTHZ_SENTINEL), "{stored}");
+}
+
+/// A claim with nothing credential-shaped in it is the same string in both
+/// settings, so the read filter costs an ordinary observation nothing.
+#[test]
+fn an_ordinary_claim_reads_back_the_same_under_both_settings() {
+    let bench = bench();
+    let conn = bench.conn();
+    let claim = "the sync retry now backs off before it gives up".to_owned();
+    observe(&conn, "session-secrets.jsonl", &claim);
+
+    let ask = |config: &Config| {
+        search::run(
+            &conn,
+            config,
+            &Request::new(Query::parse("sync"), Scope::Everything).filters(
+                verbatim_core::recall::Filters {
+                    kind: Some(verbatim_core::recall::OBSERVATION_KIND.to_owned()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(ask(&bench.config(true)).hits, ask(&bench.config(false)).hits);
+    assert_eq!(ask(&bench.config(true)).hits[0].excerpt, claim);
+}
