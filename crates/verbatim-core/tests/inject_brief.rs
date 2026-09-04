@@ -139,6 +139,24 @@ impl Bench {
         }
     }
 
+    /// A config with PRIV-03's knob written either way, through the file the
+    /// binary loads one from.
+    ///
+    /// There is no in-memory setter for it, deliberately, so a `verbatim.toml`
+    /// is the only thing that can turn it on. `on = false` spells the key out
+    /// rather than omitting it, so the two configs differ in exactly one token
+    /// of one file and in nothing else about how they were built.
+    fn redacting(&self, on: bool) -> Config {
+        let dir = self.work.join(format!("privacy-{on}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("verbatim.toml"),
+            format!("[privacy]\nredact_recall = {on}\n"),
+        )
+        .unwrap();
+        Config::load_from(&dir).unwrap()
+    }
+
     /// A config whose `[injection] brief_chars` is what the test says, loaded
     /// through the file the binary loads one from - the budget has to reach the
     /// query, and a struct built in memory would not prove that it does.
@@ -627,5 +645,124 @@ fn no_brief_exceeds_the_ceiling_whatever_the_config_says() {
     assert!(
         brief.ends_with(verbatim_core::recall::excerpt::ELISION),
         "the brief was cut at the ceiling without saying so"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PRIV-03: the brief's quotations, filtered before the budget is spent
+// ---------------------------------------------------------------------------
+
+/// The `Cookie:` value planted on the last typed turn of
+/// `session-secrets.jsonl`, which is the turn the brief quotes.
+const COOKIE_SENTINEL: &str = "sid-VBEGRESS-qcrumb-1f9";
+
+/// The fragment every planted sentinel of that fixture shares.
+const SENTINEL_MARK: &str = "VBEGRESS";
+
+/// The project `session-secrets.jsonl`'s `cwd` names, under this bench's root.
+const SECRETS_PROJECT: &str = "project-delta";
+
+/// The brief's quoted-prompt line, which is the one the sentinel is on.
+///
+/// Pulled out rather than asserting over the whole brief so that a marker
+/// appearing somewhere else - the head line, the pointer - could not stand in
+/// for the quotation actually having been filtered.
+fn asked_line(brief: &str) -> &str {
+    brief
+        .lines()
+        .find(|line| line.starts_with("It last asked:"))
+        .unwrap_or_else(|| panic!("the brief quotes no prompt:\n{brief}"))
+}
+
+/// The default, stated as an assertion: with the knob absent the brief quotes
+/// the turn exactly as the archive holds it.
+#[test]
+fn an_unfiltered_brief_quotes_the_planted_credential_whole() {
+    let bench = bench();
+    bench.archive_fixture("session-secrets.jsonl");
+
+    let brief = bench
+        .brief_with(SECRETS_PROJECT, &bench.redacting(false))
+        .expect("a brief");
+
+    assert!(
+        asked_line(&brief).contains(COOKIE_SENTINEL),
+        "the default must not filter the quotation:\n{brief}"
+    );
+}
+
+/// PRIV-03 over the `SessionStart` brief: hook stdout is the model's first
+/// context of a session, so the knob filters what it quotes.
+///
+/// The filter runs before the budget is measured (phase 4 D-06), never after
+/// `clip`: a marker cut in half by the budget would leave a nameless partial
+/// value no shape rule can catch, and the brief would be the one output where a
+/// long turn still leaks.
+#[test]
+fn the_knob_takes_the_planted_credential_out_of_the_briefs_quotation() {
+    let bench = bench();
+    bench.archive_fixture("session-secrets.jsonl");
+
+    let raw = bench
+        .brief_with(SECRETS_PROJECT, &bench.redacting(false))
+        .expect("a brief");
+    let filtered = bench
+        .brief_with(SECRETS_PROJECT, &bench.redacting(true))
+        .expect("a brief");
+
+    // The premise: the quoted turn really does carry the credential, so what
+    // follows is about the filter and not about a brief that quoted elsewhere.
+    assert!(asked_line(&raw).contains(COOKIE_SENTINEL), "{raw}");
+
+    assert!(
+        asked_line(&filtered).contains(verbatim_core::config::REDACTED),
+        "a filtered quotation names what went:\n{filtered}"
+    );
+    for absent in [COOKIE_SENTINEL, SENTINEL_MARK, "qcrumb"] {
+        assert!(
+            !filtered.contains(absent),
+            "{absent:?} survived into the brief:\n{filtered}"
+        );
+    }
+
+    // The blocks this file builds itself are not archived text and are not
+    // filtered: the brief still names the session it is resuming and still
+    // points at the index.
+    for present in ["The last session in", "phase-2-egress", "recall_search"] {
+        assert!(
+            filtered.contains(present),
+            "the filter took a block it does not own, {present:?}:\n{filtered}"
+        );
+    }
+}
+
+/// INJ-02's byte identity, restated with the knob on: two renders against an
+/// unchanged store are the same brief.
+///
+/// The filter is a pure function of the projection, so it cannot be what makes
+/// a brief vary - but that is the claim, and this is what falsifies it.
+#[test]
+fn two_filtered_briefs_against_an_unchanged_store_are_byte_identical() {
+    let bench = bench();
+    bench.archive_fixture("session-secrets.jsonl");
+    let config = bench.redacting(true);
+
+    let first = bench.brief_with(SECRETS_PROJECT, &config).expect("a brief");
+    let second = bench.brief_with(SECRETS_PROJECT, &config).expect("a brief");
+
+    assert_eq!(first, second);
+    assert!(first.contains(verbatim_core::config::REDACTED), "{first}");
+}
+
+/// The control: a project with nothing credential-shaped in it renders the same
+/// brief in both settings.
+#[test]
+fn the_knob_leaves_an_ordinary_brief_exactly_as_it_was() {
+    let bench = bench();
+    bench.archive(&LATE);
+
+    assert_eq!(
+        bench.brief_with("project-alpha", &bench.redacting(true)),
+        bench.brief_with("project-alpha", &bench.redacting(false)),
     );
 }

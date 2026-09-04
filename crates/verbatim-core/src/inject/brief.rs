@@ -60,6 +60,7 @@ use rusqlite::{Connection, OptionalExtension};
 use super::Payload;
 use crate::blob::BlobReader;
 use crate::config::Config;
+use crate::observe::egress::Redaction;
 use crate::recall::scope::Scoped;
 use crate::recall::{excerpt, Query};
 
@@ -77,7 +78,16 @@ pub fn session_start(data_dir: &Path, config: &Config, payload: &Payload) -> Opt
     }
     let store = super::open(data_dir)?;
     let scoped = super::scoped(store.conn(), config, payload)?;
-    let brief = render(store.conn(), &scoped, config.brief_chars())?;
+    // Resolved at the entry point that holds the `Config` and carried down
+    // (phase 4 D-01). A brief is hook stdout, which is the model's first
+    // context of the session, so its quotations are an egress boundary in
+    // exactly the way a search excerpt is.
+    let brief = render(
+        store.conn(),
+        &scoped,
+        config.brief_chars(),
+        &Redaction::of(config),
+    )?;
     remember(data_dir, payload, &brief);
     Some(brief.text)
 }
@@ -151,9 +161,24 @@ struct Brief {
 /// The last session first and the index pointer last: continuity is what the
 /// session is resuming, and the pointer is the standing fact that outlives it.
 /// A block that cannot be rendered is dropped rather than failing the brief.
-fn render(conn: &Connection, scoped: &Scoped, budget: usize) -> Option<Brief> {
+///
+/// `redaction` reaches the quotes before this function measures anything, which
+/// is phase 4 D-06: the filter is spent out of the budget rather than applied to
+/// what the budget left. A marker consuming room a quotation would otherwise
+/// have had is the decided behaviour. Filtering after [`clip`] is what it buys
+/// out - a marker cut in half leaves a nameless partial value no shape rule can
+/// catch, and the brief would be the one output where a long turn leaks.
+///
+/// The head line, the branch and the index pointer are built here out of
+/// `session_meta` and counts, not out of archived text, and are not filtered.
+fn render(
+    conn: &Connection,
+    scoped: &Scoped,
+    budget: usize,
+    redaction: &Redaction<'_>,
+) -> Option<Brief> {
     let budget = budget.min(MAX_BRIEF_CHARS);
-    let continuity = last_session(conn, scoped);
+    let continuity = last_session(conn, scoped, redaction);
     let pointer = index_pointer(conn, scoped);
     if continuity.is_none() && pointer.is_none() {
         return None;
@@ -358,7 +383,11 @@ struct LastSession {
 
 /// INJ-01's continuity blocks: which session was last here, when it ended, on
 /// what branch, and the last thing said in each direction.
-fn last_session(conn: &Connection, scoped: &Scoped) -> Option<Continuity> {
+fn last_session(
+    conn: &Connection,
+    scoped: &Scoped,
+    redaction: &Redaction<'_>,
+) -> Option<Continuity> {
     let row = last_session_row(conn, scoped).ok()??;
     let project = project_label(scoped);
 
@@ -372,7 +401,7 @@ fn last_session(conn: &Connection, scoped: &Scoped) -> Option<Continuity> {
         (None, None) => format!("The last session in {project} is archived."),
     };
 
-    let (prompt, reply) = last_exchange(conn, &row.session_key);
+    let (prompt, reply) = last_exchange(conn, &row.session_key, redaction);
     Some(Continuity {
         head,
         prompt,
@@ -472,14 +501,19 @@ fn day(ts: &str) -> &str {
 /// carry a record whose timestamp runs backwards (phase 3 D-22), so the last
 /// turn by clock is not the last turn of the conversation.
 ///
-/// The text is cut through [`excerpt::of_record`], which is the same projection
-/// ingest indexed these turns with and the search path reads them through -
+/// The text is cut through [`excerpt::of_record_with`] under the caller's
+/// redaction, which is the same projection under the same filter that ingest
+/// indexed these turns with and the search path reads them through -
 /// `DESIGN-BRIEF.md:230` asks for the last prompt and the last assistant turn
 /// "truncated", and a second definition of what a turn said would be a second
 /// thing to keep true. The query is empty because there is no query here: the
 /// window then falls back to the head of the turn, which is what the turn
 /// opened with.
-fn last_exchange(conn: &Connection, session_key: &str) -> (Option<Quote>, Option<Quote>) {
+fn last_exchange(
+    conn: &Connection,
+    session_key: &str,
+    redaction: &Redaction<'_>,
+) -> (Option<Quote>, Option<Quote>) {
     let prompt = last_turn(conn, session_key, "user");
     let reply = last_turn(conn, session_key, "assistant");
     if prompt.is_none() && reply.is_none() {
@@ -506,7 +540,7 @@ fn last_exchange(conn: &Connection, session_key: &str) -> (Option<Quote>, Option
     let cut = |coordinates: Option<(i64, i64, i64)>| -> Option<Quote> {
         let (turn_id, offset, len) = coordinates?;
         let bytes = reader.read_range(offset as u64, len as u64).ok()?;
-        let text = excerpt::of_record(&query, &bytes);
+        let text = excerpt::of_record_with(&query, &bytes, redaction);
         (!text.trim().is_empty()).then_some(Quote { turn_id, text })
     };
     (cut(prompt), cut(reply))
