@@ -1,0 +1,101 @@
+{
+  "status": "delivered",
+  "score": "8/8",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "All four named projections return the planted secret intact with the knob absent and the rule's marker (config::REDACTED = \"[redacted]\", the marker the header/assignment rules push at observe/egress.rs:530,609,696) with [privacy] redact_recall = true, at library level and at the process boundary.",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "Wiring: five entry points resolve Redaction::of(config) - recall/search.rs:355 and :430, recall/context.rs:202, recall/get.rs:219, inject/brief.rs:89, inject/prompt.rs:444; the decision itself at observe/egress.rs:291. Named tests, all run green: tests/redacted_recall.rs:139 an_unfiltered_search_returns_the_planted_credential_whole and :152 the_knob_takes_every_planted_credential_out_of_the_search_excerpt; tests/recall.rs:1693/:1710 (context window) and :1915/:1930 (get body, which also re-reads the id knob-off and asserts the archived line byte-for-byte); tests/inject_brief.rs:680/:702 (brief quote). Process boundary: crates/verbatim/tests/mcp.rs:1819 the_three_tools_answer_the_planted_secret_until_the_knob_is_turned_on and crates/verbatim/tests/brief.rs:429 the_knob_filters_the_briefs_quoted_prompt_at_the_hook_boundary, each running the same store twice with nothing changed but the config file. D-02's ordering has its own falsifier at redacted_recall.rs:222 (a credential whose name is cut outside the 240-char window is still taken). cargo test -p verbatim-core --features testkit: redacted_recall 8/8, recall 54/54, inject_brief 13/13; -p verbatim --features testkit: mcp 26/26, brief 4/4."
+    },
+    {
+      "n": 2,
+      "truth": "With the boolean absent the four projections are byte-identical to a golden captured from the phase's base commit, and the pre-existing tests in mcp.rs, hook.rs and the recall test files are unmodified and pass.",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "crates/verbatim-core/tests/goldens/recall-projections.txt has exactly one commit in its history, 6499e53 (plan 1 task 1, the first phase commit, before the knob landed in 3c8977e), and no later commit touches it. crates/verbatim-core/tests/recall_golden.rs:276 the_four_projections_are_what_the_golden_says compares and reports the first differing line; :308 the_golden_carries_an_unfiltered_sentinel asserts the golden actually holds sk-VBEGRESS-authz-9f2, so a byte-identical pass cannot be vacuous. `git diff --stat 6499e53~1..HEAD` over mcp.rs, hook.rs, brief.rs, recall_cli.rs, recall.rs, inject_brief.rs is 1214 insertions and 1 deletion, the single deletion being an expanded `use verbatim_core::config::Config;` import line in recall.rs - no existing test body changed. recall_golden 2/2, and one full `cargo test --workspace --features verbatim/testkit,verbatim-core/testkit` run finished with zero `test result: FAILED` lines."
+    },
+    {
+      "n": 3,
+      "truth": "The archive on disk is identical in both settings and no filter reaches the ingest path.",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "crates/verbatim/tests/recall_cli.rs:1388 turning_the_knob_on_leaves_the_archive_byte_for_byte_where_it_was ingests once, captures every session blob plus `verbatim verify --json`, writes the knob-on config, and re-reads: blob equality per session key, whole `verify --json` document equality, and a positive-control assertion that both passes were `ok: true` with `failures: []` and `checked > 0`. crates/verbatim-core/tests/egress.rs:231 nothing_in_the_ingest_path_names_the_egress_filter still passes (egress 11/11). Corroborated at library level by tests/recall.rs:1930, which re-reads the same turn id knob-off and gets the fixture's own bytes. recall_cli 23/23."
+    },
+    {
+      "n": 4,
+      "truth": "--raw is a per-invocation flag on the two terminal read commands only, and no environment variable reaches past the knob on the hook or the MCP server.",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "Escape hatch: crates/verbatim/src/cmd/show.rs:49 and crates/verbatim/src/cmd/search.rs:74 both `args.raw.then(|| reader.config().without_recall_redaction())` - a forced-off copy with no setter that can turn it on (config.rs:933-947). Config resolution reads the parsed TOML alone (config.rs:724 is the only assignment to the field), so environment immunity is structural rather than enumerated. Tests: recall_cli.rs:1235 the_knob_filters_show_at_the_process_boundary_and_raw_reaches_past_it (three runs over one store; `show --raw` output asserted equal to the no-config run, and `--json` key sets asserted identical in both settings, holding D-08); recall_cli.rs:1119 the_raw_flag_is_accepted_by_the_two_projecting_commands_and_by_no_other; recall_cli.rs:1308 for `search`; brief.rs:467 no_environment_variable_reaches_past_the_knob_on_the_session_start_brief and mcp.rs:1907 no_environment_variable_reaches_past_the_knob_on_the_mcp_surface, both spawning with RAW=1, VERBATIM_RAW=1 and VERBATIM_REDACT_RECALL=false. All green."
+    },
+    {
+      "n": 5,
+      "truth": "A successful judgment's topic and every claim text are filtered before the SQLite write, and outcome cannot carry a credential at all.",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "observe/judgment.rs:817 `fn redacted(config, credential, judgment)` gates on config.redact_recall() and scrubs topic, outcome and the text of every claim in all three lists through egress::for_model_context, leaving every turn_id untouched; called at the store call site, judgment.rs:365. Tests: tests/judgment.rs:787 an_unfiltered_judgment_stores_the_planted_credentials_whole (the knob-off premise), :814 the_knob_filters_a_judgment_before_it_reaches_sqlite - a direct SQL read of topic, decisions, learned and unresolved finds config::REDACTED and none of the four sentinels or the SENTINEL_MARK, with the three anchors asserted to be real turn ids of the session; the harness config declares provider.local = true, which is what makes it a live test of D-03. The recorded deviation holds as described: `outcome` is validated against the closed OUTCOMES enum before store, and :868 an_outcome_carrying_a_credential_never_becomes_a_stored_judgment asserts a credential-bearing outcome lands on the parse_failed path with topic = NULL. judgment 11/11."
+    },
+    {
+      "n": 6,
+      "truth": "An observation row written while the knob was absent reads back filtered once the knob is on, with the row on disk unchanged.",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "Read-side filter wired at recall/search.rs:355, the observation branch's own `Redaction::of(config)`. tests/redacted_recall.rs:309 a_claim_stored_before_the_knob_was_set_is_filtered_when_it_is_read inserts one claim directly into `observations` (deliberately not through judgment::store), queries twice with kind = observation, asserts the knob-off excerpt equals the claim verbatim and the knob-on excerpt carries the marker and none of AUTHZ_SENTINEL / VBEGRESS / \"authz\", with turn_id, session_key, ts, project and relevance identical across both, and finally re-reads the `decisions` column by SQL to prove the stored row still holds the sentinel. Control at :371. Green."
+    },
+    {
+      "n": 7,
+      "truth": "The hook stays inside its p99 wall budget over 100 runs of every event with the knob on.",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "crates/verbatim/tests/hook.rs:802 every_event_stays_inside_the_budget_with_the_redaction_knob_on writes [privacy] redact_recall = true into the hook's config dir, then runs 100 spawns of each of the four FIXTURES events, asserting exit 0 and empty stdout per run and p99 < 10.0 ms per event, inside the same COPYING lock the rest of the file uses. `cargo test -p verbatim --test hook`: 8 passed, 0 failed."
+    },
+    {
+      "n": 8,
+      "truth": "The two items the SUMMARY declares as known read exactly as declared.",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "Confirmed, first item: crates/verbatim-core/src/recall/get.rs:242-246 - the knob-on arm is `redaction.apply(&String::from_utf8_lossy(&bytes)).into_owned().into_bytes()`, so a non-UTF-8 archived line comes back with U+FFFD once the knob is on even carrying no secret (the SUMMARY cites :236; the lossy call is at :244 after the surrounding comment). The knob-off arm passes the blob's own bytes with no conversion, so the default is unaffected. Not fixed; filed per .planning/FILED.md:17 (github crenshawdev/verbatim), which also supersedes the SUMMARY's 'could not be filed' note. Confirmed, second item: crates/verbatim/tests/backfill.rs:493 is outside every file this phase's commits touched (`git diff --name-only 6499e53~1..HEAD` does not list it); on this verification's single full-workspace run it passed, so the flake did not fire, and it remains a suite-stability item rather than a phase-4 gap."
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "Four projections leak by default, filter when the knob is on",
+      "evidence": "Knob-off/knob-on pairs over one store at library level (redacted_recall.rs:139/:152, recall.rs:1693/:1710 and :1915/:1930, inject_brief.rs:680/:702) and at the process boundary (mcp.rs:1819 for all three tools, brief.rs:429 for the SessionStart hook). Filtered output carries config::REDACTED, the marker the header rule pushes at egress.rs:530/:609/:696, and none of AUTHZ_SENTINEL / COOKIE_SENTINEL / VBEGRESS. Five entry points resolve Redaction::of - search.rs:355,:430, context.rs:202, get.rs:219, brief.rs:89, prompt.rs:444."
+    },
+    {
+      "k": 2,
+      "name": "Default output is byte-identical to the pre-phase build",
+      "evidence": "recall_golden.rs:276 against tests/goldens/recall-projections.txt, whose only commit is 6499e53, the phase's first commit ahead of the knob (3c8977e); recall_golden.rs:308 proves the golden holds a live sentinel. Test files show 1214 insertions / 1 deletion since 6499e53~1, the deletion being an import line. One full workspace run with testkit: zero failures."
+    },
+    {
+      "k": 3,
+      "name": "The archive on disk is untouched in both settings",
+      "evidence": "recall_cli.rs:1388 turning_the_knob_on_leaves_the_archive_byte_for_byte_where_it_was - one ingest, blob-by-blob equality and identical `verify --json` documents across the flip, with ok/failures/checked asserted so the equality is two clean passes. egress.rs:231 nothing_in_the_ingest_path_names_the_egress_filter still passes."
+    },
+    {
+      "k": 4,
+      "name": "--raw is the owner's only escape hatch, and no env var is",
+      "evidence": "show.rs:49 and search.rs:74 use Config::without_recall_redaction() per invocation; config.rs:724 is the only assignment to the resolved field and reads the TOML alone. recall_cli.rs:1235 and :1308 prove marker-then-raw at the process boundary with `--raw` output equal to the no-config run; recall_cli.rs:1119 proves no other command takes the flag; brief.rs:467 and mcp.rs:1907 prove RAW, VERBATIM_RAW and VERBATIM_REDACT_RECALL=false on the spawn change nothing."
+    },
+    {
+      "k": 5,
+      "name": "A judgment is filtered before it reaches SQLite",
+      "evidence": "judgment.rs:817 `redacted` scrubs topic, outcome and every claim text at the store call site (judgment.rs:365), turn_ids untouched. tests/judgment.rs:814 reads topic, decisions, learned and unresolved by SQL and finds the marker and no sentinel, under a config declaring provider.local = true. The outcome half is settled in the stronger direction by tests/judgment.rs:868, as the recorded deviation states."
+    },
+    {
+      "k": 6,
+      "name": "Rows written before the flip are filtered on read",
+      "evidence": "search.rs:355 resolves the redaction on the observation branch. redacted_recall.rs:309 inserts one claim directly into `observations`, reads it twice under the two configs, gets the claim verbatim then the marker, keeps every identity field equal, and re-reads the column by SQL to show the stored row still holds the sentinel."
+    },
+    {
+      "k": 7,
+      "name": "The hook holds its wall budget with redaction on",
+      "evidence": "hook.rs:802 every_event_stays_inside_the_budget_with_the_redaction_knob_on: 100 runs of each of the four events with the knob written into the hook's config dir, exit 0 and empty stdout per run, p99 < 10 ms per event. hook binary 8/8."
+    }
+  ],
+  "gaps": [],
+  "human_checks": []
+}
