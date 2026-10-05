@@ -236,11 +236,13 @@ fn strings(value: &serde_json::Value) -> Vec<String> {
 #[test]
 fn the_dry_run_names_exactly_what_the_next_ingest_pass_evicts() {
     let bench = bench();
-    bench.config(EVICT_30);
     let old_a = bench.place(1, "session-basic.jsonl");
     let old_b = bench.place(2, "session-recall.jsonl");
     let fresh = bench.place(3, "session-continuation.jsonl");
     bench.ingest();
+    // After the first pass: the fixtures are dated 2026-08-12, so a policy in
+    // force then would act on them before anything here aged them.
+    bench.config(EVICT_30);
     bench.age(&[&old_a, &old_b], AGED);
     bench.age(&[&fresh], FRESH);
 
@@ -288,11 +290,14 @@ fn the_dry_run_names_exactly_what_the_next_ingest_pass_evicts() {
 #[test]
 fn running_the_dry_run_twice_changes_no_row_in_any_table() {
     let bench = bench();
-    bench.config(EVICT_30);
     let aged = bench.place(1, "session-basic.jsonl");
-    bench.place(2, "session-recall.jsonl");
+    let fresh = bench.place(2, "session-recall.jsonl");
     bench.ingest();
+    // After the first pass: the fixtures are dated 2026-08-12, so a policy in
+    // force then would act on them before anything here aged them.
+    bench.config(EVICT_30);
     bench.age(&[&aged], AGED);
+    bench.age(&[&fresh], FRESH);
 
     let before = bench.snapshot();
 
@@ -319,7 +324,6 @@ fn running_the_dry_run_twice_changes_no_row_in_any_table() {
 #[test]
 fn an_evicted_session_stays_listed_and_searchable_while_a_deleted_one_is_gone() {
     let bench = bench();
-    bench.config(EVICT_30);
     let evicted = bench.place(1, "session-basic.jsonl");
     let doomed = bench.place(2, "session-recall.jsonl");
     bench.ingest();
@@ -330,6 +334,9 @@ fn an_evicted_session_stays_listed_and_searchable_while_a_deleted_one_is_gone() 
         !matched.is_empty(),
         "the fixture has to be searchable to start with"
     );
+    // After the first pass: the fixtures are dated 2026-08-12, so a policy in
+    // force then would act on them before anything here aged them.
+    bench.config(EVICT_30);
     bench.age(&[&evicted], AGED);
     bench.age(&[&doomed], FRESH);
 
@@ -402,7 +409,7 @@ fn an_evicted_session_stays_listed_and_searchable_while_a_deleted_one_is_gone() 
 #[test]
 fn an_off_policy_and_a_policy_with_nothing_due_say_different_things() {
     let bench = bench();
-    bench.place(1, "session-basic.jsonl");
+    let key = bench.place(1, "session-basic.jsonl");
     bench.ingest();
 
     let out = bench.run(&["retention", "--dry-run", "--json"]);
@@ -416,6 +423,8 @@ fn an_off_policy_and_a_policy_with_nothing_due_say_different_things() {
         "{value}"
     );
 
+    // Fresh by its own date, which the fixture's 2026-08-12 no longer is.
+    bench.age(&[&key], FRESH);
     bench.config(EVICT_30);
     let out = bench.run(&["retention", "--dry-run", "--json"]);
     let value = document(&out);
@@ -461,9 +470,11 @@ fn against_no_store_it_exits_zero_and_creates_no_data_directory() {
 #[test]
 fn the_human_output_keeps_the_stream_split() {
     let bench = bench();
-    bench.config(EVICT_30);
     let aged = bench.place(1, "session-basic.jsonl");
     bench.ingest();
+    // After the first pass: the fixtures are dated 2026-08-12, so a policy in
+    // force then would act on them before anything here aged them.
+    bench.config(EVICT_30);
     bench.age(&[&aged], AGED);
 
     let out = bench.run(&["retention", "--dry-run"]);
