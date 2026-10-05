@@ -1,4 +1,4 @@
-# Roadmap: Verbatim
+# Roadmap: Terminus
 
 ## Overview
 

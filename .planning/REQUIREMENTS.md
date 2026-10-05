@@ -1,4 +1,4 @@
-# Requirements: Verbatim
+# Requirements: Terminus
 
 **Defined:** 2026-08-12
 **Core Value:** The verbatim transcript is the record: every session archived losslessly and permanently, everything else derived, rebuildable, and measurable against it.
@@ -30,21 +30,21 @@ table).
 | STOR-01 (A session's turns are stored as one block-framed zstd blob, and reading a single turn decompresses only the 64 KB blocks that turn occupies.) | 1 | Complete | v0.1.0 |
 | STOR-05 (The binary refuses to open a store whose format version is newer than it knows, and rebuilds derived tables — never the archive table — when the format is older.) | 1 | Complete | v0.1.0 |
 | STOR-02 (An ingest commits blob, turn rows, FTS rows, entity rows and the watermark in a single transaction, so a killed process leaves no partially indexed session.) | 1 | Complete | v0.1.0 |
-| STOR-03 (`verbatim verify` walks every blob, checks its per-blob checksum, and names the session ids that fail rather than declaring the store bad.) | 1 | Complete | v0.1.0 |
-| STOR-04 (`verbatim reindex` rebuilds every derived table from blobs alone and produces the same query results as before the rebuild.) | 1 | Complete | v0.1.0 |
-| ING-01 (`verbatim ingest` tails each transcript from its stored byte offset to the last complete record, and resumes correctly when the previous run stopped mid-line.) | 1 | Complete | v0.1.0 |
+| STOR-03 (`terminus verify` walks every blob, checks its per-blob checksum, and names the session ids that fail rather than declaring the store bad.) | 1 | Complete | v0.1.0 |
+| STOR-04 (`terminus reindex` rebuilds every derived table from blobs alone and produces the same query results as before the rebuild.) | 1 | Complete | v0.1.0 |
+| ING-01 (`terminus ingest` tails each transcript from its stored byte offset to the last complete record, and resumes correctly when the previous run stopped mid-line.) | 1 | Complete | v0.1.0 |
 | ING-02 (A second ingest launched while one is running exits 0 within milliseconds instead of waiting, and exactly one process does the work.) | 1 | Complete | v0.1.0 |
 | ING-03 (Ingest performs its recovery at the top of every run, with no repair command and no external supervisor, and a rerun after a kill at any point converges to a consistent store.) | 2 | Complete | v0.1.0 |
 | ING-04 (Ingest discovers nested subagent sidecar transcripts and links sessions that continue across files into one thread.) | 2 | Complete | v0.1.0 |
 | ING-08 (An excluded project is never read rather than read-then-filtered, and the exclusion is honored on the ingest path and every read path alike.) | 2 | Complete | v0.1.0 |
-| ING-09 (`verbatim status` reports sizes, counts, watermarks and the last ingest run with its error, sourced from the `runs` table rather than a log file.) | 2 | Complete | v0.1.0 |
+| ING-09 (`terminus status` reports sizes, counts, watermarks and the last ingest run with its error, sourced from the `runs` table rather than a log file.) | 2 | Complete | v0.1.0 |
 | ING-05 (A session's project is the canonical git toplevel derived from the record's `cwd`, with worktrees mapped to the parent repo and both keys stored; the encoded directory name and `basename()` are never used for identity.) | 2 | Complete | v0.1.0 |
 | ING-06 (A compaction appended to a live transcript is ingested as a boundary carrying the record's compaction metadata verbatim. The set of turns that fell out of the model's context is derived from that metadata at query time (INJ-05, Phase 5) - the metadata describes the preserved segment, so the complement is a query and not a stored column (Phase 2 D-08).) | 2 | Complete | v0.1.0 |
 | RCL-01 (Turn text is expanded in Rust at ingest into its camel, snake, kebab and path components, so a search for `SearchManager` and a search for `manager` both find the same turn through plain `unicode61` FTS5.) | 3 | Complete | v0.1.0 |
 | RCL-02 (Entities of kind path, command, error, symbol and tool are extracted from structured tool records, with per-kind normalization, rather than from prose.) | 3 | Complete | v0.1.0 |
 | RCL-03 (Error entities are normalized by stripping line numbers, addresses, timestamps and UUIDs, so the same error recurring in a later session matches the earlier one.) | 3 | Complete | v0.1.0 |
 | RCL-04 (No entity is rejected at index time; commonness is handled by IDF weighting at query time, and the number of entities emitted per turn is capped.) | 3 | Complete | v0.1.0 |
-| RCL-05 (`verbatim search`, `verbatim show` and `verbatim sessions` give terminal recall over the archive with project scoping and filters.) | 3 | Complete | v0.1.0 |
+| RCL-05 (`terminus search`, `terminus show` and `terminus sessions` give terminal recall over the archive with project scoping and filters.) | 3 | Complete | v0.1.0 |
 | RCL-07 (`recall_search` returns ranked turns filtered by project, paths, tool, kind and time window, with id, session, timestamp, project and excerpt per hit.) | 3 | Complete | v0.1.0 |
 | RCL-08 (`recall_context` returns the chronological turns around a given hit.) | 3 | Complete | v0.1.0 |
 | RCL-06 (Every data command accepts `--json` and emits a stable shape, sends data to stdout and errors to stderr, and exits 0 on success, 1 on operational failure and 2 on misuse, never non-zero for an empty result.) | 3 | Complete | v0.1.0 |
@@ -57,10 +57,10 @@ table).
 | INST-04 (Install offers to raise `cleanupPeriodDays` when it is low and prints the auto-compact recommendation, without changing either setting itself.) | 4 | Complete | v0.1.0 |
 | INST-05 (An upgrade replaces the binary and re-copies it to the stable path without rewriting a single hook entry.) | 4 | Complete | v0.1.0 |
 | INST-08 (`--yes` accepts every default so install runs unattended in a script.) | 4 | Complete | v0.1.0 |
-| INST-06 (`verbatim doctor` is read-only, never repairs, and prints the exact command that fixes each problem it reports.) | 4 | Complete | v0.1.0 |
+| INST-06 (`terminus doctor` is read-only, never repairs, and prints the exact command that fixes each problem it reports.) | 4 | Complete | v0.1.0 |
 | INST-07 (Uninstall removes only what install added, restores the settings backup when the file is otherwise unchanged, leaves the data and prints where it is, and deletes it under `--purge` only after showing its size and confirming.) | 4 | Complete | v0.1.0 |
 | ING-11 (Backfill estimates sessions, size and time up front, then runs detached, chunked, resumable and with bounded parallelism.) | 4 | Complete | v0.1.0 |
-| INST-01 (`npx verbatim install` runs from a thin npm package with per-platform optional dependencies and no postinstall script.) | 4 | Complete | v0.1.0 |
+| INST-01 (`npx terminus install` runs from a thin npm package with per-platform optional dependencies and no postinstall script.) | 4 | Complete | v0.1.0 |
 | INJ-01 (SessionStart emits a resume brief covering the last session in this project, the branch that session ended on, the index pointer and observations when enabled, inside its token budget and a single-digit-millisecond wall budget. The working-state delta is branch-only because `session_meta.branch` is the sole git fact the archive holds and a `git` subprocess costs 10-30 ms against a single-digit-millisecond budget (Phase 5 D-10).) | 5 | Complete | v0.1.0 |
 | INJ-06 (Any injection failure emits nothing and exits 0 inside the deadline, so a missing, locked or corrupt store never blocks a prompt.) | 5 | Complete | v0.1.0 |
 | INJ-02 (The resume brief contains no volatile text — stable ordering, dates rounded to the day — so unchanged state produces byte-identical output across runs and does not bust the prefix cache.) | 5 | Complete | v0.1.0 |
@@ -70,9 +70,9 @@ table).
 | FEED-01 (Every injection decision is logged, non-fires included, with the entities extracted, candidates scored, turns injected, turns suppressed with reasons, thresholds used and tokens spent.) | 6 | Complete | v0.1.0 |
 | FEED-02 (Ingest labels decisions from finalized sessions as hit, false positive, miss or wasted budget by joining them against the transcript that followed.) | 6 | Complete | v0.1.0 |
 | FEED-03 (A replay harness re-runs every logged prompt against the index as it stood, so a change to extraction or thresholds is diffed against history offline instead of tuned by feel.) | 6 | Complete | v0.1.0 |
-| FEED-04 (`verbatim stats` reports injection precision, misses, and tokens injected versus tokens referenced.) | 6 | Complete | v0.1.0 |
+| FEED-04 (`terminus stats` reports injection precision, misses, and tokens injected versus tokens referenced.) | 6 | Complete | v0.1.0 |
 | OBS-01 (Mechanical observations — files read and modified, tools used, commands run, errors seen, branch, commits, turn count, duration, compactions — are parser-derived and always available.) | 7 | Complete | v0.1.0 |
-| OBS-07 (`verbatim observations regenerate` rebuilds derived observations selected by `--since` or `--prompt-version`.) | 7 | Complete | v0.1.0 |
+| OBS-07 (`terminus observations regenerate` rebuilds derived observations selected by `--since` or `--prompt-version`.) | 7 | Complete | v0.1.0 |
 | OBS-05 (One provider block of base URL, model and key serves local, OpenRouter and any OpenAI-compatible endpoint through a single code path, with Anthropic subscription auth as a separate branch. - Phase 7 note (2026-08-22): the OpenAI-compatible half is delivered and the single code path is intact. Anthropic subscription OAuth - the "separate branch" - is DEFERRED out of phase 7 (CONTEXT D-05): no OAuth flow, refresh or storage is described anywhere in the repo and there is no Anthropic key on this machine to prove it against. Add it as its own phase via /cad-phase. A fourth key, `response_format`, exists for an endpoint whose structured-output support is narrower than `json_schema` (measured against `deepseek-chat`); it selects one field's value, not a second request shape, so "single code path" holds. See phase 7 AC4 as amended.) | 7 | Complete | v0.1.0 |
 | PRIV-01 (Redaction happens at egress and is keyed on destination — a remote provider is filtered, a local provider is not egress at all — and never at ingest.) | 7 | Complete | v0.1.0 |
 | PRIV-02 (Credentials load from the shared per-provider file with permissions enforced and load refused when they are too open, following precedence process env, then product config, then shared file, and their values never reach logs, errors or output. - Phase 7 note (2026-08-22): the permission check is a Unix mode-bit test via `PermissionsExt`. Windows ACL enforcement is DEFERRED (CONTEXT D-15); the Windows arm accepts with a caveat surfaced in `doctor`. Complete on Unix only.) | 7 | Complete | v0.1.0 |
@@ -85,11 +85,11 @@ table).
 | RET-01 (Retention is off by default, and `keep`, `evict` and `delete` can be set globally or per project.) | 8 | Complete | v0.1.0 |
 | RET-03 (Retention runs at the end of an ingest pass under the lock already held, does bounded work per pass, and `--dry-run` reports what it would do before anything is applied.) | 8 | Complete | v0.1.0 |
 | RET-02 (An evicted session stays searchable and listed with its body flagged as evicted, while a deleted one is gone from both blob and index.) | 8 | Complete | v0.1.0 |
-| RET-04 (`verbatim compact` reclaims freed space so the store actually shrinks after retention.) | 8 | Complete | v0.1.0 |
-| RET-05 (`verbatim usage` reports bytes per project and per month.) | 8 | Complete | v0.1.0 |
-| PRIV-04 (`verbatim export` produces portable output for backup or migration and states what that output contains.) | 8 | Complete | v0.1.0 |
+| RET-04 (`terminus compact` reclaims freed space so the store actually shrinks after retention.) | 8 | Complete | v0.1.0 |
+| RET-05 (`terminus usage` reports bytes per project and per month.) | 8 | Complete | v0.1.0 |
+| PRIV-04 (`terminus export` produces portable output for backup or migration and states what that output contains.) | 8 | Complete | v0.1.0 |
 | STOR-06 (Rolling snapshots run by default and produce a consistent copy of the store without stopping ingest.) | 8 | Complete | v0.1.0 |
-| STOR-07 (`verbatim data move <path>` relocates the store and updates the location pointer, so no component holds a hardcoded store path.) | 8 | Complete | v0.1.0 |
+| STOR-07 (`terminus data move <path>` relocates the store and updates the location pointer, so no component holds a hardcoded store path.) | 8 | Complete | v0.1.0 |
 | ING-07 (Capture mode (`full`, `lean`, `minimal`) controls how much of each record is stored, and every elision is marked in the stored record.) | 8 | Complete | v0.1.0 |
 | INJ-07 (The resume brief's quoted prompt is a turn the user typed. A `user` record not authored by the person - a tool result, an `isMeta` record, or a harness envelope - is not eligible to be quoted under "It last asked", the typed/not-typed discriminator is stored at ingest rather than derived by decompressing turns on the cold-start path, and a store written before this build acquires it by backfill from blobs alone. Closes the gap between `DESIGN-BRIEF.md:230`'s "last prompt" and `inject/brief.rs`'s `record_type = 'user'`, which is the transcript's own `type` field and therefore matches both.) | 1 | Complete | v0.1.1 |
 
@@ -109,7 +109,7 @@ Deferred. Tracked, not in the current roadmap.
 ### Distribution
 
 - **Secondary channels**: GitHub releases, Homebrew, Scoop/WinGet, deb/rpm. npm is the primary channel and ships first.
-- **crates.io publication**: name `verbatim` is taken; would ship as `verbatim-cli` with `[[bin]] name = "verbatim"`. Real channels are npm and releases.
+- **crates.io publication**: name `terminus` is taken. Skip crates.io; how Terminus is delivered is still open.
 
 ## Out of Scope
 
