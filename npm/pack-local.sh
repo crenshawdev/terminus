@@ -3,7 +3,7 @@
 # The acceptance check for the npm package (AC9), start to finish, on this
 # machine: build the release binary, stage it into this platform's package, pack
 # both packages, install the tarballs into a throwaway prefix, and prove the
-# installed `verbatim --version` is the version that was just built.
+# installed `terminus --version` is the version that was just built.
 #
 # It is an assertion, not a demo. Every step is checked, any failure exits
 # non-zero with a line saying which one, and the prefix and the tarballs are gone
@@ -56,17 +56,17 @@ cargo build --release
 # sets the former. Guessing would copy a stale binary or none at all.
 TARGET_DIR="$(cargo metadata --format-version 1 --no-deps |
   node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).target_directory))')"
-BINARY="$TARGET_DIR/release/verbatim"
+BINARY="$TARGET_DIR/release/terminus"
 [ -x "$BINARY" ] || fail "no release binary at $BINARY"
 
 EXPECTED_VERSION="$("$BINARY" --version)"
 printf '   %s is %s\n' "$BINARY" "$EXPECTED_VERSION"
 
-step "staging the binary into @verbatim/$PLATFORM"
+step "staging the binary into @terminus/$PLATFORM"
 mkdir -p "$PLATFORM_DIR/bin"
 # -m 755 in the copy itself: npm preserves the mode it finds, and a binary packed
 # without its executable bit installs as a file the shim cannot spawn.
-install -m 755 "$BINARY" "$PLATFORM_DIR/bin/verbatim"
+install -m 755 "$BINARY" "$PLATFORM_DIR/bin/terminus"
 
 # --------------------------------------------------------------- pack
 
@@ -89,11 +89,11 @@ step "packing both packages"
 # One tarball per directory, so the filename comes from a glob and this script
 # never has to predict how npm mangles a scoped name.
 npm pack --pack-destination "$WORK/platform" "$PLATFORM_DIR"
-npm pack --pack-destination "$WORK/thin" "$REPO/npm/verbatim"
+npm pack --pack-destination "$WORK/thin" "$REPO/npm/terminus"
 PLATFORM_TGZ="$(echo "$WORK"/platform/*.tgz)"
 THIN_TGZ="$(echo "$WORK"/thin/*.tgz)"
 [ -f "$PLATFORM_TGZ" ] || fail "npm pack produced no tarball for $PLATFORM_DIR"
-[ -f "$THIN_TGZ" ] || fail "npm pack produced no tarball for npm/verbatim"
+[ -f "$THIN_TGZ" ] || fail "npm pack produced no tarball for npm/terminus"
 
 step "checking the packed manifests"
 # INST-01: no install-time script of any kind. Checked against the manifest npm
@@ -118,13 +118,13 @@ done
 step "checking what the thin package ships"
 THIN_LIST="$(tar -tzf "$THIN_TGZ")"
 printf '%s\n' "$THIN_LIST" | sed 's/^/   /'
-printf '%s\n' "$THIN_LIST" | grep -qx 'package/bin/verbatim.js' ||
+printf '%s\n' "$THIN_LIST" | grep -qx 'package/bin/terminus.js' ||
   fail "the thin package is missing its shim"
 printf '%s\n' "$THIN_LIST" | grep -qx 'package/README.md' ||
   fail "the thin package is missing its README"
 # The thin package is thin: the 5 MB binary belongs to the platform package, and
 # a `files` list that started matching it would double every install.
-! printf '%s\n' "$THIN_LIST" | grep -qx 'package/bin/verbatim' ||
+! printf '%s\n' "$THIN_LIST" | grep -qx 'package/bin/terminus' ||
   fail "the thin package ships a binary; it must ship only the shim"
 
 # --------------------------------------------------------------- install
@@ -138,13 +138,13 @@ step "installing both tarballs into a throwaway prefix"
 npm install --global --prefix "$PREFIX" --no-audit --no-fund "$PLATFORM_TGZ"
 npm install --global --prefix "$PREFIX" --no-audit --no-fund --omit=optional "$THIN_TGZ"
 
-INSTALLED="$PREFIX/bin/verbatim"
+INSTALLED="$PREFIX/bin/terminus"
 [ -x "$INSTALLED" ] || fail "npm installed no executable at $INSTALLED"
 
-step "running the installed verbatim"
+step "running the installed terminus"
 ACTUAL_VERSION="$("$INSTALLED" --version)"
 printf '   %s --version is %s\n' "$INSTALLED" "$ACTUAL_VERSION"
 [ "$ACTUAL_VERSION" = "$EXPECTED_VERSION" ] ||
   fail "installed version $ACTUAL_VERSION is not the built version $EXPECTED_VERSION"
 
-printf '\npack-local.sh: OK - installed verbatim %s from a packed tarball, no install script ran\n' "$ACTUAL_VERSION"
+printf '\npack-local.sh: OK - installed terminus %s from a packed tarball, no install script ran\n' "$ACTUAL_VERSION"

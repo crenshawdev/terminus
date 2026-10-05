@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/verbatim-core", "crates/verbatim"]
+members = ["crates/terminus-core", "crates/terminus"]
 
 [workspace.package]
 version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/crenshawdev/verbatim"
+repository = "https://github.com/crenshawdev/terminus"
 authors = ["John Crenshaw <john@jcrenshaw.dev>"]
-# Neither crate is a registry artifact. verbatim is a binary application
-# distributed as a prebuilt binary, and verbatim-core exists to be linked
+# Neither crate is a registry artifact. terminus is a binary application
+# distributed as a prebuilt binary, and terminus-core exists to be linked
 # by it rather than depended on. false here so a stray `cargo publish`
 # cannot push either one.
 publish = false
@@ -28,7 +28,7 @@ blake3 = "1.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# Verbatim's own config file (D-15). Default features off: `display` is the
+# Terminus's own config file (D-15). Default features off: `display` is the
 # *writer* half and nothing here ever writes a config, so it is dead weight on a
 # binary whose cold start is the product. `parse` + `serde` pull toml_parser,
 # winnow, serde_core, toml_datetime and serde_spanned - no async runtime, no
@@ -68,7 +68,7 @@ lexopt = "0.3"
 # already linked and ureq's wrapper would only hide where the parse happens.
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
-verbatim-core = { path = "crates/verbatim-core" }
+terminus-core = { path = "crates/terminus-core" }
 
 # Cold start is the metric: the hook path pays for what is linked into it, so
 # the release profile trades build time for a smaller, faster-starting binary.

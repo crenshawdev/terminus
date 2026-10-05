@@ -1,0 +1,33 @@
+{
+  "name": "terminus",
+  "version": "0.1.1",
+  "description": "Persistent, cross-session memory for Claude Code. The session transcript is the record.",
+  "license": "Apache-2.0",
+  "author": "John Crenshaw <john@jcrenshaw.dev>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crenshawdev/terminus.git",
+    "directory": "npm/terminus"
+  },
+  "keywords": [
+    "claude-code",
+    "memory",
+    "transcript",
+    "recall",
+    "mcp"
+  ],
+  "bin": {
+    "terminus": "bin/terminus.js"
+  },
+  "files": [
+    "bin/terminus.js",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@terminus/linux-x64": "0.1.1",
+    "@terminus/linux-arm64": "0.1.1",
+    "@terminus/darwin-arm64": "0.1.1",
+    "@terminus/darwin-x64": "0.1.1",
+    "@terminus/win32-x64": "0.1.1"
+  }
+}

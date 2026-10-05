@@ -1,4 +1,4 @@
-# Verbatim — Design Brief
+# Terminus — Design Brief
 
 Input for `/cad-new-project`. Every decision below is settled unless marked **OPEN**.
 
@@ -8,7 +8,7 @@ Input for `/cad-new-project`. Every decision below is settled unless marked **OP
 
 Persistent, cross-session memory for Claude Code, built on the premise that **the session transcript is the record**.
 
-Claude Code already writes every prompt, tool call, tool result and assistant turn to `~/.claude/projects/**/*.jsonl`. Verbatim tails those files, stores each session unmodified and permanently, indexes it, and gives the model precise recall over its own history.
+Claude Code already writes every prompt, tool call, tool result and assistant turn to `~/.claude/projects/**/*.jsonl`. Terminus tails those files, stores each session unmodified and permanently, indexes it, and gives the model precise recall over its own history.
 
 Nothing is summarized at write time. Nothing is lossy. No inference is on the hot path.
 
@@ -21,7 +21,7 @@ The incumbent, `claude-mem` (90k stars, 224 open issues), runs a **second Claude
 - Context injection is `ORDER BY created_at DESC LIMIT n` — recency, not relevance.
 - 45 open Windows issues, 36 Chroma issues, orphaned processes reaching 157 GB and OOM.
 
-Verbatim inverts all of it: keep the truth, derive everything else, make retrieval measurable.
+Terminus inverts all of it: keep the truth, derive everything else, make retrieval measurable.
 
 ## 3. Non-goals
 
@@ -46,9 +46,9 @@ One mechanism: **SQLite** via `rusqlite` with the `bundled` feature (vendored C 
 
 ```
 <data dir>/
-  verbatim.db          everything
-  verbatim.db-wal
-  verbatim.db-shm
+  terminus.db          everything
+  terminus.db-wal
+  terminus.db-shm
   LOCK                 ingest exclusivity
 ```
 
@@ -348,7 +348,7 @@ This is cross-product infrastructure and needs its own small library rather than
 
 Front and centre in README and docs, as a contract:
 
-> Verbatim stores your sessions unmodified on your machine. Securing your machine is your responsibility. Ours begins the moment data leaves it — anything sent to a remote model is filtered; a local model receives nothing over the wire at all.
+> Terminus stores your sessions unmodified on your machine. Securing your machine is your responsibility. Ours begins the moment data leaves it — anything sent to a remote model is filtered; a local model receives nothing over the wire at all.
 
 **Redact at egress, never at ingest.** Ingest-time redaction makes the store lossy, defeats "verbatim", and destroys what it strips. The bytes already sit in plaintext in `~/.claude/projects`, so at-rest scrubbing buys little.
 
@@ -397,12 +397,12 @@ Prefix match on canonicalized paths, case-insensitive on Windows/macOS. A repo-l
 
 | Purpose | Linux | macOS | Windows |
 |---|---|---|---|
-| Binary (canonical) | `~/.local/bin/verbatim` | same | `%LOCALAPPDATA%\Programs\Verbatim\verbatim.exe` |
-| Data | `$XDG_DATA_HOME/verbatim` | `~/Library/Application Support/verbatim` | `%LOCALAPPDATA%\verbatim` |
-| Config | `$XDG_CONFIG_HOME/verbatim` | same convention | `%APPDATA%\verbatim` |
+| Binary (canonical) | `~/.local/bin/terminus` | same | `%LOCALAPPDATA%\Programs\Terminus\terminus.exe` |
+| Data | `$XDG_DATA_HOME/terminus` | `~/Library/Application Support/terminus` | `%LOCALAPPDATA%\terminus` |
+| Config | `$XDG_CONFIG_HOME/terminus` | same convention | `%APPDATA%\terminus` |
 
-- `VERBATIM_DATA_DIR` overrides. Resolved **once** at startup and passed down explicitly — never re-derived in a child.
-- A `location` pointer file in the config dir means nothing hardcodes the store path; `verbatim data move <path>` relocates safely.
+- `TERMINUS_DATA_DIR` overrides. Resolved **once** at startup and passed down explicitly — never re-derived in a child.
+- A `location` pointer file in the config dir means nothing hardcodes the store path; `terminus data move <path>` relocates safely.
 - Transcript roots: `$CLAUDE_CONFIG_DIR` → `~/.claude`, accepting a **list**. Canonicalize — symlinked config dirs are real and would otherwise ingest twice.
 - Free-space guard before writing; refuse network mounts by default.
 - Config written atomically, temp + rename.
@@ -413,9 +413,9 @@ Prefix match on canonicalized paths, case-insensitive on Windows/macOS. A repo-l
 
 ## 13. Install and packaging
 
-**npm is the primary channel.** Every Claude Code user has Node, and `npx verbatim install` is the pattern this audience already knows.
+**npm is the primary channel.** Every Claude Code user has Node, and `npx terminus install` is the pattern this audience already knows.
 
-esbuild-style: a thin `verbatim` package with `optionalDependencies` on per-platform packages (`@verbatim/linux-x64`, `@verbatim/darwin-arm64`, `@verbatim/win32-x64`, …) each shipping the prebuilt binary. **No postinstall script** — that sidesteps the blocked-postinstall failure class entirely. Node is install-time only; nothing at runtime touches it.
+esbuild-style: a thin `terminus` package with `optionalDependencies` on per-platform packages (`@terminus/linux-x64`, `@terminus/darwin-arm64`, `@terminus/win32-x64`, …) each shipping the prebuilt binary. **No postinstall script** — that sidesteps the blocked-postinstall failure class entirely. Node is install-time only; nothing at runtime touches it.
 
 Secondary: GitHub releases, Homebrew, Scoop/WinGet, deb/rpm.
 
@@ -423,9 +423,9 @@ Secondary: GitHub releases, Homebrew, Scoop/WinGet, deb/rpm.
 
 ### Binary layout
 
-`verbatim install` copies the platform binary out of the npm package to the stable path. **That copy is canonical** — hooks and MCP registration point at it, and the npm shim execs it, so there's one binary and no version skew. No PATH modification.
+`terminus install` copies the platform binary out of the npm package to the stable path. **That copy is canonical** — hooks and MCP registration point at it, and the npm shim execs it, so there's one binary and no version skew. No PATH modification.
 
-### `verbatim install`
+### `terminus install`
 
 1. Detect and canonicalize config roots; report if more than one resolves.
 2. Ask for the data directory (default shown).
@@ -437,17 +437,17 @@ Secondary: GitHub releases, Homebrew, Scoop/WinGet, deb/rpm.
 
 `--yes` accepts defaults for scripted installs.
 
-Hooks go in **user scope** — verbatim is global, one store across all projects.
+Hooks go in **user scope** — terminus is global, one store across all projects.
 
 ### Upgrade
 
-Package manager replaces the binary; `verbatim install` re-copies to the stable path. **Hooks are never rewritten** — the path doesn't change, so there is no version-check hook and nothing to repair. Store format bumps rebuild derived tables only. Config is additive.
+Package manager replaces the binary; `terminus install` re-copies to the stable path. **Hooks are never rewritten** — the path doesn't change, so there is no version-check hook and nothing to repair. Store format bumps rebuild derived tables only. Config is additive.
 
 ### Uninstall
 
 Removes only what it added, restores the settings backup if otherwise unchanged, **leaves the data** and prints where it is. `--purge` deletes it after showing size and confirming. Works even if the config is partly broken.
 
-### `verbatim doctor`
+### `terminus doctor`
 
 Read-only. Never repairs. Every problem it names carries the exact command that fixes it.
 
@@ -455,7 +455,7 @@ Checks: binary at the stable path and version; hook entries present and pointing
 
 ### Auto-compact
 
-Recommend disabling; never change it. With verbatim, compaction burns tokens to produce a lossy summary of context already stored losslessly — a fresh session plus targeted recall beats a self-summarized one. Surfaced in README, in `doctor`, and as one line in the install summary. Key is `autoCompactEnabled` (default `true`, any settings scope); also `DISABLE_AUTO_COMPACT=1` and `autoCompactWindow`.
+Recommend disabling; never change it. With terminus, compaction burns tokens to produce a lossy summary of context already stored losslessly — a fresh session plus targeted recall beats a self-summarized one. Surfaced in README, in `doctor`, and as one line in the install summary. Key is `autoCompactEnabled` (default `true`, any settings scope); also `DISABLE_AUTO_COMPACT=1` and `autoCompactWindow`.
 
 ---
 
@@ -463,19 +463,19 @@ Recommend disabling; never change it. With verbatim, compaction burns tokens to 
 
 | Command | Does |
 |---|---|
-| `verbatim status` | sizes, counts, watermarks, last ingest run and error |
-| `verbatim search` / `show` / `sessions` | terminal recall |
-| `verbatim ingest` | manual catch-up |
-| `verbatim reindex` | rebuild derived tables from blobs |
-| `verbatim verify` | walk blobs, check checksums, report bad session ids |
-| `verbatim compact` | reclaim freed space |
-| `verbatim usage` | bytes per project and month |
-| `verbatim data move <path>` | relocate the store safely |
-| `verbatim export` | portable output for backup or migration |
-| `verbatim doctor` | read-only health report |
-| `verbatim install` / `uninstall` | wiring |
-| `verbatim observations regenerate [--since] [--prompt-version]` | rebuild derived observations |
-| `verbatim mcp` | stdio MCP server |
+| `terminus status` | sizes, counts, watermarks, last ingest run and error |
+| `terminus search` / `show` / `sessions` | terminal recall |
+| `terminus ingest` | manual catch-up |
+| `terminus reindex` | rebuild derived tables from blobs |
+| `terminus verify` | walk blobs, check checksums, report bad session ids |
+| `terminus compact` | reclaim freed space |
+| `terminus usage` | bytes per project and month |
+| `terminus data move <path>` | relocate the store safely |
+| `terminus export` | portable output for backup or migration |
+| `terminus doctor` | read-only health report |
+| `terminus install` / `uninstall` | wiring |
+| `terminus observations regenerate [--since] [--prompt-version]` | rebuild derived observations |
+| `terminus mcp` | stdio MCP server |
 
 Contract: human-readable by default, `--json` on every data command with a stable shape. Errors to stderr, data to stdout. Exit `0` success, `1` operational failure, `2` misuse — never non-zero for "no results". No colour when stdout isn't a TTY; honour `NO_COLOR`. Quiet unless attached to a TTY.
 
@@ -512,7 +512,7 @@ No mocking SQLite — real temp databases throughout.
 - **Apache-2.0.** Source must be public — nobody installs a closed binary that reads every keystroke of their work. Apache over MIT for the explicit patent grant. AGPL is a documented negative signal in this category and its network clause protects nothing here. All dependencies are permissive (SQLite public domain, rusqlite MIT, zstd BSD, rayon MIT/Apache).
 - **Public OSS** — an explicit override of the private-by-default rule, scoped to this project.
 - `origin` is the self-hosted repo and the only remote. Publishing elsewhere is handled outside this project.
-- crates.io `verbatim` is taken (a verbatim-paths helper). Publish as `verbatim-cli` with `[[bin]] name = "verbatim"`, or skip crates.io — real channels are npm and releases.
+- crates.io `terminus` is taken. Skip crates.io; how Terminus is delivered is still open.
 
 ---
 

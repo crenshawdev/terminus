@@ -526,6 +526,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminus"
+version = "0.1.1"
+dependencies = [
+ "lexopt",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "terminus-core",
+]
+
+[[package]]
+name = "terminus-core"
+version = "0.1.1"
+dependencies = [
+ "blake3",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "ureq",
+ "zstd",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -635,32 +661,6 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
-
-[[package]]
-name = "verbatim"
-version = "0.1.1"
-dependencies = [
- "lexopt",
- "rusqlite",
- "serde_json",
- "tempfile",
- "verbatim-core",
-]
-
-[[package]]
-name = "verbatim-core"
-version = "0.1.1"
-dependencies = [
- "blake3",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "toml",
- "ureq",
- "zstd",
-]
 
 [[package]]
 name = "wasi"

@@ -1,12 +1,12 @@
 {
-  "name": "@verbatim/linux-arm64",
+  "name": "@terminus/linux-arm64",
   "version": "0.1.1",
-  "description": "The linux-arm64 binary for verbatim. npm selects this package by os and cpu; it is an optional dependency of the verbatim package, never a direct one.",
+  "description": "The linux-arm64 binary for terminus. npm selects this package by os and cpu; it is an optional dependency of the terminus package, never a direct one.",
   "license": "Apache-2.0",
   "author": "John Crenshaw <john@jcrenshaw.dev>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/crenshawdev/verbatim.git",
+    "url": "git+https://github.com/crenshawdev/terminus.git",
     "directory": "npm/platforms/linux-arm64"
   },
   "os": [
@@ -16,6 +16,6 @@
     "arm64"
   ],
   "files": [
-    "bin/verbatim"
+    "bin/terminus"
   ]
 }
