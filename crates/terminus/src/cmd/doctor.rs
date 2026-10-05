@@ -294,8 +294,9 @@ impl Doctor {
             )
             .with_fix(self.install_command()),
             // The marker and not the version, because version cannot tell them
-            // apart: the incumbent measured at this path on 2026-08-13 is a
-            // different program whose `--version` prints `terminus 0.1.0` (D-07).
+            // apart: the incumbent measured at the old `verbatim` path on
+            // 2026-08-13 was a different program whose `--version` printed
+            // `verbatim 0.1.0`, the same as this build's then (D-07).
             Ok(binary::Occupant::Foreign) => Check::new(
                 "binary",
                 State::Problem,

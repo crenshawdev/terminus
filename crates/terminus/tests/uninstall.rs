@@ -468,9 +468,9 @@ fn uninstall_on_a_machine_that_was_never_installed_changes_nothing() {
 /// D-07 read backwards: a file at the stable path that is not a terminus build
 /// is somebody else's, and uninstall reports it rather than deleting it.
 ///
-/// Not hypothetical - as of 2026-08-13 `~/.local/bin/terminus` on this machine
-/// is a different 12 MB program whose `--version` prints exactly what this
-/// build's does.
+/// Not hypothetical - as of 2026-08-13 `~/.local/bin/verbatim`, the stable path
+/// before the rename, was a different 12 MB program on this machine whose
+/// `--version` printed exactly what this build's did then.
 #[test]
 fn an_unmarked_file_at_the_stable_path_is_reported_and_kept() {
     let fixture = fixture();

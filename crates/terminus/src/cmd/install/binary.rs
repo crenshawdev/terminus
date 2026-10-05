@@ -21,10 +21,11 @@
 //!
 //! # The marker, and why version cannot do its job (D-07)
 //!
-//! As of 2026-08-13 `/home/john/.local/bin/terminus` is a 12,076,464-byte
-//! *different program* - "capture transcripts before cleanup", subcommands
-//! `precompact, normalize, load, ...` - whose `--version` prints `terminus
-//! 0.1.0`, byte-identical to this build's output. So identity cannot be a
+//! As of 2026-08-13 `/home/john/.local/bin/verbatim`, the stable path before
+//! the rename to terminus, was a 12,076,464-byte *different program* - "capture
+//! transcripts before cleanup", subcommands `precompact, normalize, load, ...` -
+//! whose `--version` printed `verbatim 0.1.0`, byte-identical to this build's
+//! output at the time. So identity cannot be a
 //! version string and cannot be a filename. It is [`MARKER`]: a fixed ASCII
 //! sentinel in this binary's image, referenced from [`carries_marker`] so it
 //! survives the release profile's `strip = "debuginfo"`, and looked for in

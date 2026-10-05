@@ -471,9 +471,9 @@ fn unanswerable(why: &str) -> Failure {
 
 /// The stable path holds a program that is not a terminus build (D-07).
 ///
-/// Not hypothetical: as of 2026-08-13 `/home/john/.local/bin/terminus` is a
-/// 12 MB different program whose `--version` prints `terminus 0.1.0`, byte for
-/// byte this build's output. So the refusal is the only safe answer, and the
+/// Not hypothetical: as of 2026-08-13 `/home/john/.local/bin/verbatim`, the
+/// stable path before the rename, was a 12 MB different program whose
+/// `--version` printed `verbatim 0.1.0`, byte for byte this build's output then. So the refusal is the only safe answer, and the
 /// command that overrides it has to be the user's to type.
 pub(super) fn occupied(stable: &Path) -> Failure {
     let removal = if cfg!(windows) {
