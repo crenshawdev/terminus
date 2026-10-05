@@ -347,7 +347,10 @@ fn after_install_every_wiring_check_is_ok() {
         assert_eq!(report.state(&format!("hook_{event}")), "ok", "{event}");
     }
     assert!(
-        report.check("binary").finding.contains("0.1.0"),
+        report
+            .check("binary")
+            .finding
+            .contains(env!("CARGO_PKG_VERSION")),
         "the binary check should name the version it found: {}",
         report.check("binary").finding
     );
