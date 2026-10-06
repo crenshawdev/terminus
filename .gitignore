@@ -5,7 +5,7 @@
 # npm packaging artifacts. The per-platform packages carry a ~5 MB prebuilt
 # binary that npm/pack-local.sh stages in at pack time; the manifests are the
 # tracked part, the binaries never are. Same for the tarballs pack produces.
-npm/platforms/*/bin/verbatim
-npm/platforms/*/bin/verbatim.exe
+npm/platforms/*/bin/terminus
+npm/platforms/*/bin/terminus.exe
 npm/**/*.tgz
 npm/**/node_modules/

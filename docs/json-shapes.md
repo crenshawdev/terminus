@@ -1,7 +1,7 @@
 # `--json` shapes and the exit-code contract
 
 Every data command accepts `--json`. This file is the contract, and
-`crates/verbatim/tests/cli.rs` holds it to it: one test per property across all
+`crates/terminus/tests/cli.rs` holds it to it: one test per property across all
 commands, so a seventh command added later is one line rather than a new file.
 
 ## The envelope
@@ -51,7 +51,7 @@ parses.
 ## Streams
 
 Data on stdout, every diagnostic on stderr, on every path. That is what lets
-`verbatim search --json | jq` work while a warning is still printed.
+`terminus search --json | jq` work while a warning is still printed.
 
 With `--json` the document **is** the answer, so routine commentary moves into
 it rather than being printed twice: `verify`'s "N session(s) checked" is the
@@ -117,14 +117,14 @@ data on stdout, the counts and the warnings on stderr.
 ```
 
 - `body` is the record's own archived line. It is the only lossy rendering
-  verbatim performs: a JSON string is text by definition, so a byte that is not
+  terminus performs: a JSON string is text by definition, so a byte that is not
   UTF-8 is replaced here. The human mode writes the bytes themselves. With
-  `[privacy] redact_recall = true` in `verbatim.toml` the line is put through the
+  `[privacy] redact_recall = true` in `terminus.toml` the line is put through the
   egress filter first, so `body` carries `[redacted]` markers where a credential
   stood; the archive itself is unchanged, and no key is added or removed in
   either setting.
 - `body_evicted` comes from `session_meta.is_evicted` and from nothing else. A
-  blob that will not decompress is archive damage, which `verbatim verify`
+  blob that will not decompress is archive damage, which `terminus verify`
   reports; it leaves `body` null with `body_evicted` false.
 - `context` is null unless `--before` or `--after` was asked for. When present:
 
@@ -158,7 +158,7 @@ data on stdout, the counts and the warnings on stderr.
 ### `status`
 
 ```json
-{"store": "/abs/path/verbatim.db", "size_bytes": 106496, "sessions": 11, "turns": 47,
+{"store": "/abs/path/terminus.db", "size_bytes": 106496, "sessions": 11, "turns": 47,
  "watermarks": 11, "watermark_bytes": 34012, "excluded": ["/abs/path/private"],
  "last_run": {"started_at": "...", "duration_ms": 12, "files_seen": 11,
               "files_committed": 11, "files_failed": 0, "bytes_read": 34012,
@@ -242,10 +242,10 @@ and unchanged.
   `old` is what the store holds, `new` is what the replayed rules produce.
 - `changed` names the decision ids whose label set moved, in id order, so a diff
   can be followed back into the prompts behind it.
-- `replay` never writes: the store is opened read-only, `verbatim.db` is byte
+- `replay` never writes: the store is opened read-only, `terminus.db` is byte
   for byte what it was, and the WAL carries no frame afterwards. A first
   read-only open of a WAL database does materialize SQLite's shared-memory
-  index (`verbatim.db-shm`) and an empty `verbatim.db-wal`; those hold no page
+  index (`terminus.db-shm`) and an empty `terminus.db-wal`; those hold no page
   of the database, every reader needs them, and a read-only connection cannot
   unlink them on close.
 
@@ -257,7 +257,7 @@ and unchanged.
    "session_id": "1111...", "generated_at": "2026-08-21T18:31:07.412Z",
    "mechanical": {"files_read": ["..."], "files_modified": ["..."],
                   "tools": ["Bash", "Edit"],
-                  "commands": ["cargo test -p verbatim-core --features testkit"],
+                  "commands": ["cargo test -p terminus-core --features testkit"],
                   "errors": ["..."], "commits": ["wire the observation step up"],
                   "branch": "phase-7", "turns": 47,
                   "first_turn_at": "...", "last_turn_at": "...",
@@ -298,7 +298,7 @@ and unchanged.
   unjudgeable session.
 - A store written before this build carries no `observations` table. That is an
   empty answer with a reason naming the table and exit 0, never a SQLite
-  message: the next `verbatim ingest` creates it.
+  message: the next `terminus ingest` creates it.
 
 ### `observations regenerate`
 
@@ -307,7 +307,7 @@ and unchanged.
  "selected": 2, "regenerated": 2, "notes": []}
 ```
 
-- The **only** rebuild path for the observations table. `verbatim reindex` never
+- The **only** rebuild path for the observations table. `terminus reindex` never
   touches it: the judgment half is a paid model call no blob replay reproduces,
   so a rebuild that ran on a schema bump would delete summaries a user bought.
 - `since` and `prompt_version` are the selector echoed back, each null when it
@@ -356,8 +356,8 @@ and unchanged.
  "over": 0, "excluded": 3}
 ```
 
-`verbatim retention --dry-run` describes what the **next ingest pass** would do
-under the current `verbatim.toml`. It never applies anything: retention runs as
+`terminus retention --dry-run` describes what the **next ingest pass** would do
+under the current `terminus.toml`. It never applies anything: retention runs as
 a bounded step at the end of every pass, that is the only place it acts, and
 this command and that step share one evaluation function so the two cannot
 disagree about a `'now'`-relative rule.
@@ -382,9 +382,9 @@ disagree about a `'now'`-relative rule.
 What the two verbs mean for everything else you can ask this store:
 
 - An **evicted** session keeps its row, its metadata and every derived row; only
-  its archived bytes go. It is still listed by `verbatim sessions` (with
+  its archived bytes go. It is still listed by `terminus sessions` (with
   `evicted: true`), a search that matched one of its turns still returns that
-  turn, and `verbatim show` reports `body_evicted: true` with a null `body`. Its
+  turn, and `terminus show` reports `body_evicted: true` with a null `body`. Its
   `excerpt` in a search hit is empty, because the bytes an excerpt is cut from
   are the ones that were reclaimed.
 - A **deleted** session is gone from both: no listing, no search hit, no turn.
@@ -405,19 +405,19 @@ policy with nothing due. Retention is off by default.
  "reclaimed_bytes": 7524352}
 ```
 
-`verbatim compact` reclaims the space retention already freed. It deletes
+`terminus compact` reclaims the space retention already freed. It deletes
 nothing and has no opinion about what should be kept: what to keep is
 retention's decision, made inside the ingest pass, and this is the command that
 gives the pages back to the filesystem afterwards.
 
 - `before` and `after` are **the same three files `status` reports as
-  `size_bytes`** - `verbatim.db`, `verbatim.db-wal` and `verbatim.db-shm` - each
+  `size_bytes`** - `terminus.db`, `terminus.db-wal` and `terminus.db-shm` - each
   measured with the connection open, so the two are the same measurement of the
   same store in two states. `total` is their sum.
 - The three components are carried apart because the total alone cannot be read.
   `compact` is `VACUUM` followed by `PRAGMA wal_checkpoint(TRUNCATE)`, and both
   halves are load-bearing: a bare `VACUUM` on a WAL store writes the whole
-  rebuilt database THROUGH the WAL, so `verbatim.db` shrinks while the WAL grows
+  rebuilt database THROUGH the WAL, so `terminus.db` shrinks while the WAL grows
   by as much or more and the store on disk gets *bigger*. An `after` whose `wal`
   is not 0 is that failure, visible.
 - `reclaimed_bytes` is `before.total - after.total` and is **signed**. A
@@ -482,17 +482,17 @@ other's total is the mistake it exists to prevent.
 ### `export`
 
 ```json
-{"destination": "/home/you/verbatim-export",
- "manifest": "/home/you/verbatim-export/manifest.json",
+{"destination": "/home/you/terminus-export",
+ "manifest": "/home/you/terminus-export/manifest.json",
  "sessions": 3416, "turns": 432242, "evicted": 2, "bytes": 1556598685,
  "notice": "This export is the verbatim, unredacted transcripts: ..."}
 ```
 
-`verbatim export <dir>` writes one `.jsonl` file per session, holding that
+`terminus export <dir>` writes one `.jsonl` file per session, holding that
 session's uncompressed stream exactly as the archive stores it, plus a
 `manifest.json` beside them. The transcript is the portable form for this
 product: it is the form the data arrived in, the form any future importer would
-read, and it opens without a verbatim build. A copy of the store file is a
+read, and it opens without a terminus build. A copy of the store file is a
 snapshot, not an export.
 
 - **`export`'s output is the unredacted transcripts.** Nothing is filtered on
@@ -525,10 +525,10 @@ snapshot, not an export.
 
 ```json
 {"binary": {"state": "ok",
-            "finding": "/home/you/.local/bin/verbatim is this build (0.1.0)", "fix": null},
+            "finding": "/home/you/.local/bin/terminus is this build (0.1.0)", "fix": null},
  "hook_SessionStart": {"state": "problem",
-                       "finding": "/home/you/.claude/settings.json has no verbatim entry for SessionStart",
-                       "fix": "/home/you/.local/bin/verbatim install"},
+                       "finding": "/home/you/.claude/settings.json has no terminus entry for SessionStart",
+                       "fix": "/home/you/.local/bin/terminus install"},
  "cleanup_period_days": {"state": "note",
                          "finding": "cleanupPeriodDays is 7, set in /home/you/.claude/settings.json. ...",
                          "fix": "set \"cleanupPeriodDays\": 3650 in /home/you/.claude/settings.json"}}
@@ -544,7 +544,7 @@ one object per check.
 | `fix` | string or null | What to run, or the settings edit to make. Null whenever there is nothing to do - which is every `ok`, and also a `problem` whose repair is a hand edit (a duplicated hook entry is the one that is). |
 
 - `note` is true, worth saying, and not a failure: a machine before its first
-  ingest, or a setting verbatim would choose differently and never changes
+  ingest, or a setting terminus would choose differently and never changes
   itself. `unknown` is doctor declining to guess - no `claude` on `PATH`, a
   settings file that will not parse - and, like `note`, never reaches the exit
   code.
@@ -556,7 +556,7 @@ one object per check.
   of testing for a key.
 - `fix` is a shell command wherever one exists. Where the repair is a value in
   the user's own settings file, it is that edit written out literally, because
-  verbatim never changes either of the two Claude Code settings it reports
+  terminus never changes either of the two Claude Code settings it reports
   (INST-06).
 - `doctor` writes nothing anywhere: no file, no directory, on any path,
   including the data directory it reports as absent.

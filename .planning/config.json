@@ -36,7 +36,7 @@
     "on_land_cleanup": true,
     "auto_close": false,
     "forge_provider": "github",
-    "forge_repo": "crenshawdev/verbatim"
+    "forge_repo": "crenshawdev/terminus"
   },
   "planning": {
     "commit_docs": true

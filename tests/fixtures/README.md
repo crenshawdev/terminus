@@ -8,7 +8,7 @@ They are the CI corpus; the private real-corpus fixture is reached by env var.
 The fixtures are byte-load-bearing. Tests assert on their exact bytes, and
 `session-truncated.jsonl` is a byte prefix of `session-basic.jsonl`. Editing one
 by hand without re-deriving the others will fail
-`crates/verbatim-core/tests/fixtures.rs`.
+`crates/terminus-core/tests/fixtures.rs`.
 
 | File | Exists to exercise |
 |---|---|
@@ -35,7 +35,7 @@ by hand without re-deriving the others will fail
 `hooks/session-end.json` and `hooks/post-compact.json` are a different kind of
 fixture. They are not transcripts and they are not ingested: each is the single
 line of JSON Claude Code writes to a hook's stdin before closing it, and
-`crates/verbatim/tests/hook.rs` feeds them to `verbatim hook <event>` to hold
+`crates/terminus/tests/hook.rs` feeds them to `terminus hook <event>` to hold
 AC1's "exit 0, nothing on stdout, p99 under 10 ms".
 
 Their fields are read off the 2.1.231 payload schemas rather than guessed. Every
@@ -270,7 +270,7 @@ That covers D-02's two not-typed shapes at once, and it is the *last* record
 being one of them that matters: a brief reading "the last `user` turn" quotes
 the envelope, and a brief reading "the last typed `user` turn" quotes record
 one. `session-recall.jsonl` cannot observe that difference - its only `user`
-record is a plain text block - which is why `crates/verbatim/tests/brief.rs`'s
+record is a plain text block - which is why `crates/terminus/tests/brief.rs`'s
 byte-identity test seeds from this file instead (D-15).
 
 Three things about it are deliberate. Its project key is a **third** one,

@@ -1,12 +1,27 @@
 # Changelog
 
-All notable changes to Verbatim are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the versions
-follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+All notable changes to Terminus, named Verbatim through 0.1.1, are recorded
+here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- Verbatim is now Terminus. The binary is `terminus`, the crates are `terminus`
+  and `terminus-core`, and the MCP server registers as `terminus`, so its tools
+  arrive as `mcp__terminus__recall_search`, `recall_context` and `recall_get`.
+  The data directory is `~/.local/share/terminus` (macOS
+  `~/Library/Application Support/terminus`, Windows `%LOCALAPPDATA%\terminus`)
+  holding `terminus.db`, the config file is `terminus.toml`, every `VERBATIM_*`
+  environment variable is `TERMINUS_*`, snapshots are `terminus-<time>.db`, and
+  `lean` and `minimal` capture mark an elided body `{"terminusElided": <bytes>}`.
+- Nothing reads the old names, so an existing install moves once by hand:
+  `verbatim uninstall` with the old binary, checkpoint the WAL, rename the data
+  directory, `verbatim.db` and its snapshots, then `terminus install`. A store
+  written in `lean` or `minimal` mode keeps its old elision marks, which this
+  build does not count. Archived calls to the old `mcp__verbatim__recall_search`
+  are still recognized.
 
 ## [0.1.1] - 2026-09-04
 

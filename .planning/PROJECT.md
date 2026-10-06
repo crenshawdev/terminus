@@ -1,8 +1,8 @@
-# Verbatim
+# Terminus
 
 ## What This Is
 
-Persistent, cross-session memory for Claude Code, built on the premise that the session transcript is the record. Claude Code already writes every prompt, tool call, tool result and assistant turn to `~/.claude/projects/**/*.jsonl`; Verbatim tails those files, stores each session unmodified and permanently, indexes it at turn granularity, and gives the model precise recall over its own history through three MCP tools and hook-driven context injection. A single static Rust binary, local-only, for Claude Code users — John first.
+Persistent, cross-session memory for Claude Code, built on the premise that the session transcript is the record. Claude Code already writes every prompt, tool call, tool result and assistant turn to `~/.claude/projects/**/*.jsonl`; Terminus tails those files, stores each session unmodified and permanently, indexes it at turn granularity, and gives the model precise recall over its own history through three MCP tools and hook-driven context injection. A single static Rust binary, local-only, for Claude Code users — John first. Named Verbatim until 2026-10-05.
 
 ## Core Value
 
@@ -73,7 +73,7 @@ Merged to `main` and tagged `v0.1.0`.
 
 **Greenfield.** The repo contains only `DESIGN-BRIEF.md` (the settled design this document derives from) on branch `restart`. No source code yet.
 
-**The incumbent.** claude-mem (90k stars, 224 open issues) runs a second Claude instance that compresses every tool call into an LLM-authored "observation" and throws the raw turn away. Documented consequences: users burn token budget on the memory system itself ($90 in three hours reported); the LLM's guess is the only copy, so retrieval can never be audited; context injection is `ORDER BY created_at DESC LIMIT n`; 45 open Windows issues, 36 Chroma issues, orphaned processes reaching 157 GB. Verbatim inverts all of it: keep the truth, derive everything else, make retrieval measurable. Claude-mem's issue tracker doubles as a free test plan — one regression test per failure class designed out.
+**The incumbent.** claude-mem (90k stars, 224 open issues) runs a second Claude instance that compresses every tool call into an LLM-authored "observation" and throws the raw turn away. Documented consequences: users burn token budget on the memory system itself ($90 in three hours reported); the LLM's guess is the only copy, so retrieval can never be audited; context injection is `ORDER BY created_at DESC LIMIT n`; 45 open Windows issues, 36 Chroma issues, orphaned processes reaching 157 GB. Terminus inverts all of it: keep the truth, derive everything else, make retrieval measurable. Claude-mem's issue tracker doubles as a free test plan — one regression test per failure class designed out.
 
 **Transcript facts, verified against 1,896 real files:**
 
@@ -91,7 +91,7 @@ Merged to `main` and tagged `v0.1.0`.
 - Auto-tuner for injection thresholds — hypothesis, not a plan. Ship logging + replay; gate the tuner behind evidence it converges.
 - `UserPromptSubmit` cost on Windows — to be measured during the injection phase; the FTS query is microseconds, process spawn (10–30 ms) is the real budget.
 - Import of `/data/verbatim-legacy` (801 MB) — deferred.
-- crates.io name `verbatim` is taken — publish as `verbatim-cli` with `[[bin]] name = "verbatim"`, or skip crates.io; real channels are npm and releases.
+- crates.io name `terminus` is taken — skip crates.io; how Terminus is delivered is still open.
 
 ## Constraints
 
@@ -131,6 +131,7 @@ Settled in DESIGN-BRIEF.md; outcomes pending until shipped and validated.
 | Auto-tuner is a hypothesis, not a plan | Per-user volume may be too low; "referenced downstream" is a weak proxy; gate behind evidence it converges | - Pending |
 | Recommend disabling auto-compact; never change it ourselves | Compaction burns tokens summarizing context already stored losslessly; fresh session + targeted recall beats self-summarization | - Pending |
 | Shared credentials at `~/.config/jcrenshaw/credentials.toml`, namespaced by provider | Cross-product infrastructure; every jcrenshawdev product reads the same keys | - Pending |
+| Renamed Verbatim to Terminus (2026-10-05), as a hard cut with no aliases or fallbacks | Named alongside Baley as part of a suite of loosely coupled tools. Nothing was ever published under the old name, so there were no users to migrate. "Verbatim" stays the archive's property, not the product's name | Shipped |
 
 ---
-*Last updated: 2026-08-12 after project initialization from DESIGN-BRIEF.md*
+*Last updated: 2026-10-05 after the rename from Verbatim to Terminus*
