@@ -16,7 +16,9 @@ The verbatim transcript is the record: every session archived losslessly and per
 
 ### Active
 
-No cycle open.
+**v0.2.0, opened 2026-10-12.**
+
+Four phases that bring install in line with Baley's (its ADR 0038 and 0039): provider keys from the environment only, Linux and macOS only with the npm package removed, an install that asks nothing and registers the MCP server through `claude mcp`, and a one-command installer script. A breaking change to the command line, hence the minor bump. Updates wait for signed releases, which Baley's release design (#14) owns.
 
 **Shipped: v0.1.1, closed 2026-09-04.**
 

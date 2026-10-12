@@ -7,16 +7,21 @@ Scope comes from `DESIGN-BRIEF.md`, where every decision is settled unless marke
 
 ## Active
 
-No cycle open.
+Committed scope for v0.2.0. Each maps to exactly one roadmap phase. Several
+replace behaviour that shipped under v0.1.0 rows (INST-01, INST-02, INST-03,
+INST-04's offer, INST-05, INST-08); those rows stay under `## Shipped` as
+written, because they record what shipped then.
 
-v0.1.1 closed 2026-09-04. Its one requirement, INJ-07, is under `## Shipped`
-below with the 64 that shipped in v0.1.0, each carrying the phase that
-delivered it. Phases 2, 3 and 4 of that cycle delivered against already-shipped
-rows (PRIV-01..04, RCL-09, OBS-03) rather than opening new ones, so no
-requirement is waiting here.
+### Privacy (PRIV)
 
-Nothing is deferred. `/cad-phase add` opens the next cycle and seeds this
-section.
+- **PRIV-05**: Terminus reads a provider key only from the environment variable named for the provider (`OPENROUTER_API_KEY` for `name = "openrouter"`). It never reads a key from `terminus.toml` or from `~/.config/jcrenshaw/credentials.toml`, and never writes or creates a key file. A `terminus.toml` that still carries `api_key` fails to load with a message naming the variable and none of the value.
+
+### Install (INST)
+
+- **INST-09**: Terminus supports Linux and macOS only. The npm package and its platform packages are removed, no Windows code path remains, and a Windows build fails at compile time with a message naming the supported systems.
+- **INST-10**: `terminus install` asks nothing. It applies its defaults, has no confirmation and no `--yes`, and ends with a receipt listing every change, the backfill estimate, and the current `cleanupPeriodDays` with what a low value loses and the line that raises it. It never changes `cleanupPeriodDays` or `autoCompactEnabled`.
+- **INST-11**: Terminus never writes `~/.claude.json`. Install places the MCP entry with `claude mcp add-json --scope user`, runs nothing when the entry is already correct, and reports the install incomplete with the exact command when `claude` is missing or fails. Uninstall removes the entry with `claude mcp remove`.
+- **INST-12**: One command installs Terminus. `install.sh`, given a source URL, downloads the manifest and binary for the machine's system and architecture, checks the SHA-256 in a `verify_download` step before placing anything, stores each version in its own folder behind the stable path `~/.local/bin/terminus` so a running session keeps its binary, and ends by running `terminus install`.
 
 ## Shipped
 
