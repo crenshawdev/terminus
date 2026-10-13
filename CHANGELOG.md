@@ -15,8 +15,7 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   and `terminus-core`, and the MCP server registers as `terminus`, so its tools
   arrive as `mcp__terminus__recall_search`, `recall_context` and `recall_get`.
   The data directory is `~/.local/share/terminus` (macOS
-  `~/Library/Application Support/terminus`, Windows `%LOCALAPPDATA%\terminus`)
-  holding `terminus.db`, the config file is `terminus.toml`, every `VERBATIM_*`
+  `~/Library/Application Support/terminus`) holding `terminus.db`, the config file is `terminus.toml`, every `VERBATIM_*`
   environment variable is `TERMINUS_*`, snapshots are `terminus-<time>.db`, and
   `lean` and `minimal` capture mark an elided body `{"terminusElided": <bytes>}`.
 - Nothing reads the old names, so an existing install moves once by hand:
@@ -49,6 +48,14 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `terminus observations regenerate --prompt-version` is gone. `--since` stays.
 - `terminus doctor` no longer reports `credentials`, `config_mode`,
   `mode_checks` or `provider_local`.
+- The npm package is gone. The `npm/` directory, which held the thin `terminus`
+  package, its five platform packages and `pack-local.sh`, was deleted, and
+  Terminus has no npm channel.
+- Windows support is gone. Terminus builds on Linux and macOS only, and a build
+  for any other system fails at compile time with "Terminus supports Linux and
+  macOS only." That includes other Unix systems, which used to build against a
+  generic data-directory fallback. `terminus doctor` and `terminus install`
+  print only `chmod` and `rm -f` fixes.
 
 ## [Verbatim 0.1.1] - 2026-09-04 (local test build, never released)
 
