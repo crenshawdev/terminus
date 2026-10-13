@@ -241,7 +241,7 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
                 // corpus rather than on the code.
                 fetched.records[index].body = Some(if redaction.is_on() {
                     redaction
-                        .apply(&String::from_utf8_lossy(&bytes))
+                        .apply_json_line(&String::from_utf8_lossy(&bytes))
                         .into_owned()
                         .into_bytes()
                 } else {

@@ -220,17 +220,16 @@ const PLANTED: &[(&str, &str, &str)] = &[
 #[cfg(feature = "testkit")]
 const AFTER_THE_COOKIE: &str = "the retry after that answered 204 with an empty body";
 
-/// [`FIXTURE`] ingested for real and read back as one context window, turn by
-/// turn: `(raw, redacted)`.
+/// [`FIXTURE`] ingested for real, then read by `read` with the knob off and
+/// with it on: `(raw, redacted)`.
 ///
-/// The window, not `recall::get`, because a `get` body is the archived JSON
-/// line, where the `"password"` pair sits behind escaped quotes and a
-/// different rule would fire. The knob goes through a real `terminus.toml`,
-/// the only way the binary can turn it on.
+/// The knob goes through a real `terminus.toml`, the only way the binary can
+/// turn it on.
 #[cfg(feature = "testkit")]
-fn projected() -> (Vec<String>, Vec<String>) {
+fn read_both_ways<T>(
+    read: impl Fn(&rusqlite::Connection, &terminus_core::config::Config) -> T,
+) -> (T, T) {
     use terminus_core::config::{Config, CONFIG_FILE_NAME};
-    use terminus_core::recall::{context, Scope, MAX_CONTEXT_SIDE};
     use terminus_core::store::DB_FILE_NAME;
     use terminus_core::{ingest, testkit};
 
@@ -246,13 +245,7 @@ fn projected() -> (Vec<String>, Vec<String>) {
     }
 
     let conn = rusqlite::Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
-    let first: i64 = conn
-        .query_row("SELECT id FROM turns ORDER BY turn_seq LIMIT 1", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-
-    let window = |on: bool| -> Vec<String> {
+    let with = |on: bool| -> T {
         let config_dir = work.join(format!("config-{on}"));
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
@@ -260,41 +253,74 @@ fn projected() -> (Vec<String>, Vec<String>) {
             format!("[privacy]\nredact_recall = {on}\n"),
         )
         .unwrap();
-        let config = Config::load_from(&config_dir).unwrap();
-        let window = context::window(
-            &conn,
-            &config,
-            &Scope::Everything,
-            first,
-            0,
-            MAX_CONTEXT_SIDE,
-        )
-        .unwrap();
+        read(&conn, &Config::load_from(&config_dir).unwrap())
+    };
+    (with(false), with(true))
+}
+
+/// [`FIXTURE`] read back as one context window, turn by turn.
+#[cfg(feature = "testkit")]
+fn projected() -> (Vec<String>, Vec<String>) {
+    use terminus_core::recall::{context, Scope, MAX_CONTEXT_SIDE};
+
+    read_both_ways(|conn, config| {
+        let first: i64 = conn
+            .query_row("SELECT id FROM turns ORDER BY turn_seq LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let window =
+            context::window(conn, config, &Scope::Everything, first, 0, MAX_CONTEXT_SIDE).unwrap();
         assert!(
             window.at_session_start && window.at_session_end,
             "the window does not cover the whole of {FIXTURE}: {window:?}"
         );
         window.turns.into_iter().map(|turn| turn.text).collect()
-    };
-    (window(false), window(true))
+    })
 }
 
-/// Each planted shape is gone from what recall hands the model, and the rule
-/// that took it left its marker.
+/// Every turn of [`FIXTURE`] read back through `recall_get`, one body each.
+///
+/// A body is the archived JSON line, so the `"password"` pair sits behind
+/// escaped quotes here, unlike in the window.
 #[cfg(feature = "testkit")]
-#[test]
-fn every_planted_shape_is_gone_and_its_rule_named_itself() {
-    let (raw, redacted) = projected();
-    let (raw, redacted) = (raw.join("\n"), redacted.join("\n"));
+fn got() -> (Vec<String>, Vec<String>) {
+    use terminus_core::recall::{get, Scope};
 
+    read_both_ways(|conn, config| {
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM turns ORDER BY turn_seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let fetched = get::records(conn, config, &Scope::Everything, &ids).unwrap();
+        assert!(
+            fetched.absent.is_empty() && fetched.records.len() == ids.len(),
+            "not every turn of {FIXTURE} came back: {:?}",
+            fetched.absent
+        );
+        fetched
+            .records
+            .into_iter()
+            .map(|record| String::from_utf8(record.body.expect("a body")).unwrap())
+            .collect()
+    })
+}
+
+/// Every [`PLANTED`] sentinel is in `raw` and gone from `redacted`, with its
+/// rule's marker left behind.
+#[cfg(feature = "testkit")]
+fn assert_every_planted_shape_caught(raw: &str, redacted: &str, surface: &str) {
     for (what, sentinel, marker) in PLANTED {
         assert!(
             !redacted.contains(sentinel),
-            "{what} survived into the window ({sentinel}): {redacted}"
+            "{what} survived into {surface} ({sentinel}): {redacted}"
         );
         assert!(
             redacted.contains(marker),
-            "{what} went without {marker}, so a reader can't tell what was taken: {redacted}"
+            "{what} went from {surface} without {marker}, so a reader can't tell what was taken: {redacted}"
         );
         // A shape the fixture stopped planting would pass the absence check
         // above for the wrong reason.
@@ -303,6 +329,23 @@ fn every_planted_shape_is_gone_and_its_rule_named_itself() {
             "{what} is not planted in {FIXTURE} ({sentinel}), so its absence proves nothing"
         );
     }
+}
+
+/// Each planted shape is gone from what recall hands the model, and the rule
+/// that took it left its marker.
+#[cfg(feature = "testkit")]
+#[test]
+fn every_planted_shape_is_gone_and_its_rule_named_itself() {
+    let (raw, redacted) = projected();
+    assert_every_planted_shape_caught(&raw.join("\n"), &redacted.join("\n"), "the window");
+}
+
+/// The same for a `recall_get` body, where the JSON pair is escaped.
+#[cfg(feature = "testkit")]
+#[test]
+fn every_planted_shape_is_gone_from_a_recall_get_body() {
+    let (raw, redacted) = got();
+    assert_every_planted_shape_caught(&raw.join("\n"), &redacted.join("\n"), "recall_get");
 }
 
 /// The `Cookie` match is bounded: the value goes and the rest of its turn

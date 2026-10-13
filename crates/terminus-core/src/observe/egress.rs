@@ -12,6 +12,10 @@
 //! that decision from the call sites that hold a `Config` down into the shared
 //! projection code.
 //!
+//! A `recall_get` body is the archived JSON line rather than decoded text, so
+//! [`Redaction::apply_json_line`] decodes each of its strings before the rules
+//! see it.
+//!
 //! # The rules, and why each one is here
 //!
 //! In the order they run, each with the marker it leaves. All of
@@ -227,6 +231,20 @@ impl Redaction {
             Cow::Borrowed(text)
         }
     }
+
+    /// One archived JSON line as this redaction leaves it.
+    ///
+    /// The line stores typed text JSON-escaped, so a pair typed into a message
+    /// arrives as `{\"password\":\"x\"}` and rule 4 reads straight past it.
+    /// Each string is decoded and filtered first, then the line as it stands,
+    /// which catches the pairs that are the line's own keys.
+    pub fn apply_json_line<'t>(&self, line: &'t str) -> Cow<'t, str> {
+        if self.on {
+            Cow::Owned(for_model_context(&redact_json_strings(line)))
+        } else {
+            Cow::Borrowed(line)
+        }
+    }
 }
 
 /// The one rule set.
@@ -243,6 +261,43 @@ fn redact(text: &str) -> String {
     let text = redact_flag_values(&text);
     let text = redact_jwts(&text);
     redact_github_tokens(&text)
+}
+
+/// Every string in a JSON line, decoded, filtered and written back.
+///
+/// Only a string the rules changed is re-encoded, so the rest of the line keeps
+/// its archived bytes. A line that is not JSON comes back as it was.
+fn redact_json_strings(line: &str) -> Cow<'_, str> {
+    if serde_json::from_str::<serde::de::IgnoredAny>(line).is_err() {
+        return Cow::Borrowed(line);
+    }
+    let bytes = line.as_bytes();
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'"' {
+            at += 1;
+            continue;
+        }
+        let Some(end) = quoted_end(bytes, at) else {
+            break;
+        };
+        if let Ok(text) = serde_json::from_str::<String>(&line[at..=end]) {
+            let redacted = redact(&text);
+            if redacted != text {
+                out.push_str(&line[copied..at]);
+                out.push_str(&serde_json::Value::String(redacted).to_string());
+                copied = end + 1;
+            }
+        }
+        at = end + 1;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(line);
+    }
+    out.push_str(&line[copied..]);
+    Cow::Owned(out)
 }
 
 /// Rule 1: `-----BEGIN ... PRIVATE KEY-----` through its `-----END ...-----`.
