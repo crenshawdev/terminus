@@ -56,8 +56,8 @@ pub const FIXTURE_ROOT_TOKEN: &str = "{{ROOT}}";
 ///
 /// `project-delta` has exactly one member for that same reason.
 /// `session-secrets.jsonl` is the v0.1.1 phase 2 one: its turns carry the seven
-/// credential shapes the egress filter is asked to catch, so a test can drive
-/// the real judgment request against a loopback stub and read the wire. Its
+/// credential shapes the egress filter is asked to catch, so a test can run
+/// them through recall with `redact_recall` on and check each one is gone. Its
 /// vocabulary shares none of the corpus's counted tokens, so no existing
 /// assertion moves when it joins the set.
 ///

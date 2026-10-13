@@ -2,10 +2,9 @@
 //!
 //! Every fact here is either a SQL query over tables ingest already wrote or a
 //! value lifted straight out of the session's own bytes. **No model is called
-//! and no network connection is opened on any path in this module** - that is
-//! the whole point of splitting the mechanical half out: a machine with
-//! judgment disabled, or with no network at all, still gets an auditable
-//! account of every finalized session.
+//! and no network connection is opened on any path in this module**, so a
+//! machine with no network at all still gets an auditable account of every
+//! finalized session.
 //!
 //! **Where each fact comes from (D-04).** `paths` gives the files and
 //! `turns.tool_name` says whether the turn that named one was writing it;

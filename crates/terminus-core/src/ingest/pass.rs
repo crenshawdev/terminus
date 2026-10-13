@@ -315,10 +315,7 @@ fn locked(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
     // the next one. Before `record_pass`, so whatever it could not do lands in
     // this pass's `runs.error` rather than the following pass's.
     //
-    // No model is called here and no network connection is opened. The
-    // judgment half is its own command, outside this lock (D-07): a slow
-    // provider held here would make every hook-spawned pass in that window exit
-    // as `LockHeld` and archive nothing.
+    // No model is called here and no network connection is opened.
     summary.observations = crate::observe::observe_new(store.conn(), config);
 
     // RET-03 and D-10, and both halves of the position matter. AFTER

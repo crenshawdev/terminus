@@ -404,10 +404,7 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
     // And not at all when the caller said so - see [`Request::excerpts`].
     let reads = if request.excerpts {
         // The knob is read HERE, at the entry point that already holds the
-        // config, and travels down as a value (phase 4 D-01). Rule 1 is fed
-        // this run's provider credential when there is one; on the common
-        // machine there is not, and the filter rests on the shape rules alone
-        // (D-10).
+        // config, and travels down as a value (phase 4 D-01).
         excerpt::attach(conn, &request.query, &mut hits, &Redaction::of(config))?
     } else {
         excerpt::Reads::default()
