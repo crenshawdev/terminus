@@ -388,6 +388,132 @@ impl Fixture {
             self.version_file(version).display()
         );
     }
+
+    /// Serve `version` with `extra` appended and install it; the run must
+    /// succeed. Returns the served bytes.
+    fn install(&self, version: &str, extra: &str) -> Vec<u8> {
+        let bytes = self.serve(version, extra);
+        let output = self.run();
+        assert!(
+            output.status.success(),
+            "install {version}: {}",
+            text(&output)
+        );
+        bytes
+    }
+
+    /// A tools folder whose `uname` answers `-s` with `system` and `-m` with
+    /// `machine`.
+    fn uname_tools(&self, system: &str, machine: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake = self.root.join(format!("uname-{system}-{machine}"));
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\ncase $1 in -s) printf '%s\\n' {system} ;; -m) printf '%s\\n' {machine} ;; esac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        self.tools_folder(
+            &format!("tools-{system}-{machine}"),
+            &[],
+            &[("uname", &fake)],
+        )
+    }
+
+    /// The stable path, everything under the versions folder, and both
+    /// Claude Code files, as a refusal must leave them.
+    fn snapshot(&self) -> Snapshot {
+        let mut versions = Vec::new();
+        walk(&self.versions(), Path::new("."), &mut versions);
+        Snapshot {
+            stable: entry(&self.stable()),
+            versions,
+            settings: Bytes(std::fs::read(self.settings()).unwrap()),
+            claude_json: Bytes(std::fs::read(self.claude_dir.join(".claude.json")).unwrap()),
+        }
+    }
+
+    /// Run `command` and assert it was refused: non-zero, a reason on stderr,
+    /// nothing on disk changed and no `claude` started.
+    fn assert_refused(&self, mut command: Command) {
+        let before = self.snapshot();
+        let calls = self.calls().len();
+        let output = command.output().unwrap();
+        assert!(!output.status.success(), "{}", text(&output));
+        assert!(!output.stderr.is_empty(), "{}", text(&output));
+        assert_eq!(self.snapshot(), before, "{}", text(&output));
+        assert_eq!(self.calls().len(), calls, "{:?}", self.calls());
+    }
+}
+
+/// File contents, compared in full and printed as a length.
+#[derive(PartialEq)]
+struct Bytes(Vec<u8>);
+
+impl std::fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes>", self.0.len())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Entry {
+    Missing,
+    Folder,
+    Link(PathBuf),
+    File { bytes: Bytes, inode: u64 },
+    Other,
+}
+
+#[derive(Debug, PartialEq)]
+struct Snapshot {
+    stable: Entry,
+    versions: Vec<(PathBuf, Entry)>,
+    settings: Bytes,
+    claude_json: Bytes,
+}
+
+fn entry(path: &Path) -> Entry {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Entry::Missing,
+        Err(e) => panic!("{}: {e}", path.display()),
+    };
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        Entry::Link(std::fs::read_link(path).unwrap())
+    } else if kind.is_dir() {
+        Entry::Folder
+    } else if kind.is_file() {
+        Entry::File {
+            bytes: Bytes(std::fs::read(path).unwrap()),
+            inode: meta.ino(),
+        }
+    } else {
+        Entry::Other
+    }
+}
+
+/// `path` and everything under it, sorted, named relative to the start.
+fn walk(path: &Path, name: &Path, into: &mut Vec<(PathBuf, Entry)>) {
+    let found = entry(path);
+    let folder = found == Entry::Folder;
+    into.push((name.to_path_buf(), found));
+    if folder {
+        let mut children: Vec<_> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|child| child.unwrap().file_name())
+            .collect();
+        children.sort();
+        for child in children {
+            walk(&path.join(&child), &name.join(&child), into);
+        }
+    }
 }
 
 /// A fake `claude` that exits 0: the run exits 0, the link points at the
@@ -469,4 +595,80 @@ fn shasum_computes_the_digest_when_sha256sum_is_missing() {
         text(&output)
     );
     fx.assert_linked("1.0.0", &bytes);
+}
+
+/// The manifest names version A's digest, but the binary has other bytes.
+#[test]
+fn a_digest_that_does_not_match_is_refused() {
+    let fx = fixture();
+    fx.install("1.0.0", "");
+    let binary = fx.served.join(platform()).join("terminus");
+    let digest_a = sha256(&binary);
+    copy_build(&binary, "tampered");
+    fx.serve_manifest("2.0.0", &digest_a);
+    fx.assert_refused(fx.command(&fx.server.url()));
+}
+
+#[test]
+fn an_unsupported_system_is_refused() {
+    let fx = fixture();
+    fx.install("1.0.0", "");
+    fx.serve("2.0.0", "b");
+    let tools = fx.uname_tools("FreeBSD", "x86_64");
+    fx.assert_refused(fx.command_with(&fx.server.url(), &tools));
+}
+
+#[test]
+fn an_unsupported_architecture_is_refused() {
+    let fx = fixture();
+    fx.install("1.0.0", "");
+    fx.serve("2.0.0", "b");
+    let tools = fx.uname_tools("Linux", "riscv64");
+    fx.assert_refused(fx.command_with(&fx.server.url(), &tools));
+}
+
+#[test]
+fn an_http_source_is_refused() {
+    let fx = fixture();
+    fx.install("1.0.0", "");
+    fx.serve("2.0.0", "b");
+    let source = fx.server.url().replacen("https://", "http://", 1);
+    fx.assert_refused(fx.command(&source));
+}
+
+/// `terminus install` would point the hooks and the MCP entry into that
+/// folder while the script linked `~/.local/bin/terminus`.
+#[test]
+fn terminus_bin_dir_set_is_refused() {
+    let fx = fixture();
+    fx.install("1.0.0", "");
+    fx.serve("2.0.0", "b");
+    let mut command = fx.command(&fx.server.url());
+    command.env("TERMINUS_BIN_DIR", fx.root.join("elsewhere"));
+    fx.assert_refused(command);
+}
+
+/// Somebody else's program at the stable path.
+#[test]
+fn a_file_without_the_marker_is_refused() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.stable().parent().unwrap()).unwrap();
+    std::fs::write(fx.stable(), "#!/bin/sh\nexit 0\n").unwrap();
+    fx.serve("1.0.0", "");
+    fx.assert_refused(fx.command(&fx.server.url()));
+}
+
+/// A link to nothing is the script's to replace only when it points into the
+/// versions folder.
+#[test]
+fn a_dangling_link_outside_the_versions_folder_is_refused() {
+    let fx = fixture();
+    std::fs::create_dir_all(fx.stable().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(fx.root.join("elsewhere/terminus"), fx.stable()).unwrap();
+    fx.serve("1.0.0", "");
+    fx.assert_refused(fx.command(&fx.server.url()));
+    assert_eq!(
+        std::fs::read_link(fx.stable()).unwrap(),
+        fx.root.join("elsewhere/terminus")
+    );
 }
