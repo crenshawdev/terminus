@@ -211,19 +211,47 @@ pub fn mcp_entry_is_current(found: &Json, stable: &Path) -> bool {
 /// A found object keeps every key it has, with the three terminus owns set in
 /// place. Anything else under the key holds nothing to keep, and the entry is
 /// those three alone.
-pub fn mcp_entry(found: Option<&Json>, stable: &Path) -> Result<Json, Failure> {
+pub fn mcp_entry(found: Option<&Json>, stable: &Path) -> Json {
     let mut entry = match found {
         Some(object @ Json::Object(_)) => object.clone(),
         _ => Json::object(),
     };
-    set(&mut entry, "type", Json::string("stdio"))?;
-    set(
-        &mut entry,
-        "command",
-        Json::string(&stable.display().to_string()),
-    )?;
-    set(&mut entry, "args", Json::Array(vec![Json::string("mcp")]))?;
-    Ok(entry)
+    let owned = [
+        ("type", Json::string("stdio")),
+        ("command", Json::string(&stable.display().to_string())),
+        ("args", Json::Array(vec![Json::string("mcp")])),
+    ];
+    for (key, value) in owned {
+        set(&mut entry, key, value).expect("the entry is an object, which holds any key");
+    }
+    entry
+}
+
+/// The command that places `entry` by hand:
+/// `claude mcp add-json --scope user terminus '<compact JSON>'`.
+pub fn add_command(entry: &Json) -> String {
+    format!(
+        "claude mcp add-json --scope user {MCP_SERVER_KEY} {}",
+        shell_quote(&entry.compact())
+    )
+}
+
+/// The command that finishes a registration install could not complete,
+/// built from the entry found under `.mcpServers.terminus`, or from none.
+///
+/// With an entry there it starts with the remove, because `add-json` refuses
+/// a name that already exists (D-06).
+pub fn finishing_command(found: Option<&Json>, stable: &Path) -> String {
+    let add = add_command(&mcp_entry(found, stable));
+    match found {
+        Some(_) => format!("claude mcp remove --scope user {MCP_SERVER_KEY} && {add}"),
+        None => add,
+    }
+}
+
+/// `text` as one single-quoted POSIX shell word.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 /// `object[key] = value`, in place when the key is there and appended when it
@@ -415,7 +443,7 @@ mod tests {
     fn the_entry_placed_over_a_found_one_keeps_its_other_keys() {
         let found =
             parsed(r#"{"type": "sse", "command": "/old/bin/terminus", "env": {"KEEP": "me"}}"#);
-        let entry = mcp_entry(Some(&found), &stable()).unwrap();
+        let entry = mcp_entry(Some(&found), &stable());
         assert!(mcp_entry_is_current(&entry, &stable()));
         assert_eq!(
             entry.get("env").unwrap().get("KEEP").unwrap().as_str(),
@@ -423,8 +451,45 @@ mod tests {
             "a key the user put beside ours was dropped"
         );
 
-        let fresh = mcp_entry(None, &stable()).unwrap();
+        let fresh = mcp_entry(None, &stable());
         assert_eq!(fresh.keys(), ["type", "command", "args"]);
+    }
+
+    /// The quoted JSON survives a shell exactly, even with a `'` in the path.
+    #[test]
+    fn the_finishing_command_quotes_the_entry_for_a_shell() {
+        let stable = PathBuf::from("/home/o'brien/.local/bin/terminus");
+        let command = finishing_command(None, &stable);
+        let quoted = command
+            .strip_prefix("claude mcp add-json --scope user terminus ")
+            .unwrap_or_else(|| panic!("not the add: {command}"));
+
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("printf %s {quoted}"))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            mcp_entry(None, &stable).compact()
+        );
+    }
+
+    /// An entry still under the key is removed first, or the add would refuse
+    /// the name.
+    #[test]
+    fn the_finishing_command_for_a_wrong_entry_removes_it_first() {
+        let found = parsed(r#"{"type": "sse", "command": "/old/bin/terminus"}"#);
+        let command = finishing_command(Some(&found), &stable());
+        assert!(
+            command.starts_with("claude mcp remove --scope user terminus && "),
+            "{command}"
+        );
+        assert!(
+            command.contains("&& claude mcp add-json --scope user terminus '"),
+            "{command}"
+        );
     }
 
     /// A `.hooks` that is not an object is a malformed settings file, not a

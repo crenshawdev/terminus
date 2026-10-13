@@ -147,6 +147,10 @@ pub fn run(options: Options) -> Result<(), Failure> {
     let config = Config::load()?;
     let data_dir = crate::cmd::data_dir()?;
     let settings = Document::read(&targets::settings_path()?)?;
+    // Only where it is. What is in it is read after the writes above it, and a
+    // file that cannot be read leaves the registration incomplete rather than
+    // refusing the install (phase 3 D-05).
+    let claude_json = targets::claude_json_path()?;
 
     let add_hooks = |root: &mut Json| targets::add_hooks(root, &stable);
     // Against the file's own bytes, not against a re-rendered copy of it: what
@@ -181,23 +185,36 @@ pub fn run(options: Options) -> Result<(), Failure> {
         }
         wrote_hooks = settings.apply(&add_hooks)?;
     }
-    let (claude_json, registered) = register(&stable)?;
+    let registered = register(&claude_json, &stable);
 
     advise(&settings, options.yes)?;
 
     println!();
-    println!("installed");
+    match &registered {
+        Ok(_) => println!("installed"),
+        Err(_) => println!("install incomplete: the mcp server is not registered"),
+    }
     println!("  binary            {}", stable.display());
     println!(
         "  hook entries      {} ({})",
         settings.path().display(),
         outcome(wrote_hooks, "four entries added", "already current")
     );
-    println!(
-        "  mcp server        {} ({})",
-        claude_json.display(),
-        registered.describe()
-    );
+    match &registered {
+        Ok(done) => println!(
+            "  mcp server        {} ({})",
+            claude_json.display(),
+            done.describe()
+        ),
+        Err(incomplete) => {
+            println!(
+                "  mcp server        {} (not registered: {})",
+                claude_json.display(),
+                incomplete.cause
+            );
+            println!("  to finish, run    {}", incomplete.command);
+        }
+    }
     if backups.is_empty() {
         // True whichever way it got here: a file that did not exist has nothing
         // to copy, and a file that did not change is not backed up either.
@@ -235,7 +252,13 @@ pub fn run(options: Options) -> Result<(), Failure> {
 
     // Step 6, and the last thing install does.
     start_backfill(&stable, &data_dir, &config);
-    Ok(())
+    match registered {
+        Ok(_) => Ok(()),
+        // Silent: the summary above already says what is missing and the
+        // command that finishes it. An incomplete install never exits 0,
+        // because a script reads the status (D-05).
+        Err(_) => Err(Failure::Silent),
+    }
 }
 
 /// What the registration step did.
@@ -262,44 +285,56 @@ impl Registered {
     }
 }
 
-/// Place the MCP entry through `claude mcp`, and return `.claude.json`'s path
-/// and what was done (phase 3 D-01, D-06).
+/// A registration install could not complete (D-05): why, and the command
+/// that finishes it.
+struct Incomplete {
+    cause: String,
+    command: String,
+}
+
+/// Place the MCP entry through `claude mcp` (phase 3 D-01, D-06).
 ///
 /// `.claude.json` is read and never written. An entry already current runs
 /// nothing, and `claude mcp get` is never run: it health-checks the server and
 /// writes into the file. No entry gets the add. An entry in any other shape
 /// gets the remove and then the add, because `add-json` refuses a name that
-/// exists; a remove that fails stops the add.
-fn register(stable: &Path) -> Result<(std::path::PathBuf, Registered), Failure> {
-    let path = targets::claude_json_path()?;
-    let document = Document::read(&path)?;
+/// exists; a remove that fails stops the add. A file that cannot be read runs
+/// no `claude` at all.
+fn register(path: &Path, stable: &Path) -> Result<Registered, Incomplete> {
+    let document = Document::read(path).map_err(|failure| Incomplete {
+        cause: reason(failure),
+        command: targets::finishing_command(None, stable),
+    })?;
     let found = document
         .value()
         .get("mcpServers")
         .and_then(|servers| servers.get(targets::MCP_SERVER_KEY));
     if found.is_some_and(|found| targets::mcp_entry_is_current(found, stable)) {
-        return Ok((path, Registered::Current));
+        return Ok(Registered::Current);
     }
-    let entry = targets::mcp_entry(found, stable)?.compact();
+    let entry = targets::mcp_entry(found, stable);
     let key = targets::MCP_SERVER_KEY;
     let mut registered = Registered::Added;
     if found.is_some() {
-        ran(claude::run(&["mcp", "remove", "--scope", "user", key]))?;
+        if let Some(cause) = claude::run(&["mcp", "remove", "--scope", "user", key]).cause() {
+            return Err(Incomplete {
+                cause,
+                command: targets::finishing_command(found, stable),
+            });
+        }
         registered = Registered::Replaced;
     }
-    ran(claude::run(&[
-        "mcp", "add-json", "--scope", "user", key, &entry,
-    ]))?;
-    Ok((path, registered))
-}
-
-fn ran(outcome: claude::Outcome) -> Result<(), Failure> {
-    match outcome.cause() {
-        None => Ok(()),
-        Some(cause) => Err(Failure::Operational(format!(
-            "the mcp server could not be registered: {cause}"
-        ))),
+    let compact = entry.compact();
+    if let Some(cause) = claude::run(&["mcp", "add-json", "--scope", "user", key, &compact]).cause()
+    {
+        // Whatever was under the key is gone by now, so the add alone finishes
+        // it.
+        return Err(Incomplete {
+            cause,
+            command: targets::add_command(&entry),
+        });
     }
+    Ok(registered)
 }
 
 /// Start archiving the history that is already on disk, and return (ING-11).

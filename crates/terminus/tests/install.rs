@@ -901,6 +901,81 @@ fn a_current_mcp_registration_runs_no_claude() {
     );
 }
 
+/// What every incomplete install must still have done, and how it must say
+/// so (D-05): the binary placed, the four hook entries merged, the backfill
+/// started, `.claude.json` untouched, the command that finishes it, and exit 1.
+fn assert_incomplete(fixture: &Fixture, output: &Output, claude_json: &str) -> String {
+    let said = text(output);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(fixture.stable().exists(), "{said}");
+    assert_eq!(
+        our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
+        4,
+        "{said}"
+    );
+    assert!(said.contains("incomplete"), "{said}");
+    assert!(
+        said.contains("terminus status"),
+        "the backfill was not started: {said}"
+    );
+    assert!(
+        said.lines()
+            .any(|line| line.contains("claude mcp add-json --scope user terminus '")),
+        "no command finishes the registration: {said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        claude_json
+    );
+    said
+}
+
+/// No `claude` on `PATH` leaves the registration, and only the registration,
+/// undone.
+#[test]
+fn without_claude_on_path_the_install_is_incomplete() {
+    let fixture = fixture();
+    fixture.seed();
+    std::fs::remove_file(fixture.path_dir.join("claude")).unwrap();
+
+    let output = fixture.run(&["install", "--yes"]);
+    let said = assert_incomplete(&fixture, &output, CLAUDE_JSON);
+    assert!(said.contains("not on PATH"), "{said}");
+}
+
+/// A `claude` that fails is reported by the first line of what it said.
+#[test]
+fn a_claude_that_fails_leaves_the_install_incomplete_with_its_first_line() {
+    let fixture = fixture();
+    fixture.seed();
+    fixture.fake_claude("first\nsecond", 1);
+
+    let output = fixture.run(&["install", "--yes"]);
+    let said = assert_incomplete(&fixture, &output, CLAUDE_JSON);
+    // The cause is the first line exactly, and the second is nowhere. Not a
+    // bare `contains("second")`: the backfill estimate can say "under a
+    // second".
+    assert!(
+        said.lines()
+            .any(|line| line.contains("mcp server") && line.ends_with("(not registered: first)")),
+        "{said}"
+    );
+    assert!(!said.lines().any(|line| line.trim() == "second"), "{said}");
+}
+
+/// A `.claude.json` that does not parse starts no `claude`, and no longer
+/// stops the rest of the install.
+#[test]
+fn an_unreadable_claude_json_leaves_the_install_incomplete_and_runs_no_claude() {
+    let fixture = fixture();
+    fixture.seed();
+    std::fs::write(fixture.claude_json(), "{").unwrap();
+
+    let output = fixture.run(&["install", "--yes"]);
+    assert_incomplete(&fixture, &output, "{");
+    assert_eq!(fixture.calls(), Vec::new());
+}
+
 // ---------------------------------------------------------------------------
 // Task 5: the diff, the one confirmation, and --yes
 // ---------------------------------------------------------------------------
