@@ -41,7 +41,7 @@ use std::path::Path;
 use terminus_core::ingest::lock;
 use terminus_core::store::DB_FILE_NAME;
 
-use super::install::json_file::{Document, Json};
+use super::install::json_file::{self, Document, Json};
 use super::install::{self, binary, claude, targets};
 use super::Failure;
 
@@ -295,43 +295,43 @@ fn empty(value: &Json) -> bool {
 ///
 /// Always `--scope user`: without it the remove fails when a local entry of the
 /// same name exists too. With no entry, no `claude` runs. An old
-/// `.claude.json.terminus-backup` is reported and never restored or deleted
-/// (D-15).
+/// `.claude.json.terminus-backup` is reported, even when the file does not
+/// parse, and never restored or deleted (D-15).
 fn unregister(path: &Path) -> bool {
     const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", targets::MCP_SERVER_KEY];
 
     println!("  {}", path.display());
-    let document = match Document::read(path) {
-        Ok(document) => document,
+    let ok = match Document::read(path) {
         Err(failure) => {
             println!("    left alone: {}", detail(failure));
-            return false;
+            false
         }
-    };
-    let registered = document
-        .value()
-        .get("mcpServers")
-        .and_then(|servers| servers.get(targets::MCP_SERVER_KEY))
-        .is_some();
-
-    let ok = if !registered {
-        println!("    no mcp registration of terminus's was there");
-        true
-    } else {
-        match claude::run(&REMOVE).cause() {
-            None => {
-                println!("    removed the mcp registration with claude mcp remove");
+        Ok(document) => {
+            let registered = document
+                .value()
+                .get("mcpServers")
+                .and_then(|servers| servers.get(targets::MCP_SERVER_KEY))
+                .is_some();
+            if !registered {
+                println!("    no mcp registration of terminus's was there");
                 true
-            }
-            Some(cause) => {
-                println!("    the mcp registration is still there: {cause}");
-                println!("    to remove it, run  claude {}", REMOVE.join(" "));
-                false
+            } else {
+                match claude::run(&REMOVE).cause() {
+                    None => {
+                        println!("    removed the mcp registration with claude mcp remove");
+                        true
+                    }
+                    Some(cause) => {
+                        println!("    the mcp registration is still there: {cause}");
+                        println!("    to remove it, run  claude {}", REMOVE.join(" "));
+                        false
+                    }
+                }
             }
         }
     };
 
-    if let Ok(backup) = document.backup_path() {
+    if let Ok(backup) = json_file::backup_path_for(path) {
         if std::fs::symlink_metadata(&backup).is_ok() {
             println!(
                 "    an old backup from install is at {}\n    \

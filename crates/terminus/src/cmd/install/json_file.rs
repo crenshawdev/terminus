@@ -492,9 +492,7 @@ impl Document {
     /// file, for the reason the module header gives - `~/.claude.json` is two
     /// symlinks from the file it names.
     pub fn backup_path(&self) -> Result<PathBuf, Failure> {
-        Ok(self
-            .resolved
-            .with_file_name(format!("{}{BACKUP_SUFFIX}", self.file_name()?)))
+        backup_path_for(&self.resolved)
     }
 
     fn file_name(&self) -> Result<String, Failure> {
@@ -618,6 +616,26 @@ fn render(value: &Json, trailing_newline: bool) -> String {
 /// Falls back to resolving the parent and re-attaching the name, because
 /// `canonicalize` fails on a file that does not exist yet and install has to be
 /// able to create one.
+/// Where [`Document::backup`] puts its copy of the file at `path`, found
+/// without reading the file.
+///
+/// The name depends only on where the file is, so `uninstall` can report an old
+/// `~/.claude.json` backup even when the live file does not parse (D-15).
+/// Resolving a path that is already resolved gives it back unchanged, so
+/// [`Document::backup_path`] can hand this its own resolved path.
+pub fn backup_path_for(path: &Path) -> Result<PathBuf, Failure> {
+    let resolved = resolve(path);
+    match resolved.file_name() {
+        Some(name) => {
+            Ok(resolved.with_file_name(format!("{}{BACKUP_SUFFIX}", name.to_string_lossy())))
+        }
+        None => Err(Failure::Operational(format!(
+            "{} does not name a file",
+            resolved.display()
+        ))),
+    }
+}
+
 fn resolve(path: &Path) -> PathBuf {
     if let Ok(real) = std::fs::canonicalize(path) {
         return real;

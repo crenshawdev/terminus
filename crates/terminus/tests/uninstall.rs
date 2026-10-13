@@ -422,6 +422,28 @@ fn an_old_claude_json_backup_is_reported_and_left_alone() {
     assert_eq!(bytes(&fixture.claude_json()), CLAUDE_JSON);
 }
 
+/// D-15 when `~/.claude.json` does not parse: the old backup is still
+/// reported, since a broken live file is when the user most needs to know the
+/// old copy is there, and neither file is touched.
+#[test]
+fn an_old_claude_json_backup_is_reported_when_claude_json_does_not_parse() {
+    let fixture = fixture();
+    let backup = fixture.claude_dir.join(".claude.json.terminus-backup");
+    let old = "{\n  \"numStartups\": 3\n}\n";
+    std::fs::write(&backup, old).unwrap();
+    fixture.install();
+    std::fs::write(fixture.claude_json(), "{").unwrap();
+
+    let output = fixture.uninstall();
+    assert!(
+        out(&output).contains(&backup.display().to_string()),
+        "uninstall did not print the old backup's path:\n{}",
+        text(&output)
+    );
+    assert_eq!(bytes(&backup), old);
+    assert_eq!(bytes(&fixture.claude_json()), "{");
+}
+
 /// D-13's whole point: a `/config` change made after install survives
 /// uninstall, and the entries still go.
 ///
