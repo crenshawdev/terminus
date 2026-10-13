@@ -6,10 +6,10 @@
 //! opened.
 //!
 //! **Archival, never derived (D-02).** `observations` is deliberately absent
-//! from [`crate::store::schema::DERIVED_TABLES`]: the judgment half is a paid
-//! model call that no blob replay reproduces, so a `reindex` that dropped the
-//! table would delete summaries a user bought. `terminus observations
-//! regenerate` (OBS-07) is the only rebuild path.
+//! from [`crate::store::schema::DERIVED_TABLES`]: the facts come off the
+//! session blob, and retention eviction empties that blob, so a `reindex` that
+//! dropped the table could not recompute an evicted session's row. `terminus
+//! observations regenerate` (OBS-07) is the only rebuild path.
 //!
 //! **Written by the pass, at the far end of it.** [`observe_new`] runs after
 //! `feedback::outcomes` - which is what sets `session_meta.is_final` - and
@@ -149,7 +149,8 @@ fn pending(conn: &Connection) -> Result<BTreeMap<String, Option<String>>> {
 /// `DO NOTHING` rather than an upsert, and that is the whole of why this step
 /// is safe to run on every pass: `terminus observations regenerate` is the only
 /// rebuild path, so a pass that found a row already there must leave it - the
-/// judgment half of it is a model call somebody paid for.
+/// session's blob may since have been evicted, and then nothing can recompute
+/// the row.
 fn write_one(conn: &Connection, session_key: &str, session_id: Option<&str>) -> Result<()> {
     let facts = mechanical::observe(conn, session_key)?;
     conn.execute(
@@ -193,8 +194,8 @@ pub struct Regenerated {
 /// `DERIVED_TABLES`, so `reindex` never touches it and the ingest pass inserts
 /// and never overwrites; this is the one place a stored fact set is replaced.
 ///
-/// **`mechanical` and nothing else.** Not `generated_at`, not `session_id`, and
-/// none of the judgment columns, which nothing writes any more. `generated_at`
+/// **`mechanical` and nothing else.** Not `generated_at` and not `session_id`.
+/// `generated_at`
 /// dates the row as a whole, so a recompute that moved it would misdate the
 /// parts it did not touch. One column, on exactly the selected rows, is what
 /// makes a run under a narrowed selector provably scoped.

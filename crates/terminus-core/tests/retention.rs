@@ -478,7 +478,7 @@ fn a_deletion_removes_every_row_the_session_owns() {
     assert!(applied.notes.is_empty(), "{:?}", applied.notes);
     assert!(
         applied.lines().iter().any(|l| l.contains("observation")),
-        "the loss of a paid model call has to be said out loud: {:?}",
+        "the loss of an observation no rebuild reproduces has to be said out loud: {:?}",
         applied.lines()
     );
 

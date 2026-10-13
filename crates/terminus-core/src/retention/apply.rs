@@ -26,9 +26,9 @@ pub struct Applied {
     /// Deletions that took an `observations` row with them.
     ///
     /// Counted and said out loud because it is the one thing a delete destroys
-    /// that no rebuild reproduces: the judgment half of an observation is a
-    /// paid model call, and `reindex` deliberately does not touch that table
-    /// for exactly this reason (phase 7 D-02).
+    /// that no rebuild reproduces: an observation's facts come off the session
+    /// blob, and the delete takes the blob too, which is why `reindex`
+    /// deliberately does not touch that table (phase 7 D-02).
     pub observations_lost: usize,
     /// Eligible sessions the per-pass bound left for the next pass.
     pub over: usize,
@@ -63,8 +63,8 @@ impl Applied {
             let mut line = format!("retention deleted {} session(s)", self.deleted.len());
             if self.observations_lost > 0 {
                 line.push_str(&format!(
-                    ", removing {} observation row(s) with them - an observation is a model call \
-                     no rebuild reproduces",
+                    ", removing {} observation row(s) with them - the session's blob went too, \
+                     so no rebuild reproduces them",
                     self.observations_lost
                 ));
             }

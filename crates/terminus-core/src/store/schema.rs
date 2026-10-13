@@ -10,8 +10,9 @@
 //! `decisions` and `labels` join the archive group in phase 6 (D-03): a logged
 //! injection decision is prompt-time state the blobs do not contain, so it is
 //! kept rather than rebuilt, and a `reindex` must never drop it. `observations`
-//! joins it in phase 7 (D-02): its judgment half is one paid model call, which
-//! no blob replay reproduces either.
+//! joins it in phase 7 (D-02): its facts come off the session blob, and
+//! retention eviction empties that blob, so an evicted session's observation
+//! cannot be recomputed.
 
 /// Bits of a turn id reserved for the per-session turn ordinal.
 ///
@@ -208,13 +209,10 @@ CREATE TABLE IF NOT EXISTS labels (
 CREATE INDEX IF NOT EXISTS idx_labels_decision ON labels(decision_id);
 
 -- One session's account of itself (OBS-01..OBS-04). Archival, and deliberately
--- NOT in `DERIVED_TABLES`, for the reason `decisions` is not (phase 7 D-02).
--- The mechanical half could in principle be recomputed from the blob, but the
--- judgment half cannot: it is one paid model call whose answer nothing in the
--- archive reproduces, so a `reindex` that dropped this table would silently
--- delete every purchased summary in it. `terminus observations regenerate`
--- (OBS-07) is the only rebuild path, and the two halves share one row because
--- they describe one session and are written and read together.
+-- NOT in `DERIVED_TABLES` (phase 7 D-02). The facts come off the session blob,
+-- and retention eviction empties that blob, so an evicted session's observation
+-- cannot be recomputed and a `reindex` that dropped this table would lose it for
+-- good. `terminus observations regenerate` (OBS-07) is the only rebuild path.
 --
 -- `mechanical` is one JSON document rather than a column per fact, the way
 -- `decisions` carries its list-shaped fields: nothing joins on them and they
@@ -371,9 +369,10 @@ pub const TABLES: &[&str] = &[
 /// The derived tables `reindex` drops and rebuilds from the blobs (STOR-04).
 /// `sessions` and `session_meta` are absent by design, and so are `decisions`
 /// and `labels`: nothing in a blob can reconstruct what an injector decided at
-/// prompt time (D-03). `observations` is absent for the same reason and one
-/// more (phase 7 D-02): its judgment half is a paid model call, so a `reindex`
-/// that dropped the table would delete summaries that cost money to produce.
+/// prompt time (D-03). `observations` is absent too (phase 7 D-02): its facts
+/// come off the session blob, and retention eviction empties that blob, so a
+/// `reindex` that dropped the table could not recompute an evicted session's
+/// row.
 ///
 /// In creation order, because `reindex` drops in reverse: a boundary row
 /// references `turns(id)`, so `compaction_boundaries` sits **after** `turns`

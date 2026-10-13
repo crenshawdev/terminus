@@ -423,12 +423,13 @@ fn the_observations_table_reaches_a_store_that_predates_it() {
 }
 
 /// D-02: the table is archival. A `DERIVED_TABLES` entry would make `reindex`
-/// drop it, and the judgment half of a row is a paid model call.
+/// drop it, and an evicted session's row cannot be recomputed from its emptied
+/// blob.
 #[test]
 fn observations_is_not_a_derived_table() {
     assert!(
         !schema::DERIVED_TABLES.contains(&"observations"),
-        "reindex would delete every purchased summary in the archive"
+        "reindex would delete observations an evicted blob cannot recompute"
     );
     assert!(schema::TABLES.contains(&"observations"));
 }
