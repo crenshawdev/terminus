@@ -39,6 +39,15 @@ const COMMAND: &str = "search";
 /// two-line entries is a screenful and a half.
 const DEFAULT_LIMIT: usize = 10;
 
+/// The kind that searched stored session summaries. Those are gone, and a kind
+/// that is accepted and matches nothing reads as "no results", so both front
+/// ends refuse it by name instead.
+pub(crate) const RETIRED_KIND: &str = "observation";
+
+/// What a caller asking for [`RETIRED_KIND`] is told, on either front end.
+pub(crate) const RETIRED_KIND_MESSAGE: &str =
+    "kind \"observation\" is no longer offered: session summaries were removed from Terminus";
+
 pub fn run(args: Args) -> Result<(), Failure> {
     // Parsed before the store is opened, so both exits carry the same shape: a
     // document whose fields depend on whether a store was there would be a
@@ -219,7 +228,13 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
         match arg {
             Long("project") => project = Some(super::value(parser, "project")?),
             Long("tool") => filters.tool = Some(super::value(parser, "tool")?),
-            Long("kind") => filters.kind = Some(super::value(parser, "kind")?),
+            Long("kind") => {
+                let kind = super::value(parser, "kind")?;
+                if kind == RETIRED_KIND {
+                    return Err(Failure::Misuse(RETIRED_KIND_MESSAGE.into()));
+                }
+                filters.kind = Some(kind);
+            }
             // Repeatable: a turn carrying any of the named paths is a hit, and
             // it is one hit however many of them it carries.
             Long("path") => filters.paths.push(super::value(parser, "path")?),

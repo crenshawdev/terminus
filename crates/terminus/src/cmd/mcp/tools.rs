@@ -135,12 +135,8 @@ pub fn descriptors() -> Vec<Value> {
                     },
                     "kind": {
                         "type": "string",
-                        "description": format!(
-                            "Only turns of this record type: user, assistant, system or \
-                             attachment; or \"{}\" to search stored session summaries \
-                             instead, each hit being one claim and its anchoring turn id.",
-                            terminus_core::recall::OBSERVATION_KIND
-                        )
+                        "description": "Only turns of this record type: user, assistant, \
+                                        system or attachment."
                     },
                     "since": {
                         "type": "string",
@@ -334,9 +330,13 @@ fn run_search(args: &Map<String, Value>) -> Result<Value, Refused> {
         .map(<[String]>::to_vec)
         .unwrap_or(asked_paths);
     let served_paths = paths.len();
+    let kind = optional_string(args, "kind")?;
+    if kind.as_deref() == Some(crate::cmd::search::RETIRED_KIND) {
+        return Err(Refused::caller(crate::cmd::search::RETIRED_KIND_MESSAGE));
+    }
     let filters = Filters {
         tool: optional_string(args, "tool")?,
-        kind: optional_string(args, "kind")?,
+        kind,
         paths,
         since: optional_time(args, "since")?,
         until: optional_time(args, "until")?,
