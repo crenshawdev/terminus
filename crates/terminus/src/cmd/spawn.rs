@@ -26,16 +26,16 @@
 //!
 //! # `std` alone (D-04)
 //!
-//! No `libc`, no `nix`, no `windows-sys`.
-//! [`std::os::unix::process::CommandExt::process_group`] and
-//! [`std::os::windows::process::CommandExt::creation_flags`] are the whole
+//! No `libc`, no `nix`.
+//! [`std::os::unix::process::CommandExt::process_group`] is the whole
 //! mechanism, exactly as `ingest::lock` uses [`std::fs::File::try_lock`] rather
-//! than naming `flock` and `LockFileEx` itself. Every dependency in the root
-//! `Cargo.toml` carries a comment justifying its cost against a measured
-//! 0.408 ms startup floor, and this path is the floor's whole reason to exist.
+//! than naming `flock` itself. Every dependency in the root `Cargo.toml`
+//! carries a comment justifying its cost against a measured 0.408 ms startup
+//! floor, and this path is the floor's whole reason to exist.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -60,12 +60,6 @@ use std::process::{Command, Stdio};
 /// removed while something still spells it, the parser rejects it as an
 /// unexpected argument (exit 2) rather than accepting it as a positional.
 pub const HANDOFF: &str = "--reparent";
-
-/// Windows: no console, and no parent to be killed with.
-#[cfg(windows)]
-const DETACHED_PROCESS: u32 = 0x0000_0008;
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Start this binary again with `args`, detached, and return without waiting.
 ///
@@ -134,18 +128,9 @@ fn spawn_from<S: AsRef<OsStr>>(exe: &Path, args: &[S]) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // 0 means "a new group led by the child", which is what takes it out of
-        // the group `kill(-pid)` names.
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
-    }
+    // 0 means "a new group led by the child", which is what takes it out of
+    // the group `kill(-pid)` names.
+    command.process_group(0);
 
     // Spawned and dropped: waiting is the one thing a detached spawn must never
     // do. The intermediate exits within microseconds and is reaped by whatever

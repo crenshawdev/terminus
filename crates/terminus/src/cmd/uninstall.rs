@@ -377,14 +377,6 @@ fn unplace(stable: &Path) -> bool {
             }
             Err(e) => {
                 println!("    could not be removed: {e}");
-                if std::env::current_exe().is_ok_and(|exe| exe == stable) {
-                    // Windows will not unlink a running image. Saying so beats
-                    // leaving the user with an errno.
-                    println!(
-                        "    that file is this running program; on Windows it can only be \
-                         removed after this process exits"
-                    );
-                }
                 false
             }
         },

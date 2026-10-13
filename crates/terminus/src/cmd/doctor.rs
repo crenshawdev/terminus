@@ -574,11 +574,7 @@ impl Doctor {
     /// Is the Claude Code on this machine one terminus has seen run exec-form
     /// hooks (D-16)?
     fn claude_code(&mut self) {
-        let name = if cfg!(windows) {
-            "claude.exe"
-        } else {
-            "claude"
-        };
+        let name = "claude";
         let Some(program) = on_path(name) else {
             self.push(Check::new(
                 "claude_code",
@@ -772,11 +768,7 @@ impl Doctor {
                 State::Problem,
                 format!("{} is not writable, so no ingest can commit", dir.display()),
             )
-            .with_fix(if cfg!(windows) {
-                format!("attrib -r \"{}\"", dir.display())
-            } else {
-                format!("chmod u+w '{}'", dir.display())
-            }),
+            .with_fix(format!("chmod u+w '{}'", dir.display())),
             Ok(_) => Check::new("data_directory", State::Ok, dir.display().to_string()),
         };
         self.push(check);
@@ -1248,13 +1240,9 @@ fn precedes(version: &str, floor: &str) -> bool {
     false
 }
 
-/// The command that removes a file, on the shell the user is at.
+/// The `rm -f` command that removes a file.
 fn removal(path: &Path) -> String {
-    if cfg!(windows) {
-        format!("del \"{}\"", path.display())
-    } else {
-        format!("rm -f '{}'", path.display())
-    }
+    format!("rm -f '{}'", path.display())
 }
 
 /// A failure's own words, for a check that reports it rather than raising it.
