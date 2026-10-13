@@ -117,7 +117,7 @@ Deferred. Tracked, not in the current roadmap.
 
 ### Distribution
 
-- **Secondary channels**: GitHub releases, Homebrew, Scoop/WinGet, deb/rpm. npm is the primary channel and ships first.
+- **Secondary channels**: GitHub releases, Homebrew, deb/rpm. There is no npm channel, because the npm package was removed.
 - **crates.io publication**: name `terminus` is taken. Skip crates.io; how Terminus is delivered is still open.
 
 ## Out of Scope
