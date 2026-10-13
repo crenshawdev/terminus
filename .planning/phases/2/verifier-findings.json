@@ -1,0 +1,123 @@
+{
+  "status": "gaps",
+  "score": "11/13",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "From an empty home, terminus creates its data directory and database owner-only, and doctor reports no failure caused by the fresh state",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "Ran under env -i with HOME and XDG_DATA_HOME in an empty scratch dir. Before any ingest, doctor reported data_directory, store and last_run as note/unknown (not problem); its 6 problems were the binary, four hooks and mcp_server not being installed, each with an install fix. After `terminus ingest` (exit 0): xdg/terminus 700, terminus.db 600, LOCK 600, snapshots/ 700 and its snapshot 600; doctor then showed data_directory, store and last_run ok. In a second scratch home after `terminus install --yes`, doctor printed 'no problems.' and exited 0."
+    },
+    {
+      "n": 2,
+      "truth": "npm/ is gone and npm is named only to say it was removed",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "`test -e npm` reports gone and `git ls-files npm` lists 0 files. `git grep -n -i npm -- crates docs Cargo.toml .gitignore` prints nothing (rc=1), and .gitignore holds only the Cadence trace entry and /target. DESIGN-BRIEF.md names npm once, at :380 ('There is no npm channel. The npm package was removed.'). PROJECT.md names it at :21 and :106 and :131 (each says removed) and at :35 and :55 (shipped-cycle Manifest rows). REQUIREMENTS.md names it at :21 (INST-09), :72 (INST-01) and :120 ('There is no npm channel, because the npm package was removed'). Other tracked mentions are in CHANGELOG.md, CAPTURE.md (closed items), ROADMAP.md, STATE.md and .planning/_archive-v0.1.0. ROADMAP SC1's literal 'nothing mentions npm' is read through AC1, which allows removal notices."
+    },
+    {
+      "n": 3,
+      "truth": "No Windows or Unix guard, Windows variable or .exe literal is left in crates/",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "The AC2 pattern returned rc=1 (no match) both from `git grep -nE` over crates and from `grep -rnE` over the working tree. `git grep target_os -- crates` shows only lib.rs:22 (the refusal), config.rs:928/933 (macOS and Linux fold), store/open.rs:855/869 (Linux and macOS data dir), and the cfg!(target_os = \"macos\") arms in tests/datamove.rs:71 and tests/owner_only.rs:81. No match for cfg(.*windows, windows_sys, std::os::windows, creation_flags or target_family. Remaining 'windows' words in crates are .windows( slice calls, blob.rs block windows, show.rs variables, or comments the plans kept on purpose: claude-mem history (project.rs:182, doctor.rs:1208, targets.rs:27-29), Claude Code behaviour (doctor.rs:446) and transcript data (egress.rs:423, json.rs:152)."
+    },
+    {
+      "n": 4,
+      "truth": "lib.rs carries the guarded compile_error! and a test fails if the guard or message is removed",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "crates/terminus-core/src/lib.rs:22-23 has `#[cfg(not(any(target_os = \"linux\", target_os = \"macos\")))]` followed by `compile_error!(\"Terminus supports Linux and macOS only.\");`, before the first `pub mod` at :25. crates/terminus-core/tests/supported_systems.rs::a_build_for_any_other_system_stops_at_compile_time passed in the full suite. Mutation check, compiled standalone with rustc --test against scratch copies of lib.rs: the original passes; the guard changed to not(unix) FAILS ('lib.rs has no line #[cfg(not(any(...)))]'); one word of the message changed FAILS ('lib.rs has no line compile_error!(...)'); both lines deleted FAILS."
+    },
+    {
+      "n": 5,
+      "truth": "A Windows cargo build fails with 'Terminus supports Linux and macOS only.'",
+      "status": "UNCERTAIN",
+      "uat_item": 5,
+      "evidence": "Not runnable here: `rustup target list --installed` shows only x86_64-unknown-linux-gnu, and there is no x86_64-w64-mingw32-gcc. Installing a target would need the network. The guard is present and pinned (truth 4), but whether MSVC shows the message before or among the unresolved std::os::unix errors is CONTEXT's first flagged assumption and is unobserved."
+    },
+    {
+      "n": 6,
+      "truth": "The full suite passes at the stated count and the summary lists every test helper and .exe arm removed",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "One run of `cargo test --workspace --all-features` at 100a1ec exited 0: 750 passed, 0 failed, 0 ignored. `-- --list` counts 750 `: test` lines. That is the 749 baseline plus the AC3 refusal test. `git diff 26b79d1 HEAD -- crates` adds exactly one #[test] line and removes none (the source count is 750 to 751 because corpus.rs:375 names #[test] in a doc comment). AC5's literal '749' no longer matches; CONTEXT's third flagged assumption says a moved count is accounted for in the summary, SUMMARY.md:28 does that, and issue #6 tracks the wording. Every non-comment line removed from tests is a cfg guard, one of the two `#[cfg(not(unix))] fn drain` stubs, one of the four terminus.exe arms (doctor, hook, install, uninstall), the datamove LOCALAPPDATA env line and Windows data_dir arm, one of the four USERPROFILE lines, or the `del` disjunct. This matches SUMMARY.md:20-26 item for item. `git grep -nw 'fn drain'` shows corpus.rs:560 and hook.rs:359 only."
+    },
+    {
+      "n": 7,
+      "truth": "doctor, doctor --json and uninstall print no attrib, del or .exe fix and no mention of Windows, and doctor --json keeps its top-level keys",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "In a scratch home (env -i, HOME and XDG_DATA_HOME in scratch) I ran install --yes, doctor, doctor --json, uninstall --yes and install over a stranger at the stable path. `grep -i -E 'attrib|\\bdel |\\.exe\\b|windows'` over all of that output found nothing (rc=1). With the data dir made read-only, doctor's fix was `chmod u+w '<dir>'`. The occupied-path refusal prints `rm -f '<path>' && ... install`. In the source diff 26b79d1..HEAD, doctor.rs drops only the claude.exe, attrib and del branches (no check added or removed), install/mod.rs::occupied drops only the del branch, and uninstall.rs::unplace drops only the 'on Windows it can only be removed after this process exits' block. doctor --json envelope keys are [command, data, ok, reason], pinned by tests/doctor.rs::the_json_document_carries_every_check_by_name, which passed. The data keys are the 14 check names, and none changed."
+    },
+    {
+      "n": 8,
+      "truth": "DESIGN-BRIEF and PROJECT name Linux and macOS, remaining Windows mentions are about claude-mem or the drop, and CAPTURE closes its npm, Windows and icacls items",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "In DESIGN-BRIEF.md, Windows appears only at :22 and :119 (claude-mem) and :374 (the Supported systems line naming Linux and macOS and the drop). The §12 table header at :362 is `| Purpose | Linux | macOS |`. Case folding is macOS-only at :152, :209 and :356. No LockFileEx, CREATE_NO_WINDOW, DETACHED_PROCESS, APPDATA, Scoop, WinGet, win32 or .exe. In PROJECT.md, Windows appears only at :80 (claude-mem), :103 (Compatibility: Linux and macOS only, Windows dropped) and :138 (the new decision row). In CAPTURE.md, the six npm todos (:102, :107-109, :112, :113) and the AC3 Windows item (:106) are `[x]` with 'Closed 2026-10-13: no longer applicable'. The Publish milestone has a closing bullet at :206 and 0 unchecked bullets. The icacls proposal has a closing bullet at :298. `capture-check` reports annotations []. The only open bullet naming Windows is the phase 8 data-move LOCK item (:149), which D-02 and PLAN-4 Notes leave to the owner."
+    },
+    {
+      "n": 9,
+      "truth": "CHANGELOG [Unreleased] records both removals, the rename entry names no %LOCALAPPDATA% path, and the Verbatim 0.1.1 deferral line is unchanged",
+      "status": "VERIFIED",
+      "uat_item": 9,
+      "evidence": "CHANGELOG.md:51-53 holds the npm Removed entry and :54-58 the Windows Removed entry, both under [Unreleased] ### Removed. `git grep -i -E 'npm|LOCALAPPDATA'` hits only :51 and :53. The diff 26b79d1..HEAD changes only the rename parenthetical (drops `Windows %LOCALAPPDATA%\\terminus`) and adds the two entries. :96-97 ('Unix only; `doctor` reports the mode and states the Windows deferral.') is untouched. Cosmetic only: the rejoined rename line (:16) runs past the file's ~80-column wrap, which does not affect rendering."
+    },
+    {
+      "n": 10,
+      "truth": "Code that sat behind cfg(unix) is kept and runs: the detached spawn is process_group(0) alone and every formerly guarded test executes",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "spawn.rs:133 calls command.process_group(0) unconditionally, with no creation_flags and no cfg( in the file. In the suite log, these previously guarded tests ran and passed: hook.rs the_working_process_leaves_the_group_and_the_parentage_of_the_process_that_spawned_it, the_ingest_survives_a_group_kill_and_a_descendant_sweep, reading_the_hooks_stdout_to_eof_returns_at_once_while_the_ingest_still_runs; doctor.rs a_missing_binary_is_a_problem_whose_printed_command_fixes_it; install.rs a_stale_temporary_name_is_stepped_over_rather_than_followed, a_symlink_at_the_backup_name_is_not_written_through; store_open.rs a_fresh_store_and_its_sidecars_are_owner_only, a_wide_store_is_tightened_by_a_writable_open_and_by_nothing_else; the unit tests inject::decision::tests::a_record_and_its_directory_are_owner_only and json_file::tests::writing_through_a_symlink_updates_the_target_and_keeps_the_link and the_backup_carries_the_bytes_and_the_permissions; the whole-file binaries tests/owner_only.rs (3 passed) and tests/tighten.rs (1 passed); and 5 owner_only::tests:: unit tests."
+    },
+    {
+      "n": 11,
+      "truth": "The data directory and case folding keep exactly a Linux and a macOS arm, with no other-Unix fallback",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "config.rs:926-936 has `fold` under target_os = \"macos\" (lowercase) and \"linux\" (identity), with a doc saying case-insensitive on macOS and case-sensitive on Linux. store/open.rs:855-878 has platform_data_dir under linux (XDG_DATA_HOME, else ~/.local/share/terminus) and macos (~/Library/Application Support/terminus) only. The Linux arm was exercised by the smoke run: with XDG_DATA_HOME=<scratch>/xdg the store landed at xdg/terminus/terminus.db. The macOS arm's body is unchanged and not runnable here."
+    },
+    {
+      "n": 12,
+      "truth": "terminus doctor says Linux and macOS (ROADMAP success criterion 5)",
+      "status": "FAILED",
+      "uat_item": null,
+      "evidence": "`git grep -n -i -E 'linux|macos' -- crates/terminus/src/cmd/doctor.rs` returns nothing (rc=1). The scratch doctor runs listed 14 checks (auto_compact through store), and none names the supported systems. CONTEXT D-12 chose 'no platform check', so the phase deliberately did not deliver this half of SC5. SUMMARY.md:68 records it as issue #7."
+    },
+    {
+      "n": 13,
+      "truth": "The deferred Windows ACL check is closed as no longer applicable (ROADMAP success criterion 5)",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "owner_only.rs has no ACL, deferral or windows-sys text left (grep rc=1 apart from :13 'No libc, no nix'). The no-op cfg(not(unix)) tighten arm in store/open.rs is gone (the AC2 grep is clean). CAPTURE.md:298 closes the icacls proposal and the Windows ACL deferral, identifying it by its content. The PRIV-02 row (REQUIREMENTS.md:87) stays as D-11 requires, and REQUIREMENTS.md's only change since 26b79d1 is the Distribution bullet."
+    }
+  ],
+  "passes": [
+    { "k": 1, "name": "Fresh start from an empty home", "evidence": "Scratch env -i run: ingest created xdg/terminus 700 with terminus.db, LOCK and the snapshot at 600 and snapshots/ at 700. Doctor's fresh-state data checks were notes, not problems, and after install doctor printed 'no problems.' and exited 0." },
+    { "k": 2, "name": "npm is gone", "evidence": "npm/ is absent and git ls-files npm lists 0. `git grep -i npm -- crates docs Cargo.toml .gitignore` returns rc=1. DESIGN-BRIEF.md:380, PROJECT.md:21/106/131 and REQUIREMENTS.md:120 each say npm was removed, and the other hits are the PROJECT shipped-cycle rows :35/:55 and the INST-09 and INST-01 rows." },
+    { "k": 3, "name": "No Windows or Unix guard left in crates", "evidence": "The AC2 pattern returns rc=1 over crates/ with both git grep and grep -r. target_os appears only in the refusal, the macOS and Linux fold, the Linux and macOS platform_data_dir, and two cfg!(target_os = \"macos\") test arms." },
+    { "k": 4, "name": "Compile-time refusal and its test", "evidence": "lib.rs:22-23 has the guard and message before the first pub mod. supported_systems.rs passes on the real file and fails on scratch copies with the guard changed to not(unix), with the message reworded, or with the pair deleted." },
+    { "k": 6, "name": "Full suite passes at the stated count", "evidence": "cargo test --workspace --all-features exited 0 with 750 passed and 0 failed, and --list shows 750. That is the 749 baseline plus the one AC3 test: the diff adds exactly one #[test] and removes none. The removed test lines match SUMMARY.md:20-26 item for item. The literal 749 in AC5 is tracked by issue #6." },
+    { "k": 7, "name": "Doctor and uninstall print only Unix fixes", "evidence": "Scratch run of install, doctor, doctor --json, uninstall and the occupied-path refusal: no attrib, del, .exe or Windows text. The read-only data dir fix is chmod u+w and the refusal prints rm -f. Envelope keys are [command, data, ok, reason], pinned by the_json_document_carries_every_check_by_name (passed), and the doctor diff adds and removes no check." },
+    { "k": 8, "name": "Docs name Linux and macOS and close the Windows items", "evidence": "DESIGN-BRIEF.md mentions Windows only at :22 and :119 (claude-mem) and :374 (supported systems). PROJECT.md does so only at :80 (claude-mem) and :103 and :138 (dropped). In CAPTURE.md the npm items, the AC3 Windows item, the Publish milestone (0 unchecked bullets) and the icacls proposal (:298) are closed, and capture-check reports annotations []." },
+    { "k": 9, "name": "Changelog records both removals", "evidence": "CHANGELOG.md:51-58 has the npm and Windows Removed entries under [Unreleased]. The rename entry has no %LOCALAPPDATA%. The 0.1.1 deferral line at :96-97 is unchanged in the 26b79d1..HEAD diff." }
+  ],
+  "gaps": [
+    {
+      "name": "terminus doctor says Linux and macOS (ROADMAP success criterion 5)",
+      "reason": "behavior wrong - doctor prints nothing naming Linux or macOS. CONTEXT D-12 decided doctor gets no platform check, which drops the doctor half of ROADMAP SC5 without amending the roadmap.",
+      "evidence": "crates/terminus/src/cmd/doctor.rs has no 'linux' or 'macos' text (git grep rc=1). Scratch runs of `terminus doctor` and `doctor --json` show 14 checks and none names the supported systems. .planning/ROADMAP.md:38 SC5 says 'The docs and `terminus doctor` say Linux and macOS'. .planning/phases/2/CONTEXT.md D-12 says 'Doctor prints nothing about Windows and gets no platform check.' SUMMARY.md:68 lists it as GitHub issue #7.",
+      "severity": "minor",
+      "missing": "The owner decides which way to settle it. One option is to amend ROADMAP SC5's doctor clause to what D-12 delivers (doctor prints only Unix fixes and no Windows text). The other is to have doctor state the supported systems, which adds a check name to --json data but leaves the envelope keys AC6 pins unchanged. Issue #7 already tracks it."
+    }
+  ],
+  "human_checks": [
+    {
+      "name": "On a Windows machine with Rust installed, run `cargo build` in the Terminus repository root",
+      "expected": "The build fails, and its output contains \"Terminus supports Linux and macOS only.\" It should appear first or at least among the unresolved std::os::unix errors.",
+      "why_human": "Out-of-reach resource. This machine has only the x86_64-unknown-linux-gnu std (rustup target list --installed) and no x86_64-w64-mingw32-gcc. Adding a Windows target needs the network, and a cross-build also needs a C compiler for the bundled SQLite and zstd. The source-scan test proves the guard is present, but only a real Windows build shows the message is reached (CONTEXT's first flagged assumption)."
+    }
+  ]
+}

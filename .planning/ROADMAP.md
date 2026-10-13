@@ -7,7 +7,7 @@ The archive is the product, so it is built first and everything else is built on
 ## Phases
 
 - [x] **Phase 1: No Model Calls** - the summary half of observations goes, so Terminus never calls a model, handles no API key and opens no network connection
-- [ ] **Phase 2: Linux and macOS Only, No npm** - the npm package and every Windows code path go, and a Windows build fails at compile time
+- [x] **Phase 2: Linux and macOS Only, No npm** - the npm package and every Windows code path go, and a Windows build fails at compile time
 - [ ] **Phase 3: Install Asks Nothing** - `terminus install` applies its defaults without a question, registers through `claude mcp`, and ends with a receipt
 - [ ] **Phase 4: One-Command Installer** - `install.sh` downloads, checks and stores a version behind the stable path, then runs `terminus install`
 - [ ] **Phase 5: README** - a README at the repo root for someone who has never heard of Terminus
