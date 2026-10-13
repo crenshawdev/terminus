@@ -4,7 +4,8 @@
 //! Every spawn here points `TERMINUS_BIN_DIR`, `CLAUDE_CONFIG_DIR`,
 //! `TERMINUS_DATA_DIR`, `TERMINUS_CONFIG_DIR` and `HOME` at temporary
 //! directories. That is not tidiness: without `TERMINUS_BIN_DIR` a test would
-//! copy a binary over the developer's real `~/.local/bin/terminus`, and without
+//! move a link over the developer's real `~/.local/bin/terminus`, without `HOME`
+//! it would store a version in their real versions folder, and without
 //! `CLAUDE_CONFIG_DIR` it would edit the `settings.json` and `.claude.json`
 //! this machine is running on.
 //!
@@ -124,6 +125,18 @@ impl Fixture {
         self.bin_dir.join("terminus")
     }
 
+    /// Where install stores each version, under the fixture's `HOME`.
+    fn versions(&self) -> PathBuf {
+        self.root.join(".local/lib/crenshawdev/terminus/versions")
+    }
+
+    /// The file the stable path links to after an install from this build.
+    fn version_file(&self) -> PathBuf {
+        self.versions()
+            .join(env!("CARGO_PKG_VERSION"))
+            .join("terminus")
+    }
+
     fn settings(&self) -> PathBuf {
         self.claude_dir.join("settings.json")
     }
@@ -223,6 +236,38 @@ fn assert_current(entry: &serde_json::Value, stable: &Path) {
         "{entry}"
     );
     assert_eq!(entry["args"], serde_json::json!(["mcp"]), "{entry}");
+}
+
+/// This build's bytes.
+fn build_bytes() -> Vec<u8> {
+    std::fs::read(env!("CARGO_BIN_EXE_terminus")).unwrap()
+}
+
+/// Copy this build to `to` with `extra` appended, executable.
+///
+/// The copy is written by a child shell, not by this process. A file this
+/// process had open for writing could be inherited by another test's fork,
+/// and running it would then fail with ETXTBSY.
+fn copy_build(to: &Path, extra: &str) {
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    let status = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "cat \"$1\" > \"$2\" && printf %s \"$3\" >> \"$2\" && chmod 755 \"$2\"",
+            "sh",
+            env!("CARGO_BIN_EXE_terminus"),
+            &to.display().to_string(),
+            extra,
+        ])
+        .env("PATH", "/usr/bin:/bin")
+        .status()
+        .unwrap();
+    assert!(status.success(), "the copy of this build failed");
+}
+
+fn inode(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).unwrap().ino()
 }
 
 fn text(output: &Output) -> String {
@@ -342,9 +387,13 @@ fn without_ours(
 // Task 1: the binary at the stable path
 // ---------------------------------------------------------------------------
 
-/// The copy is this build, it is executable, and a second run over it is fine.
+/// The stable path is a link to this build stored under its version, the file
+/// is executable, every settings entry names the stable path, and a second run
+/// over it is fine.
 #[test]
 fn install_places_this_build_at_the_stable_path() {
+    use std::os::unix::fs::PermissionsExt;
+
     let fixture = fixture();
     fixture.seed();
 
@@ -352,6 +401,34 @@ fn install_places_this_build_at_the_stable_path() {
     assert!(first.status.success(), "{}", text(&first));
 
     let stable = fixture.stable();
+    let version_file = fixture.version_file();
+    assert!(
+        std::fs::symlink_metadata(&stable)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the stable path is not a link"
+    );
+    assert_eq!(std::fs::read_link(&stable).unwrap(), version_file);
+    assert_eq!(std::fs::read(&version_file).unwrap(), build_bytes());
+    let mode = std::fs::metadata(&version_file)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0o111, "the version file is not executable");
+
+    let settings = read(&fixture.settings());
+    assert_eq!(our_entries(&settings, &stable).len(), 4);
+    assert!(our_entries(&settings, &version_file).is_empty());
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_current(&added_entry(&calls[0]), &stable);
+    let said = text(&first);
+    assert!(
+        said.contains(&version_file.display().to_string()),
+        "the receipt does not name the version file: {said}"
+    );
+
     let version = fixture
         .command_at(&stable, &["--version"])
         .output()
@@ -369,6 +446,74 @@ fn install_places_this_build_at_the_stable_path() {
         second.status.success(),
         "a second install over our own copy failed: {}",
         text(&second)
+    );
+}
+
+/// A plain file carrying the marker, which is what an install from before the
+/// versions folder left, is replaced by the link.
+#[test]
+fn a_marked_plain_file_at_the_stable_path_becomes_the_link() {
+    let fixture = fixture();
+    fixture.seed();
+    copy_build(&fixture.stable(), "");
+    assert!(std::fs::symlink_metadata(fixture.stable())
+        .unwrap()
+        .file_type()
+        .is_file());
+
+    let output = fixture.run(&["install"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(
+        std::fs::read_link(fixture.stable()).unwrap(),
+        fixture.version_file()
+    );
+}
+
+/// D-03: a rebuild at the same version replaces that version's file, and a
+/// rerun from the same build leaves the file alone.
+#[test]
+fn a_rebuild_at_the_same_version_replaces_its_file_and_a_rerun_does_not() {
+    let fixture = fixture();
+    fixture.seed();
+    assert!(fixture.run(&["install"]).status.success());
+
+    let rebuild = fixture.root.join("build").join("terminus");
+    copy_build(&rebuild, "\nanother build\n");
+    let reported = |exe: &Path| {
+        let output = fixture.command_at(exe, &["--version"]).output().unwrap();
+        assert!(output.status.success(), "{}", text(&output));
+        output.stdout
+    };
+    assert_eq!(
+        reported(&rebuild),
+        reported(Path::new(env!("CARGO_BIN_EXE_terminus"))),
+        "the rebuild does not report the same version"
+    );
+
+    let output = fixture
+        .command_at(&rebuild, &["install"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let version_file = fixture.version_file();
+    assert_eq!(
+        std::fs::read(&version_file).unwrap(),
+        std::fs::read(&rebuild).unwrap()
+    );
+    assert_eq!(std::fs::read_link(fixture.stable()).unwrap(), version_file);
+
+    let before = inode(&version_file);
+    let again = fixture
+        .command_at(&rebuild, &["install"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(
+        inode(&version_file),
+        before,
+        "the same bytes were stored again"
     );
 }
 
@@ -398,6 +543,10 @@ fn a_foreign_binary_at_the_stable_path_stops_everything() {
     );
 
     assert_eq!(std::fs::read(fixture.stable()).unwrap(), foreign);
+    assert!(
+        !fixture.versions().exists(),
+        "a refusal created the versions folder"
+    );
     assert_eq!(
         std::fs::read_to_string(fixture.settings()).unwrap(),
         settings_before
@@ -453,10 +602,11 @@ fn a_settings_file_with_a_repeated_key_is_refused() {
 /// A stale file at the temporary name install is about to use is stepped over,
 /// not opened through.
 ///
-/// Both temporaries are named from the process id, so a symlink left behind by
-/// a crashed run - or one landed on by a pid that came round again - is enough
+/// Every temporary is named from the process id, so a symlink left behind by a
+/// crashed run - or one landed on by a pid that came round again - is enough
 /// for `File::create` to truncate whatever it points at and for the rename that
-/// follows to move the link rather than the file.
+/// follows to move the link rather than the file. Install makes one in the
+/// version folder, one in the stable folder and one beside `settings.json`.
 ///
 /// The pause is a shell that reads one line and then `exec`s install, so the
 /// pid the test sees is the pid install runs under and the stale names can be
@@ -483,9 +633,15 @@ fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
 
     // One victim per temporary install writes, reached through the exact name
     // it builds out of its own pid.
+    let version_dir = fixture.version_file().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&version_dir).unwrap();
     let victims = [
         (
-            fixture.root.join("victim-binary"),
+            fixture.root.join("victim-version"),
+            version_dir.join(format!(".terminus-install-{pid}")),
+        ),
+        (
+            fixture.root.join("victim-link"),
             fixture.bin_dir.join(format!(".terminus-install-{pid}")),
         ),
         (
@@ -516,7 +672,15 @@ fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
     }
 
     // And it still did the whole job, under another name.
-    assert!(fixture.stable().exists(), "{said}");
+    assert_eq!(
+        std::fs::read_link(fixture.stable()).unwrap(),
+        fixture.version_file(),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.version_file()).unwrap(),
+        build_bytes()
+    );
     assert_eq!(
         our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
         4

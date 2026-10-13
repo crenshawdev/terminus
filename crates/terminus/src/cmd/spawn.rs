@@ -71,12 +71,10 @@ pub fn detached<S: AsRef<OsStr>>(args: &[S]) -> io::Result<()> {
 
 /// [`detached`], but from a named executable rather than this one.
 ///
-/// `install` needs this and nothing else does. It has just renamed a new binary
-/// over the stable path, which unlinks the inode the running process was
-/// exec'd from - so by the time it asks for the backfill, its own
-/// `current_exe()` names a deleted file and the spawn fails `ENOENT`. Passing
-/// the stable path spawns the build install just placed, which is also the
-/// build every hook entry points at.
+/// `install` needs this and nothing else does. It starts the backfill from the
+/// stable path, which is the build every hook entry runs, rather than from
+/// wherever install itself was run, such as a `target/release/terminus` the
+/// next build replaces.
 ///
 /// Only the first hop needs it. The intermediate is exec'd from `exe`, so its
 /// own `current_exe()` is that path and the hand-off below resolves correctly

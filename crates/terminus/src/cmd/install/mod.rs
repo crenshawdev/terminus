@@ -1,16 +1,19 @@
 //! `terminus install`: wire terminus into Claude Code, asking nothing.
 //!
-//! It puts this build at the stable path ([`binary`]), merges the four hook
-//! entries into `settings.json` with a one-time backup ([`targets`]), and places
-//! the MCP entry by running `claude mcp` ([`claude`]). It reads `.claude.json`
-//! and never writes it, so Claude Code stays that file's only writer.
+//! It stores this build in the versions folder and points the stable path at it
+//! with a link ([`binary`]), merges the four hook entries into `settings.json`
+//! with a one-time backup ([`targets`]), and places the MCP entry by running
+//! `claude mcp` ([`claude`]). The hook entries and the MCP entry name the
+//! stable path, never a version file. It reads `.claude.json` and never writes
+//! it, so Claude Code stays that file's only writer.
 //!
 //! Every check that can refuse runs before the first write. After that only the
 //! registration can fall short. When it does, the rest still happens, the
 //! receipt says the install is incomplete and prints the command that finishes
 //! it, and install exits 1.
 //!
-//! It ends with a receipt of every file it touched and the two Claude Code
+//! It ends with a receipt of every file it touched, the stored version file
+//! among them, and the two Claude Code
 //! settings it reports and never changes, then starts the backfill last. It
 //! never reads stdin and takes no flags, so `--yes` and `--json` are misuse.
 
@@ -37,8 +40,8 @@ const KEEP_CLEANUP_DAYS: i64 = 3650;
 
 /// A new file in `dir`, created exclusively, and the path it landed at.
 ///
-/// Every atomic write install makes - the settings files, the backups, the copy
-/// of this build - goes through a temporary file in the destination directory
+/// Every atomic write install makes - the settings files, the backups, the
+/// stored version - goes through a temporary file in the destination directory
 /// and a rename. This is the one place those temporary files are created, and
 /// `create_new` is the reason: it is `O_EXCL`, so it fails on anything already
 /// at that name rather than opening it.
@@ -55,6 +58,22 @@ pub(super) fn create_temporary(
     dir: &Path,
     prefix: &str,
 ) -> Result<(std::path::PathBuf, std::fs::File), Failure> {
+    temporary(dir, prefix, |path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    })
+}
+
+/// [`create_temporary`] for anything `create` makes at a name that must not
+/// exist yet. The link install puts over the stable path is made this way,
+/// because `symlink` also fails on a name that is taken.
+pub(super) fn temporary<T>(
+    dir: &Path,
+    prefix: &str,
+    create: impl Fn(&Path) -> std::io::Result<T>,
+) -> Result<(std::path::PathBuf, T), Failure> {
     /// Enough to step over a stale name or two. Past it, something is wrong
     /// with the directory rather than with the name, and guessing again is not
     /// going to find out what.
@@ -66,12 +85,8 @@ pub(super) fn create_temporary(
             0 => dir.join(format!("{prefix}{pid}")),
             n => dir.join(format!("{prefix}{pid}-{n}")),
         };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => return Ok((path, file)),
+        match create(&path) {
+            Ok(made) => return Ok((path, made)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
                 return Err(Failure::Operational(format!(
@@ -104,6 +119,7 @@ pub fn run() -> Result<(), Failure> {
     if let binary::Occupant::Foreign = binary::occupant(&stable)? {
         return Err(occupied(&stable));
     }
+    let versions = binary::versions_dir()?;
     let config = Config::load()?;
     let data_dir = crate::cmd::data_dir()?;
     let settings = Document::read(&targets::settings_path()?)?;
@@ -118,7 +134,7 @@ pub fn run() -> Result<(), Failure> {
     let hooks_pending = settings.would_write(&settings.preview(&add_hooks)?);
 
     // From here on, and not one line earlier, install writes.
-    binary::place(&stable)?;
+    let version_file = binary::place(&stable, &versions)?;
 
     let mut backups = Vec::new();
     let mut wrote_hooks = false;
@@ -137,7 +153,11 @@ pub fn run() -> Result<(), Failure> {
         Ok(_) => println!("installed"),
         Err(_) => println!("install incomplete: the mcp server is not registered"),
     }
-    println!("  binary            {}", stable.display());
+    println!(
+        "  binary            {} (a link to {})",
+        stable.display(),
+        version_file.display()
+    );
     println!(
         "  hook entries      {} ({})",
         settings.path().display(),
@@ -327,11 +347,9 @@ fn start_backfill(stable: &Path, data_dir: &Path, config: &Config) {
     };
     backfill::print_estimate(&estimate);
 
-    // The stable path, not this process. `binary::place` renamed a new binary
-    // over it a moment ago, which unlinked the inode this process was exec'd
-    // from - so when install is itself run from the stable path, its own
-    // `current_exe()` names a deleted file and the spawn fails ENOENT. Which is
-    // the case `doctor`'s own fix line and a plain rerun both put a user in.
+    // The stable path, not this process: it is the build every hook entry runs.
+    // This process may be a build outside the versions folder, such as
+    // `target/release/terminus`, which the next `cargo` run replaces.
     match backfill::start_from(Some(stable), data_dir, &estimate) {
         Ok(true) => println!(
             "archiving that now, in a detached process - this install is done and the\n\
