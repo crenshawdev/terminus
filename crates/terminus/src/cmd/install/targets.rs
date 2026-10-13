@@ -95,18 +95,10 @@ fn claude_config_dir() -> Result<PathBuf, Failure> {
     }
 }
 
-#[cfg(not(windows))]
 fn home_dir() -> Result<PathBuf, Failure> {
     non_empty_var("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| Failure::Operational("HOME is not set".to_owned()))
-}
-
-#[cfg(windows)]
-fn home_dir() -> Result<PathBuf, Failure> {
-    non_empty_var("USERPROFILE")
-        .map(PathBuf::from)
-        .ok_or_else(|| Failure::Operational("USERPROFILE is not set".to_owned()))
 }
 
 fn non_empty_var(name: &str) -> Option<std::ffi::OsString> {

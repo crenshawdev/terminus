@@ -1190,7 +1190,6 @@ mod tests {
     /// link two hops from the file it names. Renaming over the link would leave
     /// a regular file where the user's symlink was and orphan the real one.
     #[test]
-    #[cfg(unix)]
     fn writing_through_a_symlink_updates_the_target_and_keeps_the_link() {
         let (dir, real) = seeded(FIXTURE);
         let link = dir.path().join("link.json");
@@ -1244,7 +1243,6 @@ mod tests {
     /// 0600 is what `settings.json` is on this machine, and a fresh temporary
     /// file is 0644: a backup that widened them would be its own small leak.
     #[test]
-    #[cfg(unix)]
     fn the_backup_carries_the_bytes_and_the_permissions() {
         use std::os::unix::fs::PermissionsExt;
 

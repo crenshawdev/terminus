@@ -2,11 +2,10 @@
 //!
 //! # One path, forever (D-08, INST-02)
 //!
-//! `~/.local/bin/terminus` on Linux and macOS,
-//! `%LOCALAPPDATA%\Programs\Terminus\terminus.exe` on Windows. Nothing here
-//! touches `PATH`: a settings entry names the absolute path, so the copy does
-//! not need to be reachable by name, and editing a shell profile is a change to
-//! the user's machine install has no business making.
+//! `~/.local/bin/terminus`. Nothing here touches `PATH`: a settings entry names
+//! the absolute path, so the copy does not need to be reachable by name, and
+//! editing a shell profile is a change to the user's machine install has no
+//! business making.
 //!
 //! The path never moving is what lets [`super::targets`] write the four hook
 //! entries once and never rewrite them (INST-05). An upgrade replaces the bytes
@@ -15,9 +14,8 @@
 //!
 //! # The source is this process (D-09)
 //!
-//! [`std::env::current_exe`], not a search of an npm package layout. The npm
-//! shim execs the per-platform binary, so the process running `install` IS the
-//! artifact to copy, and install needs no knowledge of how npm resolved it.
+//! Install copies the running binary, found through [`std::env::current_exe`],
+//! so the process running `install` IS the artifact to copy.
 //!
 //! # The marker, and why version cannot do its job (D-07)
 //!
@@ -37,6 +35,7 @@
 //! memory, and a sentinel straddling a chunk boundary is still found.
 
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::cmd::Failure;
@@ -70,13 +69,9 @@ pub fn stable_path() -> Result<PathBuf, Failure> {
     Ok(stable_dir()?.join(file_name()))
 }
 
-/// The file name the copy carries on this platform.
+/// The file name the copy carries.
 pub fn file_name() -> &'static str {
-    if cfg!(windows) {
-        "terminus.exe"
-    } else {
-        "terminus"
-    }
+    "terminus"
 }
 
 fn stable_dir() -> Result<PathBuf, Failure> {
@@ -86,19 +81,10 @@ fn stable_dir() -> Result<PathBuf, Failure> {
     platform_dir()
 }
 
-#[cfg(not(windows))]
 fn platform_dir() -> Result<PathBuf, Failure> {
     let home = non_empty_var("HOME")
         .ok_or_else(|| Failure::Operational(format!("neither {BIN_DIR_ENV} nor HOME is set")))?;
     Ok(PathBuf::from(home).join(".local").join("bin"))
-}
-
-#[cfg(windows)]
-fn platform_dir() -> Result<PathBuf, Failure> {
-    let local = non_empty_var("LOCALAPPDATA").ok_or_else(|| {
-        Failure::Operational(format!("neither {BIN_DIR_ENV} nor LOCALAPPDATA is set"))
-    })?;
-    Ok(PathBuf::from(local).join("Programs").join("Terminus"))
 }
 
 /// An environment variable set to the empty string is unset: an empty path
@@ -171,10 +157,9 @@ fn carries_marker(mut file: impl Read) -> std::io::Result<bool> {
 
 /// Copy this build to the stable path, atomically.
 ///
-/// Through a temporary file in the destination directory and a rename, on every
-/// platform. That is atomic everywhere, and on Windows it is also the only way
-/// to replace an executable that may be running - the running image holds the
-/// old inode and the name points at the new one.
+/// Through a temporary file in the destination directory and a rename. The
+/// rename is atomic, and it replaces an executable that may be running, because
+/// the running image keeps the old inode and the name points at the new one.
 ///
 /// [`occupant`] is asked again immediately before the rename, and a foreign
 /// occupant refuses here too. The check `run` made is from before the
@@ -227,17 +212,13 @@ fn copy_into(source: &Path, mut file: std::fs::File, temporary: &Path) -> Result
             temporary.display()
         ))
     })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| {
-                Failure::Operational(format!(
-                    "{} could not be made executable: {e}",
-                    temporary.display()
-                ))
-            })?;
-    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| {
+            Failure::Operational(format!(
+                "{} could not be made executable: {e}",
+                temporary.display()
+            ))
+        })?;
     // Before the rename, not after: a crash between the two would otherwise put
     // an empty file at the path every hook entry names.
     file.sync_all().map_err(|e| {
