@@ -1,5 +1,7 @@
 #!/bin/sh
 # Install Terminus from unsigned development artifacts only.
+# With no argument it downloads from the GitHub releases on crenshawdev/terminus;
+# one https:// argument names another source.
 # The signature check goes inside verify_download in a later cycle, with Baley's
 # release design (issue #14 in Baley's tracker).
 # The script ends by running terminus install through the stable path, which writes Claude Code's wiring.
@@ -105,8 +107,11 @@ stage() {
     staging_temporary=
 }
 
-[ "$#" -eq 1 ] || fail 'usage: sh install.sh https://<source>'
-case $1 in https://*) source=$1 ;; *) fail 'the source must start with https://' ;; esac
+case $# in
+    0) source=https://github.com/crenshawdev/terminus/releases/latest/download ;;
+    1) case $1 in https://*) source=$1 ;; *) fail 'the source must start with https://' ;; esac ;;
+    *) fail 'usage: sh install.sh [https://<source>]' ;;
+esac
 while [ "${source%/}" != "$source" ]; do source=${source%/}; done
 
 [ -z "${TERMINUS_BIN_DIR-}" ] ||

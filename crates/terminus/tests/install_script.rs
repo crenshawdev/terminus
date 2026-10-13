@@ -350,18 +350,18 @@ impl Fixture {
         std::fs::write(manifest, format!("version {version}\nsha256 {digest}\n")).unwrap();
     }
 
-    /// `/bin/sh install.sh <source>` with the default tools folder.
-    fn command(&self, source: &str) -> Command {
-        self.command_with(source, &self.tools)
+    /// `/bin/sh install.sh <args>` with the default tools folder.
+    fn command(&self, args: &[String]) -> Command {
+        self.command_with(args, &self.tools)
     }
 
-    fn command_with(&self, source: &str, tools: &Path) -> Command {
+    fn command_with(&self, args: &[String], tools: &Path) -> Command {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
         let path = std::env::join_paths([&self.fake_dir, tools]).unwrap();
         let mut command = Command::new("/bin/sh");
         command
             .arg(script)
-            .arg(source)
+            .args(args)
             .env_clear()
             .env("PATH", path)
             .env("HOME", &self.home)
@@ -374,11 +374,11 @@ impl Fixture {
     }
 
     fn run(&self) -> Output {
-        self.command(&self.server.url()).output().unwrap()
+        self.command(&[self.server.url()]).output().unwrap()
     }
 
     fn run_with(&self, tools: &Path) -> Output {
-        self.command_with(&self.server.url(), tools)
+        self.command_with(&[self.server.url()], tools)
             .output()
             .unwrap()
     }
@@ -428,6 +428,44 @@ impl Fixture {
             &[],
             &[("uname", &fake)],
         )
+    }
+
+    /// A tools folder whose `curl` logs each URL it is asked for and copies
+    /// the served file named by the URL's last part to its `-o` path. It never
+    /// reaches the network and never reads its stdin.
+    fn curl_tools(&self) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake = self.root.join("curl");
+        let cp = which("cp").expect("cp is not on PATH");
+        let script = r#"#!/bin/sh
+url= out=
+while [ "$#" -gt 0 ]; do
+    case $1 in -o) out=$2; shift ;; https://*) url=$1 ;; esac
+    shift
+done
+printf '%s\n' "$url" >> '@LOG@'
+exec '@CP@' '@SERVED@'/"${url##*/}" "$out"
+"#
+        .replace("@LOG@", &self.curl_log().display().to_string())
+        .replace("@CP@", &cp.display().to_string())
+        .replace("@SERVED@", &self.served.display().to_string());
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        self.tools_folder("tools-curl", &[], &[("curl", &fake)])
+    }
+
+    fn curl_log(&self) -> PathBuf {
+        self.root.join("curl.log")
+    }
+
+    /// The URLs the fake `curl` was asked for, in order.
+    fn curl_urls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.curl_log())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// The stable path, everything under the versions folder, and both
@@ -577,6 +615,28 @@ fn no_claude_exits_non_zero_after_the_link_is_placed() {
     fx.assert_linked("1.0.0", &bytes);
 }
 
+/// The release URLs on crenshawdev/terminus, as the fake `curl` logs them.
+fn default_urls() -> Vec<String> {
+    let base = "https://github.com/crenshawdev/terminus/releases/latest/download";
+    vec![
+        format!("{base}/terminus-{}.manifest", platform()),
+        format!("{base}/terminus-{}", platform()),
+    ]
+}
+
+/// No argument: the two release URLs, manifest first, and the install
+/// finishes.
+#[test]
+fn no_source_downloads_from_the_github_releases() {
+    let fx = fixture();
+    let bytes = fx.serve("1.0.0", "");
+    let tools = fx.curl_tools();
+    let output = fx.command_with(&[], &tools).output().unwrap();
+    assert_eq!(fx.curl_urls(), default_urls(), "{}", text(&output));
+    assert!(output.status.success(), "{}", text(&output));
+    fx.assert_linked("1.0.0", &bytes);
+}
+
 /// Without `sha256sum`, `shasum -a 256` computes the digest: the install
 /// succeeds, and a wrong manifest digest is refused with the real one named.
 #[test]
@@ -613,7 +673,7 @@ fn a_digest_that_does_not_match_is_refused() {
     let digest_a = sha256(&binary);
     copy_build(&binary, "tampered");
     fx.serve_manifest("2.0.0", &digest_a);
-    fx.assert_refused(fx.command(&fx.server.url()));
+    fx.assert_refused(fx.command(&[fx.server.url()]));
 }
 
 #[test]
@@ -622,7 +682,7 @@ fn an_unsupported_system_is_refused() {
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
     let tools = fx.uname_tools("FreeBSD", "x86_64");
-    fx.assert_refused(fx.command_with(&fx.server.url(), &tools));
+    fx.assert_refused(fx.command_with(&[fx.server.url()], &tools));
 }
 
 #[test]
@@ -631,7 +691,7 @@ fn an_unsupported_architecture_is_refused() {
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
     let tools = fx.uname_tools("Linux", "riscv64");
-    fx.assert_refused(fx.command_with(&fx.server.url(), &tools));
+    fx.assert_refused(fx.command_with(&[fx.server.url()], &tools));
 }
 
 #[test]
@@ -640,7 +700,16 @@ fn an_http_source_is_refused() {
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
     let source = fx.server.url().replacen("https://", "http://", 1);
-    fx.assert_refused(fx.command(&source));
+    fx.assert_refused(fx.command(&[source]));
+}
+
+/// More than one source is refused before anything is read.
+#[test]
+fn two_sources_are_refused() {
+    let fx = fixture();
+    fx.install("1.0.0", "");
+    fx.serve("2.0.0", "b");
+    fx.assert_refused(fx.command(&[fx.server.url(), fx.server.url()]));
 }
 
 /// `terminus install` would point the hooks and the MCP entry into that
@@ -650,7 +719,7 @@ fn terminus_bin_dir_set_is_refused() {
     let fx = fixture();
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
-    let mut command = fx.command(&fx.server.url());
+    let mut command = fx.command(&[fx.server.url()]);
     command.env("TERMINUS_BIN_DIR", fx.root.join("elsewhere"));
     fx.assert_refused(command);
 }
@@ -662,7 +731,7 @@ fn a_file_without_the_marker_is_refused() {
     std::fs::create_dir_all(fx.stable().parent().unwrap()).unwrap();
     std::fs::write(fx.stable(), "#!/bin/sh\nexit 0\n").unwrap();
     fx.serve("1.0.0", "");
-    fx.assert_refused(fx.command(&fx.server.url()));
+    fx.assert_refused(fx.command(&[fx.server.url()]));
 }
 
 /// A link to nothing is the script's to replace only when it points into the
@@ -673,7 +742,7 @@ fn a_dangling_link_outside_the_versions_folder_is_refused() {
     std::fs::create_dir_all(fx.stable().parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(fx.root.join("elsewhere/terminus"), fx.stable()).unwrap();
     fx.serve("1.0.0", "");
-    fx.assert_refused(fx.command(&fx.server.url()));
+    fx.assert_refused(fx.command(&[fx.server.url()]));
     assert_eq!(
         std::fs::read_link(fx.stable()).unwrap(),
         fx.root.join("elsewhere/terminus")
