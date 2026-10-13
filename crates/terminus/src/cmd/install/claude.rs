@@ -164,15 +164,26 @@ mod tests {
         dir
     }
 
+    /// [`run_with`] on the fake in `dir`, run again while exec says the script
+    /// is busy. Another test's fork can hold the script's write descriptor
+    /// until that child execs, and an exec in that window fails with ETXTBSY.
+    fn run_fake(dir: &tempfile::TempDir, deadline: Duration) -> Outcome {
+        for _ in 0..100 {
+            match run_with(Some(dir.path().as_os_str()), &["mcp"], deadline) {
+                Outcome::NotStarted(why) if why.contains("os error 26") => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                outcome => return outcome,
+            }
+        }
+        panic!("the fake claude stayed busy");
+    }
+
     #[test]
     fn a_claude_that_never_ends_is_stopped_at_the_deadline() {
         let dir = fake("while :; do :; done");
         let started = Instant::now();
-        let outcome = run_with(
-            Some(dir.path().as_os_str()),
-            &["mcp"],
-            Duration::from_millis(200),
-        );
+        let outcome = run_fake(&dir, Duration::from_millis(200));
         assert_eq!(outcome, Outcome::TimedOut(Duration::from_millis(200)));
         assert!(started.elapsed() < Duration::from_secs(10));
     }
@@ -180,14 +191,14 @@ mod tests {
     #[test]
     fn a_failure_is_reported_by_its_first_stderr_line() {
         let dir = fake("printf 'first\\nsecond\\n' >&2\nexit 3");
-        let outcome = run_with(Some(dir.path().as_os_str()), &["mcp"], DEADLINE);
+        let outcome = run_fake(&dir, DEADLINE);
         assert_eq!(outcome, Outcome::Failed("first".to_owned()));
     }
 
     #[test]
     fn a_failure_with_nothing_on_stderr_is_reported_by_its_status() {
         let dir = fake("exit 4");
-        let outcome = run_with(Some(dir.path().as_os_str()), &["mcp"], DEADLINE);
+        let outcome = run_fake(&dir, DEADLINE);
         assert_eq!(
             outcome,
             Outcome::Failed("claude exited with status 4".to_owned())
@@ -207,7 +218,7 @@ mod tests {
         let dir = fake(&format!(
             "[ \"${NONESSENTIAL_TRAFFIC}\" = 1 ] || {{ echo unset >&2; exit 1; }}"
         ));
-        let outcome = run_with(Some(dir.path().as_os_str()), &["mcp"], DEADLINE);
+        let outcome = run_fake(&dir, DEADLINE);
         assert_eq!(outcome, Outcome::Done);
     }
 }
