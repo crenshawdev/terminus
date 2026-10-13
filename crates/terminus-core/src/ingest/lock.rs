@@ -10,13 +10,10 @@
 //! (`DESIGN-BRIEF.md:135`).
 //!
 //! [`std::fs::File::try_lock`] is the whole implementation and pulls in no
-//! dependency: it is `flock(2)` with `LOCK_EX | LOCK_NB` on Unix and
-//! `LockFileEx` with `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` on
-//! Windows, which is D-15 named exactly. D-20 records why that holds off Linux:
-//! APFS honors `flock` with `LOCK_NB`, the Windows path is filesystem-agnostic
-//! byte-range locking so NTFS versus ReFS does not matter, and the overlayfs
-//! hazard (pre-copy-up shared inodes) cannot arise for a file this process
-//! creates in its own data directory.
+//! dependency: it is `flock(2)` with `LOCK_EX | LOCK_NB`, which is D-15 named
+//! exactly. D-20 records why that holds off Linux: APFS honors `flock` with
+//! `LOCK_NB`, and the overlayfs hazard (pre-copy-up shared inodes) cannot arise
+//! for a file this process creates in its own data directory.
 
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
@@ -41,9 +38,9 @@ impl IngestLock {
 
 impl Drop for IngestLock {
     fn drop(&mut self) {
-        // Closing the file releases the lock on both platforms, so this is
-        // explicitness rather than necessity, and an error here has nothing to
-        // report to: the process is already on its way out of the pass.
+        // Closing the file releases the lock, so this is explicitness rather
+        // than necessity, and an error here has nothing to report to: the
+        // process is already on its way out of the pass.
         let _ = self.file.unlock();
     }
 }

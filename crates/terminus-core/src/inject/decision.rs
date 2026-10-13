@@ -283,8 +283,8 @@ fn write_file(dir: &Path, decision: &Decision) -> Option<PathBuf> {
 
     let (temporary, mut file) = create_temporary(dir)?;
     let written = file.write_all(&bytes).and_then(|()| file.flush());
-    // Closed before the rename: a Windows rename over an open handle fails, and
-    // this runs on every prompt.
+    // Closed before the rename. Nothing needs that order, and keeping it costs
+    // nothing.
     drop(file);
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);

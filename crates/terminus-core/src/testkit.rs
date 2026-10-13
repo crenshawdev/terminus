@@ -113,8 +113,8 @@ pub fn fixture_projects(root: &Path) -> Vec<PathBuf> {
 /// contains, so the key degrades to the path itself on every machine.
 ///
 /// Backslashes are doubled on the way in because the substitution lands inside
-/// a JSON string literal, where a Windows root would otherwise be an invalid
-/// escape and the whole record would stop parsing.
+/// a JSON string literal, where any backslash in the root would otherwise be an
+/// invalid escape and the whole record would stop parsing.
 pub fn copy_rooted_fixture_into(name: &str, dir: &Path, root: &Path) -> PathBuf {
     let project = fixture_project(name, root);
     std::fs::create_dir_all(&project)

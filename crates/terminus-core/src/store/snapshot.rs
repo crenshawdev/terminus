@@ -23,10 +23,11 @@
 //! `tar -x` would each have rewritten - and `VACUUM INTO` refusing a non-empty
 //! destination becomes a property rather than a hazard. The instant is
 //! read from SQLite, the same clock every stored timestamp in this store comes
-//! from, in ISO-8601 **basic** format: `:` is not a legal filename character on
-//! Windows, which is a first-class target, so the extended form every column
-//! holds cannot be a file name here. Basic format is fixed-width and still
-//! orders lexicographically, which is the property the prune actually uses.
+//! from, in ISO-8601 **basic** format rather than the extended form every
+//! column holds: the prune orders snapshots by name, and the
+//! `terminus-<time>.db` files already on disk use the basic form. Basic format
+//! is fixed-width and still orders lexicographically, which is the property the
+//! prune actually uses.
 //!
 //! **Written to a temporary name and renamed into place.** A process killed
 //! mid-copy leaves a half-written file, and a half-written file that matched

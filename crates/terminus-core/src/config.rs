@@ -903,11 +903,10 @@ fn normalize(raw: &str) -> Option<String> {
 
 /// Is this exclusion the filesystem root - the one that means "read nothing"?
 ///
-/// `RootDir` and nothing else. Not `Path::parent().is_none()`, which is also
-/// true of a Windows prefix with no directory below it (`C:`,
-/// `\\server\share`): those name a real subtree that [`Config::excludes_path`]
-/// matches component-wise, so answering "everything" for them would put the two
-/// predicates back into exactly the disagreement [`normalize`] exists to end.
+/// `RootDir` and nothing else. Any other exclusion names a real subtree that
+/// [`Config::excludes_path`] matches component-wise, so answering "everything"
+/// for it would put the two predicates back into exactly the disagreement
+/// [`normalize`] exists to end.
 fn is_filesystem_root(path: &str) -> bool {
     let mut components = Path::new(path).components();
     components.next() == Some(std::path::Component::RootDir) && components.next().is_none()

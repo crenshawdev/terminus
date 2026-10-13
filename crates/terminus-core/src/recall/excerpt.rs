@@ -42,9 +42,9 @@ pub const EXCERPT_CHARS: usize = 240;
 
 /// What stands where text was cut away.
 ///
-/// ASCII, because this is printed to a terminal whose code page is not ours to
-/// choose - the Windows console is first-class (`.planning/PROJECT.md`) and a
-/// horizontal ellipsis is exactly the character that arrives there as mojibake.
+/// ASCII, because this is printed to a terminal whose encoding is not ours to
+/// choose, and under a locale that is not UTF-8 a horizontal ellipsis is
+/// exactly the character that arrives as mojibake.
 pub const ELISION: &str = "...";
 
 /// How many session blobs an excerpt pass materialized.
