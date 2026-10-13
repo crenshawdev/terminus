@@ -78,8 +78,8 @@ impl Bench {
     /// nothing in this workspace builds one in memory, because nothing writes
     /// this file - so a retention test loads a real file like a user would.
     ///
-    /// A TOML literal string for the root, so a Windows path is not read as a
-    /// run of escapes.
+    /// A TOML literal string for the root, so the path's bytes are taken as
+    /// written, with no escape processing.
     fn config_file(&self, body: &str) -> Config {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -393,7 +393,6 @@ fn a_pass_reports_the_lock_rather_than_waiting_for_it() {
 /// group-shared workflows - which is a different bug, not a stricter version of
 /// this one. The lock is held across the assertions so the file under test is
 /// the one a real pass is holding.
-#[cfg(unix)]
 #[test]
 fn the_data_directory_and_the_lock_are_owner_only_from_the_first_acquire() {
     use std::os::unix::fs::PermissionsExt;

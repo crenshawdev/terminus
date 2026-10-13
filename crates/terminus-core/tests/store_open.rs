@@ -649,7 +649,6 @@ fn a_foreign_sqlite_database_is_refused_rather_than_initialized_over() {
 /// resolves to ever stops doing that, this test fails loudly on whatever
 /// platform ran it instead of shipping 0644 files holding uncommitted session
 /// text.
-#[cfg(unix)]
 #[test]
 fn a_fresh_store_and_its_sidecars_are_owner_only() {
     use std::os::unix::fs::PermissionsExt;
@@ -697,7 +696,6 @@ fn a_fresh_store_and_its_sidecars_are_owner_only() {
 /// The symlink is the case the repair must refuse. `set_permissions` follows
 /// one, so a link left in `snapshots/` would otherwise hand a chmod to a file
 /// that is none of terminus's business.
-#[cfg(unix)]
 #[test]
 fn a_wide_store_is_tightened_by_a_writable_open_and_by_nothing_else() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

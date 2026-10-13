@@ -302,7 +302,6 @@ fn a_deleted_worktree_under_a_live_repo_is_still_excluded() {
 
 /// A branch that could still lead to the name but cannot be followed leaves the
 /// question open rather than answering it by not looking.
-#[cfg(unix)]
 #[test]
 fn a_symlinked_branch_is_unresolved_rather_than_absent() {
     let tree = tempfile::tempdir().unwrap();

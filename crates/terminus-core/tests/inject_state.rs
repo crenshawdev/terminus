@@ -219,8 +219,7 @@ fn a_session_id_that_could_name_a_path_creates_nothing_anywhere() {
 /// The inode comparison is the direct observation of that. A rename gives the
 /// name a new inode; an `open`-truncate-write keeps the old one, and that is
 /// exactly the implementation where a kill between the truncate and the last
-/// byte leaves a prefix where a read expects a document. It is unix-only
-/// because the number is; the rest of the case holds on every platform.
+/// byte leaves a prefix where a read expects a document.
 #[test]
 fn a_write_replaces_the_target_rather_than_rewriting_it_in_place() {
     let dir = tempfile::tempdir().unwrap();
@@ -230,7 +229,6 @@ fn a_write_replaces_the_target_rather_than_rewriting_it_in_place() {
     let mut first = State::default();
     first.injected.push(1);
     assert!(first.save(&data_dir, Some(SESSION)));
-    #[cfg(unix)]
     let before = {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(&target).unwrap().ino()
@@ -244,7 +242,6 @@ fn a_write_replaces_the_target_rather_than_rewriting_it_in_place() {
     assert!(second.save(&data_dir, Some(SESSION)));
 
     assert_eq!(State::load(&data_dir, Some(SESSION)), second);
-    #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         let after = std::fs::metadata(&target).unwrap().ino();
@@ -279,7 +276,6 @@ fn a_write_replaces_the_target_rather_than_rewriting_it_in_place() {
 /// default is D-04, asserted where it can be seen -
 /// `tests/pass.rs::the_data_directory_and_the_lock_are_owner_only_from_the_first_acquire`
 /// - since a `tempfile` root is already 0700 and would prove nothing here.
-#[cfg(unix)]
 #[test]
 fn the_scratch_the_hook_writes_is_owner_only_and_so_is_what_holds_it() {
     use std::os::unix::fs::PermissionsExt;

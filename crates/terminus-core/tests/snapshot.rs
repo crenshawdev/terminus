@@ -103,10 +103,10 @@ fn session_keys(store: &Store) -> Vec<String> {
 ///
 /// The ingest lock is held by a second handle for the duration, so this is not
 /// a snapshot of a quiet store that happens to work. `File::try_lock` is
-/// `flock(2)` with `LOCK_EX | LOCK_NB` on Unix and `LockFileEx` on Windows, and
-/// both conflict between two open file descriptions whether or not they belong
-/// to the same process - so a snapshot that quietly took the lock would find it
-/// held and fail here rather than pass.
+/// `flock(2)` with `LOCK_EX | LOCK_NB`, which conflicts between two open file
+/// descriptions whether or not they belong to the same process - so a snapshot
+/// that quietly took the lock would find it held and fail here rather than
+/// pass.
 #[test]
 fn a_snapshot_taken_mid_pass_opens_verifies_and_excludes_the_uncommitted_session() {
     let bench = bench();
@@ -250,7 +250,6 @@ fn snapshots_land_inside_the_data_directory() {
 /// mode, and the rename carries that mode to the name that stays. Nothing here
 /// chmods anything, which is why the source file contains no `set_permissions`
 /// (AC2).
-#[cfg(unix)]
 #[test]
 fn a_snapshot_and_its_directory_are_owner_only() {
     use std::os::unix::fs::PermissionsExt;
@@ -479,7 +478,6 @@ fn snapshots_turned_off_write_nothing_at_all() {
 /// A snapshot that cannot be written is a NOTE. The archive is the work: the
 /// pass still ran, still committed, still wrote its `runs` row, and the copy of
 /// what is already safely stored is the only thing missing.
-#[cfg(unix)]
 #[test]
 fn a_snapshot_that_cannot_be_written_is_a_note_and_not_a_failed_pass() {
     use std::os::unix::fs::PermissionsExt;

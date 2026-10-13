@@ -744,9 +744,7 @@ fn a_transcript_rewritten_under_its_watermark_stays_flagged() {
 /// a path that is not text has no session key to flag - which is exactly why
 /// `another_per_file_failure_flags_no_session` exists beside it.
 ///
-/// Unix only: this needs a path that is bytes and not text, and Windows paths
-/// are UTF-16 where the equivalent is an unpaired surrogate.
-#[cfg(unix)]
+/// This needs a path that is bytes and not text.
 #[test]
 fn a_failure_that_is_not_a_divergence_flags_no_session() {
     use std::os::unix::ffi::OsStrExt;

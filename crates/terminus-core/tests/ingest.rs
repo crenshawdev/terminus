@@ -325,7 +325,6 @@ fn resuming_from_a_mid_line_watermark_converges_on_a_single_pass() {
 /// The same transcript reached through a symlink is one session, not two
 /// (`DESIGN-BRIEF.md:406`; CONTEXT's third flagged assumption, resolved as
 /// "canonicalize").
-#[cfg(unix)]
 #[test]
 fn two_paths_to_one_transcript_produce_one_session() {
     let bench = bench();

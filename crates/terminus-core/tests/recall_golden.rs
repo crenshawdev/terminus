@@ -194,8 +194,8 @@ const HEADER: &str = "\
 /// [`testkit::FIXTURE_ROOT_TOKEN`].
 ///
 /// The escaped spelling first and the plain one second: a `cwd` inside an
-/// archived JSON body carries a Windows root with its separators doubled, and
-/// replacing the plain form first would leave a stray backslash behind.
+/// archived JSON body carries any backslash in the root doubled, and replacing
+/// the plain form first would leave a stray backslash behind.
 fn rooted(text: &str, dir: &Path) -> String {
     let raw = dir.to_string_lossy().into_owned();
     let escaped = raw.replace('\\', "\\\\");
