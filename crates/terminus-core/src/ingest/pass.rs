@@ -64,18 +64,11 @@ pub struct Summary {
     /// RET-03, D-10). Empty and free while retention is off, which is the
     /// default and the state every user starts in.
     pub retention: crate::retention::Applied,
-    /// What the provider was asked, after the lock dropped (OBS-02, D-07).
-    ///
-    /// Empty and free while judgment is off, which is the default. Its notes do
-    /// NOT reach `runs.error`: this step runs after that row is written, so the
-    /// caller prints them on stderr instead.
-    pub judgment: crate::observe::Judged,
     /// What the rolling snapshot step did, after the lock dropped (STOR-06,
     /// D-15).
     ///
-    /// Its notes do NOT reach `runs.error` either, and for the same reason
-    /// [`Summary::judgment`] states: the row has already committed by the time
-    /// this runs.
+    /// Its notes do NOT reach `runs.error`: the row has already committed by
+    /// the time this runs, so the caller prints them on stderr instead.
     pub snapshot: Snapshotted,
     pub duration: Duration,
 }
@@ -136,31 +129,21 @@ pub fn run(data_dir: &Path) -> Result<PassOutcome> {
 ///
 /// The seam tests use, so a test never has to resolve a real transcript root.
 ///
-/// Two halves, and the boundary between them is D-07. [`locked`] is everything
-/// that touches the archive, under the ingest lock, ending with the `runs` row.
-/// The judgment call comes after it returns - which is after the guard and the
-/// store have been dropped - because a slow or hanging provider held inside the
-/// lock would make every hook-spawned pass in that window exit [`LockHeld`] and
-/// archive nothing.
-///
-/// [`LockHeld`]: PassOutcome::LockHeld
+/// Two halves. [`locked`] is everything that touches the archive, under the
+/// ingest lock, ending with the `runs` row. The snapshot comes after it
+/// returns, once the guard and the store are dropped and that row has
+/// committed, so a snapshot that failed is a note and never a failed pass.
 pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
     let mut summary = match locked(data_dir, config)? {
         PassOutcome::LockHeld => return Ok(PassOutcome::LockHeld),
         PassOutcome::Ran(summary) => summary,
     };
 
-    // Outside the lock, outside the store handle, and after the row that says
-    // the pass happened. Nothing below can fail the pass: the archive is
-    // already committed and this step only ever returns notes (OBS-04).
-    summary.judgment = crate::observe::judge_new(data_dir, config);
-
-    // STOR-06 and D-15, in the same position and for the same reason: the guard
-    // and the store handle are gone, the `runs` row has committed, and nothing
-    // below can fail the pass. A snapshot is a copy of what is already safely
-    // archived, so a snapshot that could not be written is a note - failing the
-    // pass over it would stop archiving the transcripts the copy exists to
-    // protect.
+    // STOR-06 and D-15: the guard and the store handle are gone, the `runs`
+    // row has committed, and nothing below can fail the pass. A snapshot is a
+    // copy of what is already safely archived, so one that could not be
+    // written is a note - failing the pass over it would stop archiving the
+    // transcripts the copy exists to protect.
     summary.snapshot = roll(data_dir, config);
     Ok(PassOutcome::Ran(summary))
 }
@@ -185,8 +168,7 @@ fn roll(data_dir: &Path, config: &Config) -> Snapshotted {
         return out;
     }
 
-    // Its own handle, because the pass's is gone - the same shape
-    // `observe::judge_new` has, and for the same D-07 reason.
+    // Its own handle, because the pass's is gone with the lock.
     let store = match crate::store::Store::open(data_dir) {
         Ok(store) => store,
         Err(e) => {

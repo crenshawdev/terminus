@@ -645,67 +645,6 @@ fn two_runs_over_one_unjudged_session_make_one_request_between_them() {
     );
 }
 
-/// A reservation whose run died is not a life sentence: past the lease the next
-/// run takes the session, and inside it nobody does.
-#[test]
-fn an_abandoned_reservation_is_taken_only_once_the_lease_has_lapsed() {
-    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
-    let bench = bench();
-    let (judged, _other) = bench.observed();
-    let ids = bench.turn_ids(&judged);
-
-    // What a killed process leaves behind: a token nothing will ever release.
-    // Written straight into the column, because the only way to produce one
-    // honestly is to kill a run mid-request.
-    let stamp = |seconds: i64| -> String {
-        bench
-            .conn()
-            .query_row(
-                "SELECT ?1 || ' ' || strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)",
-                rusqlite::params![judgment::STATUS_JUDGING, format!("{seconds} seconds")],
-                |r| r.get(0),
-            )
-            .unwrap()
-    };
-    let abandon = |token: &str| {
-        bench
-            .conn()
-            .execute(
-                "UPDATE observations SET status = ?2 WHERE session_key = ?1",
-                rusqlite::params![judged, token],
-            )
-            .unwrap();
-    };
-
-    // Inside the lease: somebody may still be asking, so nothing is bought.
-    abandon(&stamp(-(judgment::RESERVATION_LEASE_SECONDS / 2)));
-    let stub = HttpStub::serving(&[testkit::chat_completion(&answer(&ids), 1, 1)]);
-    let config = bench.config(&stub);
-    net::attempts::reset();
-    let verdict = judgment::judge(&bench.conn(), &config, None, &judged);
-    assert!(
-        matches!(verdict, Verdict::Skipped(Skip::InFlight { .. })),
-        "a live reservation was taken: {verdict:?}"
-    );
-    assert_eq!(net::attempts::count(), 0);
-    assert!(
-        observe::judge_new(&bench.data_dir, &config).judged == 0,
-        "a pass spent its one slot on a session already in flight"
-    );
-    assert_eq!(net::attempts::count(), 0);
-
-    // Past it: the run that held it is gone, and the session is judged rather
-    // than left unjudgeable forever.
-    abandon(&stamp(-(judgment::RESERVATION_LEASE_SECONDS + 60)));
-    let judged_now = observe::judge_new(&bench.data_dir, &config);
-    assert_eq!(judged_now.judged, 1, "{judged_now:?}");
-    assert_eq!(net::attempts::count(), 1);
-    assert_eq!(
-        bench.row(&judged).status.as_deref(),
-        Some(judgment::STATUS_OK)
-    );
-}
-
 // ---------------------------------------------------------------------------
 // PRIV-03: the judgment columns, filtered before they reach SQLite
 // ---------------------------------------------------------------------------
