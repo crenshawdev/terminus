@@ -7,7 +7,7 @@ Scope comes from `DESIGN-BRIEF.md`, where every decision is settled unless marke
 
 ## Active
 
-Committed scope for v0.2.0. Each maps to exactly one roadmap phase. Several
+Committed scope for v0.0.1. Each maps to exactly one roadmap phase. Several
 replace behaviour that shipped under v0.1.0 rows (INST-01, INST-02, INST-03,
 INST-04's offer, INST-05, INST-08); those rows stay under `## Shipped` as
 written, because they record what shipped then.
