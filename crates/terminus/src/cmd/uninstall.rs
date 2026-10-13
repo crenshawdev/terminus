@@ -1,8 +1,11 @@
 //! `terminus uninstall`: take out what install put in, and nothing else
 //! (INST-07).
 //!
-//! Install adds four hook entries to `settings.json` and the binary at the
-//! stable path, and uninstall removes both. The MCP registration is removed by
+//! Install adds four hook entries to `settings.json`, a version file in the
+//! versions folder, and a link to it at the stable path. Uninstall removes the
+//! entries and the link and keeps the versions: a session that is already
+//! running, and the ingest its hook started, run from those files, so it prints
+//! the folder's path and leaves it in place. The MCP registration is removed by
 //! running `claude mcp remove`, and only when `.claude.json` holds one. That
 //! file is read and never written: Claude Code is its only writer. An old
 //! `.claude.json.terminus-backup` is left where it is and its path printed,
@@ -31,7 +34,8 @@
 //!
 //! The data directory is left alone and its path printed. `--purge` deletes it
 //! after showing the path and the size and asking once, and takes the ingest
-//! lock first so it never pulls the store out from under a running pass.
+//! lock first so it never pulls the store out from under a running pass. It
+//! never deletes the versions folder.
 //!
 //! Human-only, no `--json` (D-24).
 
@@ -70,6 +74,7 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Options, Failure> {
 
 pub fn run(options: Options) -> Result<(), Failure> {
     let stable = binary::stable_path()?;
+    let versions = binary::versions_dir()?;
     let data_dir = super::data_dir()?;
 
     println!("terminus uninstall");
@@ -82,6 +87,16 @@ pub fn run(options: Options) -> Result<(), Failure> {
     let mut ok = clean(&targets::settings_path()?, &stable);
     ok &= unregister(&targets::claude_json_path()?);
     ok &= unplace(&stable);
+
+    println!("  versions        {}", versions.display());
+    if std::fs::symlink_metadata(&versions).is_ok() {
+        println!(
+            "    kept: a session that is already running may be running from one of these.\n    \
+             to delete them too, remove the folder once no session is running"
+        );
+    } else {
+        println!("    not there: nothing to keep");
+    }
 
     println!("  data directory  {}", data_dir.display());
     if !options.purge {
@@ -344,7 +359,10 @@ fn unregister(path: &Path) -> bool {
     ok
 }
 
-/// Remove the copy at the stable path, and only if it is terminus's (D-07).
+/// Remove the link at the stable path, and only if it is terminus's (D-07).
+///
+/// `remove_file` takes the link and not the file it names. A marked plain file
+/// an older install left there goes the same way.
 fn unplace(stable: &Path) -> bool {
     println!("  {}", stable.display());
     match binary::occupant(stable) {

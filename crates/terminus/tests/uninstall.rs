@@ -328,9 +328,26 @@ fn install_then_uninstall_leaves_both_files_exactly_as_they_were() {
         Vec::<String>::new(),
         "a restored file left its backup behind"
     );
+    // Not `exists()`: it follows the link and reports false for a dangling one.
+    assert_eq!(
+        std::fs::symlink_metadata(fixture.stable())
+            .map(|_| ())
+            .map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::NotFound),
+        "the link at the stable path was left there"
+    );
+    let versions = fixture
+        .root
+        .join(".local/lib/crenshawdev/terminus/versions");
+    assert_eq!(
+        std::fs::read(versions.join(env!("CARGO_PKG_VERSION")).join("terminus")).unwrap(),
+        std::fs::read(env!("CARGO_BIN_EXE_terminus")).unwrap(),
+        "uninstall took the version file"
+    );
+    let said = text(&out);
     assert!(
-        !fixture.stable().exists(),
-        "the copy at the stable path was left there"
+        said.contains(&versions.display().to_string()),
+        "uninstall did not print the versions folder: {said}"
     );
 }
 
