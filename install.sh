@@ -5,6 +5,9 @@
 # The signature check goes inside verify_download in a later cycle, with Baley's
 # release design (issue #14 in Baley's tracker).
 # The script ends by running terminus install through the stable path, which writes Claude Code's wiring.
+# The body is one function called on the last line, so a download cut off at a
+# line break runs nothing. Run flat, a copy cut after the link moves would leave
+# the new version linked, never run terminus install, and exit 0.
 set -eu
 
 LC_ALL=C
@@ -107,131 +110,135 @@ stage() {
     staging_temporary=
 }
 
-case $# in
-    0) source=https://github.com/crenshawdev/terminus/releases/latest/download ;;
-    1) case $1 in https://*) source=$1 ;; *) fail 'the source must start with https://' ;; esac ;;
-    *) fail 'usage: sh install.sh [https://<source>]' ;;
-esac
-while [ "${source%/}" != "$source" ]; do source=${source%/}; done
-
-[ -z "${TERMINUS_BIN_DIR-}" ] ||
-    fail "TERMINUS_BIN_DIR is set: terminus install would point the hooks and the MCP entry into $TERMINUS_BIN_DIR while this script links ~/.local/bin/terminus; unset it and run again"
-
-case ${HOME-} in
-    '') fail 'HOME is unset or empty; set it to your absolute home folder' ;;
-    /*) ;;
-    *) fail 'HOME is relative; set it to your absolute home folder' ;;
-esac
-valid_utf8 "$HOME" || fail 'HOME is not valid UTF-8; set it to a path that is'
-
-# Spell HOME without empty or . parts and without following folder links, so a
-# link this script made reads back as $versions/<version>/terminus.
-install_home=
-remaining=$HOME/
-while [ -n "$remaining" ]; do
-    component=${remaining%%/*}
-    remaining=${remaining#*/}
-    case $component in
-        '' | .) ;;
-        ..) fail 'HOME contains ..; set it to an absolute path without ..' ;;
-        *) install_home=$install_home/$component ;;
+main() {
+    case $# in
+        0) source=https://github.com/crenshawdev/terminus/releases/latest/download ;;
+        1) case $1 in https://*) source=$1 ;; *) fail 'the source must start with https://' ;; esac ;;
+        *) fail 'usage: sh install.sh [https://<source>]' ;;
     esac
-done
-versions=$install_home/.local/lib/crenshawdev/terminus/versions
-stable_folder=$install_home/.local/bin
-stable=$stable_folder/terminus
-check_stable_path
+    while [ "${source%/}" != "$source" ]; do source=${source%/}; done
 
-case $(uname -s) in
-    Linux) os=linux ;;
-    Darwin) os=macos ;;
-    *) fail 'unsupported operating system; Linux or Darwin is required' ;;
-esac
-case $(uname -m) in
-    x86_64) arch=x86_64 ;;
-    aarch64 | arm64) arch=aarch64 ;;
-    *) fail 'unsupported architecture; x86_64 or aarch64 is required' ;;
-esac
+    [ -z "${TERMINUS_BIN_DIR-}" ] ||
+        fail "TERMINUS_BIN_DIR is set: terminus install would point the hooks and the MCP entry into $TERMINUS_BIN_DIR while this script links ~/.local/bin/terminus; unset it and run again"
 
-scratch=$(mktemp -d)
-staging_temporary=
-link_temporary=
-cleanup() {
-    [ -z "$staging_temporary" ] || rm -f "$staging_temporary"
-    [ -z "$link_temporary" ] || rm -f "$link_temporary"
-    rm -rf "$scratch"
-}
-trap cleanup 0
-trap 'exit 1' HUP INT TERM
+    case ${HOME-} in
+        '') fail 'HOME is unset or empty; set it to your absolute home folder' ;;
+        /*) ;;
+        *) fail 'HOME is relative; set it to your absolute home folder' ;;
+    esac
+    valid_utf8 "$HOME" || fail 'HOME is not valid UTF-8; set it to a path that is'
 
-curl -q --proto '=https' --tlsv1.2 -fsSL "$source/terminus-$os-$arch.manifest" -o "$scratch/manifest" ||
-    fail "manifest download failed: $source/terminus-$os-$arch.manifest"
-curl -q --proto '=https' --tlsv1.2 -fsSL "$source/terminus-$os-$arch" -o "$scratch/terminus" ||
-    fail "binary download failed: $source/terminus-$os-$arch"
+    # Spell HOME without empty or . parts and without following folder links, so a
+    # link this script made reads back as $versions/<version>/terminus.
+    install_home=
+    remaining=$HOME/
+    while [ -n "$remaining" ]; do
+        component=${remaining%%/*}
+        remaining=${remaining#*/}
+        case $component in
+            '' | .) ;;
+            ..) fail 'HOME contains ..; set it to an absolute path without ..' ;;
+            *) install_home=$install_home/$component ;;
+        esac
+    done
+    versions=$install_home/.local/lib/crenshawdev/terminus/versions
+    stable_folder=$install_home/.local/bin
+    stable=$stable_folder/terminus
+    check_stable_path
 
-{
-    IFS= read -r version_line || fail 'manifest line 1 is missing or has no final newline'
-    IFS= read -r digest_line || fail 'manifest line 2 is missing or has no final newline'
-    extra=
-    if IFS= read -r extra || [ -n "$extra" ]; then
-        fail 'manifest has content after line 2'
-    fi
-} < "$scratch/manifest"
-case $version_line in
-    'version '*) version=${version_line#version } ;;
-    *) fail 'manifest line 1 must start with "version "' ;;
-esac
-valid_version "$version" || fail 'manifest line 1 needs major.minor.patch with no leading zeros and each part fitting u64'
-case $digest_line in
-    'sha256 '*) sha256=${digest_line#sha256 } ;;
-    *) fail 'manifest line 2 must start with "sha256 "' ;;
-esac
-case $sha256 in *[!0-9a-f]*) fail 'manifest line 2 needs 64 lowercase hex digits' ;; esac
-[ "${#sha256}" -eq 64 ] || fail 'manifest line 2 needs 64 lowercase hex digits'
-# Some shells discard NUL bytes during read, so compare the exact text too.
-manifest_digest=$(digest < "$scratch/manifest")
-text_digest=$(printf 'version %s\nsha256 %s\n' "$version" "$sha256" | digest)
-[ "$manifest_digest" = "$text_digest" ] || fail 'manifest is not exactly two UTF-8 lines'
+    case $(uname -s) in
+        Linux) os=linux ;;
+        Darwin) os=macos ;;
+        *) fail 'unsupported operating system; Linux or Darwin is required' ;;
+    esac
+    case $(uname -m) in
+        x86_64) arch=x86_64 ;;
+        aarch64 | arm64) arch=aarch64 ;;
+        *) fail 'unsupported architecture; x86_64 or aarch64 is required' ;;
+    esac
 
-verify_download
+    scratch=$(mktemp -d)
+    staging_temporary=
+    link_temporary=
+    cleanup() {
+        [ -z "$staging_temporary" ] || rm -f "$staging_temporary"
+        [ -z "$link_temporary" ] || rm -f "$link_temporary"
+        rm -rf "$scratch"
+    }
+    trap cleanup 0
+    trap 'exit 1' HUP INT TERM
 
-# A rebuild at the same version is renamed over the old file, and a process
-# running that file keeps its inode. Old version folders are never deleted.
-umask 022
-staged=$versions/$version/terminus
-if [ -L "$staged" ]; then
-    fail "$staged: staging conflict, a symbolic link is there"
-elif [ -f "$staged" ]; then
-    actual=$(digest < "$staged")
-    if [ "$actual" = "$sha256" ]; then
-        [ -x "$staged" ] || fail "$staged: staging conflict, the file is not executable"
+    curl -q --proto '=https' --tlsv1.2 -fsSL "$source/terminus-$os-$arch.manifest" -o "$scratch/manifest" ||
+        fail "manifest download failed: $source/terminus-$os-$arch.manifest"
+    curl -q --proto '=https' --tlsv1.2 -fsSL "$source/terminus-$os-$arch" -o "$scratch/terminus" ||
+        fail "binary download failed: $source/terminus-$os-$arch"
+
+    {
+        IFS= read -r version_line || fail 'manifest line 1 is missing or has no final newline'
+        IFS= read -r digest_line || fail 'manifest line 2 is missing or has no final newline'
+        extra=
+        if IFS= read -r extra || [ -n "$extra" ]; then
+            fail 'manifest has content after line 2'
+        fi
+    } < "$scratch/manifest"
+    case $version_line in
+        'version '*) version=${version_line#version } ;;
+        *) fail 'manifest line 1 must start with "version "' ;;
+    esac
+    valid_version "$version" || fail 'manifest line 1 needs major.minor.patch with no leading zeros and each part fitting u64'
+    case $digest_line in
+        'sha256 '*) sha256=${digest_line#sha256 } ;;
+        *) fail 'manifest line 2 must start with "sha256 "' ;;
+    esac
+    case $sha256 in *[!0-9a-f]*) fail 'manifest line 2 needs 64 lowercase hex digits' ;; esac
+    [ "${#sha256}" -eq 64 ] || fail 'manifest line 2 needs 64 lowercase hex digits'
+    # Some shells discard NUL bytes during read, so compare the exact text too.
+    manifest_digest=$(digest < "$scratch/manifest")
+    text_digest=$(printf 'version %s\nsha256 %s\n' "$version" "$sha256" | digest)
+    [ "$manifest_digest" = "$text_digest" ] || fail 'manifest is not exactly two UTF-8 lines'
+
+    verify_download
+
+    # A rebuild at the same version is renamed over the old file, and a process
+    # running that file keeps its inode. Old version folders are never deleted.
+    umask 022
+    staged=$versions/$version/terminus
+    if [ -L "$staged" ]; then
+        fail "$staged: staging conflict, a symbolic link is there"
+    elif [ -f "$staged" ]; then
+        actual=$(digest < "$staged")
+        if [ "$actual" = "$sha256" ]; then
+            [ -x "$staged" ] || fail "$staged: staging conflict, the file is not executable"
+        else
+            stage
+        fi
+    elif [ -e "$staged" ]; then
+        fail "$staged: staging conflict, an entry other than a regular file is there"
     else
         stage
     fi
-elif [ -e "$staged" ]; then
-    fail "$staged: staging conflict, an entry other than a regular file is there"
-else
-    stage
-fi
 
-mkdir -p "$stable_folder"
-temporary=$stable_folder/.${scratch##*/}
-ln -s "$staged" "$temporary"
-[ -L "$temporary" ] && [ "$(readlink "$temporary")" = "$staged" ] ||
-    fail "$temporary: temporary symbolic link does not point to $staged"
-link_temporary=$temporary
-check_stable_path
-mv -f "$link_temporary" "$stable"
-link_temporary=
+    mkdir -p "$stable_folder"
+    temporary=$stable_folder/.${scratch##*/}
+    ln -s "$staged" "$temporary"
+    [ -L "$temporary" ] && [ "$(readlink "$temporary")" = "$staged" ] ||
+        fail "$temporary: temporary symbolic link does not point to $staged"
+    link_temporary=$temporary
+    check_stable_path
+    mv -f "$link_temporary" "$stable"
+    link_temporary=
 
-printf 'terminus: placed version %s at %s\n' "$version" "$stable"
-printf 'terminus: versions present in %s:\n' "$versions"
-for folder in "$versions"/*; do
-    [ -d "$folder" ] && [ ! -L "$folder" ] || continue
-    [ -f "$folder/terminus" ] && [ ! -L "$folder/terminus" ] || continue
-    present=${folder##*/}
-    valid_version "$present" || continue
-    printf '  %s\n' "$present"
-done
+    printf 'terminus: placed version %s at %s\n' "$version" "$stable"
+    printf 'terminus: versions present in %s:\n' "$versions"
+    for folder in "$versions"/*; do
+        [ -d "$folder" ] && [ ! -L "$folder" ] || continue
+        [ -f "$folder/terminus" ] && [ ! -L "$folder/terminus" ] || continue
+        present=${folder##*/}
+        valid_version "$present" || continue
+        printf '  %s\n' "$present"
+    done
 
-"$stable" install
+    "$stable" install
+}
+
+main "$@"

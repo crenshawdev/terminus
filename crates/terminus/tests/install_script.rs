@@ -235,6 +235,10 @@ fn platform() -> String {
     format!("{os}-{arch}")
 }
 
+fn script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh")
+}
+
 /// Where `name` lives on this test process's `PATH`.
 fn which(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
@@ -357,12 +361,38 @@ impl Fixture {
     }
 
     fn command_with(&self, args: &[String], tools: &Path) -> Command {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let mut command = self.shell(tools);
+        command.arg(script()).args(args);
+        command
+    }
+
+    /// The script's bytes written into `/bin/sh`'s stdin pipe, which is then
+    /// closed, as `curl | sh` does. Any `args` go after `-s --`.
+    fn piped(&self, args: &[String], tools: &Path) -> Output {
+        use std::io::Write;
+
+        let mut command = self.shell(tools);
+        if !args.is_empty() {
+            command.args(["-s", "--"]).args(args);
+        }
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        // A shell that stops early closes the pipe; its output says why.
+        let _ = stdin.write_all(&std::fs::read(script()).unwrap());
+        drop(stdin);
+        child.wait_with_output().unwrap()
+    }
+
+    /// `/bin/sh` with the cleared environment every run uses.
+    fn shell(&self, tools: &Path) -> Command {
         let path = std::env::join_paths([&self.fake_dir, tools]).unwrap();
         let mut command = Command::new("/bin/sh");
         command
-            .arg(script)
-            .args(args)
             .env_clear()
             .env("PATH", path)
             .env("HOME", &self.home)
@@ -639,6 +669,28 @@ fn no_source_downloads_from_the_github_releases() {
     let tools = fx.curl_tools("");
     let output = fx.command_with(&[], &tools).output().unwrap();
     assert_eq!(fx.curl_urls(), default_urls(), "{}", text(&output));
+    assert!(output.status.success(), "{}", text(&output));
+    fx.assert_linked("1.0.0", &bytes);
+}
+
+/// `curl | sh`: the same two release URLs, and the install finishes.
+#[test]
+fn a_piped_script_with_no_source_downloads_from_the_github_releases() {
+    let fx = fixture();
+    let bytes = fx.serve("1.0.0", "");
+    let tools = fx.curl_tools("");
+    let output = fx.piped(&[], &tools);
+    assert_eq!(fx.curl_urls(), default_urls(), "{}", text(&output));
+    assert!(output.status.success(), "{}", text(&output));
+    fx.assert_linked("1.0.0", &bytes);
+}
+
+/// `curl | sh -s -- https://<source>` installs from that source.
+#[test]
+fn a_piped_script_installs_from_its_source() {
+    let fx = fixture();
+    let bytes = fx.serve("1.0.0", "");
+    let output = fx.piped(&[fx.server.url()], &fx.tools);
     assert!(output.status.success(), "{}", text(&output));
     fx.assert_linked("1.0.0", &bytes);
 }
