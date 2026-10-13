@@ -83,7 +83,7 @@ No stored preview column — search results decompress the hit's block on demand
 | redb | Exclusive file lock blocks *all* other processes, including readers. Young library holding the only copy of user history |
 | Tantivy | Second store, second commit, divergence handling. FTS5 is adequate at this corpus size and gives single-transaction consistency |
 | Turso / limbo | Beta; maintainers explicitly advise against mission-critical use |
-| Postgres | Requires a server. Windows is the larger user base |
+| Postgres | Requires a server. |
 | DuckDB / SurrealDB embedded | Single-process write access; forces a daemon |
 | Flat files / one file per session | Rejected outright |
 
@@ -118,13 +118,13 @@ Four hooks, all spawning a **detached** ingest process and returning 0 immediate
 
 Hook command is the **absolute path to the binary**. No shell, no `$SHELL -lc` PATH probe, no version resolution. This single choice retires most of claude-mem's Windows issue class.
 
-Spawn is fully detached: stdio to null, no inherited handles, new process group, `DETACHED_PROCESS | CREATE_NO_WINDOW` on Windows.
+Spawn is fully detached: stdio to null, no inherited handles, new process group.
 
 No daemon, no systemd/launchd/Task Scheduler. The hook spawn is the scheduler.
 
 ### Ingest run
 
-1. Try-lock (`LockFileEx` / `flock`). Held → exit 0 immediately. No waiting, no retry storms.
+1. Try-lock (`flock`). Held → exit 0 immediately. No waiting, no retry storms.
 2. Read watermarks.
 3. Tail each transcript to the last complete record; skip excluded projects.
 4. Build session blob, compress.
@@ -149,7 +149,7 @@ Recovery lives entirely in the binary at the top of every run. There is no `repa
 
 Key on the **canonical git toplevel path**, falling back to canonical cwd. Store basename only as a display label. Map worktrees to the parent repo via the git common dir and store both keys.
 
-Canonicalize everything before comparing — resolve symlinks, normalize separators, case-fold on Windows and macOS.
+Canonicalize everything before comparing — resolve symlinks, normalize separators, case-fold on macOS.
 
 ### Byte distribution (measured)
 
@@ -206,7 +206,7 @@ Extract from **structured tool records**, not prose.
 
 | Kind | Source | Normalization |
 |---|---|---|
-| `path` | Read/Edit/Write inputs, Glob/Grep paths, Bash argv | canonical absolute + repo-relative, case-folded on Win/mac |
+| `path` | Read/Edit/Write inputs, Glob/Grep paths, Bash argv | canonical absolute + repo-relative, case-folded on macOS |
 | `command` | Bash tool input | `argv[0]` + significant subcommand; flags/args to a separate raw field |
 | `error` | non-zero exits, stderr, panics | **strip variable parts** (line numbers, addresses, timestamps, UUIDs); keep the stable core |
 | `symbol` | Edit/Write content, Grep patterns, code fences | whole identifier plus components; ≥4 chars with a case transition or underscore |
@@ -353,17 +353,17 @@ exclude      = ["/data/clients", "~/work/nda"]
 include_only = []          # non-empty = allowlist mode
 ```
 
-Prefix match on canonicalized paths, case-insensitive on Windows/macOS. A repo-local marker file excludes a repo so client work carries its own policy. **Excluded means never read** — not ingest-then-filter. **Enforced on both ingest and injection**; claude-mem honors it on write and ignores it on read.
+Prefix match on canonicalized paths, case-insensitive on macOS. A repo-local marker file excludes a repo so client work carries its own policy. **Excluded means never read** — not ingest-then-filter. **Enforced on both ingest and injection**; claude-mem honors it on write and ignores it on read.
 
 ---
 
 ## 12. Paths and configuration
 
-| Purpose | Linux | macOS | Windows |
-|---|---|---|---|
-| Binary (canonical) | `~/.local/bin/terminus` | same | `%LOCALAPPDATA%\Programs\Terminus\terminus.exe` |
-| Data | `$XDG_DATA_HOME/terminus` | `~/Library/Application Support/terminus` | `%LOCALAPPDATA%\terminus` |
-| Config | `$XDG_CONFIG_HOME/terminus` | same convention | `%APPDATA%\terminus` |
+| Purpose | Linux | macOS |
+|---|---|---|
+| Binary (canonical) | `~/.local/bin/terminus` | same |
+| Data | `$XDG_DATA_HOME/terminus` | `~/Library/Application Support/terminus` |
+| Config | `$XDG_CONFIG_HOME/terminus` | same convention |
 
 - `TERMINUS_DATA_DIR` overrides. Resolved **once** at startup and passed down explicitly — never re-derived in a child.
 - A `location` pointer file in the config dir means nothing hardcodes the store path; `terminus data move <path>` relocates safely.
@@ -371,23 +371,21 @@ Prefix match on canonicalized paths, case-insensitive on Windows/macOS. A repo-l
 - Free-space guard before writing; refuse network mounts by default.
 - Config written atomically, temp + rename.
 
-**Windows specifics:** `LockFileEx` not `flock`; `DETACHED_PROCESS | CREATE_NO_WINDOW`; rename-then-replace for a running exe; `\\?\` prefix for long paths; case-folded comparison; UNC paths.
+**Supported systems:** Terminus supports Linux and macOS. Windows was dropped, as it is across all of the owner's products, and a build for any other system fails at compile time with "Terminus supports Linux and macOS only."
 
 ---
 
 ## 13. Install and packaging
 
-**npm is the primary channel.** Every Claude Code user has Node, and `npx terminus install` is the pattern this audience already knows.
+**There is no npm channel.** The npm package was removed. A one-command installer arrives in phase 4.
 
-esbuild-style: a thin `terminus` package with `optionalDependencies` on per-platform packages (`@terminus/linux-x64`, `@terminus/darwin-arm64`, `@terminus/win32-x64`, …) each shipping the prebuilt binary. **No postinstall script** — that sidesteps the blocked-postinstall failure class entirely. Node is install-time only; nothing at runtime touches it.
-
-Secondary: GitHub releases, Homebrew, Scoop/WinGet, deb/rpm.
+Secondary: GitHub releases, Homebrew, deb/rpm.
 
 **No Claude Code plugin in 0.x.** The plugin system installs into versioned directories, which is the root cause of claude-mem's inline path-resolution script and its version-check hook. Revisit at 1.0; if it ships, it stays a thin bootstrap.
 
 ### Binary layout
 
-`terminus install` copies the platform binary out of the npm package to the stable path. **That copy is canonical** — hooks and MCP registration point at it, and the npm shim execs it, so there's one binary and no version skew. No PATH modification.
+`terminus install` copies the running binary to the stable path. **That copy is canonical** — hooks and MCP registration point at it, so there's one binary and no version skew. No PATH modification.
 
 ### `terminus install`
 
@@ -405,7 +403,7 @@ Hooks go in **user scope** — terminus is global, one store across all projects
 
 ### Upgrade
 
-Package manager replaces the binary; `terminus install` re-copies to the stable path. **Hooks are never rewritten** — the path doesn't change, so there is no version-check hook and nothing to repair. Store format bumps rebuild derived tables only. Config is additive.
+The new binary's `terminus install` re-copies it to the stable path. **Hooks are never rewritten** — the path doesn't change, so there is no version-check hook and nothing to repair. Store format bumps rebuild derived tables only. Config is additive.
 
 ### Uninstall
 
@@ -458,7 +456,7 @@ Contract: human-readable by default, `--json` on every data command with a stabl
 | Concurrency | N processes race the lock — exactly one works, the rest exit 0 in ms; readers during writes |
 | Hook contract | feed the exact JSON Claude Code sends; assert exit 0, bounded wall time, clean stdout, fail-open when the DB is missing |
 | Retrieval eval | labeled (query → expected turn) set; precision@k as a regression suite via the replay harness |
-| Platform CI | Linux / macOS / Windows matrix actually exercising hooks and locking |
+| Platform CI | Linux / macOS matrix actually exercising hooks and locking |
 | Startup benchmark | assert hook cold start under budget. Startup time *is* the product |
 
 Fixture data can't be committed — transcripts are private. Small synthetic/redacted set in-repo for CI, plus a local-only corpus test pointed at the real tree via env var.
@@ -485,7 +483,6 @@ No mocking SQLite — real temp databases throughout.
 | Item | Status |
 |---|---|
 | Auto-tuner for injection thresholds | Hypothesis. Ship logging + replay; gate the tuner behind evidence it converges |
-| `UserPromptSubmit` cost on Windows | Measure. The query is microseconds; **process spawn is 10–30 ms** and that's the real budget |
 | Import of `/data/verbatim-legacy` (801 MB) | Deferred |
 | Other harnesses — Codex, Cursor, OpenCode | Out of scope for 0.x |
 | Multi-machine sync | Out of scope, stated so it doesn't creep in |
