@@ -433,13 +433,10 @@ fn a_reindex_leaves_every_observation_row_untouched() {
 
     let row = |conn: &Connection| -> Vec<Option<String>> {
         conn.query_row(
-            "SELECT o.session_key, o.session_id, o.generated_at, o.mechanical,
-                    o.status, o.model, o.prompt_version, o.topic, o.outcome,
-                    o.decisions, o.learned, o.unresolved, o.raw,
-                    CAST(o.tokens AS TEXT)
-               FROM observations o WHERE o.session_key = ?1",
+            "SELECT session_key, session_id, generated_at, mechanical
+               FROM observations WHERE session_key = ?1",
             [&key],
-            |r| (0..14).map(|i| r.get(i)).collect(),
+            |r| (0..4).map(|i| r.get(i)).collect(),
         )
         .expect("the observation row must still be there")
     };
@@ -447,13 +444,8 @@ fn a_reindex_leaves_every_observation_row_untouched() {
     bench
         .conn()
         .execute(
-            "INSERT INTO observations (
-                session_key, session_id, generated_at, mechanical, status, model,
-                prompt_version, topic, outcome, decisions, learned, unresolved,
-                raw, tokens
-             ) VALUES (?1, 'sess-1', '2026-08-21T00:00:00.000Z', '{\"turns\":3}',
-                       'ok', 'qwen3:8b', 'v1', 'the topic', 'the outcome',
-                       '[{\"turn_id\":7,\"claim\":\"a\"}]', '[]', '[]', NULL, 394)",
+            "INSERT INTO observations (session_key, session_id, generated_at, mechanical)
+             VALUES (?1, 'sess-1', '2026-08-21T00:00:00.000Z', '{\"turns\":3}')",
             [&key],
         )
         .unwrap();

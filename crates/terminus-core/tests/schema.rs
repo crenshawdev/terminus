@@ -667,3 +667,149 @@ fn capture_mode_records_the_reduced_mode_whichever_pass_came_first() {
         "the same, for the mode that elides unconditionally"
     );
 }
+
+// --- The session-summary columns, dropped once -------------------------------
+
+/// `observations` as it was declared while Terminus called a model: all
+/// fourteen columns, spelled out here so the test does not depend on any list
+/// the code under test also reads.
+#[cfg(feature = "testkit")]
+const SUMMARY_ERA_OBSERVATIONS: &str = "
+    DROP TABLE observations;
+    CREATE TABLE observations (
+        session_key    TEXT PRIMARY KEY REFERENCES sessions(session_key),
+        session_id     TEXT,
+        generated_at   TEXT,
+        mechanical     TEXT,
+        status         TEXT,
+        model          TEXT,
+        prompt_version TEXT,
+        topic          TEXT,
+        outcome        TEXT,
+        decisions      TEXT,
+        learned        TEXT,
+        unresolved     TEXT,
+        raw            TEXT,
+        tokens         INTEGER
+    );
+";
+
+/// Every row's `mechanical`, as the bytes stored, keyed by session.
+#[cfg(feature = "testkit")]
+fn mechanical_bytes(conn: &Connection) -> Vec<(String, Option<Vec<u8>>)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_key, CAST(mechanical AS BLOB) FROM observations
+             ORDER BY session_key",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// A store that still carries the ten summary columns opens without them, its
+/// mechanical facts byte-identical, the token budget key gone, `verify` clean,
+/// and the same column layout a fresh store has. A second open changes nothing.
+#[cfg(feature = "testkit")]
+#[test]
+fn a_store_with_the_summary_columns_opens_without_them() {
+    use terminus_core::store::DB_FILE_NAME;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    for fixture in ["session-basic.jsonl", "session-edits.jsonl"] {
+        let path = terminus_core::testkit::copy_fixture_into(fixture, &work);
+        match terminus_core::ingest::run(&data_dir, &path).unwrap() {
+            terminus_core::ingest::Outcome::Committed(_) => {}
+            other => panic!("{fixture} must archive: {other:?}"),
+        }
+    }
+
+    let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    let keys: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT session_key FROM sessions ORDER BY session_no")
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(keys.len(), 2, "both fixtures are archived");
+
+    conn.execute_batch(SUMMARY_ERA_OBSERVATIONS).unwrap();
+    conn.execute(
+        "INSERT INTO observations VALUES (
+            ?1, 'sid-ok', '2026-09-12T10:00:00.000Z', '{\"turns\":3,\"files_read\":[\"a.rs\"]}',
+            'ok', 'gpt-5.4-mini', 'obs-judgment-1', 'a topic', 'completed',
+            '[{\"turn_id\":1,\"text\":\"a decision\"}]', '[]', '[]', NULL, 394)",
+        [&keys[0]],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO observations (session_key, session_id, generated_at, mechanical, status)
+         VALUES (?1, 'sid-judging', '2026-09-12T11:00:00.000Z', '{\"turns\":7}',
+                 'judging 2026-09-12T11:00:01.000Z')",
+        [&keys[1]],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('observe.daily_tokens', '2026-09-12 31100000')",
+        [],
+    )
+    .unwrap();
+    let before = mechanical_bytes(&conn);
+    assert_eq!(before.len(), 2);
+    drop(conn);
+
+    let store = Store::open(&data_dir).expect("a store with the summary columns opens");
+    let present = columns(store.conn(), "observations");
+    for column in [
+        "status",
+        "model",
+        "prompt_version",
+        "topic",
+        "outcome",
+        "decisions",
+        "learned",
+        "unresolved",
+        "raw",
+        "tokens",
+    ] {
+        assert!(!present.contains(column), "{column} survived the open");
+    }
+    assert_eq!(
+        mechanical_bytes(store.conn()),
+        before,
+        "the drop changed a mechanical document"
+    );
+    let budget: i64 = store
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM meta WHERE key = 'observe.daily_tokens'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(budget, 0, "the token budget key survived the open");
+    let report = terminus_core::verify::verify(&store).unwrap();
+    assert!(report.is_ok(), "{}", report.render());
+
+    let (_fresh_dir, fresh_store) = fresh();
+    let upgraded_layout = column_layout(store.conn(), "observations");
+    assert_eq!(
+        upgraded_layout,
+        column_layout(fresh_store.conn(), "observations"),
+        "an upgraded observations table must be laid out exactly like a fresh one"
+    );
+    drop(store);
+
+    let again = Store::open(&data_dir).expect("a second open succeeds");
+    assert_eq!(column_layout(again.conn(), "observations"), upgraded_layout);
+    assert_eq!(mechanical_bytes(again.conn()), before);
+}

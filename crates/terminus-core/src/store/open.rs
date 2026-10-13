@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::error::{Error, Result};
 
@@ -181,6 +181,7 @@ impl Store {
             // opener; the destructive derived-table rebuild stays exactly where
             // it is, outside this function and inside the ingest lock.
             bring_forward(&store.conn)?;
+            drop_summary_columns(&store.conn)?;
         }
         Ok(store)
     }
@@ -529,6 +530,42 @@ fn bring_forward(conn: &Connection) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+/// Drop the session-summary columns from `observations`, and their meta key,
+/// on a store that still has them.
+///
+/// Kept out of [`bring_forward`] because it is destructive. The usual case is
+/// one `PRAGMA` read and nothing written. When a column is there, the list is
+/// read again inside an IMMEDIATE transaction, so two processes opening the
+/// same old store at once cannot both attempt the drop and have the second
+/// fail on a column the first already removed.
+fn drop_summary_columns(conn: &Connection) -> Result<()> {
+    if summary_columns(conn)?.is_empty() {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    for column in summary_columns(&tx)? {
+        // Identifiers come from a `const` in this crate, never from a caller.
+        tx.execute_batch(&format!("ALTER TABLE observations DROP COLUMN {column}"))?;
+    }
+    tx.execute(
+        "DELETE FROM meta WHERE key = ?1",
+        [crate::store::schema::DROPPED_META_KEY],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Which of [`crate::store::schema::DROPPED_OBSERVATION_COLUMNS`] the store
+/// still carries.
+fn summary_columns(conn: &Connection) -> Result<Vec<&'static str>> {
+    let present = column_names(conn, "observations")?;
+    Ok(crate::store::schema::DROPPED_OBSERVATION_COLUMNS
+        .iter()
+        .copied()
+        .filter(|name| present.iter().any(|p| p == name))
+        .collect())
 }
 
 /// Which of [`crate::store::schema::BRING_FORWARD_COLUMNS`] the open store does

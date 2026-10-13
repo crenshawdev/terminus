@@ -219,37 +219,13 @@ CREATE INDEX IF NOT EXISTS idx_labels_decision ON labels(decision_id);
 -- `mechanical` is one JSON document rather than a column per fact, the way
 -- `decisions` carries its list-shaped fields: nothing joins on them and they
 -- are read back whole.
---
--- The claim lists carry NO foreign key to `turns` and cannot (phase 7 D-03,
--- and the same constraint the `labels` comment above records). Each entry of
--- `decisions`, `learned` and `unresolved` anchors itself to a `turn_id`
--- (OBS-03), but the anchor lives INSIDE a JSON document, so there is no column
--- a reference could be declared on - which is just as well: `turns` is a table
--- `reindex` drops, and a declared reference would make the first `reindex`
--- after the first observation fail outright.
---
--- `observations.decisions` and the `decisions` TABLE are different objects
--- with the same name. Every statement naming the column qualifies it.
 CREATE TABLE IF NOT EXISTS observations (
     session_key    TEXT PRIMARY KEY REFERENCES sessions(session_key),
     session_id     TEXT,
     generated_at   TEXT,
     -- The OBS-01 facts: files, tools, commands with their arguments, errors,
     -- branch, commits, turn count, duration, compactions.
-    mechanical     TEXT,
-    -- The judgment half. Null until a provider is configured and answers.
-    status         TEXT,
-    model          TEXT,
-    prompt_version TEXT,
-    topic          TEXT,
-    outcome        TEXT,
-    decisions      TEXT,
-    learned        TEXT,
-    unresolved     TEXT,
-    -- The response as it arrived, kept for the OBS-04 `parse_failed` arm: a
-    -- response that would not parse is never dropped silently.
-    raw            TEXT,
-    tokens         INTEGER
+    mechanical     TEXT
 );
 
 -- DERIVED. Rebuildable from the blobs alone; dropped and recreated by reindex.
@@ -457,3 +433,26 @@ pub const BRING_FORWARD_COLUMNS: &[(&str, &[(&str, &str)])] = &[
     // `reindex::open_up_to_date` runs at the top of each one.
     ("turns", &[("is_typed", "INTEGER")]),
 ];
+
+/// The session-summary columns `observations` carried while Terminus called a
+/// model, which `Store::open` drops from any store that still has them.
+///
+/// Kept apart from [`BRING_FORWARD_COLUMNS`] because that list is additive
+/// only. Whether any of these is still present is the whole record of whether
+/// the drop has run: there is no marker key and no format bump.
+pub const DROPPED_OBSERVATION_COLUMNS: &[&str] = &[
+    "status",
+    "model",
+    "prompt_version",
+    "topic",
+    "outcome",
+    "decisions",
+    "learned",
+    "unresolved",
+    "raw",
+    "tokens",
+];
+
+/// The meta key the daily token budget for those summaries was kept under,
+/// deleted in the same transaction as the columns.
+pub const DROPPED_META_KEY: &str = "observe.daily_tokens";
