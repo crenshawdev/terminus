@@ -672,3 +672,104 @@ fn a_dangling_link_outside_the_versions_folder_is_refused() {
         fx.root.join("elsewhere/terminus")
     );
 }
+
+fn inode(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).unwrap().ino()
+}
+
+impl Fixture {
+    /// `<stable path> mcp`, started through the link, its stdin held open.
+    fn mcp(&self) -> Child {
+        Command::new(self.stable())
+            .arg("mcp")
+            .env_clear()
+            .env("PATH", &self.fake_dir)
+            .env("HOME", &self.home)
+            .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
+            .env("TERMINUS_DATA_DIR", self.root.join("data"))
+            .env("TERMINUS_CONFIG_DIR", self.root.join("config"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+}
+
+/// Installing B moves the link and leaves A's file exactly as it was, so a
+/// session started on A keeps running from it.
+#[test]
+fn successive_installs_keep_every_version() {
+    let fx = fixture();
+    let bytes_a = fx.install("1.0.0", "a");
+    let file_a = fx.version_file("1.0.0");
+    let inode_a = inode(&file_a);
+    let mut mcp = fx.mcp();
+
+    let bytes_b = fx.install("2.0.0", "b");
+    fx.assert_linked("2.0.0", &bytes_b);
+    assert!(
+        std::fs::read(&file_a).unwrap() == bytes_a,
+        "A's bytes changed"
+    );
+    assert_eq!(inode(&file_a), inode_a);
+
+    #[cfg(target_os = "linux")]
+    {
+        assert!(mcp.try_wait().unwrap().is_none(), "terminus mcp exited");
+        let exe = std::fs::read_link(format!("/proc/{}/exe", mcp.id())).unwrap();
+        assert_eq!(exe, file_a.canonicalize().unwrap());
+    }
+
+    drop(mcp.stdin.take());
+    mcp.wait().unwrap();
+}
+
+/// A rebuild at the same version is renamed over that version's file; the
+/// same bytes again leave it alone.
+#[test]
+fn a_rebuild_at_the_same_version_replaces_its_file() {
+    let fx = fixture();
+    fx.install("3.0.0", "c");
+    let first = inode(&fx.version_file("3.0.0"));
+
+    let rebuilt = fx.install("3.0.0", "c-rebuilt");
+    fx.assert_linked("3.0.0", &rebuilt);
+    let second = inode(&fx.version_file("3.0.0"));
+    assert_ne!(
+        second, first,
+        "the rebuild was written through, not renamed over"
+    );
+
+    fx.install("3.0.0", "c-rebuilt");
+    fx.assert_linked("3.0.0", &rebuilt);
+    assert_eq!(inode(&fx.version_file("3.0.0")), second);
+}
+
+/// A plain-file install from before the link, carrying the marker, is
+/// replaced by the link.
+#[test]
+fn a_marked_plain_file_is_replaced_by_the_link() {
+    let fx = fixture();
+    copy_build(&fx.stable(), "");
+    let bytes = fx.serve("1.0.0", "");
+    let output = fx.run();
+    assert!(output.status.success(), "{}", text(&output));
+    fx.assert_linked("1.0.0", &bytes);
+}
+
+/// The link left behind when the versions folder was deleted is the script's
+/// to replace.
+#[test]
+fn a_dangling_link_into_the_versions_folder_is_replaced() {
+    let fx = fixture();
+    fx.install("1.0.0", "a");
+    std::fs::remove_dir_all(fx.versions()).unwrap();
+    assert!(!fx.stable().exists() && fx.stable().is_symlink());
+
+    let bytes = fx.serve("2.0.0", "b");
+    let output = fx.run();
+    assert!(output.status.success(), "{}", text(&output));
+    fx.assert_linked("2.0.0", &bytes);
+}
