@@ -14,7 +14,7 @@ written, because they record what shipped then.
 
 ### Privacy (PRIV)
 
-- **PRIV-05**: Terminus reads a provider key only from the environment variable named for the provider (`OPENROUTER_API_KEY` for `name = "openrouter"`). It never reads a key from `terminus.toml` or from `~/.config/jcrenshaw/credentials.toml`, and never writes or creates a key file. A `terminus.toml` that still carries `api_key` fails to load with a message naming the variable and none of the value.
+- **PRIV-05**: Terminus never calls a model, never reads, stores or sends an API key, and opens no network connection. The judgment half of observations, the `[provider]` settings and the key lookup are removed. A `terminus.toml` that still has a `[provider]` table fails to load with a message saying so and none of its values.
 
 ### Install (INST)
 
@@ -25,7 +25,7 @@ written, because they record what shipped then.
 
 ### Docs (DOC)
 
-- **DOC-01**: The repository has a `README.md` at its root, written for someone who has never heard of Terminus. It opens on the reader's problem and what Terminus does about it, gives the one-command install and how to install a local build, says Linux and macOS only, lists every command and every `terminus.toml` setting with its key and default, states what Terminus refuses to do and exactly what leaves the machine when the opt-in summary call is on, and names no command, path or key the code does not have.
+- **DOC-01**: The repository has a `README.md` at its root, written for someone who has never heard of Terminus. It opens on the reader's problem and what Terminus does about it, gives the one-command install and how to install a local build, says Linux and macOS only, lists every command and every `terminus.toml` setting with its key and default, states what Terminus refuses to do (no model calls, no API keys, no network use at all), and names no command, path or key the code does not have.
 
 ## Shipped
 

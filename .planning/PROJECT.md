@@ -18,7 +18,7 @@ The verbatim transcript is the record: every session archived losslessly and per
 
 **v0.2.0, opened 2026-10-12.**
 
-Five phases. Four bring install in line with Baley's (its ADR 0038 and 0039): provider keys from the environment only, Linux and macOS only with the npm package removed, an install that asks nothing and registers the MCP server through `claude mcp`, and a one-command installer script. The fifth writes the README the public repository does not have yet. A breaking change to the command line, hence the minor bump. Updates wait for signed releases, which Baley's release design (#14) owns.
+Five phases. Four bring Terminus in line with Baley's ADR 0038 and 0039: no model calls and so no API keys and no network use, Linux and macOS only with the npm package removed, an install that asks nothing and registers the MCP server through `claude mcp`, and a one-command installer script. The fifth writes the README the public repository does not have yet. A breaking change to the command line, hence the minor bump. Updates wait for signed releases, which Baley's release design (#14) owns.
 
 **Shipped: v0.1.1, closed 2026-09-04.**
 

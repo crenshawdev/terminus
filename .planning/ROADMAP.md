@@ -6,7 +6,7 @@ The archive is the product, so it is built first and everything else is built on
 
 ## Phases
 
-- [ ] **Phase 1: Keys From the Environment Only** - a provider key comes only from the environment variable named for the provider, never from a file
+- [ ] **Phase 1: No Model Calls** - the summary half of observations goes, so Terminus never calls a model, handles no API key and opens no network connection
 - [ ] **Phase 2: Linux and macOS Only, No npm** - the npm package and every Windows code path go, and a Windows build fails at compile time
 - [ ] **Phase 3: Install Asks Nothing** - `terminus install` applies its defaults without a question, registers through `claude mcp`, and ends with a receipt
 - [ ] **Phase 4: One-Command Installer** - `install.sh` downloads, checks and stores a version behind the stable path, then runs `terminus install`
@@ -14,19 +14,20 @@ The archive is the product, so it is built first and everything else is built on
 
 ## Phase Details
 
-### Phase 1: Keys From the Environment Only
-**Goal:** Terminus reads a provider key only from the environment variable named for the provider, decided 2026-10-06 to match Baley's ADR 0039. `crates/terminus-core/src/credentials.rs` has three tiers today: the environment, `[provider] api_key` in `terminus.toml`, and the shared `~/.config/jcrenshaw/credentials.toml`. The last two go, with `terminus doctor`'s mode check on the shared file. A hard cut with no fallback: the only key use is the optional observation judgment call, off by default. First because it deletes code Phase 2 would otherwise edit.
+### Phase 1: No Model Calls
+**Goal:** Terminus never calls a model and never handles an API key, matching Baley's ADR 0039 rule that the binary never calls a model. The summary half of observations goes, with everything that exists only for it: `observe/judgment.rs`, `provider.rs`, `net.rs` (the only network code), `cost.rs`, `credentials.rs`, the `[provider]` table in `terminus.toml`, the `ureq` dependency, and `terminus doctor`'s key and config-permission checks. The mechanical half stays, and so do the redaction rules in `egress.rs`, which `redact_recall` uses. What happens to the summaries already stored is settled at context. First because it deletes code Phase 2 would otherwise edit.
 **Depends on:** Nothing (first phase of this cycle)
 **Requirements:** PRIV-05
 **Success Criteria:**
-1. With `name = "openrouter"` and `OPENROUTER_API_KEY` set, the judgment request carries that key. With the variable unset, no request is made and the recorded reason names the variable.
-2. A `terminus.toml` that still contains `api_key` fails to load with a message naming the variable to use instead, and the message carries no byte of the value.
-3. Nothing opens `credentials.toml`: with that file present and the variable unset, no request is made.
-4. `terminus doctor` reports only whether the variable is set, never its value.
-5. The existing egress tests still pass: the key never appears in a request body or an error string.
+1. Neither crate depends on an HTTP client (`cargo tree` shows no `ureq`, `reqwest` or `hyper`), and no source file outside the tests opens a socket.
+2. Nothing reads an API key: no `_API_KEY` lookup, and nothing reads `credentials.toml` or an `api_key` setting.
+3. A `terminus.toml` that still has a `[provider]` table fails to load with a message saying model calls were removed, naming the file and none of its values.
+4. Every finished session still gets its mechanical observation, and recall still finds it.
+5. With `redact_recall` on, recall output is still filtered by the same rules.
+6. `terminus doctor` no longer carries the key, config-permission and provider checks, and the full suite passes.
 
 ### Phase 2: Linux and macOS Only, No npm
-**Goal:** Remove `npm/` (the package, its five platform packages and `pack-local.sh`) and its references in `.gitignore`, `DESIGN-BRIEF.md`, `install/binary.rs` and the v2 Distribution note in REQUIREMENTS.md, and remove every Windows branch. Counting `cfg(windows)`, `cfg!(windows)`, `target_os = "windows"`, `cfg(unix)` and `cfg(not(windows))` guards and `LOCALAPPDATA`, that is 40 lines in 12 source files and 50 in 18 test files. Guards that existed only to exclude Windows go, and their code becomes unconditional. Before the install rework, so Phase 3 edits code with one platform shape.
+**Goal:** Remove `npm/` (the package, its five platform packages and `pack-local.sh`) and its references in `.gitignore`, `DESIGN-BRIEF.md`, `install/binary.rs` and the v2 Distribution note in REQUIREMENTS.md, and remove every Windows branch. Counting `cfg(windows)`, `cfg!(windows)`, `target_os = "windows"`, `cfg(unix)` and `cfg(not(windows))` guards and `LOCALAPPDATA`, that was 40 lines in 12 source files and 50 in 18 test files, measured 2026-10-12 before Phase 1 deleted some of those files. Guards that existed only to exclude Windows go, and their code becomes unconditional. Before the install rework, so Phase 3 edits code with one platform shape.
 **Depends on:** Nothing
 **Requirements:** INST-09
 **Success Criteria:**
@@ -61,12 +62,12 @@ The archive is the product, so it is built first and everything else is built on
 6. Qualified on Linux. macOS stays unverified until it is run on a Mac.
 
 ### Phase 5: README
-**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, what it refuses to do, and exactly what leaves the machine. Last, because it describes the installer from Phase 4 and the platform support from Phase 2.
+**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, and what it refuses to do. Last, because it describes the installer from Phase 4 and the platform support from Phase 2.
 **Depends on:** Phase 4
 **Requirements:** DOC-01
 **Success Criteria:**
 1. The README opens on the reader's problem and what Terminus does about it, before any mechanism.
 2. The install section is the one installer command, plus how to install a local build, and says Linux and macOS only.
 3. Every command is listed with one line on what it does, and every `terminus.toml` setting with its key and default.
-4. It states what Terminus refuses to do (no daemon, no telemetry, no key files, no network use except the opt-in summary call) and exactly what leaves the machine when that call is on.
+4. It states what Terminus refuses to do: no daemon, no telemetry, no model calls, no API keys and no network use at all.
 5. `/cad-docs-verify` reports no stale claim: every command, path and key the README names matches the code.
