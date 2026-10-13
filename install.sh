@@ -159,10 +159,10 @@ cleanup() {
 trap cleanup 0
 trap 'exit 1' HUP INT TERM
 
-curl -q --proto '=https' --tlsv1.2 -fsSL "$source/$os-$arch/manifest" -o "$scratch/manifest" ||
-    fail "manifest download failed: $source/$os-$arch/manifest"
-curl -q --proto '=https' --tlsv1.2 -fsSL "$source/$os-$arch/terminus" -o "$scratch/terminus" ||
-    fail "binary download failed: $source/$os-$arch/terminus"
+curl -q --proto '=https' --tlsv1.2 -fsSL "$source/terminus-$os-$arch.manifest" -o "$scratch/manifest" ||
+    fail "manifest download failed: $source/terminus-$os-$arch.manifest"
+curl -q --proto '=https' --tlsv1.2 -fsSL "$source/terminus-$os-$arch" -o "$scratch/terminus" ||
+    fail "binary download failed: $source/terminus-$os-$arch"
 
 {
     IFS= read -r version_line || fail 'manifest line 1 is missing or has no final newline'

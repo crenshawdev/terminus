@@ -185,7 +185,7 @@ struct Fixture {
     fake_dir: PathBuf,
     /// Links to every tool in [`TOOLS`], second on `PATH`.
     tools: PathBuf,
-    /// The served folder: `<os>-<arch>/manifest` and `<os>-<arch>/terminus`.
+    /// The served folder: `terminus-<os>-<arch>` and `terminus-<os>-<arch>.manifest`.
     served: PathBuf,
     server: Server,
 }
@@ -197,7 +197,7 @@ fn fixture() -> Fixture {
     let claude_dir = root.join("claude");
     let fake_dir = root.join("fake");
     let served = root.join("served");
-    for folder in [&home, &claude_dir, &fake_dir, &served.join(platform())] {
+    for folder in [&home, &claude_dir, &fake_dir, &served] {
         std::fs::create_dir_all(folder).unwrap();
     }
     std::fs::write(claude_dir.join("settings.json"), SETTINGS).unwrap();
@@ -328,10 +328,15 @@ impl Fixture {
         testkit::fake_claude_calls(&self.claude_log())
     }
 
+    /// The served binary, `terminus-<os>-<arch>`.
+    fn binary(&self) -> PathBuf {
+        self.served.join(format!("terminus-{}", platform()))
+    }
+
     /// Serve `version`: this build with `extra` appended, and a manifest
     /// naming its digest. Returns the served bytes.
     fn serve(&self, version: &str, extra: &str) -> Vec<u8> {
-        let binary = self.served.join(platform()).join("terminus");
+        let binary = self.binary();
         copy_build(&binary, extra);
         self.serve_manifest(version, &sha256(&binary));
         std::fs::read(binary).unwrap()
@@ -339,7 +344,9 @@ impl Fixture {
 
     /// Replace the served manifest with one naming `version` and `digest`.
     fn serve_manifest(&self, version: &str, digest: &str) {
-        let manifest = self.served.join(platform()).join("manifest");
+        let manifest = self
+            .served
+            .join(format!("terminus-{}.manifest", platform()));
         std::fs::write(manifest, format!("version {version}\nsha256 {digest}\n")).unwrap();
     }
 
@@ -583,7 +590,7 @@ fn shasum_computes_the_digest_when_sha256sum_is_missing() {
     assert!(output.status.success(), "{}", text(&output));
     fx.assert_linked("1.0.0", &bytes);
 
-    let binary = fx.served.join(platform()).join("terminus");
+    let binary = fx.binary();
     copy_build(&binary, "different");
     let real = sha256(&binary);
     fx.serve_manifest("2.0.0", &"0".repeat(64));
@@ -602,7 +609,7 @@ fn shasum_computes_the_digest_when_sha256sum_is_missing() {
 fn a_digest_that_does_not_match_is_refused() {
     let fx = fixture();
     fx.install("1.0.0", "");
-    let binary = fx.served.join(platform()).join("terminus");
+    let binary = fx.binary();
     let digest_a = sha256(&binary);
     copy_build(&binary, "tampered");
     fx.serve_manifest("2.0.0", &digest_a);
