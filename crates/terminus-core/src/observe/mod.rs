@@ -1,50 +1,32 @@
 //! Observations: an auditable account of what happened in a finalized session
 //! (OBS-01..OBS-04).
 //!
-//! **Two halves, one row.** The mechanical half is [`mechanical`]: parser-
-//! derived facts that are always available, never involve a model and open no
-//! network connection. The judgment half is a later plan's: one optional call
-//! per finalized session, whose every claim carries a `turn_id` resolving to a
-//! real turn. They share a row because they describe one session and are read
-//! back together.
+//! **Mechanical facts, one row per session.** [`mechanical`] derives them from
+//! the parsed transcript. No model is involved and no network connection is
+//! opened.
 //!
 //! **Archival, never derived (D-02).** `observations` is deliberately absent
 //! from [`crate::store::schema::DERIVED_TABLES`]: the judgment half is a paid
 //! model call that no blob replay reproduces, so a `reindex` that dropped the
 //! table would delete summaries a user bought. `terminus observations
 //! regenerate` (OBS-07) is the only rebuild path.
-
+//!
 //! **Written by the pass, at the far end of it.** [`observe_new`] runs after
 //! `feedback::outcomes` - which is what sets `session_meta.is_final` - and
 //! before the `runs` row, so a session becomes final and gets its observation
-//! on the same pass. It INSERTS and never overwrites: a pass that recomputed
-//! would silently discard a judgment half somebody paid for.
+//! on the same pass. It inserts and never overwrites.
 //!
 //! **Nothing here fails a pass.** The archive is the work. An observation that
 //! could not be computed is a note folded into `runs.error` - there is no log
 //! file, by design - exactly as the drain's and the labeller's failures are.
-
-//! **One door to the network.** [`net`] is the only module in either crate that
-//! names an HTTP client or opens a socket, and it counts every attempt before
-//! it makes it (PRIV-03, D-21). The mechanical half above reaches it never;
-//! that is an assertion a test reads off the attempt log rather than a promise.
-//!
-//! **Nothing is asked for twice, and nothing is asked for free.** [`cost`] holds
-//! OBS-06's four gates - the minimum turn count, the truncation budget, the
-//! daily token budget and "one call per session" - and it is the only place a
-//! judgment run learns it may not make a request.
 //!
 //! **One redaction boundary, and it only exists when data leaves.** [`egress`]
 //! filters a request body on the DECLARED destination (D-13) and scrubs every
 //! string on its way to becoming an error whatever the destination is (D-16).
 //! Nothing here redacts at ingest: `.planning/PROJECT.md` bars that outright.
 
-pub mod cost;
 pub mod egress;
-pub mod judgment;
 pub mod mechanical;
-pub mod net;
-pub mod provider;
 
 use std::collections::BTreeMap;
 
