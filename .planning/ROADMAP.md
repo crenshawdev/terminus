@@ -22,7 +22,7 @@ The archive is the product, so it is built first and everything else is built on
 1. Neither crate depends on an HTTP client (`cargo tree` shows no `ureq`, `reqwest` or `hyper`), and no source file outside the tests opens a socket.
 2. Nothing reads an API key: no `_API_KEY` lookup, and nothing reads `credentials.toml` or an `api_key` setting.
 3. A `terminus.toml` that still has a `[provider]` table fails to load with a message saying model calls were removed, naming the file and none of its values.
-4. Every finished session still gets its mechanical observation, and recall still finds it.
+4. Every finished session still gets its mechanical observation, which `terminus observations` lists, and its files, commands and errors stay searchable.
 5. With `redact_recall` on, recall output is still filtered by the same rules.
 6. `terminus doctor` no longer carries the key, config-permission and provider checks, and the full suite passes.
 
