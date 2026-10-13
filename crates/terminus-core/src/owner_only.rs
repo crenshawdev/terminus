@@ -10,16 +10,9 @@
 //! the two helpers below, so there is one place to read the rule off.
 //!
 //! `std` alone does it (D-01): [`std::os::unix::fs::DirBuilderExt::mode`] and
-//! [`std::os::unix::fs::OpenOptionsExt::mode`]. No `libc`, no `nix`, no
-//! `windows-sys` - the hook path is measured in fractions of a millisecond and
-//! does not pay for a crate to set two integers.
-//!
-//! On Windows the equivalent of owner-only is an ACL, and this build does not
-//! set one (D-15, deferred since v0.1.0 phase 7). The `#[cfg(not(unix))]` arms
-//! here create the same file and the same directory with no mode at all, so a
-//! Windows install is exactly as protected as the directory it inherits from -
-//! which is why `terminus doctor` says so in words rather than reporting "ok"
-//! over an ACL nothing examined.
+//! [`std::os::unix::fs::OpenOptionsExt::mode`]. No `libc`, no `nix` - the hook
+//! path is measured in fractions of a millisecond and does not pay for a crate
+//! to set two integers.
 
 use std::path::Path;
 
@@ -51,7 +44,6 @@ pub fn create_dir_all(path: &Path) -> std::io::Result<()> {
     }
 
     let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(DIR_MODE);
@@ -75,7 +67,6 @@ pub fn create_dir_all(path: &Path) -> std::io::Result<()> {
 /// mode here.
 pub fn options() -> std::fs::OpenOptions {
     let mut options = std::fs::OpenOptions::new();
-    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(FILE_MODE);
@@ -83,7 +74,7 @@ pub fn options() -> std::fs::OpenOptions {
     options
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

@@ -400,7 +400,6 @@ impl Store {
 /// ingest that stops dead on a store whose files another account owns, or one on
 /// a read-only mount, which trades a mode this build cannot fix for a product
 /// that does not run.
-#[cfg(unix)]
 fn tighten(data_dir: &Path) {
     narrow_directory(data_dir);
 
@@ -434,16 +433,10 @@ fn tighten(data_dir: &Path) {
     }
 }
 
-/// The Windows arm (D-15): owner-only there is an ACL, and this build sets none.
-#[cfg(not(unix))]
-fn tighten(_data_dir: &Path) {}
-
-#[cfg(unix)]
 fn narrow_directory(path: &Path) {
     narrow(path, crate::owner_only::DIR_MODE, std::fs::FileType::is_dir);
 }
 
-#[cfg(unix)]
 fn narrow_file(path: &Path) {
     narrow(
         path,
@@ -460,7 +453,6 @@ fn narrow_file(path: &Path) {
 /// anywhere on the machine and be nothing of terminus's. A path that is not
 /// there at all is the ordinary case, not a failure: most of this list is
 /// absent on most stores.
-#[cfg(unix)]
 fn narrow(path: &Path, mode: u32, wanted: fn(&std::fs::FileType) -> bool) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -882,30 +874,6 @@ fn platform_data_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home)
         .join("Library")
         .join("Application Support")
-        .join("terminus"))
-}
-
-#[cfg(target_os = "windows")]
-fn platform_data_dir() -> Result<PathBuf> {
-    let local = non_empty_var("LOCALAPPDATA").ok_or_else(|| Error::DataDirUnresolved {
-        detail: "neither TERMINUS_DATA_DIR nor LOCALAPPDATA is set".into(),
-    })?;
-    Ok(PathBuf::from(local).join("terminus"))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn platform_data_dir() -> Result<PathBuf> {
-    // Every other Unix follows the XDG layout; only the three above are
-    // first-class targets (PROJECT.md constraints).
-    if let Some(xdg) = non_empty_var("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(xdg).join("terminus"));
-    }
-    let home = non_empty_var("HOME").ok_or_else(|| Error::DataDirUnresolved {
-        detail: "neither TERMINUS_DATA_DIR, XDG_DATA_HOME nor HOME is set".into(),
-    })?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
         .join("terminus"))
 }
 

@@ -497,7 +497,6 @@ mod tests {
     /// there: [`Decision::save`] refuses a data directory that does not exist,
     /// so this call never creates one and has none to narrow. `decisions/` is
     /// the leaf it does create, and that is the one it owns.
-    #[cfg(unix)]
     #[test]
     fn a_record_and_its_directory_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;

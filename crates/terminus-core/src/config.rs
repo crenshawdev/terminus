@@ -924,14 +924,14 @@ pub fn encode(path: &str) -> String {
         .collect()
 }
 
-/// Path comparison is case-insensitive on Windows and macOS and case-sensitive
-/// elsewhere (`.planning/PROJECT.md` constraints).
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+/// Path comparison is case-insensitive on macOS and case-sensitive on Linux
+/// (`.planning/PROJECT.md` constraints).
+#[cfg(target_os = "macos")]
 fn fold(s: &str) -> String {
     s.to_lowercase()
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn fold(s: &str) -> String {
     s.to_owned()
 }
@@ -1038,7 +1038,6 @@ pub fn config_dir() -> Result<PathBuf> {
     platform_config_dir()
 }
 
-#[cfg(not(target_os = "windows"))]
 fn platform_config_dir() -> Result<PathBuf> {
     if let Some(xdg) = non_empty_var("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(xdg).join("terminus"));
@@ -1046,29 +1045,11 @@ fn platform_config_dir() -> Result<PathBuf> {
     Ok(home_dir()?.join(".config").join("terminus"))
 }
 
-#[cfg(target_os = "windows")]
-fn platform_config_dir() -> Result<PathBuf> {
-    let appdata = non_empty_var("APPDATA").ok_or_else(|| Error::ConfigUnresolved {
-        detail: format!("neither {CONFIG_DIR_ENV} nor APPDATA is set"),
-    })?;
-    Ok(PathBuf::from(appdata).join("terminus"))
-}
-
-#[cfg(not(target_os = "windows"))]
 fn home_dir() -> Result<PathBuf> {
     non_empty_var("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| Error::ConfigUnresolved {
             detail: "HOME is not set".into(),
-        })
-}
-
-#[cfg(target_os = "windows")]
-fn home_dir() -> Result<PathBuf> {
-    non_empty_var("USERPROFILE")
-        .map(PathBuf::from)
-        .ok_or_else(|| Error::ConfigUnresolved {
-            detail: "USERPROFILE is not set".into(),
         })
 }
 
