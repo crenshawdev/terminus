@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use terminus_core::config::{
-    CaptureMode, Config, ResponseFormat, RetentionAction, Secret, CLAUDE_CONFIG_DIR_ENV,
-    CONFIG_FILE_NAME, DEFAULT_BRIEF_CHARS, DEFAULT_CLAUDE_DIR, DEFAULT_PROMPT_CHARS,
-    DEFAULT_SNAPSHOTS_KEPT, DEFAULT_SNAPSHOT_INTERVAL_HOURS, PROJECTS_SUBDIR, REDACTED,
+    CaptureMode, Config, RetentionAction, CLAUDE_CONFIG_DIR_ENV, CONFIG_FILE_NAME,
+    DEFAULT_BRIEF_CHARS, DEFAULT_CLAUDE_DIR, DEFAULT_PROMPT_CHARS, DEFAULT_SNAPSHOTS_KEPT,
+    DEFAULT_SNAPSHOT_INTERVAL_HOURS, PROJECTS_SUBDIR,
 };
 use terminus_core::Error;
 
@@ -526,182 +526,50 @@ fn an_unknown_key_inside_the_injection_table_is_ignored_rather_than_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// The `[provider]` table (OBS-05, D-05, D-10, D-13)
+// A leftover `[provider]` table is refused
 
 /// A value distinctive enough that finding any part of it in a rendered string
 /// is unambiguous evidence of a leak rather than a coincidence.
 const KEY: &str = "sk-TERMINUSTESTKEY-9f3a1c-do-not-log";
 
-/// The state every user starts in, and the one OBS-02 requires: a config with
-/// no `[provider]` table asks no model anything and holds no credential.
+/// Every shape a top-level `provider` key can take fails the load with its own
+/// error, names the file and the removal, and carries no byte of the table.
 #[test]
-fn a_config_without_a_provider_table_is_not_enabled_and_has_no_key() {
-    let dir = config_dir_holding(&[(CONFIG_FILE_NAME, "exclude = [\"/data/private\"]\n")]);
-    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
-        Config::load_from(dir.path()).unwrap()
-    });
-
-    assert!(!config.provider_enabled());
-    assert!(config.provider_api_key().is_none());
-    assert_eq!(config.provider_base_url(), None);
-    assert_eq!(config.provider_model(), None);
-    assert_eq!(config.provider_name(), None);
-    assert_eq!(config.provider_daily_token_budget(), None);
-    assert!(
-        !config.provider_local(),
-        "an absent `local` means remote and therefore filtered (D-13)"
-    );
-    assert!(
-        !Config::default().provider_enabled(),
-        "a config built with no file at all agrees with one read from a file with no table"
-    );
-}
-
-/// One key configured leaves the rest alone, which is why every key is an
-/// `Option` on the way in rather than a `#[serde(default)]` zero.
-#[test]
-fn a_provider_table_naming_only_a_model_leaves_the_other_keys_at_their_defaults() {
-    let dir = config_dir_holding(&[(CONFIG_FILE_NAME, "[provider]\nmodel = \"qwen3:8b\"\n")]);
-    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
-        Config::load_from(dir.path()).unwrap()
-    });
-
-    assert_eq!(config.provider_model(), Some("qwen3:8b"));
-    assert!(
-        !config.provider_enabled(),
-        "naming a model is not asking for judgment"
-    );
-    assert!(
-        !config.provider_local(),
-        "a table that does not declare its destination is remote (D-13)"
-    );
-    assert_eq!(config.provider_base_url(), None);
-    assert_eq!(config.provider_name(), None);
-    assert!(config.provider_api_key().is_none());
-    assert_eq!(config.provider_daily_token_budget(), None);
-}
-
-/// Every key at once, so the accessors are proven to read the keys they name
-/// rather than each other.
-#[test]
-fn a_full_provider_table_resolves_to_the_values_it_names() {
-    let dir = config_dir_holding(&[(
-        CONFIG_FILE_NAME,
-        &format!(
-            "[provider]\n\
-             enabled = true\n\
-             base_url = \"http://localhost:11434/v1/\"\n\
-             model = \"qwen3:8b\"\n\
-             name = \"ollama\"\n\
-             api_key = \"{KEY}\"\n\
-             local = true\n\
-             daily_token_budget = 50000\n"
-        ),
-    )]);
-    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
-        Config::load_from(dir.path()).unwrap()
-    });
-
-    assert!(config.provider_enabled());
-    assert_eq!(
-        config.provider_base_url(),
-        Some("http://localhost:11434/v1/")
-    );
-    assert_eq!(config.provider_model(), Some("qwen3:8b"));
-    assert_eq!(config.provider_name(), Some("ollama"));
-    assert!(config.provider_local());
-    assert_eq!(config.provider_daily_token_budget(), Some(50_000));
-    assert_eq!(
-        config.provider_api_key().map(Secret::expose),
-        Some(KEY),
-        "the one accessor that reaches the value has to reach it"
-    );
-    assert_eq!(
-        config.provider_response_format(),
-        ResponseFormat::JsonSchema,
-        "a table naming no response_format asks for the default mode"
-    );
-}
-
-/// D-09's mode key, and why it exists: `deepseek-chat` answers 400 `This
-/// response_format type is unavailable now` to `json_schema` however
-/// well-formed, and takes `json_object`. Measured 2026-08-22.
-#[test]
-fn the_response_format_key_selects_the_mode_and_defaults_to_json_schema() {
-    for (written, expected) in [
-        ("json_schema", ResponseFormat::JsonSchema),
-        ("json_object", ResponseFormat::JsonObject),
-        ("JSON_OBJECT", ResponseFormat::JsonObject),
-        ("  json_object  ", ResponseFormat::JsonObject),
-        ("none", ResponseFormat::None),
-        // An unrecognized VALUE falls back the way an unrecognized KEY is
-        // ignored: this file grows every phase and a typo must not stop a
-        // store from opening.
-        ("tool_calling", ResponseFormat::JsonSchema),
-        ("", ResponseFormat::JsonSchema),
+fn any_provider_key_is_refused_by_name_and_echoes_nothing() {
+    for body in [
+        format!("[provider]\nenabled = true\nbase_url = \"http://localhost:11434/v1/\"\napi_key = \"{KEY}\"\n"),
+        "[provider]\n".to_owned(),
+        format!("[provider]\nenabled = false\napi_key = \"{KEY}\"\n"),
+        format!("provider = \"{KEY}\"\n"),
     ] {
-        let dir = config_dir_holding(&[(
-            CONFIG_FILE_NAME,
-            &format!("[provider]\nenabled = true\nresponse_format = \"{written}\"\n"),
-        )]);
-        let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
-            Config::load_from(dir.path()).unwrap()
+        let dir = config_dir_holding(&[(CONFIG_FILE_NAME, &body)]);
+        let error = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
+            Config::load_from(dir.path()).expect_err("a provider key must be refused")
         });
 
-        assert_eq!(
-            config.provider_response_format(),
-            expected,
-            "response_format = {written:?}"
-        );
-    }
-}
-
-/// The documented rule holds one level down: this file grows every phase, and a
-/// key a later build writes must not make this one refuse to start.
-#[test]
-fn an_unknown_key_inside_the_provider_table_is_ignored_rather_than_rejected() {
-    let dir = config_dir_holding(&[(
-        CONFIG_FILE_NAME,
-        "[provider]\nmodel = \"qwen3:8b\"\nsomething_phase_9_writes = \"whatever\"\n",
-    )]);
-    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
-        Config::load_from(dir.path()).expect("an unknown provider key is not an error")
-    });
-
-    assert_eq!(config.provider_model(), Some("qwen3:8b"));
-}
-
-/// PRIV-01: `Config` derives `Debug`, and nothing that derive can reach may
-/// render the key.
-#[test]
-fn a_config_carrying_an_api_key_formats_with_no_byte_of_it() {
-    let dir = config_dir_holding(&[(
-        CONFIG_FILE_NAME,
-        &format!("[provider]\nenabled = true\napi_key = \"{KEY}\"\n"),
-    )]);
-    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
-        Config::load_from(dir.path()).unwrap()
-    });
-
-    // The falsifying half: the key really is in there, so the assertions below
-    // are about a formatter and not about an empty config.
-    assert_eq!(config.provider_api_key().map(Secret::expose), Some(KEY));
-
-    let rendered = format!("{config:?}");
-    for fragment in [KEY, "TERMINUSTESTKEY", "9f3a1c"] {
         assert!(
-            !rendered.contains(fragment),
-            "the formatted config carries {fragment:?}: {rendered}"
+            matches!(error, Error::ProviderRemoved { .. }),
+            "{body:?} was not refused as a provider table: {error:?}"
         );
+        let display = error.to_string();
+        assert!(
+            display.contains(CONFIG_FILE_NAME),
+            "the refusal does not name the file: {display}"
+        );
+        assert!(
+            display.contains("Model calls were removed"),
+            "the refusal does not say why: {display}"
+        );
+        let debug = format!("{error:?}");
+        for rendered in [&display, &debug] {
+            for fragment in [KEY, "TERMINUSTESTKEY", "9f3a1c"] {
+                assert!(
+                    !rendered.contains(fragment),
+                    "the refusal carries {fragment:?}: {rendered}"
+                );
+            }
+        }
     }
-    assert!(
-        rendered.contains(REDACTED),
-        "the formatted config does not say a credential was withheld: {rendered}"
-    );
-
-    let secret = config.provider_api_key().unwrap();
-    assert_eq!(format!("{secret:?}"), REDACTED);
-    assert_eq!(format!("{secret}"), REDACTED);
 }
 
 /// The other way a config file can put a key on a stream: forget the quotes and
@@ -733,25 +601,6 @@ fn a_malformed_api_key_line_is_not_echoed_by_the_parse_error() {
         matches!(error, Error::ConfigParse { .. }),
         "an unparseable config is still a parse error: {error:?}"
     );
-}
-
-/// An empty string is not a value, in a config file as in an environment
-/// variable: `api_key = ""` must not outrank a real key in the shared file, and
-/// `base_url = ""` must not become a request against the empty string.
-#[test]
-fn an_empty_provider_string_is_the_same_as_an_absent_one() {
-    let dir = config_dir_holding(&[(
-        CONFIG_FILE_NAME,
-        "[provider]\nenabled = true\nbase_url = \"\"\napi_key = \"\"\nname = \"\"\n",
-    )]);
-    let config = with_var(CLAUDE_CONFIG_DIR_ENV, None, || {
-        Config::load_from(dir.path()).unwrap()
-    });
-
-    assert!(config.provider_enabled());
-    assert_eq!(config.provider_base_url(), None);
-    assert_eq!(config.provider_name(), None);
-    assert!(config.provider_api_key().is_none());
 }
 
 // RET-01 and D-01: retention is off unless `terminus.toml` says otherwise, and
@@ -849,8 +698,8 @@ fn the_deepest_configured_project_key_wins() {
 }
 
 /// A typo in `action` resolves to keep rather than failing the load, under the
-/// same rule `ResponseFormat::parse` states - and here the alternative is worse
-/// than a wrong mode: an action nobody meant must never be a deletion.
+/// same rule that ignores an unrecognized key - and here the alternative is
+/// worse than a wrong mode: an action nobody meant must never be a deletion.
 #[test]
 fn an_unrecognized_action_resolves_to_keep_rather_than_failing_the_load() {
     let config = retention_config("[retention]\naction = \"nonsense\"\nage_days = 30\n");
@@ -1060,7 +909,7 @@ fn the_mode_key_selects_the_capture_mode() {
 
 /// A typo must not silently start throwing away tool output, and must not stop
 /// the store from opening either. It resolves to `full`, the same rule
-/// `ResponseFormat::parse` and `RetentionAction::parse` state.
+/// `RetentionAction::parse` states.
 #[test]
 fn an_unrecognized_capture_mode_resolves_to_full_rather_than_failing_the_load() {
     for written in ["leen", "none", "off", "everything", "MINIMAL_"] {

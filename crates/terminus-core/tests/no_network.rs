@@ -22,7 +22,10 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 fn no_source_file_names_a_socket() {
     let core = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let roots = [core.join("src"), core.parent().unwrap().join("terminus/src")];
+    let roots = [
+        core.join("src"),
+        core.parent().unwrap().join("terminus/src"),
+    ];
     for root in &roots {
         let mut files = Vec::new();
         rust_files(root, &mut files);

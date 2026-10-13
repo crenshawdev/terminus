@@ -383,11 +383,7 @@ struct LastSession {
 
 /// INJ-01's continuity blocks: which session was last here, when it ended, on
 /// what branch, and the last thing said in each direction.
-fn last_session(
-    conn: &Connection,
-    scoped: &Scoped,
-    redaction: &Redaction,
-) -> Option<Continuity> {
+fn last_session(conn: &Connection, scoped: &Scoped, redaction: &Redaction) -> Option<Continuity> {
     let row = last_session_row(conn, scoped).ok()??;
     let project = project_label(scoped);
 

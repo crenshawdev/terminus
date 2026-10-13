@@ -83,6 +83,10 @@ const DIR_SCAN_BUDGET: usize = 4_096;
 /// Unknown keys are ignored rather than rejected: this file will grow across
 /// phases, and a store written by a newer binary must not make an older one
 /// refuse to start.
+///
+/// `provider` is the one exception, and it is refused rather than ignored. That
+/// table once turned on a paid model call and could hold an API key, so a file
+/// that still has one must not load as if Terminus still honored it.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct FileConfig {
     /// Claude config directories, each of whose `projects` subdirectory is a
@@ -96,9 +100,11 @@ struct FileConfig {
     /// How much context injection may write, per event (INJ-01, D-18).
     #[serde(default)]
     injection: FileInjection,
-    /// The model provider observations may ask for judgment (OBS-05, D-10).
+    /// A leftover `[provider]` table, captured only so [`Config::load_from`]
+    /// can refuse it. `IgnoredAny` keeps none of what the table held, so a key
+    /// written in it is never in memory.
     #[serde(default)]
-    provider: FileProvider,
+    provider: Option<serde::de::IgnoredAny>,
     /// How much of each project's history to keep (RET-01, D-01).
     #[serde(default)]
     retention: FileRetention,
@@ -120,14 +126,8 @@ struct FileConfig {
 /// One key, optional, and absent means off - see [`Config::redact_recall`] for
 /// why off is the only default that leaves a product behind.
 ///
-/// **Its own table, and not a key on `[provider]`.** The same boolean also
-/// gates the judgment WRITE filter, which is not a recall path, so `[recall]`
-/// would be the wrong name for half of what it does. Under `[provider]` it
-/// would read as gated on a provider being configured - the exact confusion
-/// `provider.local` already causes on this path - and a user with judgment
-/// disabled would reasonably conclude the knob does nothing. A bare top-level
-/// key would be the third spelling of a setting in a file where every other
-/// setting is a table of optional keys.
+/// A table and not a bare top-level key, because every other setting in this
+/// file is a table of optional keys.
 #[derive(Debug, Clone, Default, Deserialize)]
 struct FilePrivacy {
     redact_recall: Option<bool>,
@@ -140,7 +140,7 @@ struct FilePrivacy {
 /// transcript byte for byte. Every other mode trades that away for bytes.
 ///
 /// Unrecognized values resolve to `full` rather than failing the load, under the
-/// same rule [`ResponseFormat::parse`] states, and here the reason is sharper
+/// same rule that ignores an unrecognized key, and here the reason is sharper
 /// than "the file grows across phases": a typo in this key must not silently
 /// start throwing away tool output.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -151,8 +151,8 @@ struct FileCapture {
 /// The `[snapshot]` table of `terminus.toml` (STOR-06, D-15).
 ///
 /// **The one table in this file whose default is ON.** Every other block here
-/// defaults to off - judgment is opt-in (OBS-02), retention is opt-in (RET-01) -
-/// and this one is not, because STOR-06 says rolling snapshots run by default.
+/// defaults to off - retention is opt-in (RET-01), recall redaction is opt-in
+/// (PRIV-03) - and this one is not, because STOR-06 says rolling snapshots run by default.
 /// What makes that affordable is the interval rather than a flag: the hook spawn
 /// is the scheduler and fires on every prompt, a snapshot of the real 1.10 GB
 /// store is 1.087 GB and 0.56 s, so an ungated step would write a gigabyte per
@@ -176,7 +176,7 @@ struct FileSnapshot {
 /// than a convention a later command could quietly break.
 ///
 /// Every key is optional and a missing table means the defaults, under the same
-/// rule `[injection]` and `[provider]` follow. Here the defaults are the OFF
+/// rule `[injection]` follows. Here the defaults are the OFF
 /// state, which is RET-01 itself: a store keeps everything unless this table
 /// says otherwise.
 ///
@@ -201,29 +201,6 @@ struct FileRetention {
 struct FileRetentionTable {
     action: Option<String>,
     age_days: Option<i64>,
-}
-
-/// The `[provider]` table of `terminus.toml` (D-10).
-///
-/// Every key optional, an unrecognized key ignored under the same rule as one
-/// at the top level, and a missing table meaning the defaults - which are "ask
-/// no model anything".
-///
-/// `api_key` arrives as a plain `String` and is wrapped in a [`Secret`] by
-/// [`Config::resolve`] rather than being deserialized straight into one. A
-/// serde error names the type it wanted, and the one place a value can still
-/// reach a stream from here is the TOML parser's own excerpt of a malformed
-/// line - which [`withhold_secret_excerpt`] takes out.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct FileProvider {
-    enabled: Option<bool>,
-    base_url: Option<String>,
-    model: Option<String>,
-    name: Option<String>,
-    api_key: Option<String>,
-    local: Option<bool>,
-    daily_token_budget: Option<u64>,
-    response_format: Option<String>,
 }
 
 /// The `[injection]` table of `terminus.toml`.
@@ -271,106 +248,12 @@ pub const DEFAULT_SNAPSHOT_INTERVAL_HOURS: u64 = 24;
 /// `terminus usage` already reports.
 pub const DEFAULT_SNAPSHOTS_KEPT: usize = 3;
 
-/// What a [`Secret`] renders as, everywhere, under every formatter.
+/// What a redacted value is replaced with, when the shape rule that took it
+/// names no more specific marker (`observe::egress`).
 ///
-/// A fixed marker rather than an empty string, so a reader of a message can
-/// tell "there was a credential here and it was withheld" from "there was
-/// nothing here" - the second would make a missing key look like a wrong one.
+/// A fixed marker rather than an empty string, so a reader can tell "there was
+/// a secret here and it was withheld" from "there was nothing here".
 pub const REDACTED: &str = "[redacted]";
-
-/// A credential value, in the one wrapper in this workspace that cannot print
-/// itself.
-///
-/// **The point is what it does NOT have.** No `Debug` that shows the value, no
-/// `Display`, no `AsRef<str>`, no `Deref`, no `Into<String>`. The only way to
-/// the bytes is [`Secret::expose`], which is spelled to be conspicuous at the
-/// call site and is called in exactly the places that build a request. Every
-/// other route - a formatted config, a `{}` in an error message, a `{:?}` in a
-/// panic - renders [`REDACTED`].
-///
-/// `Config` derives `Debug` and is formatted whole in more than one place; this
-/// type is what makes that derive safe (PRIV-01).
-#[derive(Clone, PartialEq, Eq)]
-pub struct Secret(String);
-
-impl Secret {
-    /// Wrap a credential value.
-    pub fn new(value: impl Into<String>) -> Secret {
-        Secret(value.into())
-    }
-
-    /// The value itself, for the one caller that has to put it on the wire.
-    ///
-    /// Named `expose` and not `as_str` on purpose: a reviewer grepping for
-    /// where a credential leaves its wrapper finds every site in one search,
-    /// and a call added in the wrong place is visible in a diff.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-
-    /// Is the wrapped value empty?
-    ///
-    /// An empty string in a config or an environment variable means "unset"
-    /// wherever it appears in this workspace ([`non_empty_var`]), and the
-    /// caller cannot ask by looking.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl std::fmt::Debug for Secret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(REDACTED)
-    }
-}
-
-impl std::fmt::Display for Secret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(REDACTED)
-    }
-}
-
-/// Which structured-output mode the endpoint is asked for (D-09).
-///
-/// Not a second request SHAPE and not a branch on who the provider is - it is
-/// one field of one body, set by one key, and every mode goes down the same
-/// code path. What forced it into the config was an endpoint that cannot do the
-/// default: `deepseek-chat` answers 400 `This response_format type is
-/// unavailable now` to `json_schema` however well-formed it is, while accepting
-/// `json_object`. D-09 named tool-calling as the fallback and deferred it as
-/// speculative; this is the non-speculative half, measured 2026-08-22.
-///
-/// The schema reaches the model either way: it is written into the instruction
-/// turn (`crate::observe::judgment`), and every claim's `turn_id` is validated
-/// against `turns` before a row is stored. What the stricter modes add is
-/// enforcement at the endpoint, not the anchoring guarantee.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ResponseFormat {
-    /// `{"type":"json_schema","json_schema":{name,strict,schema}}` - the
-    /// endpoint holds the answer to the schema. The default, and what OpenAI,
-    /// OpenRouter and vLLM implement.
-    #[default]
-    JsonSchema,
-    /// `{"type":"json_object"}` - the endpoint guarantees parseable JSON and
-    /// nothing about its shape. DeepSeek's only structured mode.
-    JsonObject,
-    /// No `response_format` field at all, for an endpoint that rejects the key
-    /// itself. The instruction turn is then the only thing asking for JSON.
-    None,
-}
-
-impl ResponseFormat {
-    /// Parse the config value. An unrecognized one is the default, under the
-    /// same rule that ignores an unrecognized KEY: this file grows across
-    /// phases and a typo must not stop a store from opening.
-    fn parse(value: &str) -> ResponseFormat {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "json_object" => ResponseFormat::JsonObject,
-            "none" => ResponseFormat::None,
-            _ => ResponseFormat::JsonSchema,
-        }
-    }
-}
 
 /// How much of each record the archive stores (ING-07, D-05).
 ///
@@ -407,7 +290,7 @@ pub enum CaptureMode {
 
 impl CaptureMode {
     /// Parse the config value. An unrecognized one is [`CaptureMode::Full`],
-    /// under the same rule [`ResponseFormat::parse`] states and for a sharper
+    /// under the same rule that ignores an unrecognized key and for a sharper
     /// reason: a typo must not silently start throwing away tool output.
     fn parse(value: &str) -> CaptureMode {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -437,29 +320,6 @@ impl CaptureMode {
     }
 }
 
-/// The resolved `[provider]` block (OBS-05, D-05, D-10).
-///
-/// Base URL, model and key are what differ between a local ollama and a remote
-/// OpenAI-compatible endpoint; there is no second request shape behind any of
-/// these fields. `response_format` is the one exception AC4 forced, and it
-/// selects a field's value rather than a code path.
-///
-/// Nothing here is parsed as a URL, resolved as a host or looked up in DNS.
-/// There is no `url` crate in this workspace on purpose (D-13): a name
-/// resolution is itself a connection PRIV-03 bars, and it would happen while
-/// merely reading a config file.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Provider {
-    enabled: bool,
-    base_url: Option<String>,
-    model: Option<String>,
-    name: Option<String>,
-    api_key: Option<Secret>,
-    local: bool,
-    daily_token_budget: Option<u64>,
-    response_format: ResponseFormat,
-}
-
 /// What retention does to a session that has aged past its policy (RET-01).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RetentionAction {
@@ -477,9 +337,9 @@ pub enum RetentionAction {
 
 impl RetentionAction {
     /// Parse the config value. An unrecognized one is [`RetentionAction::Keep`],
-    /// under the same rule [`ResponseFormat::parse`] states for an unrecognized
-    /// value and for the same reason plus a sharper one: this file grows across
-    /// phases, and a typo here must not make a store start deleting.
+    /// under the same rule that ignores an unrecognized key and for the same
+    /// reason plus a sharper one: this file grows across phases, and a typo here
+    /// must not make a store start deleting.
     fn parse(value: &str) -> RetentionAction {
         match value.trim().to_ascii_lowercase().as_str() {
             "evict" => RetentionAction::Evict,
@@ -562,7 +422,6 @@ pub struct Config {
     encoded_exclusions: Vec<String>,
     brief_chars: usize,
     prompt_chars: usize,
-    provider: Provider,
     retention: Retention,
     snapshot: Snapshot,
     capture: CaptureMode,
@@ -583,11 +442,6 @@ impl Default for Config {
             encoded_exclusions: Vec::new(),
             brief_chars: DEFAULT_BRIEF_CHARS,
             prompt_chars: DEFAULT_PROMPT_CHARS,
-            // Every field false, absent or zero, and that is the right default
-            // here where it is the wrong one for the budgets: judgment is
-            // opt-in and off (OBS-02), and `local` absent means remote and
-            // therefore filtered (D-13).
-            provider: Provider::default(),
             // Every field at its zero, and here that IS the specified state:
             // `Keep` with no age selects nothing, so a user who never wrote a
             // `[retention]` table has retention off (RET-01).
@@ -639,6 +493,12 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
             Err(e) => return Err(Error::io(&path, e)),
         };
+        // After the parse, so a malformed line still fails as a parse error with
+        // its excerpt withheld, and before resolve, so nothing from the file is
+        // used.
+        if file.provider.is_some() {
+            return Err(Error::ProviderRemoved { path });
+        }
         let mut config = Config::resolve(file)?;
         // Whether or not the file was there. An absent file resolves to the
         // defaults and still records where they would have come from, which is
@@ -681,19 +541,6 @@ impl Config {
         if let Some(chars) = file.injection.prompt_chars {
             config.prompt_chars = chars;
         }
-        config.provider = Provider {
-            enabled: file.provider.enabled.unwrap_or(false),
-            base_url: non_empty(file.provider.base_url),
-            model: non_empty(file.provider.model),
-            name: non_empty(file.provider.name),
-            api_key: non_empty(file.provider.api_key).map(Secret::new),
-            local: file.provider.local.unwrap_or(false),
-            daily_token_budget: file.provider.daily_token_budget,
-            response_format: non_empty(file.provider.response_format)
-                .as_deref()
-                .map(ResponseFormat::parse)
-                .unwrap_or_default(),
-        };
         config.retention = resolve_retention(file.retention);
         // Key by key against the defaults, not a wholesale replacement: a table
         // that names only `keep` leaves the interval and the enabled flag where
@@ -725,46 +572,6 @@ impl Config {
         Ok(config)
     }
 
-    /// May observations ask a model for judgment (OBS-02)?
-    ///
-    /// False unless the config says otherwise, including for a config file that
-    /// has no `[provider]` table at all. Nothing in this workspace resolves a
-    /// credential or builds a request while this is false.
-    pub fn provider_enabled(&self) -> bool {
-        self.provider.enabled
-    }
-
-    /// The endpoint's base, which `chat/completions` is appended to (D-05).
-    ///
-    /// Handed back exactly as written. It is not parsed, not validated and not
-    /// resolved (D-13): there is no `url` crate here, and a DNS lookup is a
-    /// connection PRIV-03 bars.
-    pub fn provider_base_url(&self) -> Option<&str> {
-        self.provider.base_url.as_deref()
-    }
-
-    /// The model name to put in the request body.
-    pub fn provider_model(&self) -> Option<&str> {
-        self.provider.model.as_deref()
-    }
-
-    /// The provider namespace all three credential tiers key off (D-14).
-    ///
-    /// It names the section of the shared credentials file and the spelling of
-    /// the environment variable; `crate::credentials` documents both. With no
-    /// name there is no namespace to look a credential up under, so only the
-    /// `api_key` written in this file can be found.
-    pub fn provider_name(&self) -> Option<&str> {
-        self.provider.name.as_deref()
-    }
-
-    /// The product-config tier of D-14's precedence: a value, not a reference.
-    ///
-    /// Behind [`Secret`], so a `{:?}` of the whole config cannot render it.
-    pub fn provider_api_key(&self) -> Option<&Secret> {
-        self.provider.api_key.as_ref()
-    }
-
     /// The `terminus.toml` these values were read from (D-13).
     ///
     /// `None` for a config built in memory - [`Config::from_parts`] and
@@ -773,49 +580,10 @@ impl Config {
     /// the path is where the values would have come from, not proof that they
     /// did.
     ///
-    /// It exists so that a refusal over this file's MODE can name the file it
-    /// refused. `crate::credentials::resolve` is its one caller in this
-    /// workspace, with `terminus doctor` the second.
+    /// No command reads it today. It stays so a message about this file can
+    /// name the file that was actually read.
     pub fn source_path(&self) -> Option<&Path> {
         self.source.as_deref()
-    }
-
-    /// Is the configured provider on this machine (D-13)?
-    ///
-    /// **This key describes the DESTINATION, not the address.** It is declared
-    /// and never inferred: nothing here looks at the base URL to decide, because
-    /// deciding would mean parsing a host and resolving a name, and a name
-    /// resolution is itself a connection PRIV-03 bars.
-    ///
-    /// Absent or false means remote, and therefore filtered, so a user who
-    /// forgets the key pays the egress filter unnecessarily - which is
-    /// harmless. The failure that is not harmless is the other direction: set
-    /// `local = true` on a reverse proxy that forwards offsite and unfiltered
-    /// session text goes offsite. The address being `127.0.0.1` is not the
-    /// question; where the bytes end up is.
-    pub fn provider_local(&self) -> bool {
-        self.provider.local
-    }
-
-    /// How many tokens a day the provider may be paid for (OBS-06, D-11).
-    ///
-    /// The one cost control that is a config key, because it is the one facing
-    /// money. The minimum turn count and the truncation budget are quality
-    /// knobs and stay compile-time constants. `None` is no cap - which is the
-    /// safe default only because judgment is off unless
-    /// [`Config::provider_enabled`] says otherwise.
-    pub fn provider_daily_token_budget(&self) -> Option<u64> {
-        self.provider.daily_token_budget
-    }
-
-    /// Which structured-output mode to ask the endpoint for (D-09).
-    ///
-    /// [`ResponseFormat::JsonSchema`] unless the config says otherwise, so an
-    /// endpoint that implements the default needs no key and AC4's "only base
-    /// URL, model and key" holds for every provider that does. A provider that
-    /// does not - DeepSeek - is the reason the key exists.
-    pub fn provider_response_format(&self) -> ResponseFormat {
-        self.provider.response_format
     }
 
     /// How many characters the SessionStart resume brief may carry (INJ-01).
@@ -1307,9 +1075,8 @@ fn home_dir() -> Result<PathBuf> {
 /// A configured string set to `""` is treated as unset, the way an empty
 /// environment variable is ([`non_empty_var`]).
 ///
-/// One rule for both sources, because the alternative is a `base_url = ""` that
-/// resolves to a request against the empty string and an `api_key = ""` that
-/// outranks a real key in the shared file for being "present".
+/// One rule for both sources, so a key written as `""` means the same as a key
+/// not written at all.
 fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }

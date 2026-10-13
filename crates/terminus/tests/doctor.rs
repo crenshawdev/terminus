@@ -781,7 +781,12 @@ fn the_json_document_carries_no_key_or_provider_check() {
         serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).expect("valid JSON");
     let data = document["data"].as_object().expect("data is an object");
 
-    for gone in ["credentials", "config_mode", "mode_checks", "provider_local"] {
+    for gone in [
+        "credentials",
+        "config_mode",
+        "mode_checks",
+        "provider_local",
+    ] {
         assert!(!data.contains_key(gone), "{gone} is still a check");
     }
 }

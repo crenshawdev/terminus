@@ -148,6 +148,16 @@ pub enum Error {
     #[error("{path} is not valid TOML: {detail}")]
     ConfigParse { path: PathBuf, detail: String },
 
+    /// A config file still has a `[provider]` table.
+    ///
+    /// Its own variant and not [`Error::ConfigParse`], because the file is valid
+    /// TOML. It carries the path and nothing from the table.
+    #[error(
+        "{path} still has a [provider] table. Model calls were removed from Terminus, \
+         so nothing reads that table any more. Delete it from the file to continue."
+    )]
+    ProviderRemoved { path: PathBuf },
+
     /// No config directory, or no home directory to derive one from.
     #[error("cannot resolve a config directory: {detail}")]
     ConfigUnresolved { detail: String },

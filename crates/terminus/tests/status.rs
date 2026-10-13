@@ -412,3 +412,39 @@ fn status_stops_counting_a_project_excluded_after_it_was_archived() {
         .unwrap();
     assert_eq!(rows, 1, "exclusion hides a session, it does not delete it");
 }
+
+/// A leftover `[provider]` table stops the command, says why and where, and
+/// prints nothing that was written in it.
+#[test]
+fn status_refuses_a_config_with_a_provider_table_and_echoes_none_of_it() {
+    const SENTINEL: &str = "sk-TERMINUSSTATUS-3c9e0d-do-not-log";
+    for body in [
+        "[provider]\n".to_owned(),
+        format!("[provider]\napi_key = \"{SENTINEL}\"\n"),
+    ] {
+        let bench = bench();
+        let file = bench
+            .config_dir
+            .join(terminus_core::config::CONFIG_FILE_NAME);
+        std::fs::write(&file, &body).unwrap();
+
+        let out = bench.run(&["status"]);
+        let (out_text, err_text) = (stdout(&out), stderr(&out));
+
+        assert_ne!(out.status.code(), Some(0), "{body:?} loaded: {err_text}");
+        assert!(
+            err_text.contains(&file.display().to_string()),
+            "stderr does not name the file: {err_text}"
+        );
+        assert!(
+            err_text.contains("Model calls were removed"),
+            "stderr does not say why: {err_text}"
+        );
+        for fragment in [SENTINEL, "TERMINUSSTATUS", "3c9e0d"] {
+            assert!(
+                !out_text.contains(fragment) && !err_text.contains(fragment),
+                "the table's key reached a stream: {out_text}{err_text}"
+            );
+        }
+    }
+}
