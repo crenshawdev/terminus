@@ -1,6 +1,6 @@
 # State
 
 Phase: 4 of 5 (One-Command Installer)
-Status: executed
-Next: /cad-verify 4
+Status: phase complete
+Next: /cad-context 5
 Updated: 2026-10-13

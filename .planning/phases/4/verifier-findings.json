@@ -1,0 +1,142 @@
+{
+  "status": "gaps",
+  "score": "11/12",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "install.sh refuses a SHA-256 mismatch, an unsupported uname -s, an unsupported uname -m and an http:// source, and leaves the stable path and the versions folder byte-identical",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "install.sh:109 refuses a source not starting with https://; :140-149 map uname -s Linux/Darwin and uname -m x86_64/aarch64/arm64 and fail otherwise; verify_download (:71-75) is called at :191, before the first write at :195-210. Tests a_digest_that_does_not_match_is_refused, an_unsupported_system_is_refused (fake uname FreeBSD), an_unsupported_architecture_is_refused (Linux/riscv64) and an_http_source_is_refused (crates/terminus/tests/install_script.rs:600-637) each start from a completed install and call assert_refused (:441-449), which compares a snapshot of the stable path's entry, every entry and inode under the versions folder, settings.json and .claude.json, and asserts a non-zero exit, non-empty stderr and no new claude call. All four reported ok in the one full-suite run (cargo test --workspace --all-features: 784 passed, 0 failed, exit 0)."
+    },
+    {
+      "n": 2,
+      "truth": "Installing version A and then version B links the stable path to B, leaves A's file with the same bytes and inode, and a terminus mcp started through the link before B keeps running from A's file",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "Test successive_installs_keep_every_version (crates/terminus/tests/install_script.rs:702-727) installs 1.0.0, starts <stable> mcp with stdin held open, installs 2.0.0, then asserts the link targets versions/2.0.0/terminus with the served bytes, versions/1.0.0/terminus has the same bytes and inode, the mcp process is still running, and read_link(/proc/<pid>/exe) equals the canonical path of A's file. The /proc block is cfg(target_os = \"linux\") and ran on this Linux machine. Reported ok in the full-suite run. Seam trace: the manifest's version string \"2.0.0\" enters through the served manifest, is parsed at install.sh:175-179, and lands as read_link(stable) == versions/2.0.0/terminus in assert_linked."
+    },
+    {
+      "n": 3,
+      "truth": "One install.sh run with a fake claude that succeeds exits 0, merges the four hook entries naming the stable path and logs claude mcp add-json --scope user terminus; with no claude on PATH it exits non-zero after the receipt's install incomplete line",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "install.sh:232 ends with \"$stable\" install, so its status is the script's (set -eu at :6). crates/terminus/src/cmd/install/mod.rs:154 prints \"install incomplete: the mcp server is not registered\" and :237 returns Failure::Silent. Test one_run_installs_and_wires_claude_code (install_script.rs:521-553) asserts exit 0, the link to versions/1.0.0/terminus holding the served bytes, exactly one hook entry per event in SessionStart, UserPromptSubmit, SessionEnd and PostCompact whose command is the stable path, and one logged add-json call with args mcp add-json --scope user terminus, command the stable path and args [\"mcp\"]. Test no_claude_exits_non_zero_after_the_link_is_placed (:557-571) asserts a non-zero exit, the install incomplete line on stdout, and the link still placed. Both ok in the full-suite run. Seam trace: HOME enters as the script's environment, install.sh builds $stable from it (:135-137), and terminus install's stable_path() (binary.rs:79-99) resolves the same path, which lands as the hook entries' command and the add-json entry's command."
+    },
+    {
+      "n": 4,
+      "truth": "A file without the marker at the stable path is refused by both install.sh and terminus install with the file unchanged, and a plain file carrying the marker is replaced by the link into the versions folder",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "install.sh:91-93 accepts a regular file only when grep -q -F finds the marker. crates/terminus/src/cmd/install/mod.rs:119-121 refuses a Foreign occupant before versions_dir, config and settings are read and before place at :137, and binary.rs:281-282 asks occupant again just before the rename. Tests: a_file_without_the_marker_is_refused (install_script.rs:652-659, snapshot unchanged including the file's bytes), a_foreign_binary_at_the_stable_path_stops_everything (crates/terminus/tests/install.rs:522-560: non-zero exit, file bytes unchanged, no versions folder, settings and .claude.json unchanged, no claude call), a_marked_plain_file_is_replaced_by_the_link (install_script.rs:752-760) and a_marked_plain_file_at_the_stable_path_becomes_the_link (install.rs:454-470). All ok in the full-suite run. The script's marker copy (install.sh:12) is tied to binary::MARKER by install_sh_holds_the_same_marker (binary.rs:401-411), which reported ok."
+    },
+    {
+      "n": 5,
+      "truth": "terminus install run from a build stores it at versions/<its version>/terminus behind the link, a rebuild at the same version with different bytes replaces that file, and install run through the stable path keeps the link and the version file's inodes and the link's target",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "binary.rs:197-208 (place) stores current_exe() under env!(\"CARGO_PKG_VERSION\") and links to it unless linked_to (:218-232) finds the link's target, directly under the versions folder, to be the same device and inode as current_exe(); store (:239-266) leaves same bytes alone and otherwise renames a temporary over the file; link (:275-292) renames a temporary link over the stable path. Called from mod.rs:137. Tests: install_places_this_build_at_the_stable_path (install.rs:393-450: symlink, read_link == versions/<CARGO_PKG_VERSION>/terminus, bytes equal the build, mode has 0o111, hooks and add-json name the stable path and never the version file, receipt names the version file); a_rebuild_at_the_same_version_replaces_its_file_and_a_rerun_does_not (:474-518); install_from_the_stable_path_touches_neither_the_link_nor_the_file (:1399-1423); install_through_a_link_to_another_version_folder_leaves_it_alone (:1428-1450). All ok in the full-suite run. The tests run cargo's debug build (CARGO_BIN_EXE_terminus) rather than target/release/terminus; binary.rs has no profile-dependent code, so it is the same path."
+    },
+    {
+      "n": 6,
+      "truth": "terminus uninstall removes the link, keeps every file in the versions folder and prints its path; sh -n install.sh exits 0; cargo test --workspace --all-features passes",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "crates/terminus/src/cmd/uninstall.rs:89 calls unplace, which remove_file's an Ours occupant (:366-392); :91-99 print the versions folder and leave it. Test install_then_uninstall_leaves_both_files_exactly_as_they_were (crates/terminus/tests/uninstall.rs, assertions added at 331-351 in db883c4) asserts symlink_metadata(stable) is NotFound, versions/<CARGO_PKG_VERSION>/terminus still holds the build's bytes, and the output names the versions folder; ok in the full-suite run. sh -n install.sh: exit 0 (run here). cargo test --workspace --all-features: 784 passed, 0 failed, 0 ignored, exit 0 (one run, output saved and grepped)."
+    },
+    {
+      "n": 7,
+      "truth": "DESIGN-BRIEF.md describes the link and the versions folder and no copy at the stable path, PROJECT.md no longer says except the configured model provider, and CHANGELOG.md [Unreleased] records install.sh",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "grep for re-copies, That copy is canonical, copies the running binary, Binary (canonical) and arrives in phase 4 in DESIGN-BRIEF.md prints nothing; DESIGN-BRIEF.md:364-365 (§12 rows for the stable link and the stored versions), :389-400 (§13 Binary layout: the link, the versions folder outside the data directory, install.sh and terminus install, D-03, D-04, uninstall), :421 (Upgrade moves the link), :315 and :321 (§10: the binary opens no network connection, install.sh's download is the one network use). grep for configured model provider, redaction at egress, 0600 and arrives in phase 4 in .planning/PROJECT.md prints nothing; PROJECT.md:104 and :106 name install.sh (committed in 9ee9524). CHANGELOG.md:10-46 has ### Added with four install.sh entries and ### Changed with the link, the versions folder, the local-build command, D-03, kept versions, the plain-file migration and uninstall. Every path and command the prose names matches install.sh and binary.rs. Not covered by AC7 and disclosed in SUMMARY's open items: PROJECT.md:131 Key Decisions row still reads \"Canonical stable binary path\"."
+    },
+    {
+      "n": 8,
+      "truth": "install.sh refuses TERMINUS_BIN_DIR and a dangling link at the stable path pointing outside the versions folder, changing nothing, and replaces a dangling link into the versions folder",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "install.sh:112-113 refuses a non-empty TERMINUS_BIN_DIR before HOME is read or anything is downloaded; :83-90 refuse a dangling link unless readlink gives $versions/<valid version>/terminus. Tests terminus_bin_dir_set_is_refused (install_script.rs:641-649), a_dangling_link_outside_the_versions_folder_is_refused (:663-674, also asserts the link's target text is unchanged) and a_dangling_link_into_the_versions_folder_is_replaced (:764-775) all reported ok in the full-suite run."
+    },
+    {
+      "n": 9,
+      "truth": "install.sh has Baley's shape, with the SHA-256 check in its own verify_download step that the header names as where the signature check goes, and it falls back to shasum -a 256",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "Diff of /code/baley/install.sh (baley->terminus substituted) against install.sh shows only the planned changes: the header (install.sh:2-5), the marker line (:11-12), check_stable_path's ownership rule (:77-97), the TERMINUS_BIN_DIR refusal (:112-113), the HOME-loop comment (:122-123) and D-03's stage() (:99-106, :193-210). verify_download is install.sh:71-75. digest (:62-69) falls back to shasum -a 256; test shasum_computes_the_digest_when_sha256sum_is_missing (install_script.rs:575-598) installs with sha256sum absent and has a wrong digest refused with the real one named; ok in the full-suite run."
+    },
+    {
+      "n": 10,
+      "truth": "A failed download is refused before anything is written",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "Spot-check (closes part of SUMMARY's first open item): env -i HOME=<scratch>/home TMPDIR=<scratch>/tmp PATH=/usr/bin:/bin sh install.sh https://127.0.0.1:1 printed \"terminus: manifest download failed: https://127.0.0.1:1/linux-x86_64/manifest\" and exited 1; find over the scratch HOME and TMPDIR afterwards listed nothing, so the scratch folder was removed by the trap and nothing was staged or linked. The binary-download branch (install.sh:164-165) has the same shape and was not exercised."
+    },
+    {
+      "n": 11,
+      "truth": "The phase is qualified on Linux, with macOS left unverified (ROADMAP success criterion 6)",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "The 14 install_script.rs tests ran real sh, curl, sha256sum, mktemp and openssl s_server on this Linux machine and all passed in the full-suite run. CONTEXT.md:9 puts macOS qualification out of scope, and SUMMARY's goal check states the macOS current_exe() assumption was not checked, so there is nothing to verify on a Mac in this phase."
+    },
+    {
+      "n": 12,
+      "truth": "terminus uninstall removes a link at the stable path that points into the versions folder after that folder has been deleted",
+      "status": "FAILED",
+      "uat_item": null,
+      "evidence": "Spot-check: a scratch HOME with ~/.local/bin/terminus a dangling link to ~/.local/lib/crenshawdev/terminus/versions/0.1.1/terminus. env -i HOME=... CLAUDE_CONFIG_DIR=... TERMINUS_DATA_DIR=... TERMINUS_CONFIG_DIR=... target/debug/terminus uninstall exited 0, printed \"not there: nothing to remove\" for the stable path, and ls afterwards still showed the link. Cause: crates/terminus/src/cmd/uninstall.rs:366-372 asks binary::occupant, which opens with File::open (binary.rs:145-148) and calls a dangling link Vacant."
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "install.sh refuses a bad checksum, an unsupported system or architecture, and a non-https source",
+      "evidence": "install.sh:109, :140-149, :71-75 called at :191 before staging at :195-210. Tests a_digest_that_does_not_match_is_refused, an_unsupported_system_is_refused, an_unsupported_architecture_is_refused and an_http_source_is_refused (crates/terminus/tests/install_script.rs:600-637) each assert a non-zero exit and an unchanged snapshot of the stable path, every entry and inode under the versions folder, settings.json and .claude.json, with no claude call. All ok in cargo test --workspace --all-features (784 passed, 0 failed)."
+    },
+    {
+      "k": 2,
+      "name": "Installing version A and then version B keeps A",
+      "evidence": "Test successive_installs_keep_every_version (install_script.rs:702-727) asserts the link targets versions/2.0.0/terminus, versions/1.0.0/terminus keeps its bytes and inode, and /proc/<pid>/exe of a terminus mcp started through the link before the second install equals A's canonical path. The /proc block is Linux-gated and ran here. ok in the full-suite run."
+    },
+    {
+      "k": 3,
+      "name": "install.sh finishes the install with claude present, and fails without it",
+      "evidence": "install.sh:232 ends with \"$stable\" install under set -eu. Test one_run_installs_and_wires_claude_code (install_script.rs:521-553) asserts exit 0, one hook entry per event naming the stable path, and a logged mcp add-json --scope user terminus with command the stable path and args [\"mcp\"]. Test no_claude_exits_non_zero_after_the_link_is_placed (:557-571) asserts a non-zero exit with \"install incomplete: the mcp server is not registered\" on stdout. Both ok."
+    },
+    {
+      "k": 4,
+      "name": "A foreign file at the stable path is refused, and a marked plain file becomes the link",
+      "evidence": "install.sh:91-93 and crates/terminus/src/cmd/install/mod.rs:119-121 refuse an unmarked file before any write. Tests a_file_without_the_marker_is_refused (install_script.rs:652-659), a_foreign_binary_at_the_stable_path_stops_everything (crates/terminus/tests/install.rs:522-560, file bytes unchanged and no versions folder), a_marked_plain_file_is_replaced_by_the_link (install_script.rs:752-760) and a_marked_plain_file_at_the_stable_path_becomes_the_link (install.rs:454-470) all ok. install_sh_holds_the_same_marker (binary.rs:401-411) ties the script's marker to MARKER; ok."
+    },
+    {
+      "k": 5,
+      "name": "terminus install from a build stores it as a version, and from the stable path changes nothing",
+      "evidence": "binary.rs:197-266 (place, linked_to by device and inode, store) called from mod.rs:137. Tests install_places_this_build_at_the_stable_path (install.rs:393-450), a_rebuild_at_the_same_version_replaces_its_file_and_a_rerun_does_not (:474-518), install_from_the_stable_path_touches_neither_the_link_nor_the_file (:1399-1423) and install_through_a_link_to_another_version_folder_leaves_it_alone (:1428-1450) all ok. They run cargo's debug build rather than target/release/terminus; binary.rs has no profile-dependent code."
+    },
+    {
+      "k": 6,
+      "name": "Uninstall removes the link and keeps the versions; the script parses and the suite passes",
+      "evidence": "uninstall.rs:89 and :366-392 remove an Ours link with remove_file; :91-99 print the versions folder. Test install_then_uninstall_leaves_both_files_exactly_as_they_were (tests/uninstall.rs, assertions at 331-351) asserts symlink_metadata(stable) is NotFound, the version file keeps the build's bytes and the output names the versions folder; ok. sh -n install.sh exited 0. cargo test --workspace --all-features: 784 passed, 0 failed, exit 0."
+    },
+    {
+      "k": 7,
+      "name": "The docs describe the link, the versions folder and install.sh",
+      "evidence": "No match in DESIGN-BRIEF.md for re-copies, That copy is canonical, copies the running binary, Binary (canonical) or arrives in phase 4; DESIGN-BRIEF.md:364-365, :389-400 and :421 describe the link, the versions folder, both install paths and uninstall. No match in .planning/PROJECT.md for configured model provider, redaction at egress, 0600 or arrives in phase 4; :104 states the network line. CHANGELOG.md:10-46 records install.sh under Added and the link, versions folder and local build under Changed."
+    },
+    {
+      "k": 8,
+      "name": "install.sh refuses TERMINUS_BIN_DIR and a dangling link outside the versions folder",
+      "evidence": "install.sh:112-113 and :83-90. Tests terminus_bin_dir_set_is_refused (install_script.rs:641-649), a_dangling_link_outside_the_versions_folder_is_refused (:663-674) and a_dangling_link_into_the_versions_folder_is_replaced (:764-775) all ok in the full-suite run."
+    }
+  ],
+  "gaps": [
+    {
+      "name": "terminus uninstall leaves a dangling link into the versions folder at the stable path and says nothing is there",
+      "reason": "behavior wrong - unplace treats a dangling link as Vacant, so the link this phase's own layout leaves behind once the versions folder is gone is never removed, and the report line is false",
+      "evidence": "crates/terminus/src/cmd/uninstall.rs:366-372: unplace asks binary::occupant, which uses File::open (crates/terminus/src/cmd/install/binary.rs:145-148), and a link to nothing is NotFound, so Vacant, so it prints \"not there: nothing to remove\" and returns. Observed: with ~/.local/bin/terminus a dangling link to versions/0.1.1/terminus in a scratch HOME, terminus uninstall exited 0, printed that line, and the link was still there. This state is real: install.sh:78-79 and DESIGN-BRIEF.md:398 describe it as what is left after the versions folder is deleted, and DESIGN-BRIEF.md:400 says uninstall removes the link. CONTEXT D-05 says unplace inherits the Vacant rule for a dangling link, so fixing this narrows D-05 for uninstall and is the owner's call.",
+      "severity": "minor",
+      "missing": "In unplace, when symlink_metadata shows a symbolic link and occupant is Vacant, remove it if read_link gives <versions>/<one folder>/terminus (install.sh's check_stable_path rule, install.sh:83-90), and otherwise leave it and say a link to nothing outside the versions folder is there, not \"not there\". unplace needs the versions path passed in. Add a test in crates/terminus/tests/uninstall.rs that deletes the versions folder after an install, runs uninstall, and asserts symlink_metadata(stable) is NotFound."
+    }
+  ],
+  "human_checks": []
+}

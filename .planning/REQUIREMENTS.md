@@ -149,7 +149,7 @@ Explicit exclusions. The reason prevents scope creep later.
 | INST-09 | Phase 2 | Complete |
 | INST-10 | Phase 3 | Complete |
 | INST-11 | Phase 3 | Complete |
-| INST-12 | Phase 4 | Pending |
+| INST-12 | Phase 4 | Complete |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 
