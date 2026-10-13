@@ -295,9 +295,8 @@ fn extend(bound: &mut Option<String>, candidate: &Option<String>, wider: fn(&str
 /// under different parents cannot collide - the number is unique per store by
 /// declaration. The transcript's own name follows it because that is what makes
 /// a directory listing recognizable, reduced to the characters a filename may
-/// safely carry on all three platforms: the source is a path off the user's
-/// filesystem, and nothing about a name that arrived from outside gets to
-/// decide where a byte lands.
+/// safely carry: the source is a path off the user's filesystem, and nothing
+/// about a name that arrived from outside gets to decide where a byte lands.
 fn file_name(session_no: i64, session_key: &str) -> String {
     let stem: String = Path::new(session_key)
         .file_name()

@@ -401,9 +401,9 @@ impl Snapshot {
     }
 }
 
-/// `SIGKILL` on Unix, `TerminateProcess` on Windows: un-catchable either way,
-/// which is the point - a signal the process could handle would let it tidy up
-/// and prove nothing.
+/// `Child::kill` sends `SIGKILL`, which cannot be caught, and that is the
+/// point - a signal the process could handle would let it tidy up and prove
+/// nothing.
 fn kill_and_reap(child: &mut Child) {
     let _ = child.kill();
     child.wait().unwrap();

@@ -25,8 +25,8 @@
 //! rewritten".
 //!
 //! **It warns about network filesystems and asks anyway (D-16).** No `std` API
-//! detects a network mount on any of the three first-class targets, and adding
-//! one would be a platform-specific dependency on the hook-path binary. The
+//! detects a network mount on Linux or macOS, and adding one would be a
+//! platform-specific dependency on the hook-path binary. The
 //! command asks regardless of destination, so an unconditional warning costs
 //! nothing and is the mitigation this phase ships.
 
@@ -147,7 +147,7 @@ pub fn run(options: Options) -> Result<(), Failure> {
     // The lock file's own bytes carry no meaning - `ingest::lock` says so, and
     // says only the OS lock attached to it does - so the destination gets a
     // fresh empty one rather than a copy of the file this process is holding
-    // locked, which Windows would refuse to read through a second handle.
+    // locked.
     //
     // Owner-only from the creating open, like the one `ingest::lock` makes at
     // the source (PRIV-04, D-10): the lock file is short, but a `data move`
@@ -169,8 +169,10 @@ pub fn run(options: Options) -> Result<(), Failure> {
     // store's address with the data still on disk.
     write_pointer(&pointer, &destination)?;
 
-    // Only now: the lock file being removed is the one this process holds, and
-    // Windows will not unlink an open file.
+    // Only now, with the pointer naming the destination: holding the lock this
+    // long kept an ingest out of the source from the copy until the pointer
+    // was written. Releasing it before the source is removed is an order kept
+    // as it was, and harmless, since Linux and macOS remove a held file anyway.
     drop(held);
     std::fs::remove_dir_all(&source).map_err(|e| {
         Failure::Operational(format!(
