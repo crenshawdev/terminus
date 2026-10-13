@@ -1,0 +1,161 @@
+{
+  "status": "gaps",
+  "score": "10/12",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "Neither crate depends on an HTTP or TLS client, and a test fails when any file under crates/*/src names std::net, TcpStream, TcpListener or UdpSocket.",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "`cargo tree --workspace -e all --target all --offline` (375 lines) matches none of ureq, reqwest, hyper, rustls, ring, webpki, httparse, h2, tokio, openssl, native-tls or curl; no such name in Cargo.toml, crates/*/Cargo.toml or Cargo.lock. `grep -rnE 'std::net|TcpStream|TcpListener|UdpSocket' crates/*/src` is empty. crates/terminus-core/tests/no_network.rs:9,22-46 walks both src trees with a 20-file floor and is ungated; `no_source_file_names_a_socket ... ok` in the full-suite log. Falsified out of tree: the test compiled with rustc against copied src trees passed on a clean copy and failed on copies with `use std::net::TcpStream;` appended, naming `crates/terminus/src/cmd/status.rs names std::net` and `crates/terminus-core/src/observe/mechanical.rs names std::net`."
+    },
+    {
+      "n": 2,
+      "truth": "Nothing reads an API key: no _API_KEY environment lookup, no credentials.toml path and no api_key setting, outside the redaction test fixtures.",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "`grep -rnE '_API_KEY|credentials\\.toml' crates/*/src` is empty; across crates/ and tests/ the only hits are input text in crates/terminus-core/tests/egress.rs:24,49. crates/terminus-core/src/credentials.rs is gone and lib.rs has no `mod credentials`. `api_key` in src appears only in config.rs:1092-1112 (`withhold_secret_excerpt`, which hides a parser excerpt) and egress.rs:903,912 (unit-test input). FileConfig has no api_key field; `provider` is `Option<serde::de::IgnoredAny>` (config.rs:107), which keeps no value. Every env read in src was listed: none names a key."
+    },
+    {
+      "n": 3,
+      "truth": "Terminus has no code path that calls a model: judgment.rs, provider.rs, net.rs, cost.rs and credentials.rs are gone, and no child process reaches one.",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "crates/terminus-core/src/observe holds only egress.rs, mechanical.rs and mod.rs; the five modules are absent. With no HTTP crate and no socket type in source (truth 1), the only other route out is a child process: the three `Command::new` sites in src are `git rev-parse` (terminus-core/src/project.rs:203), doctor's `<program> --version` probe (terminus/src/cmd/doctor.rs:1176) and the binary re-spawning itself for a detached ingest (terminus/src/cmd/spawn.rs:127). ingest/pass.rs calls only `observe::observe_new` (pass.rs:322)."
+    },
+    {
+      "n": 4,
+      "truth": "A terminus.toml with any top-level provider key makes `terminus status` exit non-zero with a message naming the file and saying model calls were removed, and no value from the table reaches stdout or stderr.",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "config.rs:499-501 refuses after the parse and before `Config::resolve` with `Error::ProviderRemoved { path }` (error.rs:151-159), which carries only the path. Spot-check with the built binary over temp config dirs: an empty [provider], one with `api_key = \"sk-UATFOUR-SENTINEL-6161\"`, `enabled = false`, a bare `provider = \"openai\"`, and a file with [privacy] plus [provider] holding base_url and api_key. All five exited 1, stderr named `<dir>/terminus.toml` and said `Model calls were removed from Terminus`, and neither the sentinel nor the base_url appeared on either stream. `doctor --json` on the same file reports the refusal under `config_roots` with no sentinel. Tests `status_refuses_a_config_with_a_provider_table_and_echoes_none_of_it` and `any_provider_key_is_refused_by_name_and_echoes_nothing` pass in the suite log."
+    },
+    {
+      "n": 5,
+      "truth": "A store carrying the ten summary columns opens with none left, every mechanical document byte-identical, the observe.daily_tokens key gone, verify clean, and the same observations layout as a fresh store.",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "store/open.rs:184 calls `drop_summary_columns` on every writable open of an existing store; open.rs:543-558 re-reads the column list inside an IMMEDIATE transaction, drops each present column and deletes the meta key. schema.rs:220-227 declares the four columns; schema.rs:442-457 holds the ten names and the meta key. The pre-phase DDL (main:schema.rs:233-253) has no index, trigger or view on observations that could block DROP COLUMN. `a_store_with_the_summary_columns_opens_without_them` passes in the suite log. Spot-check: a temp store given the ten columns (14 in old order), filled values and the meta row; this build's `terminus status` left 4 columns, mechanical byte-identical (1 row before and after), meta key count 0, PRAGMA table_info identical to a fresh store's, `terminus verify` `1 session(s) checked, 0 failed`, and a second open exit 0."
+    },
+    {
+      "n": 6,
+      "truth": "From the current build, a brand-new store archives a session and a copy of an old store with the summary columns opens and drops them, and a search on each returns real turns.",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "target/debug/terminus, current with HEAD (the working tree has no source changes and the suite run rebuilt nothing stale). Fresh temp store: bare `terminus ingest` exited 0 and archived the session; `terminus search --json lantern.rs` returned turn 1. Upgraded copy (truth 5): the read-only listing worked before any writable open, `terminus status` exited 0 and dropped the columns, and `terminus search --json lantern.rs` returned 1 hit. The old store was simulated by adding the ten columns to a store this build wrote, not by the 0.1.1 binary; the real-snapshot run is listed as a human check."
+    },
+    {
+      "n": 7,
+      "truth": "A session finished after the change gets a mechanical observation that `terminus observations` lists, `terminus search` finds its files, commands and errors, and recall_search no longer offers kind observation or mentions summaries.",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "Spot-check: a transcript idle past the finalize window (the shape of tests/observations.rs `transcript`) placed under a temp CLAUDE_CONFIG_DIR, then bare `ingest`. `terminus observations --project * --json` listed 1 row with exactly session_key, session_id, generated_at and mechanical; mechanical.files_modified held the edited path, commands held `cargo test -p terminus-core --features testkit`, and errors held `Bash command failed`. `terminus search` found the file (turn 1), the command (turn 2) and the error (turn 3), and `--path <edited>` returned 1 hit. MCP tools/list returned three tools, and the recall_search kind description reads `Only turns of this record type: user, assistant, system or attachment.` (tools.rs:136-139). `a_finalized_session_is_listed_with_every_obs_01_fact` passes."
+    },
+    {
+      "n": 8,
+      "truth": "With redact_recall on, every secret planted in session-secrets.jsonl is absent from recall_search excerpts, recall_context, recall_get and the SessionStart brief, and each rule's marker appears in its place.",
+      "status": "FAILED",
+      "uat_item": 7,
+      "evidence": "Spot-check: session-secrets.jsonl ingested by the binary into a temp store, then MCP calls knob off and knob on: recall_get over all 12 turn ids, recall_context from turn 0 with after 25, and recall_search over nine queries covering every planted turn. Knob off, all nine sentinels came back on all three tools. Knob on, recall_search and recall_context dropped every sentinel and showed all five marker kinds. recall_get still returned `pw-VBEGRESS-mash-4d1`: turn 3's body is the archived line `...\\\"handle\\\":\\\"quill\\\",\\\"password\\\":\\\"pw-VBEGRESS-mash-4d1\\\"}...`, where the JSON-pair rule never fires on the escaped quotes. The SessionStart brief half holds: inject_brief.rs:702 and the hook-boundary test assert the shared VBEGRESS fragment is absent from the whole filtered brief."
+    },
+    {
+      "n": 9,
+      "truth": "`terminus doctor --json` carries no credentials, config_mode, mode_checks or provider_local key, and `cargo test --workspace --all-features` passes.",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "`grep credentials|config_mode|mode_checks|provider_local|host_of|is_loopback` in crates/terminus/src/cmd/doctor.rs finds only an unrelated module-doc line (doctor.rs:30); in tests it finds only the absence test (tests/doctor.rs:772-792). Spot-check: `doctor --json` on a temp HOME returned data keys auto_compact, binary, claude_code, cleanup_period_days, config_roots, data_directory, the four hook_* keys, last_run, mcp_server, settings_file and store, and none of the four names appears anywhere in its stdout. One full run of `cargo test --workspace --all-features --offline` exited 0: 62 test binaries, 748 passed, 0 failed, 0 ignored."
+    },
+    {
+      "n": 10,
+      "truth": "`terminus observations regenerate` rebuilds the mechanical column only, and refuses --prompt-version.",
+      "status": "VERIFIED",
+      "uat_item": 9,
+      "evidence": "Spot-check on the fresh temp store: `observations regenerate --json` exited 0 with data keys exactly notes, regenerated, selected and since (`{notes: [], regenerated: 1, selected: 1, since: null}`), and the mechanical column was identical before and after. `observations regenerate --prompt-version v1` exited 2 with `terminus: unexpected argument '--prompt-version'`. `regenerate_rebuilds_the_selected_rows_and_leaves_the_rest_untouched` passes."
+    },
+    {
+      "n": 11,
+      "truth": "kind observation is refused by name: `terminus search --kind observation` exits 2 naming the retired kind, and recall_search with kind observation returns isError.",
+      "status": "VERIFIED",
+      "uat_item": 10,
+      "evidence": "cmd/search.rs:45-49 holds RETIRED_KIND and its message; search.rs:233-234 returns Failure::Misuse; cmd/mcp/tools.rs:333-336 returns Refused::caller before a reader opens. Spot-check: `terminus search --kind observation anything` exited 2 with stderr `terminus: kind \"observation\" is no longer offered: session summaries were removed from Terminus`. MCP recall_search with kind observation returned `isError: true` with the same reason. `recall_search_refuses_the_retired_observation_kind_by_name` and `the_terminal_search_refuses_the_retired_observation_kind` pass."
+    },
+    {
+      "n": 12,
+      "truth": "Nothing left in source describes the removed judgment half, provider or provider credential as current.",
+      "status": "FAILED",
+      "uat_item": null,
+      "evidence": "Four comments still describe removed code as current. crates/terminus-core/src/ingest/pass.rs:318-321: `The judgment half is its own command, outside this lock (D-07): a slow provider held here...`. crates/terminus-core/src/recall/search.rs:407-410: `Rule 1 is fed this run's provider credential when there is one`, which is wrong because rule 1 is now PEM blocks and no credential exists. crates/terminus-core/src/testkit.rs:58-60: the fixture exists `so a test can drive the real judgment request against a loopback stub and read the wire`. crates/terminus-core/src/observe/mechanical.rs:6-8: `a machine with judgment disabled`. SUMMARY's Open items lists only the pass.rs comment."
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "Cold start on a fresh and an upgraded store",
+      "evidence": "Current debug build on temp stores. Fresh: bare `ingest` exit 0, and `search lantern.rs` returned turn 1. Upgraded (the ten columns and the meta key added to a copy): `status` exit 0 dropped them to 4 columns, and `search lantern.rs` returned 1 hit."
+    },
+    {
+      "k": 2,
+      "name": "No HTTP or TLS crate, and a socket in source fails the build",
+      "evidence": "`cargo tree --workspace -e all --target all` names no ureq, reqwest, hyper or rustls (or ring, webpki, httparse, tokio). tests/no_network.rs passes, and it fails naming the file when `use std::net::TcpStream;` is planted in a copy of either crate's src."
+    },
+    {
+      "k": 3,
+      "name": "No API key lookup and no credentials.toml path",
+      "evidence": "No `_API_KEY` or `credentials.toml` in crates/*/src; the only hits are input text in tests/egress.rs:24,49. credentials.rs is deleted, and api_key appears in src only in withhold_secret_excerpt and egress unit-test input."
+    },
+    {
+      "k": 4,
+      "name": "A leftover [provider] table refuses to load",
+      "evidence": "`terminus status` exited 1 for an empty table, an api_key sentinel, `enabled = false`, a bare scalar and a mixed file. Each stderr named the file and said model calls were removed, and no sentinel appeared on either stream. Refusal at config.rs:499-501, ProviderRemoved at error.rs:159."
+    },
+    {
+      "k": 5,
+      "name": "An old store loses the ten summary columns and nothing else",
+      "evidence": "On a 14-column temp store, the open went to 4 columns with mechanical byte-identical, the meta key gone, the layout equal to a fresh store's, `verify` 0 failed and a second open clean. `a_store_with_the_summary_columns_opens_without_them` passes."
+    },
+    {
+      "k": 6,
+      "name": "A new session still gets a mechanical observation",
+      "evidence": "A finalized temp session was listed with only the four keys; mechanical held the edited file, the command with its arguments and the error. `terminus search` found the file, command and error turns. recall_search's kind description lists four record types and no summaries, and there are 3 tools."
+    },
+    {
+      "k": 8,
+      "name": "Doctor drops the key checks and the suite passes",
+      "evidence": "`doctor --json` contains none of credentials, config_mode, mode_checks or provider_local anywhere in its output. The full `cargo test --workspace --all-features` run exited 0 with 748 passed and 0 failed."
+    },
+    {
+      "k": 9,
+      "name": "observations regenerate rebuilds the mechanical facts only",
+      "evidence": "`regenerate --json` returned exactly since, selected, regenerated and notes, and mechanical was unchanged. `--prompt-version v1` exited 2 with `unexpected argument '--prompt-version'`."
+    },
+    {
+      "k": 10,
+      "name": "kind observation is refused by name",
+      "evidence": "`search --kind observation` exited 2 with `kind \"observation\" is no longer offered: session summaries were removed from Terminus`. MCP recall_search with kind observation returned isError true with the same reason."
+    }
+  ],
+  "gaps": [
+    {
+      "k": 7,
+      "name": "Every planted secret is redacted on every recall surface",
+      "reason": "behavior wrong: with redact_recall on, recall_get still returns the planted JSON password value whole. The gap predates the phase, but AC6 names recall_get and the SUMMARY reports AC6 as proven.",
+      "evidence": "recall/get.rs:219-243 runs Redaction over the raw archived JSON line, where the session-secrets.jsonl turn-3 pair is written `\\\"password\\\":\\\"pw-VBEGRESS-mash-4d1\\\"`. observe/egress.rs:241's `redact_json_pairs` never fires on escaped quotes, and no later rule catches the value. PLAN-1 Task 1 already noted that in a get body `a different rule, or none, would fire`. The other 8 sentinels were redacted on recall_get, and all 9 on recall_search and recall_context. The get tests carry only the Authorization turn: crates/terminus-core/tests/recall.rs:1930 `authz_turn` and crates/terminus/tests/mcp.rs:1768 `turn_ids: [anchor]`. The plan review raised this (ADJUDICATION-plan-plan-51a4979.json, first entry). It was downgraded on the claim that the get test asserts the VBEGRESS fragment of every planted sentinel is gone, but that test reads one turn. The shape rules and get.rs are unchanged by this phase apart from rule renumbering.",
+      "severity": "major",
+      "missing": "Make recall_get's filter catch a secret-named JSON pair whose quotes are backslash-escaped inside the archived line, either by teaching the pair rule the escaped spelling or by redacting the line's decoded text fields. Then add a test that runs every PLANTED row through recall_get over all twelve turns of session-secrets.jsonl with the knob on, asserting each sentinel gone and its marker present. If the owner rules this pre-existing case out of the phase, it should be filed and AC6's recall_get wording narrowed, rather than the item passing as written."
+    },
+    {
+      "name": "Source comments still describe the removed judgment half and provider credential",
+      "reason": "stale: four comments describe deleted code as current, one of them on the redaction path.",
+      "evidence": "crates/terminus-core/src/ingest/pass.rs:318-321 says the judgment half is its own command outside the lock. crates/terminus-core/src/recall/search.rs:407-410 says rule 1 is fed this run's provider credential. crates/terminus-core/src/testkit.rs:58-60 says the secrets fixture drives the real judgment request against a loopback stub. crates/terminus-core/src/observe/mechanical.rs:6-8 says `a machine with judgment disabled`. SUMMARY Open items names only the pass.rs one.",
+      "severity": "cosmetic",
+      "missing": "Reword or remove the four comments so each states the code's current reason: no judgment command, no provider credential, no loopback stub."
+    }
+  ],
+  "human_checks": [
+    {
+      "name": "Copy one rolling snapshot `terminus-<time>.db` from the real data directory into an empty temp directory as `terminus.db`, run this branch's `terminus status` with TERMINUS_DATA_DIR pointed there, then `sqlite3 <dir>/terminus.db 'PRAGMA table_info(observations)'` and `SELECT count(*) FROM observations`, and run `terminus verify`.",
+      "expected": "Four columns (session_key, session_id, generated_at, mechanical), the same row count as before the open, no `observe.daily_tokens` meta row, and verify reporting 0 failed.",
+      "why_human": "Out-of-reach resource: it needs the owner's real store, which this verification was told not to touch. The drop was observed on a simulated old store and by the AC4 test. The SUMMARY says it ran on the 2026-10-12 snapshot (14 to 4 columns, 6,440 rows, verify 0 failed), but I could not observe that run."
+    }
+  ]
+}
