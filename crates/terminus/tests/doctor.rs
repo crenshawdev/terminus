@@ -167,7 +167,6 @@ impl Fixture {
     /// description, not a sentence with a path in it. So the test runs the
     /// string rather than asserting on its text, and answers the confirmation
     /// `install` asks (INST-03) the way a user at a terminal would.
-    #[cfg(unix)]
     fn shell(&self, line: &str) -> Output {
         let mut command = Command::new("sh");
         command.arg("-c").arg(line);
@@ -318,7 +317,6 @@ fn after_install_every_wiring_check_is_ok() {
 /// The command is run rather than matched, because the requirement is not that
 /// doctor prints a plausible string - it is that what it prints fixes the thing
 /// it reported.
-#[cfg(unix)]
 #[test]
 fn a_missing_binary_is_a_problem_whose_printed_command_fixes_it() {
     let fixture = fixture();

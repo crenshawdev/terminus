@@ -482,7 +482,6 @@ fn a_settings_file_with_a_repeated_key_is_refused() {
 /// for `File::create` to truncate whatever it points at and for the rename that
 /// follows to move the link rather than the file.
 #[test]
-#[cfg(unix)]
 fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
     let fixture = fixture();
     fixture.seed();
@@ -534,7 +533,6 @@ fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
 /// that follows then creates the link's target, somewhere install was never
 /// asked to write.
 #[test]
-#[cfg(unix)]
 fn a_symlink_at_the_backup_name_is_not_written_through() {
     let fixture = fixture();
     fixture.seed();

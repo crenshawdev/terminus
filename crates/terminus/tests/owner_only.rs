@@ -19,8 +19,6 @@
 //! user finds on disk, and a constant that moved with the code would move the
 //! assertion with it.
 
-#![cfg(unix)]
-
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
