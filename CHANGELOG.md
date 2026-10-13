@@ -9,8 +9,41 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `install.sh` installs Terminus with one command, run as
+  `sh install.sh https://<source>`. On Linux or macOS, on x86_64 or aarch64, it
+  downloads `<source>/<os>-<arch>/manifest` and `<source>/<os>-<arch>/terminus`,
+  where `<os>` is `linux` or `macos`. The manifest is exactly two lines,
+  `version X.Y.Z` and `sha256 <64 lowercase hex>`. `verify_download` checks the
+  binary's SHA-256 against it before anything is placed. The script then stores
+  the binary by version, links `~/.local/bin/terminus` to it and runs
+  `~/.local/bin/terminus install`, exiting non-zero when that does.
+- `install.sh` installs unsigned development artifacts only. No release is
+  published, and the signature check comes later, inside `verify_download`.
+- `install.sh` refuses to run when `TERMINUS_BIN_DIR` is set, and refuses a
+  stable path holding a file that is not a Terminus build, leaving it as it is.
+- `install.sh`'s `curl` download is the one network use. The Terminus binary
+  opens no network connection.
+
 ### Changed
 
+- `~/.local/bin/terminus` is now a symbolic link to
+  `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus`. The hooks and
+  the MCP registration name the link, so they are not rewritten when the
+  version behind it changes.
+- `terminus install` stores its own binary as a version and points the link at
+  it, so a local build is installed with
+  `cargo build --release && target/release/terminus install`. Run through the
+  link, it changes neither the link nor the version file.
+- A rebuild at the same version replaces that version's file, through a rename,
+  so a process running the old file keeps it. The same bytes are left alone.
+- Old versions are kept, and nothing prunes them, so a running session keeps
+  the file it started from.
+- An existing install that is a plain file at `~/.local/bin/terminus` becomes
+  the link on the next install.
+- `terminus uninstall` removes the link, leaves the versions folder, and prints
+  its path.
 - Verbatim is now Terminus. The binary is `terminus`, the crates are `terminus`
   and `terminus-core`, and the MCP server registers as `terminus`, so its tools
   arrive as `mcp__terminus__recall_search`, `recall_context` and `recall_get`.
