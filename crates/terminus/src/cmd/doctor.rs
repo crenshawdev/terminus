@@ -38,9 +38,9 @@ use std::time::{Duration, Instant};
 use terminus_core::config::visible;
 use terminus_core::Config;
 
-use super::install::binary;
 use super::install::json_file::{Document, Json};
 use super::install::targets;
+use super::install::{binary, claude};
 use super::json::Document as Envelope;
 use super::read::{self, Opened};
 use super::{hook, Failure};
@@ -70,9 +70,8 @@ const MAX_ERROR_LINE: usize = 200;
 const AUTO_COMPACT_ENV: &str = "DISABLE_AUTO_COMPACT";
 
 /// Below this many days of Claude Code's own retention, doctor says what that
-/// costs. `cmd::install` holds the same three numbers for the advisory it gives
-/// at install time; they are the same policy said in two places, and a change to
-/// one belongs in both.
+/// costs. `cmd::install` holds the default and the raise value too, for its
+/// receipt. A change to either belongs in both.
 const LOW_CLEANUP_DAYS: i64 = 90;
 
 /// What Claude Code deletes after when `cleanupPeriodDays` is not set at all.
@@ -478,6 +477,11 @@ impl Doctor {
     }
 
     /// The registration recall is reached through, in `.claude.json` (D-05).
+    ///
+    /// A problem's fix is `install` when `claude` is on `PATH`, because install
+    /// places the entry through it. Without `claude`, install could not finish
+    /// either, so the fix is the `claude mcp` command itself, with the remove in
+    /// front when an entry is there (phase 3 D-16).
     fn mcp_server(&mut self, stable: &Path) {
         let path = match targets::claude_json_path() {
             Ok(path) => path,
@@ -498,11 +502,15 @@ impl Doctor {
                 return;
             }
         };
-        let stable = stable.display().to_string();
         let server = document
             .value()
             .get("mcpServers")
             .and_then(|servers| servers.get(targets::MCP_SERVER_KEY));
+        let fix = match on_path("claude") {
+            Some(_) => self.install_command(),
+            None => targets::finishing_command(server, stable),
+        };
+        let stable = stable.display().to_string();
 
         let check = match server {
             None => Check::new(
@@ -515,7 +523,7 @@ impl Doctor {
                     targets::MCP_SERVER_KEY
                 ),
             )
-            .with_fix(self.install_command()),
+            .with_fix(fix),
             Some(server) => match server.get("command").and_then(Json::as_str) {
                 Some(command) if command == stable => {
                     let stdio =
@@ -543,7 +551,7 @@ impl Doctor {
                                 targets::MCP_SERVER_KEY
                             ),
                         )
-                        .with_fix(self.install_command())
+                        .with_fix(fix)
                     }
                 }
                 Some(other) => Check::new(
@@ -555,7 +563,7 @@ impl Doctor {
                         targets::MCP_SERVER_KEY
                     ),
                 )
-                .with_fix(self.install_command()),
+                .with_fix(fix),
                 None => Check::new(
                     "mcp_server",
                     State::Problem,
@@ -565,7 +573,7 @@ impl Doctor {
                         targets::MCP_SERVER_KEY
                     ),
                 )
-                .with_fix(self.install_command()),
+                .with_fix(fix),
             },
         };
         self.push(check);
@@ -1167,6 +1175,8 @@ fn args_of(entry: &Json) -> Vec<String> {
 fn version_of(program: &Path) -> Option<String> {
     let mut child = Command::new(program)
         .arg("--version")
+        // Every `claude` terminus starts gets it (D-04). Inert for terminus's own.
+        .env(claude::NONESSENTIAL_TRAFFIC, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

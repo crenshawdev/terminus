@@ -476,7 +476,8 @@ fn a_settings_file_that_is_not_json_is_reported_as_itself() {
 }
 
 /// An mcp registration pointing at a binary that has moved is a problem, and
-/// install is the fix: it repairs a registration of its own in place.
+/// with `claude` on `PATH` install is the fix: it repairs the registration
+/// through `claude mcp`.
 #[test]
 fn an_mcp_registration_that_points_elsewhere_is_a_problem() {
     let fixture = fixture();
@@ -497,7 +498,81 @@ fn an_mcp_registration_that_points_elsewhere_is_a_problem() {
         "{}",
         report.check("mcp_server").finding
     );
-    assert!(report.check("mcp_server").fix.is_some());
+    assert_eq!(
+        report.check("mcp_server").fix.as_deref(),
+        Some(install_fix().as_str())
+    );
+}
+
+/// `<this build> install`, the fix doctor prints when `claude` is on `PATH`.
+fn install_fix() -> String {
+    format!("{} install", env!("CARGO_BIN_EXE_terminus"))
+}
+
+/// The two broken registrations: no entry, and an entry naming another binary.
+fn break_registration(fixture: &Fixture, missing: bool) {
+    let claude_json = fixture.claude_dir.join(".claude.json");
+    let mut value = read(&claude_json);
+    let servers = value["mcpServers"].as_object_mut().unwrap();
+    if missing {
+        servers.remove("terminus");
+    } else {
+        servers["terminus"]["command"] = serde_json::Value::from("/old/bin/terminus");
+    }
+    write(&claude_json, &value);
+}
+
+/// D-16: with no `claude` on `PATH`, install cannot place the entry either, so
+/// the fix is the `claude mcp` command itself. With the remove in front when an
+/// entry is there, because `add-json` refuses a name that exists.
+#[test]
+fn without_claude_on_path_the_mcp_fix_is_the_claude_mcp_command() {
+    for missing in [true, false] {
+        let fixture = fixture();
+        fixture.install();
+        break_registration(&fixture, missing);
+        let empty = fixture.root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let (_, report) = fixture.doctor_with(&[("PATH", empty.to_str().unwrap())]);
+        assert_eq!(report.state("mcp_server"), "problem");
+        let fix = report.check("mcp_server").fix.clone().unwrap();
+        let add = "claude mcp add-json --scope user terminus '";
+        if missing {
+            assert!(fix.starts_with(add), "{fix}");
+        } else {
+            assert!(
+                fix.starts_with(&format!("claude mcp remove --scope user terminus && {add}")),
+                "{fix}"
+            );
+        }
+        assert!(
+            fix.contains(&fixture.stable().display().to_string()),
+            "{fix}"
+        );
+
+        // The same state with the fake on `PATH` is fixed by install.
+        let (_, report) = fixture.doctor();
+        assert_eq!(
+            report.check("mcp_server").fix.as_deref(),
+            Some(install_fix().as_str())
+        );
+    }
+}
+
+/// D-04: doctor's own `claude --version` carries the traffic variable. The
+/// fixture takes it out of doctor's environment, so a logged `1` can only have
+/// come from doctor.
+#[test]
+fn doctors_claude_version_runs_with_nonessential_traffic_off() {
+    let fixture = fixture();
+    fixture.doctor();
+    let calls = testkit::fake_claude_calls(&fixture.root.join("claude.log"));
+    let version = calls
+        .iter()
+        .find(|call| call.args == ["--version"])
+        .unwrap_or_else(|| panic!("doctor never ran claude --version: {calls:?}"));
+    assert_eq!(version.traffic.as_deref(), Some("1"), "{calls:?}");
 }
 
 // ---------------------------------------------------------------------------
