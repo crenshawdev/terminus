@@ -1,7 +1,10 @@
 # Changelog
 
-All notable changes to Terminus, named Verbatim through 0.1.1, are recorded
-here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+All notable changes to Terminus are recorded here. Terminus was named Verbatim
+until 2026-10-05. The two Verbatim versions at the bottom were local test
+builds, tagged `verbatim-v0.1.0` and `verbatim-v0.1.1` and never released.
+Terminus numbers its unreleased work 0.0.x, and its first release will be
+0.1.0. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
@@ -23,7 +26,7 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   build does not count. Archived calls to the old `mcp__verbatim__recall_search`
   are still recognized.
 
-## [0.1.1] - 2026-09-04
+## [Verbatim 0.1.1] - 2026-09-04 (local test build, never released)
 
 A privacy and correctness release. Three of the four things in it are defects
 in shipped 0.1.0 behaviour, and one of them meant the redaction you thought you
@@ -82,7 +85,7 @@ had was mostly not running.
   costs nothing observable there. Tracked as
   [#1](https://github.com/crenshawdev/verbatim/issues/1).
 
-## [0.1.0] - 2026-08-23
+## [Verbatim 0.1.0] - 2026-08-23 (local test build, never released)
 
 First release. A single static Rust binary that tails Claude Code's session
 transcripts, stores every session unmodified and permanently, indexes it at turn
@@ -90,6 +93,6 @@ granularity, and gives the model recall over its own history through three MCP
 tools and hook-driven context injection. Local only, no daemon, no port, no
 telemetry.
 
-[Unreleased]: https://github.com/crenshawdev/verbatim/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/crenshawdev/verbatim/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/crenshawdev/verbatim/releases/tag/v0.1.0
+[Unreleased]: https://github.com/crenshawdev/terminus/compare/verbatim-v0.1.1...HEAD
+[Verbatim 0.1.1]: https://github.com/crenshawdev/terminus/compare/verbatim-v0.1.0...verbatim-v0.1.1
+[Verbatim 0.1.0]: https://github.com/crenshawdev/terminus/tree/verbatim-v0.1.0
