@@ -1,15 +1,22 @@
-//! The two files install writes, and the exact entries it puts in them.
+//! The file install writes, the file it only reads, and the exact entries that
+//! belong in each.
 //!
-//! # Two files, not one (D-05)
+//! # One file written, one read (D-05)
 //!
-//! Hook entries go in `settings.json` under `.hooks`. The MCP registration goes
-//! in `.claude.json` under `.mcpServers`. Measured 2026-08-13: `settings.json`
-//! carries 29 top-level keys and no `mcpServers` among them, and the Claude Code
-//! 2.1.231 settings schema carries every MCP key *except* that one, while
-//! `~/.claude.json` `.mcpServers` holds the servers that are actually loaded. An
-//! `mcpServers` block written into `settings.json` would be ignored, `doctor`
-//! would report MCP registered, and recall would be unreachable from inside a
-//! session with every check passing.
+//! Hook entries go in `settings.json` under `.hooks`, and install writes that
+//! file itself. The MCP entry lives in `.claude.json` under `.mcpServers`.
+//! Measured 2026-08-13: `settings.json` carries 29 top-level keys and no
+//! `mcpServers` among them, and the Claude Code 2.1.231 settings schema carries
+//! every MCP key *except* that one, while `~/.claude.json` `.mcpServers` holds
+//! the servers that are actually loaded. An `mcpServers` block written into
+//! `settings.json` would be ignored, `doctor` would report MCP registered, and
+//! recall would be unreachable from inside a session with every check passing.
+//!
+//! Install only reads `.claude.json`. It places the MCP entry by running
+//! `claude mcp` ([`super::claude`]), so Claude Code stays that file's only
+//! writer. The read is what decides whether anything runs at all: an entry
+//! already in the shape [`mcp_entry_is_current`] accepts means no `claude`
+//! process starts (phase 3 D-01).
 //!
 //! Where those files are is Claude Code's own rule, read out of the 2.1.231
 //! bundle: `$CLAUDE_CONFIG_DIR/settings.json` falling back to
@@ -35,8 +42,7 @@
 //! `.hooks.SessionStart` is `[]` and `.hooks.UserPromptSubmit` is a one-element
 //! array carrying the user's own script. So: ensure the event key exists as an
 //! array, append one group with `matcher: ""`, and leave every group already
-//! there exactly where it was. Same for `.mcpServers`, keyed on `terminus`, with
-//! `context7` untouched beside it.
+//! there exactly where it was.
 //!
 //! # Idempotency and upgrade are the same rule (INST-05)
 //!
@@ -54,15 +60,20 @@
 //! or an older terminus's shape - would make install skip that event and leave
 //! it with no working hook at all, for good. So a terminus entry that is the
 //! wrong shape is repaired in place, keeping its position and any key beside it
-//! the user added, such as a `timeout`. Same rule under `.mcpServers.terminus`:
-//! a registration pointing at a binary path that has moved is corrected rather
-//! than left to rot, because "keeping itself current with no user action" is
-//! exactly what fails when it is not.
+//! the user added, such as a `timeout`.
 //!
-//! Nothing here shells out to `claude mcp add -s user` (D-06). Install must not
-//! depend on `claude` being on `PATH`, from a binary whose stated contract is no
-//! shell and no subprocess, and `.claude.json` is 240 KB of the user's project
-//! history and caches to lose if that call misbehaves.
+//! The MCP entry follows the same rule under `.mcpServers.terminus` (phase 3
+//! D-02). Any user-level entry under that key is terminus's to replace, and one
+//! naming a binary path that has moved is corrected rather than left to rot.
+//! [`mcp_entry`] keeps every key the user put beside the three terminus owns,
+//! such as `env`, in the JSON handed to `claude mcp add-json`.
+//!
+//! # A subprocess, never a shell (phase 3 D-03)
+//!
+//! v0.1.0's D-06 rule kept install off `claude mcp` with a contract of "no
+//! shell and no subprocess". That rule is gone. Phase 3 D-03 replaces it: no
+//! shell, and `claude` run as a subprocess by the absolute path found on
+//! `PATH`, so `.claude.json` is changed only by the program that owns it.
 
 use std::path::{Path, PathBuf};
 
@@ -180,24 +191,39 @@ fn repair_entries(entries: &mut Json, stable: &str, event: &str) -> Result<(), F
     Ok(())
 }
 
-/// Register the MCP server, or put the registration back in the shape terminus
-/// writes.
-pub fn add_mcp_server(root: &mut Json, stable: &Path) -> Result<(), Failure> {
-    let stable = stable.display().to_string();
-    let servers = root.entry("mcpServers", Json::object())?;
-    let server = servers.entry(MCP_SERVER_KEY, Json::object())?;
-    if !matches!(server, Json::Object(_)) {
-        // Under terminus's own key, and not a server registration at all. There
-        // is nothing in it to keep.
-        *server = Json::object();
-    }
-    // The three fields terminus owns, and no others: a `command` naming a
-    // binary path that has moved is corrected, and an `env` block the user put
-    // beside it survives.
-    set(server, "type", Json::string("stdio"))?;
-    set(server, "command", Json::string(&stable))?;
-    set(server, "args", Json::Array(vec![Json::string("mcp")]))?;
-    Ok(())
+/// Is the entry found at `.mcpServers.terminus` already the one install would
+/// place (D-01)?
+///
+/// `type` is `"stdio"`, `command` decodes to the stable path and `args` is
+/// exactly `["mcp"]`. Any other key is ignored. Doctor's `mcp_server` check
+/// asks the same question.
+pub fn mcp_entry_is_current(found: &Json, stable: &Path) -> bool {
+    let args = found.get("args").map(Json::items).unwrap_or(&[]);
+    found.get("type").and_then(Json::as_str).as_deref() == Some("stdio")
+        && found.get("command").and_then(Json::as_str) == Some(stable.display().to_string())
+        && args.len() == 1
+        && args[0].as_str().as_deref() == Some("mcp")
+}
+
+/// The entry install places, given what was found at `.mcpServers.terminus`
+/// (D-02).
+///
+/// A found object keeps every key it has, with the three terminus owns set in
+/// place. Anything else under the key holds nothing to keep, and the entry is
+/// those three alone.
+pub fn mcp_entry(found: Option<&Json>, stable: &Path) -> Result<Json, Failure> {
+    let mut entry = match found {
+        Some(object @ Json::Object(_)) => object.clone(),
+        _ => Json::object(),
+    };
+    set(&mut entry, "type", Json::string("stdio"))?;
+    set(
+        &mut entry,
+        "command",
+        Json::string(&stable.display().to_string()),
+    )?;
+    set(&mut entry, "args", Json::Array(vec![Json::string("mcp")]))?;
+    Ok(entry)
 }
 
 /// `object[key] = value`, in place when the key is there and appended when it
@@ -287,40 +313,9 @@ mod tests {
     fn a_second_application_changes_nothing() {
         let mut root = parsed("{}");
         add_hooks(&mut root, &stable()).unwrap();
-        add_mcp_server(&mut root, &stable()).unwrap();
         let once = root.clone();
         add_hooks(&mut root, &stable()).unwrap();
-        add_mcp_server(&mut root, &stable()).unwrap();
         assert_eq!(once, root);
-    }
-
-    /// `context7` keeps its place and its value.
-    #[test]
-    fn another_server_is_left_alone() {
-        let mut root = parsed(
-            r#"{"mcpServers": {"context7": {"type": "http", "url": "https://example.invalid"}}}"#,
-        );
-        add_mcp_server(&mut root, &stable()).unwrap();
-        let servers = root.get("mcpServers").unwrap();
-        assert_eq!(servers.keys(), ["context7", "terminus"]);
-        assert_eq!(
-            servers
-                .get("context7")
-                .unwrap()
-                .get("url")
-                .and_then(Json::as_str)
-                .unwrap(),
-            "https://example.invalid"
-        );
-        assert_eq!(
-            servers
-                .get("terminus")
-                .unwrap()
-                .get("command")
-                .and_then(Json::as_str)
-                .unwrap(),
-            stable().display().to_string()
-        );
     }
 
     /// An entry of terminus's that is the wrong shape is repaired where it
@@ -395,31 +390,41 @@ mod tests {
         );
     }
 
-    /// A registration of ours pointing at a binary path that has moved is
-    /// corrected, and what the user put beside it survives.
+    /// D-01: the three owned keys decide, and a key beside them does not.
     #[test]
-    fn a_stale_mcp_registration_is_brought_up_to_date() {
-        let mut root = parsed(
-            r#"{"mcpServers": {"terminus": {"type": "sse", "command": "/old/bin/terminus",
-             "env": {"KEEP": "me"}}}}"#,
+    fn a_current_entry_is_the_three_owned_keys_whatever_is_beside_them() {
+        let current = parsed(
+            r#"{"type": "stdio", "command": "/home/someone/.local/bin/terminus",
+               "args": ["mcp"], "env": {"KEEP": "me"}}"#,
         );
-        add_mcp_server(&mut root, &stable()).unwrap();
+        assert!(mcp_entry_is_current(&current, &stable()));
 
-        let server = root.get("mcpServers").unwrap().get("terminus").unwrap();
-        assert_eq!(server.get("type").and_then(Json::as_str).unwrap(), "stdio");
+        for wrong in [
+            r#"{"type": "sse", "command": "/home/someone/.local/bin/terminus", "args": ["mcp"]}"#,
+            r#"{"type": "stdio", "command": "/old/bin/terminus", "args": ["mcp"]}"#,
+            r#"{"type": "stdio", "command": "/home/someone/.local/bin/terminus",
+                "args": ["mcp", "x"]}"#,
+        ] {
+            assert!(!mcp_entry_is_current(&parsed(wrong), &stable()), "{wrong}");
+        }
+    }
+
+    /// D-02: the entry placed over a found object keeps what the user put
+    /// there, and sets the three owned keys.
+    #[test]
+    fn the_entry_placed_over_a_found_one_keeps_its_other_keys() {
+        let found =
+            parsed(r#"{"type": "sse", "command": "/old/bin/terminus", "env": {"KEEP": "me"}}"#);
+        let entry = mcp_entry(Some(&found), &stable()).unwrap();
+        assert!(mcp_entry_is_current(&entry, &stable()));
         assert_eq!(
-            server.get("command").and_then(Json::as_str).unwrap(),
-            stable().display().to_string()
-        );
-        assert_eq!(
-            server.get("args").unwrap().items()[0].as_str().unwrap(),
-            "mcp"
-        );
-        assert_eq!(
-            server.get("env").unwrap().get("KEEP").unwrap().as_str(),
+            entry.get("env").unwrap().get("KEEP").unwrap().as_str(),
             Some("me".to_owned()),
             "a key the user put beside ours was dropped"
         );
+
+        let fresh = mcp_entry(None, &stable()).unwrap();
+        assert_eq!(fresh.keys(), ["type", "command", "args"]);
     }
 
     /// A `.hooks` that is not an object is a malformed settings file, not a

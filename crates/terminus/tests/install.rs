@@ -22,7 +22,7 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
-use terminus_core::testkit::{self, NONESSENTIAL_TRAFFIC};
+use terminus_core::testkit::{self, FakeCall, NONESSENTIAL_TRAFFIC};
 
 /// The events install writes an entry for. `cmd::hook::EVENTS` spelled again:
 /// `terminus` is a binary crate with no library target, so a test cannot name
@@ -174,6 +174,11 @@ impl Fixture {
         self.root.join("claude.log")
     }
 
+    /// Every `claude` call terminus made, oldest first.
+    fn calls(&self) -> Vec<FakeCall> {
+        testkit::fake_claude_calls(&self.claude_log())
+    }
+
     /// Run with stdin at end of file, which is what a script that did not
     /// answer looks like.
     fn run(&self, args: &[&str]) -> Output {
@@ -278,6 +283,33 @@ impl Paused {
         let status = self.child.wait().unwrap();
         (status, format!("{}{rest}{errors}", self.shown))
     }
+}
+
+/// The arguments of `claude mcp add-json --scope user terminus <JSON>`, up to
+/// the JSON.
+const ADD: [&str; 5] = ["mcp", "add-json", "--scope", "user", "terminus"];
+
+/// The arguments of `claude mcp remove --scope user terminus`.
+const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", "terminus"];
+
+/// The entry a logged add carried, after checking the call was the add and
+/// carried the traffic variable.
+fn added_entry(call: &FakeCall) -> serde_json::Value {
+    assert_eq!(call.args.len(), 6, "{call:?}");
+    assert_eq!(call.args[..5], ADD, "{call:?}");
+    assert_eq!(call.traffic.as_deref(), Some("1"), "{call:?}");
+    serde_json::from_str(&call.args[5]).expect("the add's last argument is JSON")
+}
+
+/// `type` `"stdio"`, `command` the stable path, `args` `["mcp"]`.
+fn assert_current(entry: &serde_json::Value, stable: &Path) {
+    assert_eq!(entry["type"], "stdio", "{entry}");
+    assert_eq!(
+        entry["command"],
+        serde_json::Value::from(stable.display().to_string()),
+        "{entry}"
+    );
+    assert_eq!(entry["args"], serde_json::json!(["mcp"]), "{entry}");
 }
 
 fn text(output: &Output) -> String {
@@ -462,6 +494,7 @@ fn a_foreign_binary_at_the_stable_path_stops_everything() {
         claude_before
     );
     assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
+    assert_eq!(fixture.calls(), Vec::new(), "a refusal ran claude");
 }
 
 /// A settings file with a repeated key is refused, loudly, and nothing is
@@ -501,6 +534,7 @@ fn a_settings_file_with_a_repeated_key_is_refused() {
         CLAUDE_JSON
     );
     assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
+    assert_eq!(fixture.calls(), Vec::new(), "a refusal ran claude");
 }
 
 /// A stale file at the temporary name install is about to use is stepped over,
@@ -670,11 +704,8 @@ fn two_installs_leave_one_hook_entry_per_event_and_change_nothing_else() {
 
     assert_eq!(
         fixture.backups(),
-        vec![
-            ".claude.json.terminus-backup",
-            "settings.json.terminus-backup"
-        ],
-        "expected exactly one backup of each file"
+        vec!["settings.json.terminus-backup"],
+        "expected exactly one backup, of settings.json"
     );
     assert_eq!(
         std::fs::read_to_string(fixture.claude_dir.join("settings.json.terminus-backup")).unwrap(),
@@ -780,59 +811,43 @@ fn an_entry_of_ours_in_the_wrong_shape_is_repaired_rather_than_skipped() {
 // Task 4: the MCP registration
 // ---------------------------------------------------------------------------
 
-/// AC4 for `.claude.json`: `context7` keeps its place, `terminus` is added once
-/// however many times install runs, and nothing else in the file moves.
+/// Install places the MCP entry by running `claude mcp add-json`, and never
+/// writes `.claude.json` itself.
+///
+/// The fake writes nothing, so the file is byte-identical after two installs,
+/// and each install finds no entry and asks for the add once.
 #[test]
-fn two_installs_leave_one_mcp_entry_beside_the_servers_already_there() {
+fn two_installs_leave_claude_json_alone_and_each_asks_claude_for_the_add() {
     let fixture = fixture();
     fixture.seed();
-    let before_keys = key_order(&fixture.claude_json());
 
     assert!(fixture.run(&["install", "--yes"]).status.success());
     assert!(fixture.run(&["install", "--yes"]).status.success());
 
-    let claude = read(&fixture.claude_json());
-    let servers = claude["mcpServers"].as_object().unwrap();
-    assert_eq!(servers.len(), 2);
     assert_eq!(
-        servers["terminus"]["command"],
-        serde_json::Value::from(fixture.stable().display().to_string())
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        CLAUDE_JSON,
+        "install wrote .claude.json"
     );
-    assert_eq!(servers["terminus"]["args"][0], "mcp");
-    assert_eq!(servers["terminus"]["type"], "stdio");
-    assert_eq!(
-        servers["context7"]["url"],
-        serde_json::Value::from("https://example.invalid/mcp")
-    );
-
-    // `del(.mcpServers.terminus)` is the file it was given.
-    let mut stripped = claude.clone();
-    stripped["mcpServers"]
-        .as_object_mut()
-        .unwrap()
-        .remove("terminus");
-    let seeded: serde_json::Value = serde_json::from_str(CLAUDE_JSON).unwrap();
-    assert_eq!(stripped, seeded);
-    assert_eq!(key_order(&fixture.claude_json()), before_keys);
-
-    // `mcpServers` keeps its own key order: context7 was there first.
-    let raw = std::fs::read_to_string(fixture.claude_json()).unwrap();
     assert!(
-        raw.find("\"context7\"").unwrap() < raw.find("\"terminus\"").unwrap(),
-        "the server object was reordered"
+        !fixture
+            .claude_dir
+            .join(".claude.json.terminus-backup")
+            .exists(),
+        "install backed up a file it does not write"
     );
-    // The file it read had no trailing newline, and neither has the one it wrote.
-    assert!(raw.ends_with('}'), "a trailing newline appeared");
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    for call in &calls {
+        assert_current(&added_entry(call), &fixture.stable());
+    }
 }
 
-/// A registration of terminus's that names a binary path which has moved is
-/// brought up to date.
-///
-/// This is the phase goal at its narrowest: "keeping itself current with no
-/// user action" is exactly what fails if a registration under terminus's own
-/// key is left alone whatever it holds.
+/// An entry under terminus's key in the wrong shape is removed and placed
+/// again, and the add keeps what the user put beside the three keys terminus
+/// owns (D-02, D-06).
 #[test]
-fn a_stale_mcp_registration_is_brought_up_to_date() {
+fn a_stale_mcp_registration_is_removed_and_added_again() {
     let fixture = fixture();
     fixture.seed();
     let stale = CLAUDE_JSON.replace(
@@ -843,28 +858,47 @@ fn a_stale_mcp_registration_is_brought_up_to_date() {
     );
     std::fs::write(fixture.claude_json(), &stale).unwrap();
 
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    let output = fixture.run(&["install", "--yes"]);
+    assert!(output.status.success(), "{}", text(&output));
 
-    let servers = read(&fixture.claude_json())["mcpServers"].clone();
-    let ours = &servers["terminus"];
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    assert_eq!(calls[0].args, REMOVE);
+    assert_eq!(calls[0].traffic.as_deref(), Some("1"));
+    let entry = added_entry(&calls[1]);
+    assert_current(&entry, &fixture.stable());
     assert_eq!(
-        ours["command"],
-        serde_json::Value::from(fixture.stable().display().to_string()),
-        "the registration still names a binary that is not there"
+        entry["env"]["KEEP"], "me",
+        "a key beside ours was dropped: {entry}"
     );
-    assert_eq!(ours["type"], "stdio");
-    assert_eq!(ours["args"][0], "mcp");
     assert_eq!(
-        ours["env"]["KEEP"],
-        serde_json::Value::from("me"),
-        "a key beside ours was dropped"
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        stale
     );
-    // And the server that is not ours is exactly as it was.
+}
+
+/// An entry already current starts no `claude` at all (D-01).
+#[test]
+fn a_current_mcp_registration_runs_no_claude() {
+    let fixture = fixture();
+    fixture.seed();
+    let current = CLAUDE_JSON.replace(
+        "    \"context7\": {",
+        &format!(
+            "    \"terminus\": {{\"type\": \"stdio\", \"command\": {}, \"args\": [\"mcp\"]}},\n    \
+             \"context7\": {{",
+            serde_json::Value::from(fixture.stable().display().to_string())
+        ),
+    );
+    std::fs::write(fixture.claude_json(), &current).unwrap();
+
+    let output = fixture.run(&["install", "--yes"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(fixture.calls(), Vec::new(), "a current entry ran claude");
     assert_eq!(
-        servers["context7"]["url"],
-        serde_json::Value::from("https://example.invalid/mcp")
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        current
     );
-    assert_eq!(servers.as_object().unwrap().len(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -940,10 +974,6 @@ fn an_accepted_confirmation_writes_all_three_after_showing_the_diff() {
         shown.contains("   + ") && shown.contains("PostCompact"),
         "no hook diff was shown: {shown}"
     );
-    assert!(
-        shown.contains("\"terminus\": {"),
-        "no mcp diff was shown: {shown}"
-    );
     // A `-` line is only ever a reshaping install caused - `"SessionStart": []`
     // becoming a populated array, `"PreToolUse": []` gaining a comma. None of
     // them may carry a line the user wrote.
@@ -953,8 +983,8 @@ fn an_accepted_confirmation_writes_all_three_after_showing_the_diff() {
             .any(|line| line.starts_with("   - ") && line.contains("terse-answers")),
         "the diff removes the user's own hook: {shown}"
     );
-    // And it is the change, not the file: neither of these is anywhere near
-    // an insertion point.
+    // And it is the change, not the file: none of these is anywhere near an
+    // insertion point, and `.claude.json` is not shown at all.
     for untouched in ["oauthAccount", "numStartups", "\"theme\""] {
         assert!(
             !shown.contains(untouched),
@@ -967,7 +997,9 @@ fn an_accepted_confirmation_writes_all_three_after_showing_the_diff() {
         our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
         4
     );
-    assert!(read(&fixture.claude_json())["mcpServers"]["terminus"].is_object());
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 1, "{calls:#?}");
+    assert_current(&added_entry(&calls[0]), &fixture.stable());
 }
 
 /// INST-03: the diff is the file's own bytes against what will land on top of
@@ -1089,7 +1121,7 @@ fn the_summary_names_the_data_directory_and_the_backups_it_wrote() {
             );
         }
     }
-    assert_eq!(fixture.backups().len(), 2);
+    assert_eq!(fixture.backups().len(), 1);
 }
 
 /// AC8/ING-11, the case a user actually hits: `~/.local/bin/terminus install`.

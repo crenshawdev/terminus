@@ -5,7 +5,9 @@
 //! 1. puts this build at the canonical stable path ([`binary`], D-08, INST-02),
 //! 2. writes the four exec-form hook entries into `settings.json`
 //!    ([`targets`], D-01),
-//! 3. registers the MCP server in `.claude.json` ([`targets`], D-05),
+//! 3. places the MCP entry in `.claude.json` by running `claude mcp`, so Claude
+//!    Code stays that file's only writer ([`claude`], [`targets`], phase 3
+//!    D-01 and D-06),
 //! 4. says what a low `cleanupPeriodDays` costs and what auto-compact costs, and
 //!    changes neither by itself (INST-04),
 //! 5. starts the backfill ([`start_backfill`], ING-11) - which is the one step
@@ -38,6 +40,7 @@
 //! no INST requirement asks for one.
 
 pub mod binary;
+pub mod claude;
 pub mod json_file;
 pub mod targets;
 
@@ -144,15 +147,12 @@ pub fn run(options: Options) -> Result<(), Failure> {
     let config = Config::load()?;
     let data_dir = crate::cmd::data_dir()?;
     let settings = Document::read(&targets::settings_path()?)?;
-    let claude = Document::read(&targets::claude_json_path()?)?;
 
     let add_hooks = |root: &mut Json| targets::add_hooks(root, &stable);
-    let add_server = |root: &mut Json| targets::add_mcp_server(root, &stable);
     // Against the file's own bytes, not against a re-rendered copy of it: what
     // `apply` writes is the whole document, so a settings file this renderer did
     // not format is rewritten in full and the diff has to say so (INST-03).
     let hook_diff = pending(&settings, &settings.preview(&add_hooks)?);
-    let server_diff = pending(&claude, &claude.preview(&add_server)?);
 
     println!("terminus install");
     println!();
@@ -163,11 +163,6 @@ pub fn run(options: Options) -> Result<(), Failure> {
         &settings,
         &hook_diff,
         "the four hook entries are already there",
-    );
-    show(
-        &claude,
-        &server_diff,
-        "the mcp server is already registered",
     );
 
     if !confirm("apply these changes?", true, options.yes)? {
@@ -186,13 +181,7 @@ pub fn run(options: Options) -> Result<(), Failure> {
         }
         wrote_hooks = settings.apply(&add_hooks)?;
     }
-    let mut wrote_server = false;
-    if !server_diff.is_empty() {
-        if let Some(backup) = claude.backup()? {
-            backups.push(backup);
-        }
-        wrote_server = claude.apply(&add_server)?;
-    }
+    let (claude_json, registered) = register(&stable)?;
 
     advise(&settings, options.yes)?;
 
@@ -206,8 +195,8 @@ pub fn run(options: Options) -> Result<(), Failure> {
     );
     println!(
         "  mcp server        {} ({})",
-        claude.path().display(),
-        outcome(wrote_server, "registered", "already registered")
+        claude_json.display(),
+        registered.describe()
     );
     if backups.is_empty() {
         // True whichever way it got here: a file that did not exist has nothing
@@ -247,6 +236,70 @@ pub fn run(options: Options) -> Result<(), Failure> {
     // Step 6, and the last thing install does.
     start_backfill(&stable, &data_dir, &config);
     Ok(())
+}
+
+/// What the registration step did.
+enum Registered {
+    /// The entry was already current, so no `claude` ran.
+    Current,
+    /// `claude mcp add-json` placed it.
+    Added,
+    /// `claude mcp remove` took out an entry in the wrong shape, and the add
+    /// placed it again.
+    Replaced,
+}
+
+impl Registered {
+    fn describe(&self) -> &'static str {
+        match self {
+            Registered::Current => "already registered, no claude command run",
+            Registered::Added => "registered with claude mcp add-json",
+            Registered::Replaced => {
+                "an entry in another shape removed with claude mcp remove, then registered with \
+                 claude mcp add-json"
+            }
+        }
+    }
+}
+
+/// Place the MCP entry through `claude mcp`, and return `.claude.json`'s path
+/// and what was done (phase 3 D-01, D-06).
+///
+/// `.claude.json` is read and never written. An entry already current runs
+/// nothing, and `claude mcp get` is never run: it health-checks the server and
+/// writes into the file. No entry gets the add. An entry in any other shape
+/// gets the remove and then the add, because `add-json` refuses a name that
+/// exists; a remove that fails stops the add.
+fn register(stable: &Path) -> Result<(std::path::PathBuf, Registered), Failure> {
+    let path = targets::claude_json_path()?;
+    let document = Document::read(&path)?;
+    let found = document
+        .value()
+        .get("mcpServers")
+        .and_then(|servers| servers.get(targets::MCP_SERVER_KEY));
+    if found.is_some_and(|found| targets::mcp_entry_is_current(found, stable)) {
+        return Ok((path, Registered::Current));
+    }
+    let entry = targets::mcp_entry(found, stable)?.compact();
+    let key = targets::MCP_SERVER_KEY;
+    let mut registered = Registered::Added;
+    if found.is_some() {
+        ran(claude::run(&["mcp", "remove", "--scope", "user", key]))?;
+        registered = Registered::Replaced;
+    }
+    ran(claude::run(&[
+        "mcp", "add-json", "--scope", "user", key, &entry,
+    ]))?;
+    Ok((path, registered))
+}
+
+fn ran(outcome: claude::Outcome) -> Result<(), Failure> {
+    match outcome.cause() {
+        None => Ok(()),
+        Some(cause) => Err(Failure::Operational(format!(
+            "the mcp server could not be registered: {cause}"
+        ))),
+    }
 }
 
 /// Start archiving the history that is already on disk, and return (ING-11).

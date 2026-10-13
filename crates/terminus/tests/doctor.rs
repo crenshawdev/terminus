@@ -57,12 +57,23 @@ const SETTINGS: &str = r#"{
 }
 "#;
 
+/// `.claude.json` with terminus's entry already current for the fixture's
+/// stable path, which the fixture fills in for `{STABLE}`. Install places the
+/// entry through `claude`, and the fake writes nothing, so a fresh install
+/// runs no `claude` and leaves doctor an entry to call ok.
 const CLAUDE_JSON: &str = r#"{
   "numStartups": 412,
   "mcpServers": {
     "context7": {
       "type": "http",
       "url": "https://example.invalid/mcp"
+    },
+    "terminus": {
+      "type": "stdio",
+      "command": {STABLE},
+      "args": [
+        "mcp"
+      ]
     }
   }
 }"#;
@@ -84,7 +95,12 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
     std::fs::write(claude_dir.join("settings.json"), SETTINGS).unwrap();
-    std::fs::write(claude_dir.join(".claude.json"), CLAUDE_JSON).unwrap();
+    let stable = serde_json::Value::from(bin_dir.join("terminus").display().to_string());
+    std::fs::write(
+        claude_dir.join(".claude.json"),
+        CLAUDE_JSON.replace("{STABLE}", &stable.to_string()),
+    )
+    .unwrap();
     let path_dir = root.join("path");
     std::fs::create_dir_all(&path_dir).unwrap();
     testkit::fake_claude(&path_dir, &root.join("claude.log"), "", 0);

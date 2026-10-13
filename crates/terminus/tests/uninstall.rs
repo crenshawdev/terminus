@@ -304,6 +304,19 @@ fn install_then_uninstall_leaves_both_files_exactly_as_they_were() {
 #[test]
 fn only_the_terminus_key_leaves_mcp_servers() {
     let fixture = fixture();
+    // Install places the entry through `claude`, and the fake writes nothing,
+    // so the entry uninstall takes out is seeded in its current shape.
+    let mut seeded = json(&fixture.claude_json());
+    seeded["mcpServers"]["terminus"] = serde_json::json!({
+        "type": "stdio",
+        "command": fixture.stable().display().to_string(),
+        "args": ["mcp"],
+    });
+    std::fs::write(
+        fixture.claude_json(),
+        serde_json::to_string_pretty(&seeded).unwrap(),
+    )
+    .unwrap();
     fixture.install();
     let installed = json(&fixture.claude_json());
     assert_eq!(

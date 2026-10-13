@@ -270,6 +270,43 @@ impl Json {
         }
     }
 
+    /// This value on one line with no whitespace between tokens, the form
+    /// `claude mcp add-json` takes as its argument. Scalars and keys are written
+    /// as their source text, as in the two-space form.
+    pub fn compact(&self) -> String {
+        let mut out = String::new();
+        self.write_compact(&mut out);
+        out
+    }
+
+    fn write_compact(&self, out: &mut String) {
+        match self {
+            Json::Scalar(raw) => out.push_str(raw),
+            Json::Array(items) => {
+                out.push('[');
+                for (at, item) in items.iter().enumerate() {
+                    if at > 0 {
+                        out.push(',');
+                    }
+                    item.write_compact(out);
+                }
+                out.push(']');
+            }
+            Json::Object(members) => {
+                out.push('{');
+                for (at, member) in members.iter().enumerate() {
+                    if at > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&member.raw_key);
+                    out.push(':');
+                    member.value.write_compact(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
     fn write_to(&self, out: &mut String, depth: usize) {
         match self {
             Json::Scalar(raw) => out.push_str(raw),
@@ -1155,6 +1192,18 @@ mod tests {
         let (_dir, path) = seeded(FIXTURE);
         let document = Document::read(&path).unwrap();
         assert_eq!(document.rendered(), FIXTURE);
+    }
+
+    /// The compact form drops whitespace only: every scalar and key is its
+    /// source text, and the value it parses back to is the same one.
+    #[test]
+    fn the_compact_form_is_the_same_value_on_one_line() {
+        let (_dir, path) = seeded(FIXTURE);
+        let document = Document::read(&path).unwrap();
+        let compact = document.value().compact();
+        assert!(!compact.contains('\n'), "{compact}");
+        assert!(compact.contains(r#""C:\\Users\\jo\u00e9\\code":{"lastCost":0.5,"#));
+        assert_eq!(parse(&compact).unwrap(), *document.value());
     }
 
     /// AC4 in one test: adding a key changes that key and nothing else, and
