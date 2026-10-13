@@ -1347,12 +1347,9 @@ fn the_summary_names_the_data_directory_and_the_backups_it_wrote() {
 
 /// AC8/ING-11, the case a user actually hits: `~/.local/bin/terminus install`.
 ///
-/// `binary::place` renames a new binary over the stable path, which unlinks the
-/// inode the running process was exec'd from. Install then asks for a backfill.
-/// Spawning `current_exe()` at that point spawns a deleted file and fails
-/// ENOENT, so the backfill install has just announced never starts and the
-/// store does not grow - silently, because a backfill cannot fail an install.
-/// The rerun install is exactly what doctor's own fix line tells a user to run.
+/// A backfill that will not start is silent, because a backfill cannot fail an
+/// install, so the store growing is the only proof it ran. The rerun install is
+/// exactly what doctor's own fix line tells a user to run.
 #[test]
 fn install_from_the_stable_path_still_starts_its_backfill() {
     let fixture = fixture();
@@ -1395,6 +1392,61 @@ fn install_from_the_stable_path_still_starts_its_backfill() {
     );
 
     wait_for_sessions(&fixture, 2);
+}
+
+/// D-02: install run through the link it made last time changes neither the
+/// link nor the version file.
+#[test]
+fn install_from_the_stable_path_touches_neither_the_link_nor_the_file() {
+    let fixture = fixture();
+    fixture.seed();
+    assert!(fixture.run(&["install"]).status.success());
+
+    let stable = fixture.stable();
+    let version_file = fixture.version_file();
+    let link_before = inode(&stable);
+    let file_before = inode(&version_file);
+
+    let output = fixture
+        .command_at(&stable, &["install"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(inode(&stable), link_before, "the link was made again");
+    assert_eq!(std::fs::read_link(&stable).unwrap(), version_file);
+    assert_eq!(
+        inode(&version_file),
+        file_before,
+        "the file was stored again"
+    );
+}
+
+/// `install.sh` names the version folder from its manifest, which need not be
+/// the version the build reports. Install run through that link leaves it
+/// where it is and stores nothing under its own version.
+#[test]
+fn install_through_a_link_to_another_version_folder_leaves_it_alone() {
+    let fixture = fixture();
+    fixture.seed();
+    let other = fixture.versions().join("9.9.9").join("terminus");
+    copy_build(&other, "");
+    let stable = fixture.stable();
+    std::os::unix::fs::symlink(&other, &stable).unwrap();
+    let link_before = inode(&stable);
+
+    let output = fixture
+        .command_at(&stable, &["install"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        !fixture.versions().join(env!("CARGO_PKG_VERSION")).exists(),
+        "install stored a second copy under its own version"
+    );
+    assert_eq!(std::fs::read_link(&stable).unwrap(), other);
+    assert_eq!(inode(&stable), link_before, "the link was made again");
 }
 
 /// Block until the store holds `expected` sessions, or fail.

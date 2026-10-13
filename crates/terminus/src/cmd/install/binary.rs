@@ -192,15 +192,43 @@ const TEMPORARY: &str = ".terminus-install-";
 
 /// Store this build as a version and point the stable path at it.
 ///
-/// Returns the version file the link now names.
+/// Returns the version file the link now names. When install runs from the
+/// file the link already names, nothing is written.
 pub fn place(stable: &Path, versions: &Path) -> Result<PathBuf, Failure> {
     let source = std::env::current_exe().map_err(|e| {
         Failure::Operational(format!("this build's own path could not be resolved: {e}"))
     })?;
+    if let Some(target) = linked_to(stable, versions, &source) {
+        return Ok(target);
+    }
     let version_file = versions.join(env!("CARGO_PKG_VERSION")).join(file_name());
     store(&source, &version_file)?;
     link(stable, &version_file)?;
     Ok(version_file)
+}
+
+/// The link's target, when it is a file in a folder directly under the
+/// versions folder and is the same file as `source`.
+///
+/// Same file means the same device and inode. A path comparison would miss a
+/// HOME reached through a linked folder, because `current_exe()` is resolved
+/// and the link holds whatever spelling of HOME wrote it. The folder's name is
+/// never compared with this build's version: `install.sh` names it from its
+/// manifest.
+fn linked_to(stable: &Path, versions: &Path, source: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let target = std::fs::read_link(stable).ok()?;
+    let mut rest = target.strip_prefix(versions).ok()?.components();
+    let (Some(Component::Normal(_)), Some(Component::Normal(_)), None) =
+        (rest.next(), rest.next(), rest.next())
+    else {
+        return None;
+    };
+    let linked = std::fs::metadata(&target).ok()?;
+    let running = std::fs::metadata(source).ok()?;
+    (linked.dev() == running.dev() && linked.ino() == running.ino()).then_some(target)
 }
 
 /// Put `source`'s bytes at `dest`, unless they are already there.
