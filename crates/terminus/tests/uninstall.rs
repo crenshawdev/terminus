@@ -147,7 +147,7 @@ impl Fixture {
     }
 
     fn install(&self) -> &Self {
-        let out = self.run(&["install", "--yes"]);
+        let out = self.run(&["install"]);
         assert!(out.status.success(), "install failed: {}", text(&out));
         self
     }

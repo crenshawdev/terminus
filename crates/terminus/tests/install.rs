@@ -18,7 +18,7 @@
 //! order, which is why these tests read key order out of the raw text instead
 //! of parsing into a map that would sort it.
 
-use std::io::{BufRead, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
@@ -179,63 +179,12 @@ impl Fixture {
         testkit::fake_claude_calls(&self.claude_log())
     }
 
-    /// Run with stdin at end of file, which is what a script that did not
-    /// answer looks like.
+    /// Run with stdin at end of file, which is what a command in a script sees.
     fn run(&self, args: &[&str]) -> Output {
         self.command(args)
             .stdin(Stdio::null())
             .output()
             .expect("the binary runs")
-    }
-
-    /// Run and write `answer` to the confirmation.
-    fn answer(&self, args: &[&str], answer: &str) -> Output {
-        let mut child = self
-            .command(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("the binary runs");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(answer.as_bytes())
-            .unwrap();
-        child.wait_with_output().unwrap()
-    }
-
-    /// Spawn install and read up to its confirmation, leaving the question
-    /// unanswered.
-    ///
-    /// The pause is the point: it is the one moment install has decided
-    /// everything it will do and has done none of it, which is where a check
-    /// made before the answer and a write made after it come apart.
-    // The child is waited on in `Paused::answer`, which is the only way to end
-    // one; clippy cannot see across the return.
-    #[allow(clippy::zombie_processes)]
-    fn at_the_prompt(&self, args: &[&str]) -> Paused {
-        let mut child = self
-            .command(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("the binary runs");
-        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
-        let mut shown = String::new();
-        loop {
-            let mut line = String::new();
-            assert!(
-                out.read_line(&mut line).unwrap() > 0,
-                "install never asked:\n{shown}"
-            );
-            shown.push_str(&line);
-            if line.contains("apply these changes?") {
-                return Paused { child, out, shown };
-            }
-        }
     }
 
     fn backups(&self) -> Vec<String> {
@@ -246,42 +195,6 @@ impl Fixture {
             .collect();
         found.sort();
         found
-    }
-}
-
-/// An install stopped at its confirmation, with everything it printed so far.
-struct Paused {
-    child: Child,
-    out: std::io::BufReader<std::process::ChildStdout>,
-    shown: String,
-}
-
-impl Paused {
-    /// The pid install is running under, and so the pid its temporary file
-    /// names are built from.
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
-    /// Answer the question and collect what install did with the answer.
-    fn answer(mut self, answer: &str) -> (std::process::ExitStatus, String) {
-        self.child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(answer.as_bytes())
-            .unwrap();
-        let mut rest = String::new();
-        self.out.read_to_string(&mut rest).unwrap();
-        let mut errors = String::new();
-        self.child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut errors)
-            .unwrap();
-        let status = self.child.wait().unwrap();
-        (status, format!("{}{rest}{errors}", self.shown))
     }
 }
 
@@ -435,7 +348,7 @@ fn install_places_this_build_at_the_stable_path() {
     let fixture = fixture();
     fixture.seed();
 
-    let first = fixture.run(&["install", "--yes"]);
+    let first = fixture.run(&["install"]);
     assert!(first.status.success(), "{}", text(&first));
 
     let stable = fixture.stable();
@@ -451,7 +364,7 @@ fn install_places_this_build_at_the_stable_path() {
         "the copy is not this build"
     );
 
-    let second = fixture.run(&["install", "--yes"]);
+    let second = fixture.run(&["install"]);
     assert!(
         second.status.success(),
         "a second install over our own copy failed: {}",
@@ -472,7 +385,7 @@ fn a_foreign_binary_at_the_stable_path_stops_everything() {
     let settings_before = std::fs::read_to_string(fixture.settings()).unwrap();
     let claude_before = std::fs::read_to_string(fixture.claude_json()).unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(!output.status.success(), "install overwrote a stranger");
     let said = text(&output);
     assert!(
@@ -516,7 +429,7 @@ fn a_settings_file_with_a_repeated_key_is_refused() {
     );
     std::fs::write(fixture.settings(), &duplicated).unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(!output.status.success(), "install edited an ambiguous file");
     let said = text(&output);
     assert!(
@@ -544,12 +457,29 @@ fn a_settings_file_with_a_repeated_key_is_refused() {
 /// a crashed run - or one landed on by a pid that came round again - is enough
 /// for `File::create` to truncate whatever it points at and for the rename that
 /// follows to move the link rather than the file.
+///
+/// The pause is a shell that reads one line and then `exec`s install, so the
+/// pid the test sees is the pid install runs under and the stale names can be
+/// planted before install starts.
 #[test]
 fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
     let fixture = fixture();
     fixture.seed();
-    let paused = fixture.at_the_prompt(&["install"]);
-    let pid = paused.pid();
+    let mut paused = fixture
+        .command_at(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "read -r line; exec \"$0\" install",
+                env!("CARGO_BIN_EXE_terminus"),
+            ],
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the shell runs");
+    let pid = paused.id();
 
     // One victim per temporary install writes, reached through the exact name
     // it builds out of its own pid.
@@ -570,8 +500,12 @@ fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
         std::os::unix::fs::symlink(victim, stale).unwrap();
     }
 
-    let (status, said) = paused.answer("y\n");
-    assert!(status.success(), "{said}");
+    let mut go = paused.stdin.take().unwrap();
+    go.write_all(b"\n").unwrap();
+    drop(go);
+    let output = paused.wait_with_output().unwrap();
+    let said = text(&output);
+    assert!(output.status.success(), "{said}");
     for (victim, _) in &victims {
         assert_eq!(
             std::fs::read(victim).unwrap(),
@@ -606,7 +540,7 @@ fn a_symlink_at_the_backup_name_is_not_written_through() {
     )
     .unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(output.status.success(), "{}", text(&output));
     assert!(
         !victim.exists(),
@@ -619,38 +553,6 @@ fn a_symlink_at_the_backup_name_is_not_written_through() {
         our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
         4
     );
-}
-
-/// D-07 again, at the other end of the confirmation: a program that appears at
-/// the stable path while install is waiting for an answer is refused, not
-/// renamed over.
-///
-/// The check `run` makes is from before the question. The rename clobbers.
-#[test]
-fn a_binary_that_appears_during_the_confirmation_is_still_refused() {
-    let fixture = fixture();
-    fixture.seed();
-    let paused = fixture.at_the_prompt(&["install"]);
-
-    let foreign = b"#!/bin/sh\nexit 0\n";
-    std::fs::write(fixture.stable(), foreign).unwrap();
-
-    let (status, said) = paused.answer("y\n");
-    assert!(!status.success(), "install overwrote a stranger: {said}");
-    assert!(
-        said.contains("is not a terminus build"),
-        "the refusal did not say what it found: {said}"
-    );
-    assert_eq!(std::fs::read(fixture.stable()).unwrap(), foreign);
-    assert_eq!(
-        std::fs::read_to_string(fixture.settings()).unwrap(),
-        SETTINGS
-    );
-    assert_eq!(
-        std::fs::read_to_string(fixture.claude_json()).unwrap(),
-        CLAUDE_JSON
-    );
-    assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
 }
 
 // ---------------------------------------------------------------------------
@@ -666,9 +568,9 @@ fn two_installs_leave_one_hook_entry_per_event_and_change_nothing_else() {
     fixture.seed();
     let before_keys = key_order(&fixture.settings());
 
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
     let after_first = std::fs::read_to_string(fixture.settings()).unwrap();
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
 
     let settings = read(&fixture.settings());
     let ours = our_entries(&settings, &fixture.stable());
@@ -727,7 +629,7 @@ fn two_installs_leave_one_hook_entry_per_event_and_change_nothing_else() {
 fn an_upgrade_rewrites_no_byte_of_the_hooks_object() {
     let fixture = fixture();
     fixture.seed();
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
     let hooks = read(&fixture.settings())["hooks"].clone();
     let raw = std::fs::read_to_string(fixture.settings()).unwrap();
 
@@ -736,7 +638,7 @@ fn an_upgrade_rewrites_no_byte_of_the_hooks_object() {
     replacement.extend_from_slice(b"\0a later build\0");
     std::fs::write(fixture.stable(), &replacement).unwrap();
 
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
     assert_eq!(read(&fixture.settings())["hooks"], hooks);
     assert_eq!(std::fs::read_to_string(fixture.settings()).unwrap(), raw);
 }
@@ -780,7 +682,7 @@ fn an_entry_of_ours_in_the_wrong_shape_is_repaired_rather_than_skipped() {
     );
     std::fs::write(fixture.settings(), &seeded).unwrap();
 
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
 
     let settings = read(&fixture.settings());
     let groups = settings["hooks"]["SessionStart"].as_array().unwrap();
@@ -799,7 +701,7 @@ fn an_entry_of_ours_in_the_wrong_shape_is_repaired_rather_than_skipped() {
     // AC3 still holds: with everything in the intended shape, a second install
     // rewrites nothing.
     let after_first = std::fs::read_to_string(fixture.settings()).unwrap();
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
     assert_eq!(
         std::fs::read_to_string(fixture.settings()).unwrap(),
         after_first,
@@ -821,8 +723,8 @@ fn two_installs_leave_claude_json_alone_and_each_asks_claude_for_the_add() {
     let fixture = fixture();
     fixture.seed();
 
-    assert!(fixture.run(&["install", "--yes"]).status.success());
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
 
     assert_eq!(
         std::fs::read_to_string(fixture.claude_json()).unwrap(),
@@ -858,7 +760,7 @@ fn a_stale_mcp_registration_is_removed_and_added_again() {
     );
     std::fs::write(fixture.claude_json(), &stale).unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(output.status.success(), "{}", text(&output));
 
     let calls = fixture.calls();
@@ -892,7 +794,7 @@ fn a_current_mcp_registration_runs_no_claude() {
     );
     std::fs::write(fixture.claude_json(), &current).unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(output.status.success(), "{}", text(&output));
     assert_eq!(fixture.calls(), Vec::new(), "a current entry ran claude");
     assert_eq!(
@@ -938,7 +840,7 @@ fn without_claude_on_path_the_install_is_incomplete() {
     fixture.seed();
     std::fs::remove_file(fixture.path_dir.join("claude")).unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     let said = assert_incomplete(&fixture, &output, CLAUDE_JSON);
     assert!(said.contains("not on PATH"), "{said}");
 }
@@ -950,7 +852,7 @@ fn a_claude_that_fails_leaves_the_install_incomplete_with_its_first_line() {
     fixture.seed();
     fixture.fake_claude("first\nsecond", 1);
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     let said = assert_incomplete(&fixture, &output, CLAUDE_JSON);
     // The cause is the first line exactly, and the second is nowhere. Not a
     // bare `contains("second")`: the backfill estimate can say "under a
@@ -971,151 +873,43 @@ fn an_unreadable_claude_json_leaves_the_install_incomplete_and_runs_no_claude() 
     fixture.seed();
     std::fs::write(fixture.claude_json(), "{").unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert_incomplete(&fixture, &output, "{");
     assert_eq!(fixture.calls(), Vec::new());
 }
 
 // ---------------------------------------------------------------------------
-// Task 5: the diff, the one confirmation, and --yes
+// Install asks nothing (phase 3 D-08, D-12)
 // ---------------------------------------------------------------------------
 
-/// Nothing to read and no `--yes`: refuse, name `--yes`, and write nothing -
-/// not the settings files, and not the binary either.
+/// D-12: a settings file terminus's renderer did not produce is rewritten in
+/// full, two-space indented, without a question. The backup holds the original
+/// bytes and the summary says what happened to the file.
 #[test]
-fn without_an_answer_and_without_yes_install_refuses_and_writes_nothing() {
-    let fixture = fixture();
-    fixture.seed();
-
-    let output = fixture.run(&["install"]);
-    assert!(!output.status.success());
-    let said = text(&output);
-    assert!(said.contains("--yes"), "{said}");
-
-    assert!(!fixture.stable().exists(), "a refusal placed the binary");
-    assert_eq!(
-        std::fs::read_to_string(fixture.settings()).unwrap(),
-        SETTINGS
-    );
-    assert_eq!(
-        std::fs::read_to_string(fixture.claude_json()).unwrap(),
-        CLAUDE_JSON
-    );
-    assert!(fixture.backups().is_empty());
-}
-
-/// A declined confirmation is a success that changed nothing, and it says so.
-#[test]
-fn a_declined_confirmation_changes_nothing_and_exits_zero() {
-    let fixture = fixture();
-    fixture.seed();
-
-    let output = fixture.answer(&["install"], "n\n");
-    assert!(output.status.success(), "{}", text(&output));
-    assert!(text(&output).contains("nothing was changed"));
-
-    assert!(!fixture.stable().exists());
-    assert_eq!(
-        std::fs::read_to_string(fixture.settings()).unwrap(),
-        SETTINGS
-    );
-    assert_eq!(
-        std::fs::read_to_string(fixture.claude_json()).unwrap(),
-        CLAUDE_JSON
-    );
-    assert!(fixture.backups().is_empty());
-}
-
-/// An accepted confirmation writes all three, and the diff it showed first
-/// carried the change rather than the file.
-#[test]
-fn an_accepted_confirmation_writes_all_three_after_showing_the_diff() {
-    let fixture = fixture();
-    fixture.seed();
-
-    let output = fixture.answer(&["install"], "y\n");
-    assert!(output.status.success(), "{}", text(&output));
-    let said = text(&output);
-    let shown = said
-        .split("apply these changes?")
-        .next()
-        .expect("the confirmation is asked once");
-    assert_eq!(
-        said.matches("apply these changes?").count(),
-        1,
-        "install asked more than once: {said}"
-    );
-    assert!(
-        shown.contains("   + ") && shown.contains("PostCompact"),
-        "no hook diff was shown: {shown}"
-    );
-    // A `-` line is only ever a reshaping install caused - `"SessionStart": []`
-    // becoming a populated array, `"PreToolUse": []` gaining a comma. None of
-    // them may carry a line the user wrote.
-    assert!(
-        !shown
-            .lines()
-            .any(|line| line.starts_with("   - ") && line.contains("terse-answers")),
-        "the diff removes the user's own hook: {shown}"
-    );
-    // And it is the change, not the file: none of these is anywhere near an
-    // insertion point, and `.claude.json` is not shown at all.
-    for untouched in ["oauthAccount", "numStartups", "\"theme\""] {
-        assert!(
-            !shown.contains(untouched),
-            "the diff printed {untouched}, which nothing changed: {shown}"
-        );
-    }
-
-    assert!(fixture.stable().exists());
-    assert_eq!(
-        our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
-        4
-    );
-    let calls = fixture.calls();
-    assert_eq!(calls.len(), 1, "{calls:#?}");
-    assert_current(&added_entry(&calls[0]), &fixture.stable());
-}
-
-/// INST-03: the diff is the file's own bytes against what will land on top of
-/// them, so a settings file terminus's renderer did not produce shows the whole
-/// rewrite it is about to get. A diff of two re-rendered copies would show a
-/// four-line insertion and then reformat the file.
-#[test]
-fn a_differently_formatted_file_shows_the_rewrite_it_will_get() {
+fn a_differently_formatted_file_is_rewritten_in_full_and_the_summary_says_so() {
     let fixture = fixture();
     fixture.seed();
     std::fs::write(fixture.settings(), four_space(SETTINGS)).unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(output.status.success(), "{}", text(&output));
     let said = text(&output);
-    let shown = said
-        .split("apply these changes?")
-        .next()
-        .expect("the confirmation is asked once");
-
-    // The line as the file spells it, removed; the line as install will write
-    // it, added. Neither appears in a diff taken between two rendered copies,
-    // because nothing in `theme` changed - only its indentation did.
+    assert!(!said.contains("[Y/n]"), "install asked:\n{said}");
     assert!(
-        shown.contains("   -     \"theme\": \"dark\""),
-        "the diff hid the reformatting of a line it is about to rewrite:\n{shown}"
+        said.contains("rewritten in full in two-space form, keys and values unchanged"),
+        "the summary did not say the file was rewritten:\n{said}"
     );
     assert!(
-        shown.contains("   +   \"theme\": \"dark\""),
-        "the diff did not show the line it will write:\n{shown}"
-    );
-    assert!(
-        shown.contains("rewrites all of it"),
-        "the diff did not say why it is the whole file:\n{shown}"
+        said.lines()
+            .any(|line| line.contains("the original bytes are in")
+                && line.contains("settings.json.terminus-backup")),
+        "the summary did not say where the original is:\n{said}"
     );
 
-    // And what landed is what it showed.
     let after = std::fs::read_to_string(fixture.settings()).unwrap();
     assert!(
         after.contains("\n  \"theme\": \"dark\""),
-        "the file was not rewritten the way the diff said it would be"
+        "the file was not rewritten in two-space form:\n{after}"
     );
     assert_eq!(
         our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
@@ -1126,6 +920,121 @@ fn a_differently_formatted_file_shows_the_rewrite_it_will_get() {
         std::fs::read_to_string(fixture.claude_dir.join("settings.json.terminus-backup")).unwrap(),
         four_space(SETTINGS)
     );
+}
+
+/// AC1: `--yes` and `-y` are misuse now that there is nothing to say yes to.
+/// Exit 2, and nothing is placed, written or run.
+#[test]
+fn install_takes_no_yes_flag() {
+    for flag in ["--yes", "-y"] {
+        let fixture = fixture();
+        fixture.seed();
+        let output = fixture.run(&["install", flag]);
+        assert_eq!(output.status.code(), Some(2), "{flag}: {}", text(&output));
+        assert!(!fixture.stable().exists(), "{flag}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.settings()).unwrap(),
+            SETTINGS,
+            "{flag}"
+        );
+        assert_eq!(fixture.calls(), Vec::new(), "{flag}");
+    }
+}
+
+/// Wait for `child` under a deadline, so an install that blocks on stdin fails
+/// the test rather than hanging it.
+fn finish_within(mut child: Child, seconds: u64) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "install was still running after {seconds}s, waiting on stdin:\n{}",
+                text(&output)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// AC1: install reads nothing from stdin. A run with stdin closed and a run
+/// with stdin open and never written both finish, ask nothing, and leave the
+/// same files and the same `claude` calls behind.
+///
+/// No test can attach a terminal. Install has no `confirm` call and no
+/// terminal check, so a terminal takes the same path as these two runs.
+#[test]
+fn install_reads_nothing_from_stdin() {
+    let closed = fixture();
+    closed.seed();
+    let held = fixture();
+    held.seed();
+
+    let first = finish_within(
+        closed
+            .command(&["install"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        30,
+    );
+    let mut child = held
+        .command(&["install"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held open, never written, and dropped only once install has exited.
+    let open_stdin = child.stdin.take();
+    let second = finish_within(child, 30);
+    drop(open_stdin);
+
+    for (fixture, output) in [(&closed, &first), (&held, &second)] {
+        let said = text(output);
+        assert!(output.status.success(), "{said}");
+        assert!(!said.contains("[Y/n]") && !said.contains("[y/N]"), "{said}");
+        assert!(
+            !said.lines().any(|line| line.trim_end().ends_with('?')),
+            "install asked a question:\n{said}"
+        );
+        assert!(fixture.stable().exists());
+    }
+
+    let root = |fixture: &Fixture, text: String| {
+        text.replace(&fixture.root.display().to_string(), "<root>")
+    };
+    let settings = |fixture: &Fixture| {
+        root(
+            fixture,
+            std::fs::read_to_string(fixture.settings()).unwrap(),
+        )
+    };
+    let calls = |fixture: &Fixture| {
+        let calls: Vec<Vec<String>> = fixture
+            .calls()
+            .into_iter()
+            .map(|call| {
+                assert_eq!(call.traffic.as_deref(), Some("1"));
+                call.args
+                    .into_iter()
+                    .map(|arg| root(fixture, arg))
+                    .collect()
+            })
+            .collect();
+        calls
+    };
+    assert_eq!(settings(&closed), settings(&held));
+    assert_eq!(
+        std::fs::read(closed.stable()).unwrap(),
+        std::fs::read(held.stable()).unwrap()
+    );
+    assert_eq!(calls(&closed), calls(&held));
+    assert_eq!(calls(&closed).len(), 1, "{:?}", calls(&closed));
 }
 
 /// D-24: `install` is human-only. `--json` is misuse, exit 2.
@@ -1143,14 +1052,14 @@ fn install_takes_no_json_flag() {
 // ---------------------------------------------------------------------------
 
 /// INST-04: a low `cleanupPeriodDays` is reported and auto-compact is
-/// recommended, and `--yes` changes neither.
+/// recommended, and install changes neither.
 #[test]
 fn install_reports_the_two_settings_it_never_changes() {
     let fixture = fixture();
     fixture.seed();
     let before = read(&fixture.settings());
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(output.status.success(), "{}", text(&output));
     let said = text(&output);
     assert!(said.contains("cleanupPeriodDays"), "{said}");
@@ -1170,7 +1079,7 @@ fn the_summary_names_the_data_directory_and_the_backups_it_wrote() {
     let fixture = fixture();
     fixture.seed();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     let said = text(&output);
     let data_dir = said
         .lines()
@@ -1226,7 +1135,7 @@ fn install_from_the_stable_path_still_starts_its_backfill() {
         "11111111-1111-4111-8111-111111111111.jsonl",
         "session-basic.jsonl",
     );
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
     wait_for_sessions(&fixture, 1);
 
     // A second session, so the rerun has work to find and the assertion is
@@ -1237,7 +1146,7 @@ fn install_from_the_stable_path_still_starts_its_backfill() {
     );
 
     let output = fixture
-        .command_at(&fixture.stable(), &["install", "--yes"])
+        .command_at(&fixture.stable(), &["install"])
         .stdin(Stdio::null())
         .output()
         .expect("the placed binary runs");

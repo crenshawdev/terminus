@@ -157,13 +157,13 @@ fn dispatch(name: &str, parser: &mut lexopt::Parser) -> Result<(), Failure> {
         // no directory on any path it takes.
         "doctor" => cmd::doctor::run(cmd::json_flag(parser)?),
         // Human-only and deliberately not a `--json` data command (D-24): it
-        // shows a diff and asks once, and a single JSON document on stdout
-        // cannot be both of those things.
-        "install" => cmd::install::run(cmd::install::parse(parser)?),
-        // Human-only for the same reason, and the only command in this binary
-        // that deletes anything: it removes what install added, leaves the
-        // archive alone and prints its path, and destroys it only under
-        // `--purge`, after showing the size and asking (INST-07, D-13).
+        // prints a receipt for a person to read.
+        "install" => cmd::install::parse(parser).and_then(|()| cmd::install::run()),
+        // Human-only and not a `--json` data command (D-24): it asks under
+        // `--purge`. The only command in this binary that deletes anything: it
+        // removes what install added, leaves the archive alone and prints its
+        // path, and destroys it only under `--purge`, after showing the size
+        // and asking (INST-07, D-13).
         "uninstall" => cmd::uninstall::run(cmd::uninstall::parse(parser)?),
         // STOR-07. Human-only for the third time and the same reason: it prints
         // what is about to move, warns about the one hazard nothing can detect

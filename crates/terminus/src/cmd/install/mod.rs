@@ -1,6 +1,6 @@
 //! `terminus install`: one command wires terminus into Claude Code.
 //!
-//! It does five things and refuses to do any of the first four halfway:
+//! It applies its defaults and asks nothing. Five steps:
 //!
 //! 1. puts this build at the canonical stable path ([`binary`], D-08, INST-02),
 //! 2. writes the four exec-form hook entries into `settings.json`
@@ -9,35 +9,25 @@
 //!    Code stays that file's only writer ([`claude`], [`targets`], phase 3
 //!    D-01 and D-06),
 //! 4. says what a low `cleanupPeriodDays` costs and what auto-compact costs, and
-//!    changes neither by itself (INST-04),
-//! 5. starts the backfill ([`start_backfill`], ING-11) - which is the one step
-//!    that cannot fail the install, because by then everything above it has
-//!    already succeeded.
+//!    changes neither (INST-04),
+//! 5. starts the backfill ([`start_backfill`], ING-11).
 //!
-//! # Nothing is written before the answer (INST-03)
+//! Every check that can refuse runs before the first write, and a refusal
+//! changes nothing. Once writing starts, only the registration can come up
+//! short: then the binary, the hook entries and the backfill still happen, and
+//! the summary says the install is incomplete and prints the command that
+//! finishes it (phase 3 D-05).
 //!
-//! Every refusable check runs first, both diffs are rendered from files nothing
-//! has touched, and then one confirmation covers the lot - not one per file, and
-//! never one after a write. The binary copy counts as a write and is ordered
-//! with the rest. A declined confirmation exits 0 having changed nothing and
-//! says so.
+//! # Install asks nothing (phase 3 D-08)
 //!
-//! The diff is the change, not the file: `.claude.json` is 240 KB, and a user
-//! asked to approve two added lines must be shown two added lines.
+//! There is no confirmation and no `--yes`, so `--yes` is misuse and exits 2.
+//! Install never reads stdin, which is what makes a run from a script and a run
+//! from a terminal the same run. A `settings.json` it did not format is
+//! rewritten in full without asking; the one-time backup holds the original
+//! bytes, and the summary says so (D-12).
 //!
-//! # `--yes`, and what happens with nothing to read (INST-08, D-20)
-//!
-//! `--yes` accepts every default and prompts for nothing, which is what makes
-//! install runnable from a script. Without it, install asks and reads the
-//! answer; if there is no answer to read - stdin at end of file, closed, or
-//! unreadable - it refuses and names `--yes`, because a scripted install that
-//! silently took defaults it never showed anyone is the failure this rule
-//! exists to prevent. `std::io::IsTerminal` decides only how the question is
-//! presented, and needs no dependency.
-//!
-//! `install` stays human-only with no `--json` (D-24): an interactive
-//! confirmation and a single JSON document on stdout contradict each other, and
-//! no INST requirement asks for one.
+//! `install` stays human-only with no `--json` (D-24): it prints a receipt for
+//! a person to read.
 
 pub mod binary;
 pub mod claude;
@@ -62,13 +52,6 @@ const LOW_CLEANUP_DAYS: i64 = 90;
 
 /// What Claude Code deletes after, when `cleanupPeriodDays` is not set at all.
 const CLAUDE_DEFAULT_CLEANUP_DAYS: i64 = 30;
-
-/// What install offers to raise it to: ten years, which is "keep them".
-const KEEP_CLEANUP_DAYS: i64 = 3650;
-
-pub struct Options {
-    pub yes: bool,
-}
 
 /// A new file in `dir`, created exclusively, and the path it landed at.
 ///
@@ -123,21 +106,16 @@ pub(super) fn create_temporary(
     )))
 }
 
-pub fn parse(parser: &mut lexopt::Parser) -> Result<Options, Failure> {
-    use lexopt::prelude::*;
-
-    let mut yes = false;
-    while let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
-        match arg {
-            Short('y') | Long("yes") => yes = true,
-            // Including `--json`, deliberately (D-24).
-            other => return Err(Failure::Misuse(crate::unexpected(other))),
-        }
+/// Install takes no arguments. Anything given is misuse, `--json` (D-24) and
+/// `--yes` (D-08) included.
+pub fn parse(parser: &mut lexopt::Parser) -> Result<(), Failure> {
+    match parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
+        Some(other) => Err(Failure::Misuse(crate::unexpected(other))),
+        None => Ok(()),
     }
-    Ok(Options { yes })
 }
 
-pub fn run(options: Options) -> Result<(), Failure> {
+pub fn run() -> Result<(), Failure> {
     let stable = binary::stable_path()?;
 
     // Everything that can refuse, before anything that can write.
@@ -153,33 +131,16 @@ pub fn run(options: Options) -> Result<(), Failure> {
     let claude_json = targets::claude_json_path()?;
 
     let add_hooks = |root: &mut Json| targets::add_hooks(root, &stable);
-    // Against the file's own bytes, not against a re-rendered copy of it: what
-    // `apply` writes is the whole document, so a settings file this renderer did
-    // not format is rewritten in full and the diff has to say so (INST-03).
-    let hook_diff = pending(&settings, &settings.preview(&add_hooks)?);
-
-    println!("terminus install");
-    println!();
-    println!("  this build  {}", current_exe_display());
-    println!("  copied to   {}", stable.display());
-    println!();
-    show(
-        &settings,
-        &hook_diff,
-        "the four hook entries are already there",
-    );
-
-    if !confirm("apply these changes?", true, options.yes)? {
-        println!("nothing was changed.");
-        return Ok(());
-    }
+    // A formatting difference alone is not a reason to write or back up: the
+    // file is re-rendered only when install also has something to add to it.
+    let hooks_pending = settings.would_write(&settings.preview(&add_hooks)?);
 
     // From here on, and not one line earlier, install writes.
     binary::place(&stable)?;
 
     let mut backups = Vec::new();
     let mut wrote_hooks = false;
-    if !hook_diff.is_empty() {
+    if hooks_pending {
         if let Some(backup) = settings.backup()? {
             backups.push(backup);
         }
@@ -187,7 +148,7 @@ pub fn run(options: Options) -> Result<(), Failure> {
     }
     let registered = register(&claude_json, &stable);
 
-    advise(&settings, options.yes)?;
+    advise(&settings)?;
 
     println!();
     match &registered {
@@ -200,6 +161,20 @@ pub fn run(options: Options) -> Result<(), Failure> {
         settings.path().display(),
         outcome(wrote_hooks, "four entries added", "already current")
     );
+    if wrote_hooks && settings.reformats() {
+        // The file was not in the two-space form this renderer writes, so the
+        // write re-rendered all of it (D-12).
+        println!(
+            "                    rewritten in full in two-space form, keys and values unchanged"
+        );
+        match backups.first() {
+            Some(backup) => println!(
+                "                    the original bytes are in {}",
+                backup.display()
+            ),
+            None => println!("                    no backup was written"),
+        }
+    }
     match &registered {
         Ok(done) => println!(
             "  mcp server        {} ({})",
@@ -402,7 +377,7 @@ fn reason(failure: Failure) -> String {
 }
 
 /// The advisories install gives and the settings it never changes (INST-04).
-fn advise(settings: &Document, yes: bool) -> Result<(), Failure> {
+fn advise(settings: &Document) -> Result<(), Failure> {
     // Re-read: the file may be the one install just wrote, and it may have been
     // rewritten by Claude Code in between either way.
     let current = Document::read(settings.path())?;
@@ -427,19 +402,7 @@ fn advise(settings: &Document, yes: bool) -> Result<(), Failure> {
              recovery path: what is already archived stays, but a session terminus never\n  \
              got to read goes with them."
         );
-        if offer(
-            &format!("  raise cleanupPeriodDays to {KEEP_CLEANUP_DAYS}?"),
-            yes,
-        ) {
-            current.apply(&|root: &mut Json| {
-                *root.entry("cleanupPeriodDays", Json::number(KEEP_CLEANUP_DAYS))? =
-                    Json::number(KEEP_CLEANUP_DAYS);
-                Ok(())
-            })?;
-            println!("  cleanupPeriodDays is now {KEEP_CLEANUP_DAYS}.");
-        } else {
-            println!("  cleanupPeriodDays left as it is.");
-        }
+        println!("  cleanupPeriodDays is left as it is.");
     }
     println!(
         "  autoCompactEnabled is left as it is, and terminus never sets it. Turning it\n  \
@@ -448,41 +411,6 @@ fn advise(settings: &Document, yes: bool) -> Result<(), Failure> {
          a self-summarization."
     );
     Ok(())
-}
-
-/// The diff install will write, or nothing at all when it will write nothing.
-///
-/// Taken against the file on disk. The empty string means install has nothing
-/// to add to this file, which is also the answer when the file's formatting is
-/// not this renderer's: install re-renders a file only when it also has
-/// something to put in it, so a formatting difference alone is not a change to
-/// show or a file to back up.
-fn pending(document: &Document, after: &str) -> String {
-    if !document.would_write(after) {
-        return String::new();
-    }
-    json_file::diff(document.source(), after)
-}
-
-fn show(document: &Document, diff: &str, unchanged: &str) {
-    println!("  {}", document.path().display());
-    if diff.is_empty() {
-        println!("    no change: {unchanged}");
-    } else {
-        if document.reformats() {
-            // The diff is large and every line of it is real: this file is not
-            // written the way terminus writes one, and terminus writes the whole
-            // document. Saying so is the difference between a confusing diff and
-            // an informed answer.
-            println!(
-                "    note: this file is not formatted the way terminus writes one, so applying\n    \
-                 this rewrites all of it - two-space indented, keys and values unchanged and in\n    \
-                 the order they are in now. every line below is part of that."
-            );
-        }
-        print!("{diff}");
-    }
-    println!();
 }
 
 fn outcome(wrote: bool, yes: &str, no: &str) -> String {
@@ -502,10 +430,10 @@ fn current_exe_display() -> String {
 
 /// Ask once, read the answer, and refuse rather than assume one.
 ///
-/// `pub(super)` for `cmd::uninstall`, whose `--purge` asks the same question
-/// about something it cannot undo. The rule that matters is the refusal when
-/// there is no answer to read, and a second copy of it beside a second copy of
-/// `--yes` and the terminal test is exactly how the two come apart.
+/// The shared question for `uninstall --purge` and `data move`. Install asks
+/// nothing. Under `yes` it answers with `default`. With no answer to read -
+/// stdin at end of file, closed, or unreadable - it fails rather than assume
+/// one, and both callers replace that failure with their own wording.
 pub(super) fn confirm(question: &str, default: bool, yes: bool) -> Result<bool, Failure> {
     let hint = if default { "[Y/n]" } else { "[y/N]" };
     if yes {
@@ -528,33 +456,17 @@ pub(super) fn confirm(question: &str, default: bool, yes: bool) -> Result<bool, 
     let read = std::io::stdin()
         .lock()
         .read_line(&mut answer)
-        .map_err(|e| unanswerable(&format!("stdin could not be read: {e}")))?;
+        .map_err(|e| Failure::Operational(format!("no answer could be read: {e}")))?;
     if read == 0 {
-        return Err(unanswerable("stdin is at end of file"));
+        return Err(Failure::Operational(
+            "no answer could be read: stdin is at end of file".to_owned(),
+        ));
     }
     Ok(match answer.trim().to_ascii_lowercase().as_str() {
         "" => default,
         "y" | "yes" => true,
         _ => false,
     })
-}
-
-/// The same question, asked after everything is already written.
-///
-/// No answer is the default here rather than a refusal. `advise` runs after the
-/// binary and both settings files have been written, and an offer that could
-/// return a failure would make a completed install exit non-zero - reporting
-/// that nothing worked when everything did. The default is no change, so the
-/// worst an unread answer costs is a setting left as the user had it.
-fn offer(question: &str, yes: bool) -> bool {
-    confirm(question, false, yes).unwrap_or(false)
-}
-
-fn unanswerable(why: &str) -> Failure {
-    Failure::Operational(format!(
-        "install needs an answer and {why}; nothing was changed.\n  \
-         rerun with --yes to accept every default without being asked"
-    ))
 }
 
 /// The stable path holds a program that is not a terminus build (D-07).

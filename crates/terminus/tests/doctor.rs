@@ -16,7 +16,6 @@
 //! the wrong reason.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -161,10 +160,9 @@ impl Fixture {
             .expect("the binary runs")
     }
 
-    /// Wire terminus in, the way a user would, answering every question with
-    /// its default.
+    /// Wire terminus in, the way a user would.
     fn install(&self) -> &Self {
-        let out = self.run(&["install", "--yes"]);
+        let out = self.run(&["install"]);
         assert!(
             out.status.success(),
             "install did not succeed: {}",
@@ -196,22 +194,15 @@ impl Fixture {
     ///
     /// The point of AC6 is that the command in the report is a command: not a
     /// description, not a sentence with a path in it. So the test runs the
-    /// string rather than asserting on its text, and answers the confirmation
-    /// `install` asks (INST-03) the way a user at a terminal would.
+    /// string rather than asserting on its text. Stdin is null: nothing a fix
+    /// runs may wait on an answer.
     fn shell(&self, line: &str) -> Output {
         // By absolute path: a bare `sh` is looked up on the child's `PATH`,
         // which holds only the fake `claude`.
         let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(line);
         self.env(&mut command);
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("sh runs");
-        child.stdin.take().unwrap().write_all(b"y\n").unwrap();
-        child.wait_with_output().unwrap()
+        command.stdin(Stdio::null()).output().expect("sh runs")
     }
 }
 
