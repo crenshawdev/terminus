@@ -1,33 +1,18 @@
-//! `terminus install`: one command wires terminus into Claude Code.
+//! `terminus install`: wire terminus into Claude Code, asking nothing.
 //!
-//! It applies its defaults and asks nothing. Five steps:
+//! It puts this build at the stable path ([`binary`]), merges the four hook
+//! entries into `settings.json` with a one-time backup ([`targets`]), and places
+//! the MCP entry by running `claude mcp` ([`claude`]). It reads `.claude.json`
+//! and never writes it, so Claude Code stays that file's only writer.
 //!
-//! 1. puts this build at the canonical stable path ([`binary`], D-08, INST-02),
-//! 2. writes the four exec-form hook entries into `settings.json`
-//!    ([`targets`], D-01),
-//! 3. places the MCP entry in `.claude.json` by running `claude mcp`, so Claude
-//!    Code stays that file's only writer ([`claude`], [`targets`], phase 3
-//!    D-01 and D-06),
-//! 4. says what a low `cleanupPeriodDays` costs and what auto-compact costs, and
-//!    changes neither (INST-04),
-//! 5. starts the backfill ([`start_backfill`], ING-11).
+//! Every check that can refuse runs before the first write. After that only the
+//! registration can fall short. When it does, the rest still happens, the
+//! receipt says the install is incomplete and prints the command that finishes
+//! it, and install exits 1.
 //!
-//! Every check that can refuse runs before the first write, and a refusal
-//! changes nothing. Once writing starts, only the registration can come up
-//! short: then the binary, the hook entries and the backfill still happen, and
-//! the summary says the install is incomplete and prints the command that
-//! finishes it (phase 3 D-05).
-//!
-//! # Install asks nothing (phase 3 D-08)
-//!
-//! There is no confirmation and no `--yes`, so `--yes` is misuse and exits 2.
-//! Install never reads stdin, which is what makes a run from a script and a run
-//! from a terminal the same run. A `settings.json` it did not format is
-//! rewritten in full without asking; the one-time backup holds the original
-//! bytes, and the summary says so (D-12).
-//!
-//! `install` stays human-only with no `--json` (D-24): it prints a receipt for
-//! a person to read.
+//! It ends with a receipt of every file it touched and the two Claude Code
+//! settings it reports and never changes, then starts the backfill last. It
+//! never reads stdin and takes no flags, so `--yes` and `--json` are misuse.
 
 pub mod binary;
 pub mod claude;
@@ -43,15 +28,12 @@ use json_file::{Document, Json};
 
 use crate::cmd::Failure;
 
-/// Below this many days, install says what Claude Code's cleanup costs.
-///
-/// A quarter of transcripts is the window in which a session terminus has not
-/// yet seen can still be recovered from Claude Code's own files. Below it, the
-/// second recovery path is short enough to be worth a sentence.
-const LOW_CLEANUP_DAYS: i64 = 90;
-
 /// What Claude Code deletes after, when `cleanupPeriodDays` is not set at all.
 const CLAUDE_DEFAULT_CLEANUP_DAYS: i64 = 30;
+
+/// What the printed line raises it to: ten years, which is "keep them". Doctor
+/// prints the same line.
+const KEEP_CLEANUP_DAYS: i64 = 3650;
 
 /// A new file in `dir`, created exclusively, and the path it landed at.
 ///
@@ -387,23 +369,25 @@ fn advise(settings: &Document) -> Result<(), Failure> {
         .and_then(Json::as_i64);
     let effective = configured.unwrap_or(CLAUDE_DEFAULT_CLEANUP_DAYS);
 
+    let how = match configured {
+        Some(days) => format!("cleanupPeriodDays is {days}"),
+        None => format!(
+            "cleanupPeriodDays is unset, so Claude Code's default of \
+             {CLAUDE_DEFAULT_CLEANUP_DAYS} applies"
+        ),
+    };
+
     println!();
-    if effective < LOW_CLEANUP_DAYS {
-        let how = match configured {
-            Some(days) => format!("cleanupPeriodDays is {days}"),
-            None => format!(
-                "cleanupPeriodDays is unset, so Claude Code's default of \
-                 {CLAUDE_DEFAULT_CLEANUP_DAYS} applies"
-            ),
-        };
-        println!(
-            "  {how}. Claude Code deletes its own transcripts that\n  \
-             many days after they are written, and those files are terminus's second\n  \
-             recovery path: what is already archived stays, but a session terminus never\n  \
-             got to read goes with them."
-        );
-        println!("  cleanupPeriodDays is left as it is.");
-    }
+    println!(
+        "  {how}.\n  \
+         Claude Code deletes its own transcripts that many days after they are written,\n  \
+         so its transcripts older than {effective} days are already gone. What terminus\n  \
+         has archived stays. install leaves the setting as it is. To keep them longer:"
+    );
+    println!(
+        "    set \"cleanupPeriodDays\": {KEEP_CLEANUP_DAYS} in {}",
+        settings.path().display()
+    );
     println!(
         "  autoCompactEnabled is left as it is, and terminus never sets it. Turning it\n  \
          off is the recommendation: compaction spends tokens summarizing context this\n  \

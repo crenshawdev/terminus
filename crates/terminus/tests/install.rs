@@ -1051,24 +1051,97 @@ fn install_takes_no_json_flag() {
 // Task 6: the advisories, and the settings install never changes
 // ---------------------------------------------------------------------------
 
-/// INST-04: a low `cleanupPeriodDays` is reported and auto-compact is
-/// recommended, and install changes neither.
+/// INST-04 and D-11: the receipt states `cleanupPeriodDays` at every value,
+/// says what is already gone, and prints the line that raises it, and install
+/// changes neither it nor `autoCompactEnabled`. It also names every file the
+/// run touched and where to watch the backfill.
 #[test]
 fn install_reports_the_two_settings_it_never_changes() {
+    let seven = "  \"cleanupPeriodDays\": 7,\n";
+    assert!(SETTINGS.contains(seven));
+    let seeds = [
+        (SETTINGS.to_owned(), "cleanupPeriodDays is 7.", 7),
+        (
+            SETTINGS.replace(seven, "  \"cleanupPeriodDays\": 3650,\n"),
+            "cleanupPeriodDays is 3650.",
+            3650,
+        ),
+        (
+            SETTINGS.replace(seven, ""),
+            "cleanupPeriodDays is unset, so Claude Code's default of 30 applies.",
+            30,
+        ),
+    ];
+
+    for (settings, stated, days) in seeds {
+        let fixture = fixture();
+        fixture.seed();
+        std::fs::write(fixture.settings(), &settings).unwrap();
+        let before = read(&fixture.settings());
+
+        let output = fixture.run(&["install"]);
+        let said = text(&output);
+        assert!(output.status.success(), "{said}");
+
+        assert!(said.contains(stated), "{said}");
+        assert!(
+            said.contains(&format!("older than {days} days are already gone")),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!(
+                "set \"cleanupPeriodDays\": 3650 in {}",
+                fixture.settings().display()
+            )),
+            "{said}"
+        );
+        assert!(said.contains("autoCompactEnabled"), "{said}");
+
+        let backup = fixture.claude_dir.join("settings.json.terminus-backup");
+        assert!(backup.exists());
+        for named in [
+            fixture.stable(),
+            fixture.settings(),
+            backup,
+            fixture.claude_json(),
+        ] {
+            assert!(
+                said.contains(&named.display().to_string()),
+                "the receipt does not name {}: {said}",
+                named.display()
+            );
+        }
+        assert!(said.contains("terminus status"), "{said}");
+
+        let after = read(&fixture.settings());
+        assert_eq!(after["cleanupPeriodDays"], before["cleanupPeriodDays"]);
+        assert_eq!(after["autoCompactEnabled"], before["autoCompactEnabled"]);
+    }
+}
+
+/// D-10: with a transcript on disk, the receipt carries the backfill estimate.
+#[test]
+fn the_receipt_carries_the_backfill_estimate() {
     let fixture = fixture();
     fixture.seed();
-    let before = read(&fixture.settings());
+    let project = fixture.claude_dir.join("projects").join("-tmp-receipt");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::copy(
+        testkit::fixture_path("session-basic.jsonl"),
+        project.join("11111111-1111-4111-8111-111111111111.jsonl"),
+    )
+    .unwrap();
 
     let output = fixture.run(&["install"]);
-    assert!(output.status.success(), "{}", text(&output));
     let said = text(&output);
-    assert!(said.contains("cleanupPeriodDays"), "{said}");
-    assert!(said.contains("autoCompactEnabled"), "{said}");
+    assert!(output.status.success(), "{said}");
+    assert!(said.contains("transcript(s)"), "{said}");
+    assert!(said.contains("not yet archived"), "{said}");
+    assert!(said.contains("terminus status"), "{said}");
 
-    let after = read(&fixture.settings());
-    assert_eq!(after["cleanupPeriodDays"], before["cleanupPeriodDays"]);
-    assert_eq!(after["autoCompactEnabled"], before["autoCompactEnabled"]);
-    assert_eq!(after["cleanupPeriodDays"], serde_json::Value::from(7));
+    // The backfill it started runs detached; let it finish before the
+    // fixture's directory goes.
+    wait_for_sessions(&fixture, 1);
 }
 
 /// The closing summary names where things went, and the paths it names are
