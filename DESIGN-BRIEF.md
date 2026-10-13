@@ -361,7 +361,8 @@ Prefix match on canonicalized paths, case-insensitive on macOS. A repo-local mar
 
 | Purpose | Linux | macOS |
 |---|---|---|
-| Binary (canonical) | `~/.local/bin/terminus` | same |
+| Stable link to the active version | `~/.local/bin/terminus` | same |
+| Stored versions | `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus` | same |
 | Data | `$XDG_DATA_HOME/terminus` | `~/Library/Application Support/terminus` |
 | Config | `$XDG_CONFIG_HOME/terminus` | same convention |
 
@@ -377,7 +378,7 @@ Prefix match on canonicalized paths, case-insensitive on macOS. A repo-local mar
 
 ## 13. Install and packaging
 
-**There is no npm channel.** The npm package was removed. A one-command installer arrives in phase 4.
+**There is no npm channel.** The npm package was removed. `install.sh` is the one-command installer, run as `sh install.sh https://<source>`. No release is published yet.
 
 Secondary: GitHub releases, Homebrew, deb/rpm.
 
@@ -385,7 +386,20 @@ Secondary: GitHub releases, Homebrew, deb/rpm.
 
 ### Binary layout
 
-`terminus install` copies the running binary to the stable path. **That copy is canonical** — hooks and MCP registration point at it, so there's one binary and no version skew. No PATH modification.
+`~/.local/bin/terminus` is a symbolic link to `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus`, one folder per version. It is the layout Baley uses, which is why the path carries the `crenshawdev` folder. The hooks and the MCP registration name the link, so they are written once and the version behind them changes without touching them. No PATH modification.
+
+The versions folder sits under HOME and outside the data directory. The data directory moves with `TERMINUS_DATA_DIR` and `terminus data move`, and `terminus uninstall --purge` deletes it, which would delete the file every hook runs.
+
+A version gets there one of two ways:
+
+- `install.sh` downloads the manifest and the binary for the machine, checks the binary's SHA-256 in `verify_download`, stages it in the folder for the manifest's version through a temporary file and `mv`, and moves a temporary link over the stable path with `mv -f`. It ends by running `~/.local/bin/terminus install`.
+- `terminus install` run from anywhere else stores its own binary under its own version and points the link at it. A local build is installed with `cargo build --release && target/release/terminus install`. Run from the file the link already names, as `install.sh`'s last step is, it changes neither the link nor the file.
+
+Both replace what is at the stable path only when nothing is there or it carries the Terminus marker, a fixed string every build holds, directly or through a link, so a plain-file install from before the link becomes the link. A link to nothing counts as nothing to `terminus install`, and to `install.sh` only when it points into the versions folder. Anything else is refused and left as it is.
+
+A version folder that already holds the same bytes is left alone. One holding different bytes, which is what a rebuild at the same version finds, gets the new file renamed over it, and a process running the old file keeps its inode. Old version folders are never deleted and nothing prunes them, so a running session's MCP server and the ingest its hook spawned keep their file.
+
+Uninstall removes the link and leaves the versions folder, printing its path.
 
 ### `terminus install`
 
@@ -404,7 +418,7 @@ Hooks go in **user scope** — terminus is global, one store across all projects
 
 ### Upgrade
 
-The new binary's `terminus install` re-copies it to the stable path. **Hooks are never rewritten** — the path doesn't change, so there is no version-check hook and nothing to repair. Store format bumps rebuild derived tables only. Config is additive.
+Installing a new version, with `install.sh` or with the new binary's `terminus install`, moves the link to that version's file. **Hooks are never rewritten** — the path doesn't change, so there is no version-check hook and nothing to repair. Store format bumps rebuild derived tables only. Config is additive.
 
 ### Uninstall
 
