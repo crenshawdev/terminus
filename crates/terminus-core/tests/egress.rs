@@ -251,6 +251,176 @@ fn nothing_in_the_ingest_path_names_the_egress_filter() {
 }
 
 // ---------------------------------------------------------------------------
+// Every planted shape, on a recall projection (PRIV-03)
+
+// Gated per item and NOT with a file-level `#![cfg(feature = "testkit")]`: a
+// file-level gate makes `cargo test --test egress` compile an empty binary and
+// report green, which would retire the ingest-path scan above silently.
+
+/// The transcript with one turn per credential shape.
+#[cfg(feature = "testkit")]
+const FIXTURE: &str = "session-secrets.jsonl";
+
+/// The nine planted sentinels, each with the marker of the only rule able to
+/// catch it, and a name for the failure message.
+///
+/// One table rather than nine tests, so a shape that quietly stopped being
+/// planted can't be missed. The last two are the double-quoted spellings of
+/// the first and fourth, kept as their own rows because nothing caught them
+/// until 2026-08-30.
+#[cfg(feature = "testkit")]
+const PLANTED: &[(&str, &str, &str)] = &[
+    (
+        "an Authorization: Bearer header",
+        "sk-VBEGRESS-authz-9f2",
+        REDACTED,
+    ),
+    ("a JSON \"password\" pair", "pw-VBEGRESS-mash-4d1", REDACTED),
+    (
+        "a space-separated --token flag",
+        "tk-VBEGRESS-flagv-7c3",
+        egress::REDACTED_FLAG_VALUE,
+    ),
+    ("a Cookie header", "sid-VBEGRESS-crumb-2b8", REDACTED),
+    (
+        "a bare JWT",
+        "eyJhbGciOiJIUzI1NiJ9.VBEGRESSjwt3e7",
+        egress::REDACTED_JWT,
+    ),
+    (
+        "a GitHub token",
+        "ghp_VBEGRESSgh0zq",
+        egress::REDACTED_GITHUB_TOKEN,
+    ),
+    (
+        "a connection URL's userinfo",
+        "dsn-VBEGRESS-pg-8a4",
+        egress::REDACTED_URL_USERINFO,
+    ),
+    (
+        "a double-quoted Authorization header, the curl spelling",
+        "sk-VBEGRESS-curlz-5e6",
+        REDACTED,
+    ),
+    (
+        "a double-quoted Cookie header, the curl spelling",
+        "sid-VBEGRESS-qcrumb-1f9",
+        REDACTED,
+    ),
+];
+
+/// The `Cookie` turn's prose, which follows the value on the same line.
+#[cfg(feature = "testkit")]
+const AFTER_THE_COOKIE: &str = "the retry after that answered 204 with an empty body";
+
+/// [`FIXTURE`] ingested for real and read back as one context window, turn by
+/// turn: `(raw, redacted)`.
+///
+/// The window, not `recall::get`, because a `get` body is the archived JSON
+/// line, where the `"password"` pair sits behind escaped quotes and a
+/// different rule would fire. The knob goes through a real `terminus.toml`,
+/// the only way the binary can turn it on.
+#[cfg(feature = "testkit")]
+fn projected() -> (Vec<String>, Vec<String>) {
+    use terminus_core::config::CONFIG_FILE_NAME;
+    use terminus_core::recall::{context, Scope, MAX_CONTEXT_SIDE};
+    use terminus_core::store::DB_FILE_NAME;
+    use terminus_core::{ingest, testkit};
+
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let path = testkit::copy_rooted_fixture_into(FIXTURE, &work, &dir.path().join("root"));
+    match ingest::run(&data_dir, &path).unwrap() {
+        ingest::Outcome::Committed(_) => {}
+        other => panic!("{FIXTURE}: {other:?}"),
+    }
+
+    let conn = rusqlite::Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+    let first: i64 = conn
+        .query_row("SELECT id FROM turns ORDER BY turn_seq LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+
+    let window = |on: bool| -> Vec<String> {
+        let config_dir = work.join(format!("config-{on}"));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(CONFIG_FILE_NAME),
+            format!("[privacy]\nredact_recall = {on}\n"),
+        )
+        .unwrap();
+        let config = Config::load_from(&config_dir).unwrap();
+        let window = context::window(
+            &conn,
+            &config,
+            &Scope::Everything,
+            first,
+            0,
+            MAX_CONTEXT_SIDE,
+        )
+        .unwrap();
+        assert!(
+            window.at_session_start && window.at_session_end,
+            "the window does not cover the whole of {FIXTURE}: {window:?}"
+        );
+        window.turns.into_iter().map(|turn| turn.text).collect()
+    };
+    (window(false), window(true))
+}
+
+/// Each planted shape is gone from what recall hands the model, and the rule
+/// that took it left its marker.
+#[cfg(feature = "testkit")]
+#[test]
+fn every_planted_shape_is_gone_and_its_rule_named_itself() {
+    let (raw, redacted) = projected();
+    let (raw, redacted) = (raw.join("\n"), redacted.join("\n"));
+
+    for (what, sentinel, marker) in PLANTED {
+        assert!(
+            !redacted.contains(sentinel),
+            "{what} survived into the window ({sentinel}): {redacted}"
+        );
+        assert!(
+            redacted.contains(marker),
+            "{what} went without {marker}, so a reader can't tell what was taken: {redacted}"
+        );
+        // A shape the fixture stopped planting would pass the absence check
+        // above for the wrong reason.
+        assert!(
+            raw.contains(sentinel),
+            "{what} is not planted in {FIXTURE} ({sentinel}), so its absence proves nothing"
+        );
+    }
+}
+
+/// The `Cookie` match is bounded: the value goes and the rest of its turn
+/// stays.
+#[cfg(feature = "testkit")]
+#[test]
+fn a_mid_line_cookie_takes_its_value_and_leaves_the_turn_standing() {
+    let (raw, redacted) = projected();
+    let at = raw
+        .iter()
+        .position(|text| text.contains("sid-VBEGRESS-crumb-2b8"))
+        .unwrap_or_else(|| panic!("no turn of {FIXTURE} carries the cookie"));
+    let turn = &redacted[at];
+
+    assert!(
+        !turn.contains("sid-VBEGRESS-crumb-2b8"),
+        "the cookie survived: {turn}"
+    );
+    assert!(
+        turn.contains(AFTER_THE_COOKIE),
+        "the match ran past the value and took the rest of the turn: {turn}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // What is actually sent (PRIV-01, PRIV-03, D-01, D-14, D-15, D-16)
 
 /// The bytes `provider::complete` hands `net::post`, read off a loopback stub.
@@ -272,9 +442,9 @@ mod wire {
     use std::path::PathBuf;
 
     use rusqlite::Connection;
-    use terminus_core::config::{Config, CONFIG_FILE_NAME, REDACTED};
+    use terminus_core::config::{Config, CONFIG_FILE_NAME};
+    use terminus_core::observe::cost;
     use terminus_core::observe::judgment::{self, Verdict};
-    use terminus_core::observe::{cost, egress};
     use terminus_core::store::DB_FILE_NAME;
     use terminus_core::testkit::{self, HttpStub};
     use terminus_core::{ingest, observe};
@@ -284,60 +454,6 @@ mod wire {
 
     /// What the model is told it is, so the stub's one answer is enough.
     const MODEL: &str = "wire-stub";
-
-    /// The nine planted sentinels, each with the marker of the rule that is
-    /// the only thing able to catch it, and a name for the failure message.
-    ///
-    /// One table rather than nine tests: the claim is about the SET - every
-    /// shape gone, each one accounted for by a named rule - and a table makes a
-    /// shape that quietly stopped being planted impossible to miss.
-    ///
-    /// The last two are the DOUBLE-QUOTED spellings of the first and fourth.
-    /// They are separate rows rather than a rewrite of those rows because they
-    /// were caught by nothing until 2026-08-30: rule 4 handed a quoted name to
-    /// rule 5, which only fires once the quoted run closes before the colon.
-    const PLANTED: &[(&str, &str, &str)] = &[
-        (
-            "an Authorization: Bearer header",
-            "sk-VBEGRESS-authz-9f2",
-            REDACTED,
-        ),
-        ("a JSON \"password\" pair", "pw-VBEGRESS-mash-4d1", REDACTED),
-        (
-            "a space-separated --token flag",
-            "tk-VBEGRESS-flagv-7c3",
-            egress::REDACTED_FLAG_VALUE,
-        ),
-        ("a Cookie header", "sid-VBEGRESS-crumb-2b8", REDACTED),
-        (
-            "a bare JWT",
-            "eyJhbGciOiJIUzI1NiJ9.VBEGRESSjwt3e7",
-            egress::REDACTED_JWT,
-        ),
-        (
-            "a GitHub token",
-            "ghp_VBEGRESSgh0zq",
-            egress::REDACTED_GITHUB_TOKEN,
-        ),
-        (
-            "a connection URL's userinfo",
-            "dsn-VBEGRESS-pg-8a4",
-            egress::REDACTED_URL_USERINFO,
-        ),
-        (
-            "a double-quoted Authorization header, the curl spelling",
-            "sk-VBEGRESS-curlz-5e6",
-            REDACTED,
-        ),
-        (
-            "a double-quoted Cookie header, the curl spelling",
-            "sid-VBEGRESS-qcrumb-1f9",
-            REDACTED,
-        ),
-    ];
-
-    /// The `Cookie` turn's prose, which follows the value on the SAME line.
-    const AFTER_THE_COOKIE: &str = "the retry after that answered 204 with an empty body";
 
     /// One archived, observed session, ready to be judged.
     struct Wire {
@@ -644,81 +760,5 @@ mod wire {
             ids.len(),
             cost::MIN_TURNS
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // AC2 and AC5: every shape, and what is left standing
-
-    /// Each of the seven planted shapes is gone, and the rule that took it said
-    /// so by name.
-    ///
-    /// Four of the seven sit in the fixture with no name-keyed text beside
-    /// them, which is what makes this an assertion about a rule rather than
-    /// about the assignment rule catching a `NAME=` that happened to be
-    /// nearby.
-    #[test]
-    fn every_planted_shape_is_gone_and_its_rule_named_itself() {
-        let wire = wire();
-        let (filtered, whole) = wire.both_bodies();
-
-        for (what, sentinel, marker) in PLANTED {
-            assert!(
-                !filtered.contains(sentinel),
-                "{what} went out on the wire ({sentinel}): {filtered}"
-            );
-            assert!(
-                filtered.contains(marker),
-                "{what} went without {marker}, so a reader cannot tell what was taken: {filtered}"
-            );
-            // Loudly, rather than as a pass: a shape the fixture stopped
-            // planting would satisfy the absence above for the wrong reason.
-            assert!(
-                whole.contains(sentinel),
-                "{what} is not planted in {FIXTURE} ({sentinel}), so its absence proves nothing"
-            );
-        }
-    }
-
-    /// AC5: a bounded match. The `Cookie` value goes and the rest of that turn
-    /// does not.
-    ///
-    /// The anchor is the reason this matters. A rule running to end of line
-    /// would erase the rest of the turn while leaving its `turn_id=` standing,
-    /// so the model would be shown a fragment and could still hang a claim on
-    /// it - a claim the store would accept, because the id is real.
-    #[test]
-    fn a_mid_line_cookie_takes_its_value_and_leaves_the_turn_standing() {
-        let wire = wire();
-        let filtered = wire.recorded_body(None, false);
-        let shown: serde_json::Value = serde_json::from_str(&filtered).unwrap();
-        let shown = shown["messages"][1]["content"]
-            .as_str()
-            .expect("a user turn");
-
-        assert!(
-            !shown.contains("sid-VBEGRESS-crumb-2b8"),
-            "the cookie went out: {shown}"
-        );
-        assert!(
-            shown.contains(AFTER_THE_COOKIE),
-            "the match ran past the value and took the rest of the turn: {shown}"
-        );
-        // Read off the store rather than hardcoded: an anchor a test invented
-        // is not the anchor the model was given.
-        let anchors: Vec<String> = wire
-            .turn_ids()
-            .iter()
-            .map(|id| format!("turn_id={id}"))
-            .collect();
-        assert!(
-            anchors.len() >= 6,
-            "too few anchors to assert on: {anchors:?}"
-        );
-        for anchor in &anchors {
-            assert!(
-                shown.contains(anchor.as_str()),
-                "{anchor} was not shown to the model: {shown}"
-            );
-        }
     }
 }
