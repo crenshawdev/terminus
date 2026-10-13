@@ -99,18 +99,18 @@
       `cargo test --workspace` runs 0 of their 41 tests and still reports 304
       passed / 0 failed, so the two binaries carrying AC5/AC6/AC7's
       process-level assertions are silently absent from the default command.
-- [ ] (phase 4) The npm shim does not forward signals to the child: spawnSync blocks the event loop, so a SIGTERM aimed at the shim's own PID kills node and orphans the binary. Ctrl-C and job control signal the whole process group and are unaffected. risk_surface review finding, adjudicated downgraded (medium).
+- [x] (phase 4) The npm shim does not forward signals to the child: spawnSync blocks the event loop, so a SIGTERM aimed at the shim's own PID kills node and orphans the binary. Ctrl-C and job control signal the whole process group and are unaffected. risk_surface review finding, adjudicated downgraded (medium). Closed 2026-10-13: no longer applicable, because phase 2 removed the npm package.
 - [ ] (phase 4) Hoist pass::record_pass and pass::walk's per-file failure arm into ingest/mod.rs (or make them pub(crate)) so pass and backfill share one runs-row writer and one skip rule. Needs a plan whose lease covers crates/verbatim-core/src/ingest/pass.rs.
 - [ ] (phase 4) The four-worker backfill pipeline is only 8% faster than the sequential pass on the real corpus (49,089 ms vs 53,007 ms). The remaining cost is the single SQLite writer's: batch derived-row inserts, or move derive_turn's text expansion and entity extraction onto the workers. Measurement-led task, not a guess.
 - [ ] (phase 4) verbatim status can fail with 'sqlite: database is locked' in the ~1 ms window while a backfill creates the store and sets journal_mode=wal (1 of 20 polls, at t=1 ms). Pre-existing in Store::open.
-- [ ] (phase 4) AC3's Windows half - no console window, no handle inherited from the hook - is unrunnable on Linux and stays a human-verify on a Windows machine.
-- [ ] (phase 4) npm's os/cpu selection of an optionalDependency cannot be exercised locally, only the shim's resolution of an already-placed platform package. AC9's remaining risk lives in the publish step (D-21).
-- [ ] (phase 4) Four of the five npm platform packages carry no binary; they arrive with cross-compilation in a later shipping step. pack-local.sh fails with a named message on any host it cannot stage.
-- [ ] (phase 4) npm name checked 2026-08-23: 'verbatim' is TAKEN (dormant - 0.0.1, last published 2022-06-28, "Record and replay error first callbacks in a deterministic order"), so npm/verbatim/package.json's current name cannot publish. 'verbatim-cli' is free on npm. The '@verbatim' scope owner is still unresolved (npmjs.com answers 403 to anonymous org/user probes). crates.io is moot - both crates are now publish = false (0f18d04). Naming decision deferred to the publish milestone; see Seeds.
+- [x] (phase 4) AC3's Windows half - no console window, no handle inherited from the hook - is unrunnable on Linux and stays a human-verify on a Windows machine. Closed 2026-10-13: no longer applicable, because phase 2 removed Windows support.
+- [x] (phase 4) npm's os/cpu selection of an optionalDependency cannot be exercised locally, only the shim's resolution of an already-placed platform package. AC9's remaining risk lives in the publish step (D-21). Closed 2026-10-13: no longer applicable, because phase 2 removed the npm package.
+- [x] (phase 4) Four of the five npm platform packages carry no binary; they arrive with cross-compilation in a later shipping step. pack-local.sh fails with a named message on any host it cannot stage. Closed 2026-10-13: no longer applicable, because phase 2 removed the npm package.
+- [x] (phase 4) npm name checked 2026-08-23: 'verbatim' is TAKEN (dormant - 0.0.1, last published 2022-06-28, "Record and replay error first callbacks in a deterministic order"), so npm/verbatim/package.json's current name cannot publish. 'verbatim-cli' is free on npm. The '@verbatim' scope owner is still unresolved (npmjs.com answers 403 to anonymous org/user probes). crates.io is moot - both crates are now publish = false (0f18d04). Naming decision deferred to the publish milestone; see Seeds. Closed 2026-10-13: no longer applicable, because phase 2 removed the npm package.
 - [ ] (phase 4) ingest::backfill deliberately does not honour fault::pass_fails_after (the 'a pass that died still leaves its runs row' fault). The sequential walk still has it; add it if a later task wants to kill a backfill's walk rather than its process.
 - [ ] (phase 4) cargo fmt --check reports two pre-existing diffs in crates/verbatim/tests/hook.rs, both on lines committed in plan 1 and neither in code any later pass wrote. cargo fmt closes them whenever the file is next edited for its own reasons.
-- [ ] (phase 4) Declined an engines.node field on the thin npm package - nothing in the Verify exercises a Node floor and the shim uses only long-present APIs. Add one when a task states a minimum.
-- [ ] (phase 4) shellcheck is not installed on this machine, so npm/pack-local.sh's static analysis was bash -n only.
+- [x] (phase 4) Declined an engines.node field on the thin npm package - nothing in the Verify exercises a Node floor and the shim uses only long-present APIs. Add one when a task states a minimum. Closed 2026-10-13: no longer applicable, because phase 2 removed the npm package.
+- [x] (phase 4) shellcheck is not installed on this machine, so npm/pack-local.sh's static analysis was bash -n only. Closed 2026-10-13: no longer applicable, because phase 2 removed the npm package.
 - [ ] (phase 5) AC6's watchdog timeout arm has no test that forces it: the exclusive-writer case is bounded by SQLite before the 50 ms watchdog fires on Linux. Forcing it needs a fault point in the injection path (phase 4's testkit pattern).
 - [ ] (phase 5) crates/verbatim/tests/hook.rs flakes with ETXTBSY at its spawn-the-copied-binary sites under parallel tests; reproduced on the pre-phase-5 baseline 3fd5b19, so it pre-dates phase 5.
 - [ ] (phase 5) cargo fmt --check reports pre-existing diffs in crates/verbatim-core/src/ingest/backfill.rs:250 and crates/verbatim/tests/hook.rs:252,681 under rustfmt 1.9.0; every phase-5 file is clean.
@@ -203,75 +203,77 @@ store exists outside this machine.
 
 ### Publish milestone (discussed 2026-08-23, not yet a roadmap milestone)
 
+- [x] Closed 2026-10-13: no longer applicable, because phase 2 removed the npm package and Windows support, and a one-command installer arrives in phase 4. The text below stays as the record of what was decided.
+
 Scope note: v0.1.1 stays the hardening cycle (phases 1-4). Publishing is its own
 later milestone. Nothing below is planned work yet.
 
 **Decided**
 
-- Canonical code home is Forgejo, `git.jcrenshaw.dev/crenshawdev/verbatim`.
+- [x] Canonical code home is Forgejo, `git.jcrenshaw.dev/crenshawdev/verbatim`.
   Issues, PRs and releases live there. Both it and its issue tracker already
   answer 200 anonymously, so strangers can read without an account.
-- GitHub is a discovery mirror and nothing else: Issues off in settings, a PR
+- [x] GitHub is a discovery mirror and nothing else: Issues off in settings, a PR
   template and CONTRIBUTING routing contributors to Forgejo, and a first line in
   the README marking it read-only. GitHub cannot fully disable PRs, so the
   template is what keeps an opened PR from being a silent void.
-- Builds run on GitHub Actions, all five targets on native runners (ubuntu,
+- [x] Builds run on GitHub Actions, all five targets on native runners (ubuntu,
   ubuntu arm64, windows-latest, macos-latest). The droplet builds nothing, which
   retires the capacity question and the whole cross-compilation problem
   (cargo-zigbuild, cargo-xwin, osxcross) unopened.
-- npm publish uses trusted publishing (OIDC). No long-lived npm token exists
+- [x] npm publish uses trusted publishing (OIDC). No long-lived npm token exists
   anywhere. This was the deciding factor: an npm publish token can push
   arbitrary code to every user of a tool that reads every transcript and holds
   provider credentials, so the best outcome is for it not to exist.
-- Accepted consequence: `npm/verbatim/package.json`'s `repository.url` MUST
+- [x] Accepted consequence: `npm/verbatim/package.json`'s `repository.url` MUST
   point at `github.com/crenshawdev/verbatim`, because trusted publishing
   verifies an exact match. The public provenance attestation will therefore name
   the GitHub mirror as the build source. That is accurate rather than
   misleading - it records where the bytes were built, which is a different claim
   from where the code lives. `Cargo.toml`'s `repository` is unconstrained and
   moves to Forgejo; both READMEs lead with the canonical home.
-- Neither crate goes to crates.io. `publish = false` landed in 0f18d04. Verbatim
+- [x] Neither crate goes to crates.io. `publish = false` landed in 0f18d04. Verbatim
   is a binary application, not a library: `cargo install` would make users
   compile bundled SQLite under LTO on their own machine, needs a Rust toolchain
   most Claude Code users do not have, and produces no provenance.
-- `win32-x64` stays in the platform matrix.
+- [x] `win32-x64` stays in the platform matrix.
 
 **Constraints measured or verified 2026-08-23**
 
-- npm trusted publishing supports GitHub Actions, GitLab CI and CircleCI cloud
+- [x] npm trusted publishing supports GitHub Actions, GitLab CI and CircleCI cloud
   only. **Self-hosted runners are not supported**, which is what killed the
   earlier idea of publishing from a Forgejo runner on the droplet - that path
   would need a classic long-lived token, the exact thing being designed out.
-- Requires `id-token: write` in the workflow and npm CLI >= 11.5.1. Provenance
+- [x] Requires `id-token: write` in the workflow and npm CLI >= 11.5.1. Provenance
   needs a public repo AND a public package, and is silently skipped otherwise.
-- The npmjs.com trusted-publisher config needs org/user, repository, workflow
+- [x] The npmjs.com trusted-publisher config needs org/user, repository, workflow
   filename and environment name, all case-sensitive and exact. Configurations
   created after 2026-05-20 must also explicitly select the allowed actions.
-- Provenance is automatic under OIDC (no `--provenance` flag) and yields a SLSA
+- [x] Provenance is automatic under OIDC (no `--provenance` flag) and yields a SLSA
   Build Level 3 attestation naming repository, commit and workflow.
-- Apple's SDK licence permits use only on Apple hardware, so cross-compiling the
+- [x] Apple's SDK licence permits use only on Apple hardware, so cross-compiling the
   two darwin targets on a Linux droplet would mean knowingly violating an EULA.
   GitHub's macos runners are Apple hardware and legal, which is a second
   independent reason builds sit there.
-- npm does not set `com.apple.quarantine`, so an unsigned darwin binary
+- [x] npm does not set `com.apple.quarantine`, so an unsigned darwin binary
   installed through the npm shim generally runs without a Gatekeeper prompt. A
   release tarball downloaded in a browser does get quarantined. Codesigning and
   notarization therefore matter for the release channel, not the npm one.
 
 **Open, needs a decision before anything publishes**
 
-- The npm package name. `verbatim` is taken (see the phase 4 todo above), and
+- [x] The npm package name. `verbatim` is taken (see the phase 4 todo above), and
   `package.json` currently claims it. Whatever replaces it moves through the
   package name, the `bin` entry, both READMEs, the install docs and every
   platform package under the scope.
-- Whether the `@verbatim` scope is claimable - anonymous probes return 403.
-- SECURITY.md and a private disclosure channel. Forgejo has no GitHub-style
+- [x] Whether the `@verbatim` scope is claimable - anonymous probes return 403.
+- [x] SECURITY.md and a private disclosure channel. Forgejo has no GitHub-style
   private vulnerability reporting, so this is an email address. Key
   `693AB15F91734B0C` already signs the commits and could both sign releases and
   receive reports, one identity to verify.
-- What compatibility promise the archive format makes across 0.x, once people
+- [x] What compatibility promise the archive format makes across 0.x, once people
   other than John hold archives and schema migration stops being private.
-- Whether a tag arriving at GitHub via Forgejo's push mirror triggers Actions.
+- [x] Whether a tag arriving at GitHub via Forgejo's push mirror triggers Actions.
   It should - mirror pushes authenticate with a PAT, and only pushes made by a
   workflow's own `GITHUB_TOKEN` are suppressed - but it is load-bearing and
   unverified. Fallback is `workflow_dispatch`.
@@ -286,12 +288,14 @@ later milestone. Nothing below is planned work yet.
   workflow, at the point where the answer is load-bearing. First tag pushed to
   Forgejo is the test; if no run appears within a couple of minutes, switch the
   workflow to `workflow_dispatch` and move on.
-- Release CI does not exist at all: neither `.github/workflows` nor
+- [x] Release CI does not exist at all: neither `.github/workflows` nor
   `.forgejo/workflows` is present in the tree.
-- The version bump. Workspace `Cargo.toml` and `npm/verbatim/package.json` both
+- [x] The version bump. Workspace `Cargo.toml` and `npm/verbatim/package.json` both
   still say 0.1.0 while the branch is `cadence/v0.1.1`.
 
 **Proposed amendment to Phase 3 (v0.1.1, awaiting John's yes)**
+
+- [x] Closed 2026-10-13: no longer applicable, because phase 2 removed Windows support. There is no Windows ACL left to check, so the deferral this proposal would have replaced, Windows ACL enforcement left as a `doctor` caveat while only the Unix mode bits were checked, is closed too. The proposal stays below as the record.
 
 Phase 3 currently says Windows ACL handling stays deferred per D-15 with a
 `doctor` caveat. Replace that with an effective-DACL **check** - not
