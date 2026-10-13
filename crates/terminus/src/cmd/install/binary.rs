@@ -395,4 +395,18 @@ mod tests {
         let bytes = vec![b'x'; CHUNK * 2 + 17];
         assert!(!carries_marker(bytes.as_slice()).unwrap());
     }
+
+    /// `install.sh` decides ownership of the stable path with its own copy of
+    /// the marker, so the two must not drift apart.
+    #[test]
+    fn install_sh_holds_the_same_marker() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let text = std::fs::read_to_string(&script)
+            .unwrap_or_else(|e| panic!("read {}: {e}", script.display()));
+        let held: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("marker="))
+            .collect();
+        assert_eq!(held, [format!("'{MARKER}'")], "{}", script.display());
+    }
 }
