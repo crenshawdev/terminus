@@ -232,7 +232,7 @@ fn fill_text(
     session_key: &str,
     rows: &[(ContextTurn, (i64, i64))],
     turns: &mut [ContextTurn],
-    redaction: &Redaction<'_>,
+    redaction: &Redaction,
 ) -> Result<()> {
     if rows.is_empty() {
         return Ok(());

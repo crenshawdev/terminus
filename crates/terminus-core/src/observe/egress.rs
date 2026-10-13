@@ -1,81 +1,53 @@
-//! Redaction at egress, keyed on the declared destination (PRIV-03, D-13,
-//! D-16).
+//! Redaction of recall projections on their way into the model's context
+//! (PRIV-03).
 //!
-//! # Three entry points, one rule set
+//! # One entry point
 //!
-//! [`for_destination`] is the gate for text on its way to the configured model
-//! PROVIDER: a whole request body, or one message's content on its way into
-//! one. It parses nothing and reads no structure, so it has no opinion about
-//! which of those it was given, and every rule below is written to hold on
-//! plain prose as well as on a document. `local = true` hands the text back
-//! untouched, because a local provider is not egress at all and filtering it
-//! would destroy detail for nothing; anything else - including a `local` key
-//! the user forgot to write - hands back a filtered copy.
-//!
-//! [`scrub`] is the error boundary, and it runs whatever the destination is.
-//! That is the half of D-16 that survives the `local` distinction, and it
-//! survives for a reason with a paper trail: `feedback`'s `Drained::discarded`
-//! and `Labeled::notes` travel into `runs.error` because there is no log file,
-//! `runs.error` is free text, and `terminus status` prints that column. A 401
-//! body echoing an API key would be durably stored and reprinted, which is
-//! worse than a leak that scrolls past.
-//!
-//! [`for_model_context`] is the third destination and the newest: a derived
-//! projection - a recall excerpt, a context window's turn, a `recall_get` body,
-//! a quotation in an injected brief - on its way into the MODEL's context
-//! through a hook or through the MCP server. It takes no `local` argument, and
-//! that absence is the decision (phase 4 D-03). `provider.local` is a
-//! declaration about where a REQUEST's bytes end up, and it says nothing about
-//! this destination: hook stdout and an MCP result are read by the harness's
-//! model whether or not judgment was ever configured, and routing this through
-//! [`for_destination`] would return the text unfiltered for every user who
-//! declared a local provider - leaving the knob silently inert for exactly the
-//! person who runs a local model for privacy reasons. It is also opt-in and off
-//! by default, because unlike a provider request every byte it would take out
-//! has already reached this model once, when it was typed
-//! ([`crate::config::Config::redact_recall`]).
-//!
-//! All three go through [`redact`], so there is one rule set and not three that
-//! drift.
+//! [`for_model_context`] filters a derived projection - a recall excerpt, a
+//! context window's turn, a `recall_get` body, a quotation in an injected brief,
+//! the per-prompt injection - on its way into the model's context through a
+//! hook or through the MCP server. It is opt-in and off by default, because
+//! every byte it would take out has already reached this model once, when it
+//! was typed ([`crate::config::Config::redact_recall`]). [`Redaction`] carries
+//! that decision from the call sites that hold a `Config` down into the shared
+//! projection code.
 //!
 //! # The rules, and why each one is here
 //!
-//! In the order the one rule set runs them, each with the marker it leaves.
+//! In the order they run, each with the marker it leaves. All of
+//! them are guesses at shape; none knows a secret's exact value.
 //!
-//! 1. **The credential this run resolved**, wherever it appears. The only exact
-//!    rule; everything below it is a guess at shape.
-//!    Marker: [`REDACTED_CREDENTIAL`].
-//! 2. **PEM private key blocks**, whole. Marker: [`REDACTED_PRIVATE_KEY`].
-//! 3. **A connection URL's userinfo** - the span between `://` and the `@` that
+//! 1. **PEM private key blocks**, whole. Marker: [`REDACTED_PRIVATE_KEY`].
+//! 2. **A connection URL's userinfo** - the span between `://` and the `@` that
 //!    closes it, with the scheme and the host left standing so a reader can see
-//!    which machine was reached. Ahead of rule 4 deliberately: a userinfo name
-//!    matching [`SECRET_NAMES`] is a `name: value` shape, and rule 4 would take
+//!    which machine was reached. Ahead of rule 3 deliberately: a userinfo name
+//!    matching [`SECRET_NAMES`] is a `name: value` shape, and rule 3 would take
 //!    the host away with the password. Marker: [`REDACTED_URL_USERINFO`].
-//! 4. **Header shapes, ANYWHERE on a line** - `name: value` whose name matches
+//! 3. **Header shapes, ANYWHERE on a line** - `name: value` whose name matches
 //!    [`SECRET_NAMES`]. `Authorization: Bearer ...` is the case this exists for,
-//!    and "anywhere" is what makes it fire on a transcript turn, which arrives
-//!    as one line behind a `turn_id=` prefix rather than as a bare header line.
-//!    What it takes is bounded, so the rest of that turn survives.
+//!    and "anywhere" is what makes it fire on a projected turn, where the header
+//!    sits mid-line inside prose rather than on a bare header line. What it
+//!    takes is bounded, so the rest of that line survives.
 //!    Marker: [`REDACTED`].
-//! 5. **JSON string pairs** whose name matches [`SECRET_NAMES`].
+//! 4. **JSON string pairs** whose name matches [`SECRET_NAMES`].
 //!    Marker: [`REDACTED`].
-//! 6. **Assignment-shaped text** - `NAME=value` whose name matches
+//! 5. **Assignment-shaped text** - `NAME=value` whose name matches
 //!    [`SECRET_NAMES`]. Marker: [`REDACTED`].
-//! 7. **Space-separated secret flags** - `--name value`, quoted or bare, which
-//!    rule 6 cannot see because it scans for `=`.
+//! 6. **Space-separated secret flags** - `--name value`, quoted or bare, which
+//!    rule 5 cannot see because it scans for `=`.
 //!    Marker: [`REDACTED_FLAG_VALUE`].
-//! 8. **Bare JSON Web Tokens** - an `eyJ`-prefixed base64url run. Nothing names
-//!    it, so rules 4 to 7 have nothing to catch it by; it names itself instead,
+//! 7. **Bare JSON Web Tokens** - an `eyJ`-prefixed base64url run. Nothing names
+//!    it, so rules 3 to 6 have nothing to catch it by; it names itself instead,
 //!    because `eyJ` is `{"` in base64url. Marker: [`REDACTED_JWT`].
-//! 9. **GitHub tokens** - a run opening with one of [`GITHUB_TOKEN_PREFIXES`],
+//! 8. **GitHub tokens** - a run opening with one of [`GITHUB_TOKEN_PREFIXES`],
 //!    also nameless in the wild. That list is a pinned 2026-08-30 snapshot with
 //!    no in-repo source of truth and it will go stale: a prefix GitHub invents
 //!    after that date is missed until someone edits the array.
 //!    Marker: [`REDACTED_GITHUB_TOKEN`].
 //!
-//! Every one of them leaves a marker naming what went. A payload that came back
-//! silently shorter would leave a reader unable to tell filtering from a
-//! provider that returned less.
+//! Every one of them leaves a marker naming what went. A projection that came
+//! back silently shorter would leave a reader unable to tell filtering from a
+//! turn that said less.
 //!
 //! # The direction to be wrong in
 //!
@@ -84,7 +56,7 @@
 //! name-substring false positive costs a caller some detail in one message,
 //! while under-redaction costs a key rotation.
 //!
-//! Rules 8 and 9 over-match for a second reason and in the same direction.
+//! Rules 7 and 8 over-match for a second reason and in the same direction.
 //! Their length floors are set against this repo's short unrealistic sentinels
 //! (`ghp_abc123XYZ`) rather than against real credentials, because
 //! realistic-length values in a public repo trip GitHub push protection - and a
@@ -94,9 +66,9 @@
 //! GitHub prefix occurred 0 times and bare `eyJ`-prefixed runs 4 times.
 //!
 //! Over-matching is the direction to be wrong in; it is NOT a licence for a
-//! rule to hand a shape off to another rule that does not take it. Rule 4 did
+//! rule to hand a shape off to another rule that does not take it. Rule 3 did
 //! exactly that until 2026-08-30: it deferred every header name preceded by a
-//! double quote to rule 5, and rule 5 fires only once the quoted run CLOSES
+//! double quote to rule 4, and rule 4 fires only once the quoted run CLOSES
 //! before the colon, so the ordinary curl spelling `-H "Authorization: Bearer
 //! <v>"` was caught by neither and went out whole. Measured on the same corpus
 //! D-03 used, 347 of 1333 `Authorization:` occurrences sat immediately behind a
@@ -115,7 +87,7 @@
 
 use std::borrow::Cow;
 
-use crate::config::{Config, Secret, REDACTED};
+use crate::config::{Config, REDACTED};
 
 /// The name fragments that make a value a secret, matched case-insensitively
 /// as substrings.
@@ -131,14 +103,10 @@ pub const SECRET_NAMES: &[&str] = &[
     // shape after `Authorization` - measured 7 times over the 60 most recent
     // real transcripts, 21 MB, on 2026-08-30.
     "cookie",
-    // Not in the phase plan's list and here anyway: it is the exact header the
-    // one request this phase makes carries its credential in, and matching it
-    // by the `bearer` in its value would depend on the scheme's spelling.
+    // The header a credential is pasted under most often. Matching it by the
+    // `bearer` in its value would depend on the scheme's spelling.
     "authorization",
 ];
-
-/// What replaces the configured credential wherever it is found.
-pub const REDACTED_CREDENTIAL: &str = "[redacted: the configured provider credential]";
 
 /// What replaces a PEM private key block.
 pub const REDACTED_PRIVATE_KEY: &str = "[redacted: a PEM private key block]";
@@ -191,67 +159,25 @@ const MIN_GITHUB_TOKEN_BODY: usize = 6;
 /// cost over the same sample: 4 bare `eyJ`-prefixed runs.
 const MIN_JWT_CHARS: usize = 12;
 
-/// A credential shorter than this is not replaced by rule 1.
-///
-/// The rule is a plain substring replacement, so a two-character credential
-/// would blank two characters out of every word in the payload and leave a
-/// reader with rubble. Nothing that short is a credential; if one ever is, the
-/// shape rules below still catch it wherever it is labelled.
-const MIN_CREDENTIAL_CHARS: usize = 4;
-
-/// Filter text for its declared destination (D-13).
-///
-/// `local = true` is the only thing that returns the text unchanged, and it is
-/// a DECLARATION about where the bytes end up rather than an observation about
-/// the address. Absent or false means remote, so a user who forgets the key
-/// pays the filter - which is the harmless direction to be wrong in.
-pub fn for_destination<'a>(
-    local: bool,
-    credential: Option<&Secret>,
-    text: &'a str,
-) -> Cow<'a, str> {
-    if local {
-        Cow::Borrowed(text)
-    } else {
-        Cow::Owned(redact(credential, text))
-    }
-}
-
-/// Scrub a string that is about to become an error (D-16).
-///
-/// No destination argument, deliberately: an error travels to `runs.error` and
-/// to stderr whatever the provider was, and those are local destinations that
-/// keep the bytes.
-pub fn scrub(credential: Option<&Secret>, text: &str) -> String {
-    redact(credential, text)
-}
-
-/// Filter a derived projection on its way into the model's context (PRIV-03,
-/// phase 4 D-03).
-///
-/// No `local` argument and no way to add one. The destination is the harness's
-/// model, reached through hook stdout or an MCP result, and `provider.local` is
-/// a declaration about a request this text is not part of - see the module doc.
+/// Filter a derived projection on its way into the model's context (PRIV-03).
 ///
 /// Unconditional here and gated by the caller: whether a projection is filtered
 /// at all is [`crate::config::Config::redact_recall`], read at the entry points
 /// that hold a `Config`, and carried down as a [`Redaction`] so that the shared
 /// projection code has no config to consult and no decision to get wrong.
-pub fn for_model_context(credential: Option<&Secret>, text: &str) -> String {
-    redact(credential, text)
+pub fn for_model_context(text: &str) -> String {
+    redact(text)
 }
 
-/// Whether a derived projection is filtered on its way to the model, and with
-/// which credential.
+/// Whether a derived projection is filtered on its way to the model.
 ///
 /// A value the caller resolves ONCE and passes down, because the projection is
 /// shared: `recall::excerpt` cuts the text for a search hit, a context window, a
 /// brief's quotation and the per-prompt injection alike, and only its callers
-/// know which of those are model-facing. Phase 4 D-01 turns on exactly that -
-/// the knob is read at the entry points that already carry a `&Config`, and
-/// `excerpt::of_record`/`excerpt::attach` read no config at all - so which
-/// surfaces filter is a property of the call sites and stays reviewable at
-/// them, rather than being decided once inside a projection all of them share.
+/// know which of those are model-facing. The knob is read at the entry points
+/// that already carry a `&Config`, and `excerpt::of_record`/`excerpt::attach`
+/// read no config at all, so which surfaces filter is a property of the call
+/// sites and stays reviewable at them.
 ///
 /// Five call sites resolve one today and every one of them passes
 /// [`Redaction::of`]: the four projections PRIV-03 names, and
@@ -264,37 +190,24 @@ pub fn for_model_context(credential: Option<&Secret>, text: &str) -> String {
 /// what [`Redaction::of`] resolves to when the knob is off - which is what
 /// keeps the default path a borrow rather than a copy per turn.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Redaction<'a> {
-    /// Rule 1's exact value, when there is one to give it. `None` on the common
-    /// machine, where no provider is configured, and there the filter rests on
-    /// the eight shape rules alone (phase 4 D-10).
-    credential: Option<&'a Secret>,
+pub struct Redaction {
     on: bool,
 }
 
-impl<'a> Redaction<'a> {
+impl Redaction {
     /// Filter nothing: the projection is handed back exactly as it was cut.
-    pub const fn none() -> Redaction<'a> {
-        Redaction {
-            credential: None,
-            on: false,
-        }
+    pub const fn none() -> Redaction {
+        Redaction { on: false }
     }
 
     /// What this config asks for, resolved at a call site that holds one.
     ///
-    /// The one constructor that reads the knob, and it takes the `Config` by
-    /// reference from a caller that already had it. Nothing inside the shared
-    /// projection may call this: that is D-01, and it is why the value travels
-    /// rather than the config.
-    pub fn of(config: &'a Config) -> Redaction<'a> {
-        if config.redact_recall() {
-            Redaction {
-                credential: config.provider_api_key(),
-                on: true,
-            }
-        } else {
-            Redaction::none()
+    /// The one constructor that reads the knob, and it takes the `Config` from
+    /// a caller that already had it. Nothing inside the shared projection may
+    /// call this, which is why the value travels rather than the config.
+    pub fn of(config: &Config) -> Redaction {
+        Redaction {
+            on: config.redact_recall(),
         }
     }
 
@@ -309,20 +222,19 @@ impl<'a> Redaction<'a> {
     /// of a copy per projected turn.
     pub fn apply<'t>(&self, text: &'t str) -> Cow<'t, str> {
         if self.on {
-            Cow::Owned(for_model_context(self.credential, text))
+            Cow::Owned(for_model_context(text))
         } else {
             Cow::Borrowed(text)
         }
     }
 }
 
-/// The one rule set both entry points run.
-fn redact(credential: Option<&Secret>, text: &str) -> String {
-    let text = replace_credential(text, credential);
-    let text = redact_pem_blocks(&text);
+/// The one rule set.
+fn redact(text: &str) -> String {
+    let text = redact_pem_blocks(text);
     // Before the header rule, not after: a userinfo username matching
     // `SECRET_NAMES` (`postgres://apiuser:pw@host/db`) is a `name: value` shape
-    // to rule 4, which would take the host along with the password and leave a
+    // to rule 3, which would take the host along with the password and leave a
     // reader unable to see which machine was reached.
     let text = redact_url_userinfo(&text);
     let text = redact_header_lines(&text);
@@ -333,17 +245,7 @@ fn redact(credential: Option<&Secret>, text: &str) -> String {
     redact_github_tokens(&text)
 }
 
-/// Rule 1: the exact value, wherever it is.
-fn replace_credential(text: &str, credential: Option<&Secret>) -> String {
-    match credential {
-        Some(secret) if secret.expose().chars().count() >= MIN_CREDENTIAL_CHARS => {
-            text.replace(secret.expose(), REDACTED_CREDENTIAL)
-        }
-        _ => text.to_owned(),
-    }
-}
-
-/// Rule 2: `-----BEGIN ... PRIVATE KEY-----` through its `-----END ...-----`.
+/// Rule 1: `-----BEGIN ... PRIVATE KEY-----` through its `-----END ...-----`.
 ///
 /// An unterminated block is redacted to the end of the text. A private key that
 /// was cut off mid-way is still most of a private key.
@@ -390,12 +292,11 @@ fn redact_pem_blocks(text: &str) -> String {
     out
 }
 
-/// Rule 3: the userinfo a connection URL carries before its `@`.
+/// Rule 2: the userinfo a connection URL carries before its `@`.
 ///
 /// The scheme and everything from the `@` onward stay, so a reader can still
 /// see which host was reached - which is the whole reason this is its own rule
-/// rather than a header match. Nothing here assumes the surrounding text is a
-/// request body.
+/// rather than a header match.
 fn redact_url_userinfo(text: &str) -> String {
     const SEP: &str = "://";
     let bytes = text.as_bytes();
@@ -429,45 +330,43 @@ fn is_userinfo_byte(b: u8) -> bool {
     !(b.is_ascii_whitespace() || matches!(b, b'/' | b'?' | b'#' | b'"' | b'\'' | b'`' | b'\\'))
 }
 
-/// Rule 4: a header shape ANYWHERE on a line, whose name is a secret name.
+/// Rule 3: a header shape ANYWHERE on a line, whose name is a secret name.
 ///
 /// The name is the run of ASCII letters, digits, `-` and `_` that ends at a
 /// colon, and every colon on the line is tested rather than only the first.
-/// Transcript text is why: `judgment::transcript` writes each turn as
-/// `turn_id=<id> <record_type>: <said>` and collapses the turn to one line, so
-/// the first colon on every line sits behind a prefix carrying a space and an
-/// `=`. A rule that could only ever test that colon was inert on exactly the
-/// text this filter exists to guard.
+/// A projected turn is why: a header shape turns up mid-line inside prose
+/// (`I set Authorization: Bearer <v> and it worked`), often behind a colon that
+/// is only punctuation, and a rule that tested only the first colon on a line
+/// would miss it.
 ///
-/// A JSON pair is left to rule 5 without needing a test for it here: `"x": "y"`
+/// A JSON pair is left to rule 4 without needing a test for it here: `"x": "y"`
 /// puts a closing quote immediately before the colon, that quote is not a name
 /// byte, and the walk-back therefore yields an EMPTY name run, which the empty
 /// check below already skips. A test on the byte preceding the name is a
 /// different test entirely - it also matches a name whose quote has not closed
 /// yet, which is the ordinary curl spelling `-H "Authorization: Bearer <v>"`,
-/// and that shape is a header this rule owns rather than a pair rule 5 will
-/// take. Rule 5 requires the run to close before the colon, so deferring the
+/// and that shape is a header this rule owns rather than a pair rule 4 will
+/// take. Rule 4 requires the run to close before the colon, so deferring the
 /// curl spelling to it deferred it to nothing at all.
 ///
 /// A value may be quoted (`Cookie: "<v>"`), so the value span is taken with
 /// [`flag_value_span`] rather than [`value_run_end`], which stops ON an opening
-/// quote and would leave an empty span - the same under-match rule 7 was
+/// quote and would leave an empty span - the same under-match rule 6 was
 /// carrying until it was fixed. The opening quote is re-emitted before the
 /// marker, so the redacted line stays balanced.
 ///
 /// What goes is BOUNDED - an optional auth scheme word plus one value run -
-/// rather than the rest of the line. A whole turn is one line, so running to
-/// end of line would erase the rest of that turn from the prompt while leaving
-/// its `turn_id=` anchor standing, and the model can still anchor a claim to a
-/// turn it was shown a fragment of.
+/// rather than the rest of the line. One projected line can be a whole text
+/// block, so running to end of line would erase the rest of what the turn said
+/// along with the value.
 fn redact_header_lines(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     // `split_inclusive` keeps each line's own newline on it, so nothing has to
     // be re-added and a text with no trailing newline round-trips unchanged.
     for line in text.split_inclusive('\n') {
         // The line ending is held back and re-attached, so a CRLF payload
-        // keeps its CRs: this runs over text that may already be an HTTP
-        // request, where a lost \r is a protocol error rather than cosmetics.
+        // keeps its CRs: a turn that pasted an HTTP exchange or a Windows file
+        // comes back with the line endings it went in with.
         let ending_len = if line.ends_with("\r\n") {
             2
         } else {
@@ -495,7 +394,7 @@ fn redact_header_spans(line: &str, out: &mut String) {
         while name_start > copied && is_name_byte(bytes[name_start - 1]) {
             name_start -= 1;
         }
-        // An empty run (rule 5's `"name": "value"`, whose closing quote ends the
+        // An empty run (rule 4's `"name": "value"`, whose closing quote ends the
         // run before it starts) or an ordinary word: not a header, and the colon
         // is just punctuation.
         if name_start == colon || !is_secret_name(&line[name_start..colon]) {
@@ -554,7 +453,7 @@ fn skip_blanks(bytes: &[u8], from: usize) -> usize {
 
 /// The end of an unquoted value run starting at `from`.
 ///
-/// It stops at whitespace, at a quote and at a backslash for rule 6's reason:
+/// It stops at whitespace, at a quote and at a backslash for rule 5's reason:
 /// this filter runs over text that may sit INSIDE a JSON string, where the byte
 /// after the value is the string's closing quote, and running past it would
 /// hand the endpoint a document that is not JSON.
@@ -578,7 +477,7 @@ fn is_auth_scheme(word: &str) -> bool {
         .any(|scheme| word.eq_ignore_ascii_case(scheme))
 }
 
-/// Rule 5: `"name": "value"` where the name is a secret name.
+/// Rule 4: `"name": "value"` where the name is a secret name.
 ///
 /// Byte indices throughout, and every slice boundary is an ASCII quote or a
 /// position already copied from, so a payload holding multi-byte text is cut in
@@ -643,7 +542,7 @@ fn quoted_end(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-/// Rule 6: `NAME=value` where the name is a secret name.
+/// Rule 5: `NAME=value` where the name is a secret name.
 ///
 /// The value runs to the closing quote when it is quoted and to the next
 /// whitespace when it is not - which is how a shell export, a `.env` line and a
@@ -701,12 +600,12 @@ fn redact_assignments(text: &str) -> String {
     out
 }
 
-/// Rule 7: `--name value` where the flag's name is a secret name.
+/// Rule 6: `--name value` where the flag's name is a secret name.
 ///
-/// Rule 6 scans for `=` and its name run admits `-`, so `--token=x` is already
+/// Rule 5 scans for `=` and its name run admits `-`, so `--token=x` is already
 /// its case; the space-separated spelling is not, and it was measured 5 times
 /// over the 60 most recent real transcripts, 21 MB. An unquoted value stops at
-/// the same quote and backslash bytes rule 6 stops at, for the reason stated
+/// the same quote and backslash bytes rule 5 stops at, for the reason stated
 /// there: this text may sit inside a JSON string, and running to the next space
 /// would swallow the string's closing quote and the comma after it. A QUOTED
 /// value is [`flag_value_span`]'s case, because those same stop bytes are what
@@ -728,7 +627,7 @@ fn redact_flag_values(text: &str) -> String {
         }
         let name = &text[at..name_end];
         // A bare `--` names nothing, and a name run followed by anything but a
-        // blank is either rule 6's `--token=x` or not a flag at all.
+        // blank is either rule 5's `--token=x` or not a flag at all.
         if !name.trim_start_matches('-').is_empty()
             && is_secret_name(name)
             && matches!(bytes.get(name_end), Some(b' ' | b'\t'))
@@ -748,7 +647,7 @@ fn redact_flag_values(text: &str) -> String {
     out
 }
 
-/// Is this byte part of a flag's name? The same run rule 6 reads a name by.
+/// Is this byte part of a flag's name? The same run rule 5 reads a name by.
 fn is_flag_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'
 }
@@ -797,12 +696,10 @@ fn flag_value_span(bytes: &[u8], from: usize) -> (usize, usize) {
     (inner_start, value_run_end(bytes, inner_start))
 }
 
-/// Rule 8: a bare JSON Web Token, with no name beside it to catch it by.
+/// Rule 7: a bare JSON Web Token, with no name beside it to catch it by.
 ///
 /// A JWT says what it is: `eyJ` is `{"` in base64url, so a run opening with it
-/// is a serialized JSON header and very little else. Nothing here assumes the
-/// surrounding text is a request body - phase 4 runs this same set over recall
-/// excerpts and brief windows.
+/// is a serialized JSON header and very little else.
 fn redact_jwts(text: &str) -> String {
     redact_runs(text, is_jwt_byte, is_jwt, REDACTED_JWT)
 }
@@ -816,10 +713,9 @@ fn is_jwt(run: &str) -> bool {
     run.len() >= MIN_JWT_CHARS && run.starts_with("eyJ")
 }
 
-/// Rule 9: a GitHub token, keyed on [`GITHUB_TOKEN_PREFIXES`].
+/// Rule 8: a GitHub token, keyed on [`GITHUB_TOKEN_PREFIXES`].
 ///
 /// Also nameless in the wild: a token pasted into a turn arrives on its own.
-/// Nothing here assumes the surrounding text is a request body.
 fn redact_github_tokens(text: &str) -> String {
     redact_runs(
         text,
@@ -886,14 +782,14 @@ mod tests {
     use super::*;
 
     /// The curl spelling. The header name opens inside a double-quoted string,
-    /// so the quoted run does NOT close before the colon and rule 5 never fires
-    /// on it - rule 4 has to take it or nothing does.
+    /// so the quoted run does NOT close before the colon and rule 4 never fires
+    /// on it - rule 3 has to take it or nothing does.
     #[test]
     fn a_double_quoted_header_name_is_still_a_header() {
         let turn =
             "turn_id=11 user: ran curl -H \"Authorization: Bearer sk-PLANTED-Q1\" https://api.example.com and got 200";
 
-        let scrubbed = scrub(None, turn);
+        let scrubbed = for_model_context(turn);
 
         assert!(
             !scrubbed.contains("sk-PLANTED-Q1"),
@@ -922,7 +818,7 @@ mod tests {
     fn a_double_quoted_cookie_header_is_still_a_header() {
         let turn = "turn_id=12 user: curl -H \"Cookie: sid-PLANTED-Q2\" -X GET then retried";
 
-        let scrubbed = scrub(None, turn);
+        let scrubbed = for_model_context(turn);
 
         assert!(
             !scrubbed.contains("sid-PLANTED-Q2"),
@@ -941,7 +837,7 @@ mod tests {
     fn a_quoted_header_value_is_taken_from_inside_its_quotes() {
         let turn = "turn_id=13 user: set Cookie: \"sid-PLANTED-Q3\" and the rest of the turn";
 
-        let scrubbed = scrub(None, turn);
+        let scrubbed = for_model_context(turn);
 
         assert!(
             !scrubbed.contains("sid-PLANTED-Q3"),
@@ -965,7 +861,7 @@ mod tests {
     fn an_unterminated_quoted_header_value_stays_bounded() {
         let turn = "turn_id=14 user: Cookie: \"sid-PLANTED-Q5 and the rest of the turn";
 
-        let scrubbed = scrub(None, turn);
+        let scrubbed = for_model_context(turn);
 
         assert!(
             !scrubbed.contains("sid-PLANTED-Q5"),
@@ -987,7 +883,7 @@ mod tests {
     fn a_header_inside_a_json_string_keeps_the_documents_punctuation() {
         let body = "{\"note\": \"ran with Cookie: sid-PLANTED-Q6 today\", \"n\": 1}";
 
-        let scrubbed = scrub(None, body);
+        let scrubbed = for_model_context(body);
 
         assert!(
             !scrubbed.contains("sid-PLANTED-Q6"),
@@ -999,14 +895,14 @@ mod tests {
         );
     }
 
-    /// The hand-off rule 4 makes to rule 5 has to keep working: a real JSON
-    /// pair closes its quoted run BEFORE the colon, and rule 5 must be the one
+    /// The hand-off rule 3 makes to rule 4 has to keep working: a real JSON
+    /// pair closes its quoted run BEFORE the colon, and rule 4 must be the one
     /// that takes it, comma and document structure intact.
     #[test]
-    fn a_json_pair_is_still_rule_5s_and_keeps_its_comma() {
+    fn a_json_pair_is_still_rule_4s_and_keeps_its_comma() {
         let body = "{\"api_key\": \"sk-PLANTED-Q4\", \"model\": \"m\"}";
 
-        let scrubbed = scrub(None, body);
+        let scrubbed = for_model_context(body);
 
         assert!(
             !scrubbed.contains("sk-PLANTED-Q4"),
@@ -1014,18 +910,17 @@ mod tests {
         );
         assert_eq!(
             scrubbed, "{\"api_key\": \"[redacted]\", \"model\": \"m\"}",
-            "rule 4 took a pair rule 5 owns and reshaped the document"
+            "rule 3 took a pair rule 4 owns and reshaped the document"
         );
     }
 
-    /// A turn as `judgment::transcript` writes it: one line, prefixed
-    /// `turn_id=<id> <record_type>: `, with the header shape sitting mid-line
-    /// behind that prefix.
+    /// One line with an ordinary `name: ` prefix, and the header shape sitting
+    /// mid-line behind it.
     #[test]
     fn a_header_shape_mid_line_loses_its_scheme_and_its_value() {
         let turn = "turn_id=42 user: I set Authorization: Bearer sk-PLANTED-1 and it worked";
 
-        let scrubbed = scrub(None, turn);
+        let scrubbed = for_model_context(turn);
 
         assert!(
             !scrubbed.contains("sk-PLANTED-1"),
@@ -1055,7 +950,7 @@ mod tests {
     fn a_cookie_header_takes_its_value_and_leaves_the_rest_of_the_turn() {
         let turn = "turn_id=7 user: Cookie: sid-PLANTED-2; the rest of the turn";
 
-        let scrubbed = scrub(None, turn);
+        let scrubbed = for_model_context(turn);
 
         assert!(
             !scrubbed.contains("sid-PLANTED-2"),
@@ -1071,8 +966,8 @@ mod tests {
         );
     }
 
-    /// Neither shape carries a name, so neither is catchable by rules 3, 4 or
-    /// 5. Both sentinels sit in plain prose with no `:`, no `=` and no quoted
+    /// Neither shape carries a name, so neither is catchable by rules 3 to 6.
+    /// Both sentinels sit in plain prose with no `:`, no `=` and no quoted
     /// pair anywhere near them, so the rule under test is the only thing that
     /// can be what caught them.
     #[test]
@@ -1080,7 +975,7 @@ mod tests {
         let prose =
             "the log line read eyJQTEFOVEVEXzMz then stopped, and ghp_abc123XYZ sat beside it";
 
-        let scrubbed = scrub(None, prose);
+        let scrubbed = for_model_context(prose);
 
         assert!(
             !scrubbed.contains("eyJQTEFOVEVEXzMz"),
@@ -1105,7 +1000,7 @@ mod tests {
         // Both markers are inert against the whole set, which is what lets a
         // test say which rule made a catch.
         assert_eq!(
-            scrub(None, &scrubbed),
+            for_model_context(&scrubbed),
             scrubbed,
             "a second scrub changed the markers the first one left"
         );
@@ -1118,7 +1013,7 @@ mod tests {
         let turn =
             "turn_id=11 user: it connects to postgres://user:pw-PLANTED-3@db.example.invalid/app";
 
-        let scrubbed = scrub(None, turn);
+        let scrubbed = for_model_context(turn);
 
         assert!(
             !scrubbed.contains("pw-PLANTED-3"),
@@ -1142,17 +1037,17 @@ mod tests {
             "https://example.com/path@thing",
             "https://example.invalid/keys",
         ] {
-            assert_eq!(scrub(None, plain), plain, "changed: {plain}");
+            assert_eq!(for_model_context(plain), plain, "changed: {plain}");
         }
     }
 
-    /// Rule 6 catches `--token=x` already. The space-separated spelling is this
+    /// Rule 5 catches `--token=x` already. The space-separated spelling is this
     /// rule's, and what follows the value has to still be there.
     #[test]
     fn a_space_separated_secret_flag_loses_its_value_and_nothing_else() {
         let turn = "turn_id=12 user: gh auth login --token tok-PLANTED-4 --scopes repo";
 
-        let scrubbed = scrub(None, turn);
+        let scrubbed = for_model_context(turn);
 
         assert!(
             !scrubbed.contains("tok-PLANTED-4"),
@@ -1167,7 +1062,7 @@ mod tests {
             "the flag value went into an unlabelled hole: {scrubbed}"
         );
         assert_eq!(
-            scrub(None, &scrubbed),
+            for_model_context(&scrubbed),
             scrubbed,
             "a second scrub re-consumed the marker the first one left"
         );
@@ -1206,7 +1101,7 @@ mod tests {
                 "and it worked",
             ),
         ] {
-            let scrubbed = scrub(None, turn);
+            let scrubbed = for_model_context(turn);
 
             assert!(
                 !scrubbed.contains(planted),
@@ -1221,7 +1116,7 @@ mod tests {
                 "the rule took `{survives}` with the value: {scrubbed}"
             );
             assert_eq!(
-                scrub(None, &scrubbed),
+                for_model_context(&scrubbed),
                 scrubbed,
                 "a second scrub re-consumed the marker the first one left"
             );
@@ -1255,7 +1150,7 @@ mod tests {
                 "tok-PLANTED-12",
             ),
         ] {
-            let scrubbed = scrub(None, turn);
+            let scrubbed = for_model_context(turn);
 
             assert!(
                 !scrubbed.contains(planted),
@@ -1270,15 +1165,15 @@ mod tests {
                 "the rule ran past the value's closing quote: {scrubbed}"
             );
             assert_eq!(
-                scrub(None, &scrubbed),
+                for_model_context(&scrubbed),
                 scrubbed,
                 "a second scrub re-consumed the marker the first one left"
             );
         }
     }
 
-    /// The prefix `judgment::transcript` writes is itself a `name: value` shape
-    /// (`user: ...`), and it must not be one this rule takes.
+    /// A `user: ...` prefix is itself a `name: value` shape, and it must not be
+    /// one this rule takes.
     #[test]
     fn an_ordinary_turn_prefix_and_ordinary_prose_come_back_unchanged() {
         for plain in [
@@ -1286,7 +1181,7 @@ mod tests {
             "a line with a colon: and an = sign",
             "{\"model\":\"qwen3:8b\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
         ] {
-            assert_eq!(scrub(None, plain), plain, "changed: {plain}");
+            assert_eq!(for_model_context(plain), plain, "changed: {plain}");
         }
     }
 }

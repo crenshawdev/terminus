@@ -20,10 +20,10 @@
 //! could not be computed is a note folded into `runs.error` - there is no log
 //! file, by design - exactly as the drain's and the labeller's failures are.
 //!
-//! **One redaction boundary, and it only exists when data leaves.** [`egress`]
-//! filters a request body on the DECLARED destination (D-13) and scrubs every
-//! string on its way to becoming an error whatever the destination is (D-16).
-//! Nothing here redacts at ingest: `.planning/PROJECT.md` bars that outright.
+//! **Redaction is for recall, never for ingest.** [`egress`] holds the shape
+//! rules recall applies to a projection on its way into the model's context
+//! when `[privacy] redact_recall` is on. Nothing redacts at ingest:
+//! `.planning/PROJECT.md` bars that outright.
 
 pub mod egress;
 pub mod mechanical;

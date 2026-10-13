@@ -175,7 +175,7 @@ fn render(
     conn: &Connection,
     scoped: &Scoped,
     budget: usize,
-    redaction: &Redaction<'_>,
+    redaction: &Redaction,
 ) -> Option<Brief> {
     let budget = budget.min(MAX_BRIEF_CHARS);
     let continuity = last_session(conn, scoped, redaction);
@@ -386,7 +386,7 @@ struct LastSession {
 fn last_session(
     conn: &Connection,
     scoped: &Scoped,
-    redaction: &Redaction<'_>,
+    redaction: &Redaction,
 ) -> Option<Continuity> {
     let row = last_session_row(conn, scoped).ok()??;
     let project = project_label(scoped);
@@ -512,7 +512,7 @@ fn day(ts: &str) -> &str {
 fn last_exchange(
     conn: &Connection,
     session_key: &str,
-    redaction: &Redaction<'_>,
+    redaction: &Redaction,
 ) -> (Option<Quote>, Option<Quote>) {
     let prompt = last_turn(conn, session_key, "user");
     let reply = last_turn(conn, session_key, "assistant");

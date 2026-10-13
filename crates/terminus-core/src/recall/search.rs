@@ -504,7 +504,7 @@ fn observations(
     conn: &Connection,
     request: &Request,
     scoped: &scope::Scoped,
-    redaction: &Redaction<'_>,
+    redaction: &Redaction,
 ) -> Result<Response> {
     // The table, not the row count: a store written before phase 7 has no
     // `observations` at all, and left to the query that is `no such table`

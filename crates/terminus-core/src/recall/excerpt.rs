@@ -76,7 +76,7 @@ pub fn attach(
     conn: &Connection,
     query: &Query,
     hits: &mut [Hit],
-    redaction: &Redaction<'_>,
+    redaction: &Redaction,
 ) -> Result<Reads> {
     let mut reads = Reads::default();
     if hits.is_empty() {
@@ -181,7 +181,7 @@ pub fn of_record(query: &Query, record: &[u8]) -> String {
 /// What it costs is measured rather than argued. Over the live store on
 /// 2026-09-04, scrubbing the real projection of every turn of the 60 most
 /// recent sessions (5,412 records, 12.9 MB) changed 0.18% of projections.
-pub fn of_record_with(query: &Query, record: &[u8], redaction: &Redaction<'_>) -> String {
+pub fn of_record_with(query: &Query, record: &[u8], redaction: &Redaction) -> String {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(record) else {
         // A line that is not JSON is archived verbatim all the same (D-13), and
         // it has no projection. Nothing to excerpt is an empty excerpt.
