@@ -89,11 +89,7 @@ fn fixture() -> Fixture {
 
 impl Fixture {
     fn stable(&self) -> PathBuf {
-        self.bin_dir.join(if cfg!(windows) {
-            "terminus.exe"
-        } else {
-            "terminus"
-        })
+        self.bin_dir.join("terminus")
     }
 
     fn settings(&self) -> PathBuf {
@@ -112,8 +108,7 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("TERMINUS_DATA_DIR", self.root.join("data"))
             .env("TERMINUS_CONFIG_DIR", self.config_dir())
-            .env("HOME", &self.root)
-            .env("USERPROFILE", &self.root);
+            .env("HOME", &self.root);
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -172,7 +167,6 @@ impl Fixture {
     /// description, not a sentence with a path in it. So the test runs the
     /// string rather than asserting on its text, and answers the confirmation
     /// `install` asks (INST-03) the way a user at a terminal would.
-    #[cfg(unix)]
     fn shell(&self, line: &str) -> Output {
         let mut command = Command::new("sh");
         command.arg("-c").arg(line);
@@ -323,7 +317,6 @@ fn after_install_every_wiring_check_is_ok() {
 /// The command is run rather than matched, because the requirement is not that
 /// doctor prints a plausible string - it is that what it prints fixes the thing
 /// it reported.
-#[cfg(unix)]
 #[test]
 fn a_missing_binary_is_a_problem_whose_printed_command_fixes_it() {
     let fixture = fixture();

@@ -1,12 +1,12 @@
 //! AC2 / AC6 / STOR-02: killing ingest anywhere leaves a store that converges.
 //!
-//! The harness kills the child un-catchably - `Child::kill` is `SIGKILL` on
-//! Unix and `TerminateProcess` on Windows - at more than forty points across
-//! three scenarios, spread three ways. Some are *aimed at a moment*: the child
-//! announces that it has reached a named point inside one file's pass and waits
-//! there to be killed. Some are *aimed at a file*: the walk stalls once a given
-//! number of transcripts have committed, so the kill lands in the middle of a
-//! tree. The rest are timed, at pseudorandom delays.
+//! The harness kills the child un-catchably - `Child::kill` is `SIGKILL` - at
+//! more than forty points across three scenarios, spread three ways. Some are
+//! *aimed at a moment*: the child announces that it has reached a named point
+//! inside one file's pass and waits there to be killed. Some are *aimed at a
+//! file*: the walk stalls once a given number of transcripts have committed, so
+//! the kill lands in the middle of a tree. The rest are timed, at pseudorandom
+//! delays.
 //!
 //! Aiming is not a convenience. A release ingest of a few-KB fixture finishes
 //! in single-digit milliseconds, so a harness that only randomizes on elapsed
@@ -278,9 +278,9 @@ fn kill_after(dirs: &Dirs, data_dir: &Path, transcript: Option<&Path>, delay: Du
     kill_and_reap(&mut child);
 }
 
-/// `SIGKILL` on Unix, `TerminateProcess` on Windows: un-catchable either way,
-/// which is the point - a signal the process could handle would let it tidy up
-/// and prove nothing.
+/// `Child::kill` sends `SIGKILL`, which cannot be caught, and that is the
+/// point - a signal the process could handle would let it tidy up and prove
+/// nothing.
 fn kill_and_reap(child: &mut Child) {
     let _ = child.kill();
     child.wait().unwrap();

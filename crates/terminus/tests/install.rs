@@ -108,11 +108,7 @@ fn fixture() -> Fixture {
 impl Fixture {
     /// Where install will put this build.
     fn stable(&self) -> PathBuf {
-        self.bin_dir.join(if cfg!(windows) {
-            "terminus.exe"
-        } else {
-            "terminus"
-        })
+        self.bin_dir.join("terminus")
     }
 
     fn settings(&self) -> PathBuf {
@@ -145,8 +141,7 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("TERMINUS_DATA_DIR", self.root.join("data"))
             .env("TERMINUS_CONFIG_DIR", self.root.join("config"))
-            .env("HOME", &self.root)
-            .env("USERPROFILE", &self.root);
+            .env("HOME", &self.root);
         command
     }
 
@@ -424,7 +419,7 @@ fn a_foreign_binary_at_the_stable_path_stops_everything() {
         "the refusal did not name the path: {said}"
     );
     assert!(
-        said.contains("rm -f") || said.contains("del "),
+        said.contains("rm -f"),
         "the refusal printed no command that fixes it: {said}"
     );
 
@@ -487,7 +482,6 @@ fn a_settings_file_with_a_repeated_key_is_refused() {
 /// for `File::create` to truncate whatever it points at and for the rename that
 /// follows to move the link rather than the file.
 #[test]
-#[cfg(unix)]
 fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
     let fixture = fixture();
     fixture.seed();
@@ -539,7 +533,6 @@ fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
 /// that follows then creates the link's target, somewhere install was never
 /// asked to write.
 #[test]
-#[cfg(unix)]
 fn a_symlink_at_the_backup_name_is_not_written_through() {
     let fixture = fixture();
     fixture.seed();
@@ -699,7 +692,7 @@ fn an_upgrade_rewrites_no_byte_of_the_hooks_object() {
 fn an_entry_of_ours_in_the_wrong_shape_is_repaired_rather_than_skipped() {
     let fixture = fixture();
     fixture.seed();
-    // JSON needs the Windows separators doubled; nothing else about the path
+    // JSON needs any backslash in the path doubled; nothing else about the path
     // changes.
     let stable = fixture.stable().display().to_string().replace('\\', "\\\\");
     let seeded = format!(

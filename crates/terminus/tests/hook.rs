@@ -71,11 +71,7 @@ fn hook() -> Hook {
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
     std::fs::create_dir_all(&bin).unwrap();
 
-    let exe = bin.join(if cfg!(windows) {
-        "terminus.exe"
-    } else {
-        "terminus"
-    });
+    let exe = bin.join("terminus");
     // `fs::copy` carries the permission bits, so the copy is executable. The
     // guard is what keeps a sibling test's fork out of the window where this
     // destination is open for writing (see [`COPYING`]).
@@ -204,7 +200,6 @@ fn feed(hook: &Hook, event: &str, payload: &[u8]) -> Output {
 }
 
 /// One row of the process table.
-#[cfg(unix)]
 #[derive(Debug, Clone)]
 struct Proc {
     pid: u32,
@@ -219,7 +214,6 @@ struct Proc {
 /// calls turns a real answer into a flaky one, and the group, the parent and
 /// the command line have to describe the same instant to mean anything.
 /// `-ww` is what keeps a long temporary path in `argv` from being truncated.
-#[cfg(unix)]
 fn ps() -> Vec<Proc> {
     let listing = output(Command::new("ps").args(["-e", "-ww", "-o", "pid=,ppid=,pgid=,args="]))
         .expect("run ps");
@@ -243,7 +237,6 @@ fn ps() -> Vec<Proc> {
 }
 
 /// Poll the process table until one process is running exactly `argv`.
-#[cfg(unix)]
 fn await_process(argv: &str) -> Proc {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
@@ -270,7 +263,6 @@ fn await_process(argv: &str) -> Proc {
 /// marker in front of the arguments is what a hook's spawn puts there - so this
 /// reads the property off one level of the chain. The kill test reads it off
 /// the whole chain.
-#[cfg(unix)]
 #[test]
 fn the_working_process_leaves_the_group_and_the_parentage_of_the_process_that_spawned_it() {
     let hook = hook();
@@ -364,7 +356,6 @@ fn an_ambient_environment_marker_cannot_divert_an_ordinary_invocation() {
 /// Not tidiness: the temporary directory is removed when the test returns, and
 /// a pass still walking it would be reading a tree that is being deleted under
 /// it.
-#[cfg(unix)]
 fn drain(argv: &str) {
     let deadline = Instant::now() + Duration::from_secs(120);
     while ps().iter().any(|p| p.argv == argv) {
@@ -372,9 +363,6 @@ fn drain(argv: &str) {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
-
-#[cfg(not(unix))]
-fn drain(_argv: &str) {}
 
 /// AC1: the four events, the exact payloads, the clean stdout and the budget.
 ///
@@ -574,7 +562,6 @@ fn an_unterminated_line_stops_being_read_at_the_cap() {
 /// the hook exits. A child holding the inherited write end of that pipe would
 /// keep the read blocked for the whole pass instead - which on a backfill is
 /// minutes of a harness waiting on a hook that already returned.
-#[cfg(unix)]
 #[test]
 fn reading_the_hooks_stdout_to_eof_returns_at_once_while_the_ingest_still_runs() {
     let hook = hook();
@@ -622,7 +609,6 @@ fn reading_the_hooks_stdout_to_eof_returns_at_once_while_the_ingest_still_runs()
 /// The tree the kill test walks: four transcripts, one project, ~1.4 s of
 /// debug-build pass. Big enough that the whole of it is still ahead of the
 /// ingest when the kill lands, so finishing it is what proves the survival.
-#[cfg(unix)]
 const TREE: usize = 4;
 
 /// Sessions committed so far, read through a second connection while the pass
@@ -630,7 +616,6 @@ const TREE: usize = 4;
 ///
 /// Read-only and never `Connection::open`: an ordinary open would *create* the
 /// database file, and this poll runs before the ingest has made one.
-#[cfg(unix)]
 fn committed(hook: &Hook) -> usize {
     let db = hook.data_dir.join(DB_FILE_NAME);
     if !db.is_file() {
@@ -648,7 +633,6 @@ fn committed(hook: &Hook) -> usize {
 
 /// Every pid below `root`, breadth first, the way Claude Code 2.1.231 builds
 /// the list it kills: `pid ppid` pairs out of `ps`, walked from the hook.
-#[cfg(unix)]
 fn descendants(root: u32, table: &[Proc]) -> Vec<u32> {
     let mut found: Vec<u32> = Vec::new();
     let mut frontier = vec![root];
@@ -663,7 +647,6 @@ fn descendants(root: u32, table: &[Proc]) -> Vec<u32> {
     found
 }
 
-#[cfg(unix)]
 fn sigkill(target: &str) {
     output(Command::new("kill").args(["-KILL", target])).expect("run kill");
 }
@@ -697,7 +680,6 @@ fn sigkill(target: &str) {
 /// which its `setsid` settled at spawn and no later instant can change. The
 /// pass being wholly unfinished at the kill is asserted rather than waited for,
 /// and the drain below then proves it ran the entire tree afterwards.
-#[cfg(unix)]
 #[test]
 fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
     use std::os::unix::process::{CommandExt, ExitStatusExt};

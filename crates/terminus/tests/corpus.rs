@@ -557,7 +557,6 @@ fn payload_for(fixture: &str, project: &str) -> Vec<u8> {
 /// removed when this returns, and a pass still walking it would be reading a
 /// tree that is being deleted under it. Here it also keeps a detached pass from
 /// arriving in the middle of the forced rebuild below.
-#[cfg(unix)]
 fn drain(argv: &str) {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -575,9 +574,6 @@ fn drain(argv: &str) {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
-
-#[cfg(not(unix))]
-fn drain(_argv: &str) {}
 
 /// Roll the store's derived schema back one, then time the open that repairs it.
 fn time_a_forced_rebuild(data_dir: &Path) -> Duration {

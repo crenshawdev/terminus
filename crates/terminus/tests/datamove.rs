@@ -3,9 +3,9 @@
 //! **No spawn here sets `TERMINUS_DATA_DIR`.** The environment override outranks
 //! the location pointer by design (D-06), so a bench that set it would pass
 //! whether the pointer worked or not. Every spawn points the PLATFORM data-dir
-//! variable at a temporary directory instead - `XDG_DATA_HOME`, `HOME` or
-//! `LOCALAPPDATA` depending on the target - which is the same protection by the
-//! only route that leaves the pointer load-bearing.
+//! variable at a temporary directory instead - `XDG_DATA_HOME` or `HOME`
+//! depending on the target - which is the same protection by the only route
+//! that leaves the pointer load-bearing.
 //!
 //! The claims are about a process and cannot be made from inside a library
 //! call: that a hook resolves the moved store, that a separately spawned MCP
@@ -68,9 +68,7 @@ impl Bench {
     /// resolved by the same rule `store::open::platform_data_dir` uses on this
     /// target.
     fn data_dir(&self) -> PathBuf {
-        if cfg!(target_os = "windows") {
-            self.root.join("local").join("terminus")
-        } else if cfg!(target_os = "macos") {
+        if cfg!(target_os = "macos") {
             self.root
                 .join("Library")
                 .join("Application Support")
@@ -99,9 +97,7 @@ impl Bench {
             .current_dir(&self.work)
             .env_remove("TERMINUS_DATA_DIR")
             .env("XDG_DATA_HOME", self.root.join("share"))
-            .env("LOCALAPPDATA", self.root.join("local"))
             .env("HOME", &self.root)
-            .env("USERPROFILE", &self.root)
             .env("TERMINUS_CONFIG_DIR", &self.config_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir);
         command
