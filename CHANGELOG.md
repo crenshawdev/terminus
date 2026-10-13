@@ -24,6 +24,37 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   written in `lean` or `minimal` mode keeps its old elision marks, which this
   build does not count. Archived calls to the old `mcp__verbatim__recall_search`
   are still recognized.
+- `terminus install` asks nothing. It applies its defaults, never reads stdin,
+  and ends with a receipt: every file it changed, the backfill estimate,
+  `terminus status` as the place to watch the backfill, and the current
+  `cleanupPeriodDays`, with a line saying transcripts older than that are
+  already gone and the line that raises it.
+- Install places the MCP entry with `claude mcp add-json --scope user terminus`
+  and never writes `~/.claude.json`, so Claude Code is that file's only writer.
+  When the entry under `.mcpServers.terminus` is already correct, no `claude`
+  runs. An entry in another shape is removed with
+  `claude mcp remove --scope user terminus` and then added again.
+- A `claude` that is not on `PATH`, times out or exits non-zero, or a
+  `~/.claude.json` that does not parse, leaves the install incomplete rather
+  than aborting it. The binary and the hooks are still placed and the backfill
+  still starts, the receipt prints the exact command that finishes the
+  registration, and install exits 1.
+- Every `claude` Terminus starts, doctor's `claude --version` included, gets
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, so wiring Terminus up opens no
+  network connection.
+- `terminus uninstall` removes the MCP entry with
+  `claude mcp remove --scope user terminus`, only when `~/.claude.json` holds
+  one, and no longer writes that file. An existing
+  `.claude.json.terminus-backup` from an earlier install is left in place and
+  its path printed. It is never restored, because it holds an older copy of
+  Claude Code's own state. When `claude` is missing or fails, uninstall prints
+  the command, finishes its other steps and exits 1.
+- When `claude` is not on `PATH`, `terminus doctor` gives the
+  `claude mcp add-json` command as the fix for a missing or wrong MCP entry,
+  preceded by `claude mcp remove` when an entry in another shape is there,
+  instead of `terminus install`.
+- A `settings.json` that is not in the two-space format is rewritten in full
+  without a question, and its backup holds the original bytes.
 
 ### Removed
 
@@ -56,6 +87,12 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   macOS only." That includes other Unix systems, which used to build against a
   generic data-directory fallback. `terminus doctor` and `terminus install`
   print only `chmod` and `rm -f` fixes.
+- The install diff and its confirmation are gone.
+- `terminus install --yes` is gone. Install takes no arguments, so `--yes` now
+  exits 2 as an unexpected argument. `terminus uninstall --purge --yes` is
+  unchanged.
+- Install no longer offers to raise `cleanupPeriodDays`. Terminus never changes
+  the setting, and the receipt prints the line that raises it.
 
 ## [Verbatim 0.1.1] - 2026-09-04 (local test build, never released)
 
