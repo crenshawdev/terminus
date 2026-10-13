@@ -1,6 +1,6 @@
 # State
 
-Phase: 1 of 5 (No Model Calls)
-Status: phase complete
-Next: /cad-context 2
+Phase: 2 of 5 (Linux and macOS Only, No npm)
+Status: context gathered
+Next: /cad-plan 2
 Updated: 2026-10-13
