@@ -26,6 +26,30 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   build does not count. Archived calls to the old `mcp__verbatim__recall_search`
   are still recognized.
 
+### Removed
+
+- Terminus no longer calls a model, reads an API key or opens a network
+  connection. Observations keep their mechanical facts (files, tools, commands,
+  errors, branch, commits, turn count, duration and compactions), which never
+  needed a model, and lose the session summary a model used to write.
+- A `terminus.toml` that still has a `[provider]` table now fails to load, with
+  a message naming the file and saying model calls were removed. Until the table
+  is deleted, every command that reads the config exits non-zero and the hooks
+  archive nothing.
+- `~/.config/jcrenshaw/credentials.toml` is no longer read. Terminus leaves the
+  file where it is.
+- Stored session summaries are dropped the first time an existing store opens
+  with this build. The ten columns `status`, `model`, `prompt_version`, `topic`,
+  `outcome`, `decisions`, `learned`, `unresolved`, `raw` and `tokens` leave the
+  `observations` table, and every row's mechanical facts stay as they were. A
+  fresh store and an upgraded one have the same columns. Snapshots taken before
+  the upgrade still hold the old text until they rotate out.
+- `kind: observation` is refused. `terminus search --kind observation` exits 2,
+  and `recall_search` answers `isError`, both naming the reason.
+- `terminus observations regenerate --prompt-version` is gone. `--since` stays.
+- `terminus doctor` no longer reports `credentials`, `config_mode`,
+  `mode_checks` or `provider_local`.
+
 ## [Verbatim 0.1.1] - 2026-09-04 (local test build, never released)
 
 A privacy and correctness release. Three of the four things in it are defects

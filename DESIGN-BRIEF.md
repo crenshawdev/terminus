@@ -36,7 +36,7 @@ Terminus inverts all of it: keep the truth, derive everything else, make retriev
 
 Rust. Single static binary. No Node, Bun, Python, or native shared libraries at runtime.
 
-Concurrency: no async runtime. Cold start is the metric that matters — the hook path must not pay for a runtime it doesn't use. `rayon` for backfill parse/compress fan-out; a single writer thread for SQLite; blocking HTTP scoped to the observation command only.
+Concurrency: no async runtime. Cold start is the metric that matters — the hook path must not pay for a runtime it doesn't use. `rayon` for backfill parse/compress fan-out; a single writer thread for SQLite.
 
 ---
 
@@ -61,7 +61,7 @@ One mechanism: **SQLite** via `rusqlite` with the `bundled` feature (vendored C 
 | `entities` | (turn_id, kind, value_norm) — exact match for paths, symbols, commands, errors, tools |
 | `paths` | turn → files touched |
 | `watermarks` | transcript path → byte offset |
-| `observations` | opt-in, derived |
+| `observations` | per finalized session: mechanical facts off the blob, kept rather than rebuilt |
 | `decisions`, `labels` | injection decision log + replay outcomes |
 | `runs` | last N ingest runs: timestamp, duration, counts, error |
 | `meta` | store format version, compression flag |
@@ -89,7 +89,7 @@ No stored preview column — search results decompress the hit's block on demand
 
 ### Truth and derived data
 
-`sessions` is truth. Everything else — FTS, entities, observations, decisions, labels — is derived and rebuildable by replaying blobs.
+`sessions` is truth. Turns, FTS, entities and paths are derived and rebuildable by replaying blobs. `decisions` and `labels` are kept, not rebuilt: what an injector decided at prompt time is in no blob. `observations` is kept too: its facts come off the session blob, and retention eviction empties that blob, so an evicted session's observation cannot be recomputed.
 
 **The archive table never migrates.** A store format bump rebuilds derived tables only. This is the property that prevents claude-mem's 49-migration situation.
 
@@ -181,7 +181,7 @@ Three MCP tools. Not twenty. Every tool description sits in every session's cont
 - Auto-scoped to the current project; `project: "*"` opts into cross-project.
 - Hard result budget enforced server-side.
 - Errors return empty results with a reason. Never throw, never block.
-- Observations are a `kind` filter, not a separate tool.
+- Observations are not a recall target. The files, commands and errors they list are searchable through the turn index.
 - Transport: short-lived stdio server, WAL reads. No worker, no port, no HTTP, no SSE.
 
 `stats`, `usage`, `verify`, `reindex`, `export` are CLI only — never MCP.
@@ -230,7 +230,6 @@ No query exists yet, so the signal is **continuity**, not a memory dump:
 | Block | Source |
 |---|---|
 | Last session in this project | verbatim last prompt + last assistant turn, truncated |
-| Summary / open threads | observations, if enabled |
 | Working-state delta | git HEAD then vs now, branch, dirty files — no LLM |
 | Index pointer | "N sessions, M turns indexed here; search tools available" |
 
@@ -301,46 +300,11 @@ Claude-mem cannot do any of this: it discards the turns and keeps only the model
 
 ## 9. Observations
 
-**Opt-in, off by default.** The product is complete without them.
+**Always on.** One row per finalized session, written by the ingest pass and listed by `terminus observations`.
 
-**Principle: only ask the model for what a parser cannot do.** Claude-mem asks the LLM for `files_read`/`files_edited` and has 0 of 5,059 rows populated.
+**Principle: a parser does this, never a model.** Claude-mem asks the LLM for `files_read`/`files_edited` and has 0 of 5,059 rows populated.
 
-**Mechanical** (always on, exact, free): files read/modified, tools used, commands run, errors seen, branch, commits, turn count, duration, compactions.
-
-**Judgment** (LLM, one call per finalized session):
-
-```
-session_id
-model, prompt_version, generated_at, status
-topic            one line
-outcome          completed | partial | abandoned | exploratory
-decisions[]      { what, why, turn_id }   0–5
-learned[]        { claim, turn_id }       0–5
-unresolved[]     { what, turn_id }        0–5
-```
-
-**Every claim carries a `turn_id` anchoring it to a verbatim turn.** Auditable, anti-hallucination, and a jump target for retrieval. No other memory product can do this because none keep the turn.
-
-Output is **JSON against a strict schema** — structured output or tool-calling where available. Not XML; claude-mem's XML protocol causes permanent silent loss on schema drift. Parse failure → retry once → store raw with `status = parse_failed`. Never silently drop, never block ingest. The session is still in the archive, so regeneration is always available.
-
-Cost control: skip sessions under N turns, truncate input with explicit elision markers, daily token budget, one call per session — never per turn.
-
-### Providers
-
-One config block — **base URL, model, API key** — collapsing local (Ollama/llama.cpp), OpenRouter, and any self-hosted OpenAI-compatible endpoint into a single code path. Anthropic subscription auth is a separate branch (OAuth, not a key).
-
-Base URL is a first-class setting, not a hidden env var. It was among the highest-voted unaddressed requests on claude-mem for a year.
-
-### Shared credentials
-
-```
-~/.config/jcrenshaw/credentials.toml        Linux/macOS
-%APPDATA%\jcrenshaw\credentials.toml        Windows
-```
-
-Namespaced by **provider**, not product, so every jcrenshawdev product reads the same keys. `0600`, refuse to load if group/world-readable, ACL check on Windows. Precedence: process env → product config → shared file. Values never reach logs, errors, or output — redaction at the boundary, not per call site. Migration reads a legacy `.env` once, writes the shared file, and tells the user; never deletes it.
-
-This is cross-product infrastructure and needs its own small library rather than reimplementation per repo.
+**Mechanical** (exact, free): files read/modified, tools used, commands run, errors seen, branch, commits, turn count, duration, compactions.
 
 ---
 
@@ -348,13 +312,13 @@ This is cross-product infrastructure and needs its own small library rather than
 
 Front and centre in README and docs, as a contract:
 
-> Terminus stores your sessions unmodified on your machine. Securing your machine is your responsibility. Ours begins the moment data leaves it — anything sent to a remote model is filtered; a local model receives nothing over the wire at all.
+> Terminus stores your sessions unmodified on your machine. Securing your machine is your responsibility. Terminus calls no model, handles no API key and opens no network connection. With `redact_recall` on, recall output is filtered by the shape rules before it reaches the model's context.
 
 **Redact at egress, never at ingest.** Ingest-time redaction makes the store lossy, defeats "verbatim", and destroys what it strips. The bytes already sit in plaintext in `~/.claude/projects`, so at-rest scrubbing buys little.
 
-**Key redaction on destination, not operation.** `resolve()`, injection, and observation generation are egress when the provider is remote and not egress at all when it's local. `export` writes to a path the user chose but should still state what it contains.
+**Recall redaction.** With `[privacy] redact_recall = true` (off by default), `recall_search` excerpts, `recall_context`, `recall_get`, the `SessionStart` brief and the per-prompt injection pass through the shape rules on their way into the model's context, and each rule leaves its marker where it cut. `export` writes to a path the user chose but should still state what it contains.
 
-No encryption at rest. No telemetry. No network connections except to the model provider the user configured.
+No encryption at rest. No telemetry. No network connections.
 
 ---
 
@@ -474,7 +438,7 @@ Recommend disabling; never change it. With terminus, compaction burns tokens to 
 | `terminus export` | portable output for backup or migration |
 | `terminus doctor` | read-only health report |
 | `terminus install` / `uninstall` | wiring |
-| `terminus observations regenerate [--since] [--prompt-version]` | rebuild derived observations |
+| `terminus observations regenerate [--since]` | recompute stored observations from their blobs |
 | `terminus mcp` | stdio MCP server |
 
 Contract: human-readable by default, `--json` on every data command with a stable shape. Errors to stderr, data to stdout. Exit `0` success, `1` operational failure, `2` misuse — never non-zero for "no results". No colour when stdout isn't a TTY; honour `NO_COLOR`. Quiet unless attached to a TTY.
