@@ -10,6 +10,7 @@ The archive is the product, so it is built first and everything else is built on
 - [ ] **Phase 2: Linux and macOS Only, No npm** - the npm package and every Windows code path go, and a Windows build fails at compile time
 - [ ] **Phase 3: Install Asks Nothing** - `terminus install` applies its defaults without a question, registers through `claude mcp`, and ends with a receipt
 - [ ] **Phase 4: One-Command Installer** - `install.sh` downloads, checks and stores a version behind the stable path, then runs `terminus install`
+- [ ] **Phase 5: README** - a README at the repo root for someone who has never heard of Terminus
 
 ## Phase Details
 
@@ -58,3 +59,14 @@ The archive is the product, so it is built first and everything else is built on
 4. A stable path held by something other than a Terminus install is refused, as `terminus install` refuses it today (D-07).
 5. A local build can still be installed without publishing anything.
 6. Qualified on Linux. macOS stays unverified until it is run on a Mac.
+
+### Phase 5: README
+**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, what it refuses to do, and exactly what leaves the machine. Last, because it describes the installer from Phase 4 and the platform support from Phase 2.
+**Depends on:** Phase 4
+**Requirements:** DOC-01
+**Success Criteria:**
+1. The README opens on the reader's problem and what Terminus does about it, before any mechanism.
+2. The install section is the one installer command, plus how to install a local build, and says Linux and macOS only.
+3. Every command is listed with one line on what it does, and every `terminus.toml` setting with its key and default.
+4. It states what Terminus refuses to do (no daemon, no telemetry, no key files, no network use except the opt-in summary call) and exactly what leaves the machine when that call is on.
+5. `/cad-docs-verify` reports no stale claim: every command, path and key the README names matches the code.

@@ -23,6 +23,10 @@ written, because they record what shipped then.
 - **INST-11**: Terminus never writes `~/.claude.json`. Install places the MCP entry with `claude mcp add-json --scope user`, runs nothing when the entry is already correct, and reports the install incomplete with the exact command when `claude` is missing or fails. Uninstall removes the entry with `claude mcp remove`.
 - **INST-12**: One command installs Terminus. `install.sh`, given a source URL, downloads the manifest and binary for the machine's system and architecture, checks the SHA-256 in a `verify_download` step before placing anything, stores each version in its own folder behind the stable path `~/.local/bin/terminus` so a running session keeps its binary, and ends by running `terminus install`.
 
+### Docs (DOC)
+
+- **DOC-01**: The repository has a `README.md` at its root, written for someone who has never heard of Terminus. It opens on the reader's problem and what Terminus does about it, gives the one-command install and how to install a local build, says Linux and macOS only, lists every command and every `terminus.toml` setting with its key and default, states what Terminus refuses to do and exactly what leaves the machine when the opt-in summary call is on, and names no command, path or key the code does not have.
+
 ## Shipped
 
 Delivered and verified. Kept as rows for shipped-scope trace; git history

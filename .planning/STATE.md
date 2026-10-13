@@ -1,6 +1,6 @@
 # State
 
-Phase: 1 of 4 (Keys From the Environment Only)
+Phase: 1 of 5 (Keys From the Environment Only)
 Status: ready to plan
 Next: /cad-context 1
-Updated: 2026-10-12
+Updated: 2026-10-13
