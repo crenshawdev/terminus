@@ -312,13 +312,13 @@ Claude-mem cannot do any of this: it discards the turns and keeps only the model
 
 Front and centre in README and docs, as a contract:
 
-> Terminus stores your sessions unmodified on your machine. Securing your machine is your responsibility. Terminus calls no model, handles no API key and opens no network connection. With `redact_recall` on, recall output is filtered by the shape rules before it reaches the model's context.
+> Terminus stores your sessions unmodified on your machine. Securing your machine is your responsibility. Terminus calls no model and handles no API key. The Terminus binary opens no network connection, and downloading it with `install.sh` is the one network use. With `redact_recall` on, recall output is filtered by the shape rules before it reaches the model's context.
 
 **Redact at egress, never at ingest.** Ingest-time redaction makes the store lossy, defeats "verbatim", and destroys what it strips. The bytes already sit in plaintext in `~/.claude/projects`, so at-rest scrubbing buys little.
 
 **Recall redaction.** With `[privacy] redact_recall = true` (off by default), `recall_search` excerpts, `recall_context`, `recall_get`, the `SessionStart` brief and the per-prompt injection pass through the shape rules on their way into the model's context, and each rule leaves its marker where it cut. `export` writes to a path the user chose but should still state what it contains.
 
-No encryption at rest. No telemetry. No network connections.
+No encryption at rest. No telemetry. No network connections from the binary: `install.sh`'s `curl` download is the one network use.
 
 ---
 

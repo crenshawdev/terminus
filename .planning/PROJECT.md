@@ -101,9 +101,9 @@ Merged to `main` and tagged `v0.1.0`.
 - **Tech stack**: Rust, single static binary — no Node, Bun, Python, or native shared libraries at runtime; `rusqlite` with `bundled` feature; zstd; `rayon` for backfill fan-out; no async runtime (cold start is the metric; the hook path must not pay for a runtime it doesn't use)
 - **Performance**: SessionStart synchronous work in single-digit milliseconds; UserPromptSubmit under a hard deadline, fail open; hook cold start under an asserted budget in CI — startup time is the product
 - **Compatibility**: Linux and macOS only. Windows was dropped, as it is across all of the owner's products, and a build for any other system fails at compile time. Path comparison is case-folded on macOS
-- **Privacy**: no telemetry; no network connections except the configured model provider; redaction at egress only; credentials `0600`-enforced and redacted at the boundary
+- **Privacy**: no telemetry; the Terminus binary opens no network connection, and `install.sh`'s `curl` download is the one network use
 - **Licensing**: Apache-2.0, public OSS — an explicit override of the private-by-default rule, scoped to this project; all dependencies permissive
-- **Distribution**: there is no npm channel, because the npm package was removed; a one-command installer arrives in phase 4. `origin` (self-hosted) is the only remote
+- **Distribution**: there is no npm channel, because the npm package was removed; `install.sh` is the one-command installer, and no release is published yet. `origin` (self-hosted) is the only remote
 - **Testing**: real SQLite temp databases, never mocks; private real-corpus fixture reached via env var, small synthetic set in-repo for CI
 
 ## Key Decisions
