@@ -326,8 +326,7 @@ fn a_finalized_session_is_listed_with_every_obs_01_fact() {
     let row = &listed[0];
     assert_eq!(row["session_id"], SESSION, "{row}");
     assert!(row["generated_at"].is_string(), "{row}");
-    // The judgment half is present and null, so a consumer reads one shape
-    // whether or not a provider has ever answered.
+    // The summary half is gone from the row, not left behind as nulls.
     for column in [
         "status",
         "model",
@@ -340,7 +339,7 @@ fn a_finalized_session_is_listed_with_every_obs_01_fact() {
         "raw",
         "tokens",
     ] {
-        assert_eq!(row[column], Value::Null, "{column} is not null yet: {row}");
+        assert!(row.get(column).is_none(), "{column} is still in the row: {row}");
     }
 
     let facts = &row["mechanical"];
