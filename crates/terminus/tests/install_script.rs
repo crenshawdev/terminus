@@ -18,7 +18,8 @@
 //! a fake `uname`.
 //!
 //! `s_server -WWW` answers a missing file with `200 ok` and an error text, so
-//! every test serves both the manifest and the binary.
+//! every real-server test serves both the manifest and the binary, and the
+//! download refusals run on a fake `curl` instead.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -431,9 +432,11 @@ impl Fixture {
     }
 
     /// A tools folder whose `curl` logs each URL it is asked for and copies
-    /// the served file named by the URL's last part to its `-o` path. It never
-    /// reaches the network and never reads its stdin.
-    fn curl_tools(&self) -> PathBuf {
+    /// the served file named by the URL's last part to its `-o` path. For the
+    /// file named `failing` it writes nothing and exits 22, curl's status for
+    /// an HTTP error under `-f`. It never reaches the network and never reads
+    /// its stdin.
+    fn curl_tools(&self, failing: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let fake = self.root.join("curl");
@@ -445,11 +448,13 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 printf '%s\n' "$url" >> '@LOG@'
+[ "${url##*/}" != '@FAILING@' ] || exit 22
 exec '@CP@' '@SERVED@'/"${url##*/}" "$out"
 "#
         .replace("@LOG@", &self.curl_log().display().to_string())
         .replace("@CP@", &cp.display().to_string())
-        .replace("@SERVED@", &self.served.display().to_string());
+        .replace("@SERVED@", &self.served.display().to_string())
+        .replace("@FAILING@", failing);
         std::fs::write(&fake, script).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         self.tools_folder("tools-curl", &[], &[("curl", &fake)])
@@ -482,8 +487,8 @@ exec '@CP@' '@SERVED@'/"${url##*/}" "$out"
     }
 
     /// Run `command` and assert it was refused: non-zero, a reason on stderr,
-    /// nothing on disk changed and no `claude` started.
-    fn assert_refused(&self, mut command: Command) {
+    /// nothing on disk changed and no `claude` started. Returns the output.
+    fn assert_refused(&self, mut command: Command) -> Output {
         let before = self.snapshot();
         let calls = self.calls().len();
         let output = command.output().unwrap();
@@ -491,6 +496,7 @@ exec '@CP@' '@SERVED@'/"${url##*/}" "$out"
         assert!(!output.stderr.is_empty(), "{}", text(&output));
         assert_eq!(self.snapshot(), before, "{}", text(&output));
         assert_eq!(self.calls().len(), calls, "{:?}", self.calls());
+        output
     }
 }
 
@@ -630,11 +636,42 @@ fn default_urls() -> Vec<String> {
 fn no_source_downloads_from_the_github_releases() {
     let fx = fixture();
     let bytes = fx.serve("1.0.0", "");
-    let tools = fx.curl_tools();
+    let tools = fx.curl_tools("");
     let output = fx.command_with(&[], &tools).output().unwrap();
     assert_eq!(fx.curl_urls(), default_urls(), "{}", text(&output));
     assert!(output.status.success(), "{}", text(&output));
     fx.assert_linked("1.0.0", &bytes);
+}
+
+/// After 1.0.0 is installed, a no-argument run whose fake `curl` fails
+/// `failing` is refused, and stderr holds `message`.
+fn assert_download_refused(failing: &str, message: &str) {
+    let fx = fixture();
+    fx.install("1.0.0", "");
+    fx.serve("2.0.0", "b");
+    let tools = fx.curl_tools(failing);
+    let output = fx.assert_refused(fx.command_with(&[], &tools));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(message),
+        "{}",
+        text(&output)
+    );
+}
+
+#[test]
+fn a_failed_manifest_download_is_refused() {
+    assert_download_refused(
+        &format!("terminus-{}.manifest", platform()),
+        &format!("manifest download failed: {}", default_urls()[0]),
+    );
+}
+
+#[test]
+fn a_failed_binary_download_is_refused() {
+    assert_download_refused(
+        &format!("terminus-{}", platform()),
+        &format!("binary download failed: {}", default_urls()[1]),
+    );
 }
 
 /// Without `sha256sum`, `shasum -a 256` computes the digest: the install
