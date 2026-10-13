@@ -1,6 +1,6 @@
 # State
 
-Phase: 3 of 5 (Install Asks Nothing)
-Status: phase complete
-Next: /cad-context 4
+Phase: 4 of 5 (One-Command Installer)
+Status: context gathered
+Next: /cad-plan 4
 Updated: 2026-10-13
