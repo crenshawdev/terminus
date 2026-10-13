@@ -15,6 +15,13 @@
 //! `terminus backfill`. There is still no pool, global or otherwise - no
 //! `rayon`, nothing that outlives the call that created it.
 
+// The refusal sits in core because the binary compiles core first and core
+// uses `std::os::unix` unguarded, so one in `main.rs` would never be reached.
+// It names Linux and macOS rather than `not(unix)` so FreeBSD and the other
+// Unix systems are refused too.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("Terminus supports Linux and macOS only.");
+
 pub mod blob;
 pub mod capture;
 pub mod config;
