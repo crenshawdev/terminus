@@ -35,7 +35,7 @@ The archive is the product, so it is built first and everything else is built on
 2. No `cfg(windows)`, `cfg!(windows)`, `target_os = "windows"` or `LOCALAPPDATA` remains in `crates/`.
 3. A build for Windows fails at compile time with a message naming Linux and macOS.
 4. The full suite passes, and every test removed because it only covered Windows is listed in the phase summary.
-5. The docs and `terminus doctor` say Linux and macOS, and the deferred Windows ACL check (D-15) is closed as no longer applicable.
+5. The docs say Linux and macOS, `terminus doctor` prints no Windows fix, and the deferred Windows ACL check (D-15) is closed as no longer applicable.
 
 ### Phase 3: Install Asks Nothing
 **Goal:** `terminus install` applies its defaults and asks nothing, as `baley install` does. It drops the diff-and-confirm step and `--yes`, registers the MCP server by running `claude mcp` so Claude Code stays the only writer of `~/.claude.json`, and ends with a receipt. Uninstall keeps its confirmation and `--purge`, and removes the registration with `claude mcp remove`.
