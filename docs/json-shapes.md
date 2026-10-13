@@ -95,16 +95,9 @@ data on stdout, the counts and the warnings on stderr.
   spelling, not the query's.
 - `excerpt` is cut from the session blob, never from FTS5, and may be empty when
   the archive would not give the bytes up.
-- `--kind observation` searches stored session summaries instead of turns, and
-  is the whole of how observations are reachable from the model - there is no
-  fourth MCP tool. Each hit is one CLAIM: `turn_id` is the turn that claim is
-  anchored to, `excerpt` is the claim's own text, `record_type` is
-  `observation`, and `ts` is when the observation was written rather than when
-  the turn happened. `relevance` is flat at 1.0, because there is no FTS index
-  over these to score against and every hit matched every token; the order is
-  newest observation first and is total. Scope and exclusion apply exactly as
-  they do to turns. On a store written before the observations table exists, the
-  answer is empty with that named in `reason` - never zero hits in silence.
+- `--kind` takes `user`, `assistant`, `system` or `attachment`. `observation`
+  is refused, as misuse (exit 2) from `terminus search` and as `isError` from
+  `recall_search`, because Terminus stores no session summaries.
 
 ### `show`
 
@@ -261,10 +254,7 @@ and unchanged.
                   "errors": ["..."], "commits": ["wire the observation step up"],
                   "branch": "phase-7", "turns": 47,
                   "first_turn_at": "...", "last_turn_at": "...",
-                  "duration_seconds": 5421, "compactions": 1, "truncated": []},
-   "status": null, "model": null, "prompt_version": null, "topic": null,
-   "outcome": null, "decisions": null, "learned": null, "unresolved": null,
-   "raw": null, "tokens": null}]}
+                  "duration_seconds": 5421, "compactions": 1, "truncated": []}}]}
 ```
 
 - One entry per **finalized** session that has been observed, in ingest order.
@@ -280,22 +270,6 @@ and unchanged.
   present and not named there is the whole of what the session did.
 - `duration_seconds` is the wall clock between the first and the last turn, and
   it is null on a session carrying no timestamp to measure from.
-- The judgment columns - `status`, `model`, `prompt_version`, `topic`,
-  `outcome`, `decisions`, `learned`, `unresolved`, `raw`, `tokens` - are the
-  optional LLM half. They are **present and null** until a provider is
-  configured and answers, so a consumer reads one shape either way.
-  `observations.decisions` here is the column and not the `decisions` table.
-- `status` has three shapes and only two of them are answers. `"ok"` is a
-  validated judgment; `"parse_failed"` is the OBS-04 arm, with the raw response
-  in `raw` and the claim columns null; and `"judging <timestamp>"` is a
-  **reservation**, written before the request goes out so that two overlapping
-  runs cannot both pay for the same session - the second reads it, skips, and
-  asks nothing. A reservation is transient: the run that took it replaces it
-  with one of the two answers, or puts the column back to what it was if the
-  provider never answered. One left standing by a killed process is treated as
-  abandoned 15 minutes after its timestamp and the next ingest takes the
-  session, so a crash mid-request costs a delay and never a permanently
-  unjudgeable session.
 - A store written before this build carries no `observations` table. That is an
   empty answer with a reason naming the table and exit 0, never a SQLite
   message: the next `terminus ingest` creates it.
@@ -303,49 +277,28 @@ and unchanged.
 ### `observations regenerate`
 
 ```json
-{"since": "2026-08-14T00:00:00.000Z", "prompt_version": null,
- "selected": 2, "regenerated": 2, "notes": []}
+{"since": "2026-08-14T00:00:00.000Z", "selected": 2, "regenerated": 2, "notes": []}
 ```
 
 - The **only** rebuild path for the observations table. `terminus reindex` never
-  touches it: the judgment half is a paid model call no blob replay reproduces,
-  so a rebuild that ran on a schema bump would delete summaries a user bought.
-- `since` and `prompt_version` are the selector echoed back, each null when it
-  was not given. "Two rows were rebuilt" is unreadable without the bound that
-  chose them.
+  touches it: the facts come off the session blob, and retention eviction
+  empties that blob, so a rebuild that dropped the table could not recompute an
+  evicted session's observation.
+- `since` is the selector echoed back, null when it was not given. "Two rows
+  were rebuilt" is unreadable without the bound that chose them.
 - `--since` takes `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS.mmmZ` and selects
   sessions whose `session_meta.last_turn_at` is at or after it. A session
-  carrying no `last_turn_at` is outside every bound. `--prompt-version` selects
-  rows carrying exactly that value in the `prompt_version` column. Given both,
-  they narrow conjunctively; given neither, every visible session is selected.
+  carrying no `last_turn_at` is outside every bound. Without it, every visible
+  session is selected.
 - `selected` counts the rows the selector named **and** the exclusion gate
   allows; `regenerated` counts the ones actually rewritten, and `notes` names
   the difference, one line per row that could not be recomputed.
-- The mechanical half writes the `mechanical` column and only that, on the
-  selected rows. `generated_at` dates the row as a whole - the judgment half
-  included - so a mechanical recompute leaves it alone, and every unselected row
-  stays byte for byte what it was.
-- With `[provider] enabled = true`, the same selected rows are then re-asked of
-  the model, which is what makes `--prompt-version` mean anything: the reason to
-  pay for a session twice is that the prompt changed. This is the **only** path
-  allowed to ask about a session that already carries a judgment status; every
-  other cost control still applies, so a session under the minimum turn count is
-  still not bought, and a session an ingest pass is asking about right now is
-  skipped with a note rather than asked a second time in parallel. With no provider, the stored judgment columns are left
-  exactly as they were and no request is made at all - a user without a model can
-  still rebuild facts.
-- `notes` carries the judgment half's report too: one `re-judged N of M selected
-  session(s)` line whenever a provider was asked, one line per session whose
-  answer could not be used, and - when the daily token budget runs out part way
-  through the set - one line naming how many selected sessions were left
-  unasked. A run that exhausts the budget stops asking, keeps every row it
-  already rebuilt, and still exits 0.
+- It writes the `mechanical` column and only that, on the selected rows.
+  `generated_at` dates the row as a whole, so a recompute leaves it alone, and
+  every unselected row stays byte for byte what it was.
 - This command writes, so it opens the store for writing and takes the ingest
   lock. A run refused because another process holds that lock is `ok: false`
-  with the lock named in `reason`, exit 1 - the same answer `reindex` gives. The
-  lock covers the mechanical rewrite only: provider calls are made after it is
-  released, because an HTTP call held inside the ingest lock would make every
-  hook-spawned pass in that window archive nothing.
+  with the lock named in `reason`, exit 1 - the same answer `reindex` gives.
 
 ### `retention`
 
