@@ -476,16 +476,12 @@ fn unanswerable(why: &str) -> Failure {
 /// `--version` printed `verbatim 0.1.0`, byte for byte this build's output then. So the refusal is the only safe answer, and the
 /// command that overrides it has to be the user's to type.
 pub(super) fn occupied(stable: &Path) -> Failure {
-    let removal = if cfg!(windows) {
-        format!("del \"{}\"", stable.display())
-    } else {
-        format!("rm -f '{}'", stable.display())
-    };
     Failure::Operational(format!(
         "{} is not a terminus build; install will not overwrite it, and nothing was changed.\n  \
          that path is where every hook entry and the mcp registration point, so it has to hold\n  \
          this binary. to replace it, remove it and run install again:\n\n    \
-         {removal} && {} install",
+         rm -f '{}' && {} install",
+        stable.display(),
         stable.display(),
         current_exe_display()
     ))
