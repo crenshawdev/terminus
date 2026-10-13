@@ -802,13 +802,7 @@ const DATA_COMMANDS: &[(&str, &[&str], &[&str])] = &[
     (
         "observations regenerate",
         &[],
-        &[
-            "since",
-            "prompt_version",
-            "selected",
-            "regenerated",
-            "notes",
-        ],
+        &["since", "selected", "regenerated", "notes"],
     ),
     // RET-03 and D-17, on exactly the terms this table's own comment states: a
     // report of what the NEXT ingest pass would evict and delete is a data

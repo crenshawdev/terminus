@@ -159,12 +159,9 @@ fn regenerate(args: Regenerate) -> Result<(), Failure> {
     let data_dir = super::data_dir()?;
     let config = terminus_core::Config::load()?;
 
-    // The lock covers the mechanical rewrite and nothing more. Scoped to this
-    // block on purpose: the judgment half below makes HTTP calls, and D-07 bars
-    // one from being made while the ingest lock is held - a rebuild that sat on
-    // it through a run of provider calls would make every hook-spawned pass in
-    // that window exit `LockHeld` and archive nothing.
-    let mut done = {
+    // The lock covers the mechanical rewrite and is released as soon as it is
+    // done, so a hook-spawned pass waits no longer than the rewrite itself.
+    let done = {
         let _guard = match lock::try_acquire(&data_dir)? {
             // Non-zero, the way `reindex`'s contention is: a rebuild is asked
             // for explicitly, so silently not doing it would be the wrong
@@ -196,15 +193,9 @@ fn regenerate(args: Regenerate) -> Result<(), Failure> {
             &config,
             &observe::Selector {
                 since: args.since.as_deref(),
-                prompt_version: args.prompt_version.as_deref(),
             },
         )?
     };
-
-    // Outside the lock, and a no-op without a provider - which is the default,
-    // and is what lets a user with no provider rebuild facts and keep whatever
-    // judgment the rows already carry.
-    observe::rejudge(&data_dir, &config, &mut done);
 
     if args.json {
         regenerated_document(&args, &done).emit();
@@ -217,12 +208,6 @@ fn regenerate(args: Regenerate) -> Result<(), Failure> {
         "regenerated {} of {} selected observation(s)",
         done.rewritten, done.selected
     );
-    if config.provider_enabled() {
-        eprintln!(
-            "re-judged {} of {} selected observation(s)",
-            done.judged, done.selected
-        );
-    }
     for note in &done.notes {
         eprintln!("{note}");
     }
@@ -240,13 +225,6 @@ fn regenerated_document(args: &Regenerate, done: &Regenerated) -> Document {
             "since",
             match &args.since {
                 Some(since) => Value::from(since.as_str()),
-                None => Value::Null,
-            },
-        )
-        .field(
-            "prompt_version",
-            match &args.prompt_version {
-                Some(version) => Value::from(version.as_str()),
                 None => Value::Null,
             },
         )
@@ -421,7 +399,6 @@ pub struct List {
 pub struct Regenerate {
     /// A `cmd::time_bound` bound against `session_meta.last_turn_at`.
     pub since: Option<String>,
-    pub prompt_version: Option<String>,
     pub json: bool,
 }
 
@@ -489,9 +466,6 @@ fn regenerate_args(parser: &mut lexopt::Parser) -> Result<Regenerate, Failure> {
             // wrong set and report success.
             Long("since") => {
                 args.since = Some(super::time_bound("since", &super::value(parser, "since")?)?)
-            }
-            Long("prompt-version") => {
-                args.prompt_version = Some(super::value(parser, "prompt-version")?)
             }
             Long(super::JSON_FLAG) => args.json = true,
             other => return Err(Failure::Misuse(crate::unexpected(other))),
