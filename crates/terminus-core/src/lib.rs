@@ -18,7 +18,6 @@
 pub mod blob;
 pub mod capture;
 pub mod config;
-pub mod credentials;
 pub mod derive;
 pub mod discover;
 pub mod error;
