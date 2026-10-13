@@ -5,7 +5,9 @@
 //! `TERMINUS_DATA_DIR`, `TERMINUS_CONFIG_DIR` and `HOME` at temporary
 //! directories, for the reason `tests/install.rs` states: without them a test
 //! would read - and its `install` half would write - the settings files and the
-//! `~/.local/bin/terminus` this machine is actually running on.
+//! `~/.local/bin/terminus` this machine is actually running on. `PATH` is a
+//! fixture directory holding a fake `claude` and nothing else, so no test can
+//! start the real one.
 //!
 //! The assertions read the report rather than grepping it. Doctor prints one
 //! line per check, `<state>  <name>  <finding>`, with a `fix` line under any
@@ -17,6 +19,8 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+use terminus_core::testkit::{self, NONESSENTIAL_TRAFFIC};
 
 /// The events install writes an entry for. `cmd::hook::EVENTS` spelled again:
 /// `terminus` is a binary crate with no library target, so a test cannot name
@@ -68,6 +72,8 @@ struct Fixture {
     root: PathBuf,
     bin_dir: PathBuf,
     claude_dir: PathBuf,
+    /// The whole of every spawned terminus's `PATH`.
+    path_dir: PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -79,11 +85,15 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
     std::fs::write(claude_dir.join("settings.json"), SETTINGS).unwrap();
     std::fs::write(claude_dir.join(".claude.json"), CLAUDE_JSON).unwrap();
+    let path_dir = root.join("path");
+    std::fs::create_dir_all(&path_dir).unwrap();
+    testkit::fake_claude(&path_dir, &root.join("claude.log"), "", 0);
     Fixture {
         _dir: dir,
         root,
         bin_dir,
         claude_dir,
+        path_dir,
     }
 }
 
@@ -102,8 +112,13 @@ impl Fixture {
         self.root.join("config")
     }
 
+    /// `PATH` holds the fake `claude` and nothing else, and the traffic
+    /// variable is taken out so a logged value can only have come from
+    /// terminus.
     fn env(&self, command: &mut Command) {
         command
+            .env("PATH", &self.path_dir)
+            .env_remove(NONESSENTIAL_TRAFFIC)
             .env("TERMINUS_BIN_DIR", &self.bin_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("TERMINUS_DATA_DIR", self.root.join("data"))
@@ -168,7 +183,9 @@ impl Fixture {
     /// string rather than asserting on its text, and answers the confirmation
     /// `install` asks (INST-03) the way a user at a terminal would.
     fn shell(&self, line: &str) -> Output {
-        let mut command = Command::new("sh");
+        // By absolute path: a bare `sh` is looked up on the child's `PATH`,
+        // which holds only the fake `claude`.
+        let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(line);
         self.env(&mut command);
         let mut child = command
@@ -309,6 +326,15 @@ fn after_install_every_wiring_check_is_ok() {
             .contains(env!("CARGO_PKG_VERSION")),
         "the binary check should name the version it found: {}",
         report.check("binary").finding
+    );
+    // The `claude` doctor found is the fixture's fake, never one on the
+    // machine's own `PATH`.
+    let fake = fixture.path_dir.join("claude").display().to_string();
+    assert_eq!(report.state("claude_code"), "ok", "{}", report.whole);
+    assert!(
+        report.check("claude_code").finding.contains(&fake),
+        "doctor found a claude other than the fixture's fake: {}",
+        report.check("claude_code").finding
     );
 }
 

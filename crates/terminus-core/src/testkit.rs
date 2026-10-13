@@ -1,4 +1,5 @@
-//! Test support: the shared way to reach the synthetic fixture corpus.
+//! Test support: the shared way to reach the synthetic fixture corpus, and the
+//! fake `claude` the install, uninstall and doctor tests run against.
 //!
 //! Behind the `testkit` cargo feature, off by default, so none of it is
 //! compiled into the shipped binary. It lives in the library rather than in a
@@ -525,6 +526,102 @@ pub fn seed(label: &str) -> u64 {
     };
     println!("{label}: TERMINUS_TEST_SEED={seed}");
     seed
+}
+
+/// The variable every `claude` process terminus starts must carry, so the fake
+/// records it on every call.
+pub const NONESSENTIAL_TRAFFIC: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+
+/// Write a fake `claude` into `dir` and return its path.
+///
+/// A real `claude` run from a test writes its own keys into the fixture's
+/// `.claude.json`, creates `backups/` and connects to `api.anthropic.com`, so
+/// no test may start one. The fake appends one record per run to `log` (see
+/// [`fake_claude_calls`]), prints `stderr` to stderr when it is not empty, and
+/// exits with `status`. Asked for `--version` alone it prints the version line
+/// doctor reads and exits 0.
+///
+/// Builtins only: the `PATH` it runs under holds the fake and nothing else.
+/// Writing it again over the same path replaces it.
+pub fn fake_claude(dir: &Path, log: &Path, stderr: &str, status: i32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let quoted_log = quote(&log.display().to_string());
+    let complain = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("printf '%s\\n' {} >&2\n", quote(stderr))
+    };
+    let script = format!(
+        "#!/bin/sh\n\
+         {{\n\
+         printf 'call\\n'\n\
+         printf 'traffic=%s\\n' \"${{{NONESSENTIAL_TRAFFIC}-<unset>}}\"\n\
+         for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
+         }} >> {quoted_log}\n\
+         if [ \"$#\" -eq 1 ] && [ \"$1\" = --version ]; then\n\
+         printf '2.1.296 (Claude Code)\\n'\n\
+         exit 0\n\
+         fi\n\
+         {complain}\
+         exit {status}\n"
+    );
+    // The log exists from here on, so a test listing its directory sees the same
+    // names whether or not anything ran.
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .unwrap_or_else(|e| panic!("create {}: {e}", log.display()));
+    let path = dir.join("claude");
+    std::fs::write(&path, script).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+    path
+}
+
+/// One run of the fake `claude`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeCall {
+    /// Every argument, in order.
+    pub args: Vec<String>,
+    /// [`NONESSENTIAL_TRAFFIC`] as the process saw it, `None` when unset.
+    pub traffic: Option<String>,
+}
+
+/// Every run the fake `claude` logged to `log`, oldest first. No log file is
+/// no runs.
+///
+/// An argument holding a newline would split across records; nothing terminus
+/// passes holds one, and the compact JSON it passes is a single line.
+pub fn fake_claude_calls(log: &Path) -> Vec<FakeCall> {
+    let Ok(text) = std::fs::read_to_string(log) else {
+        return Vec::new();
+    };
+    let mut calls: Vec<FakeCall> = Vec::new();
+    for line in text.lines() {
+        if line == "call" {
+            calls.push(FakeCall {
+                args: Vec::new(),
+                traffic: None,
+            });
+            continue;
+        }
+        let call = calls.last_mut().expect("a record starts with 'call'");
+        if let Some(value) = line.strip_prefix("traffic=") {
+            call.traffic = (value != "<unset>").then(|| value.to_owned());
+        } else if let Some(arg) = line.strip_prefix("arg=") {
+            call.args.push(arg.to_owned());
+        } else {
+            panic!("an unreadable line in {}: {line:?}", log.display());
+        }
+    }
+    calls
+}
+
+/// `text` as one single-quoted shell word.
+fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Copy a fixture into `dir` (a temp dir, in every current caller) and return

@@ -5,7 +5,8 @@
 //! `TERMINUS_DATA_DIR`, `TERMINUS_CONFIG_DIR` and `HOME` at temporary
 //! directories, for the reason `tests/install.rs` states: without them a test
 //! would delete the `~/.local/bin/terminus` and edit the settings files this
-//! machine is actually running on.
+//! machine is actually running on. `PATH` is a fixture directory holding a
+//! fake `claude` and nothing else, so no test can start the real one.
 //!
 //! AC7's "restores it to its pre-install bytes" is asserted as a byte
 //! comparison against the seed and never as a `jq` or `serde_json` comparison.
@@ -16,6 +17,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+use terminus_core::testkit::{self, NONESSENTIAL_TRAFFIC};
 
 /// A `settings.json` shaped like the real one, and the same seed
 /// `tests/install.rs` and `tests/doctor.rs` use: top-level keys in an order no
@@ -75,6 +78,8 @@ struct Fixture {
     root: PathBuf,
     bin_dir: PathBuf,
     claude_dir: PathBuf,
+    /// The whole of every spawned terminus's `PATH`.
+    path_dir: PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -86,11 +91,15 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
     std::fs::write(claude_dir.join("settings.json"), SETTINGS).unwrap();
     std::fs::write(claude_dir.join(".claude.json"), CLAUDE_JSON).unwrap();
+    let path_dir = root.join("path");
+    std::fs::create_dir_all(&path_dir).unwrap();
+    testkit::fake_claude(&path_dir, &root.join("claude.log"), "", 0);
     Fixture {
         _dir: dir,
         root,
         bin_dir,
         claude_dir,
+        path_dir,
     }
 }
 
@@ -111,11 +120,16 @@ impl Fixture {
         self.root.join("data")
     }
 
+    /// `PATH` holds the fake `claude` and nothing else, and the traffic
+    /// variable is taken out so a logged value can only have come from
+    /// terminus.
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_terminus"));
         command
             .args(args)
             .current_dir(&self.root)
+            .env("PATH", &self.path_dir)
+            .env_remove(NONESSENTIAL_TRAFFIC)
             .env("TERMINUS_BIN_DIR", &self.bin_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("TERMINUS_DATA_DIR", self.data_dir())

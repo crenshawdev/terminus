@@ -8,6 +8,9 @@
 //! `CLAUDE_CONFIG_DIR` it would edit the `settings.json` and `.claude.json`
 //! this machine is running on.
 //!
+//! `PATH` is a fixture directory holding a fake `claude` and nothing else, so
+//! no test can start the real one.
+//!
 //! The assertions are the ones AC4 and AC5 are written in, spelled in Rust
 //! rather than in `jq`: "every other key byte-identical" is a comparison of the
 //! file with terminus's own additions removed against the file as it was
@@ -18,6 +21,8 @@
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+
+use terminus_core::testkit::{self, NONESSENTIAL_TRAFFIC};
 
 /// The events install writes an entry for. `cmd::hook::EVENTS` spelled again:
 /// `terminus` is a binary crate with no library target, so a test cannot name
@@ -88,6 +93,9 @@ struct Fixture {
     root: PathBuf,
     bin_dir: PathBuf,
     claude_dir: PathBuf,
+    /// The whole of every spawned terminus's `PATH`: the fake `claude` and
+    /// nothing else.
+    path_dir: PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -95,14 +103,19 @@ fn fixture() -> Fixture {
     let root = dir.path().to_path_buf();
     let bin_dir = root.join("bin");
     let claude_dir = root.join("claude");
+    let path_dir = root.join("path");
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
-    Fixture {
+    std::fs::create_dir_all(&path_dir).unwrap();
+    let fixture = Fixture {
         _dir: dir,
         root,
         bin_dir,
         claude_dir,
-    }
+        path_dir,
+    };
+    fixture.fake_claude("", 0);
+    fixture
 }
 
 impl Fixture {
@@ -133,16 +146,32 @@ impl Fixture {
     ///
     /// Only the stable-path rerun needs it: running install *from* the copy it
     /// placed last time is the case where `current_exe()` stops resolving.
+    ///
+    /// `PATH` is the fixture's own directory and nothing else, because a system
+    /// directory can hold a real `claude`. The traffic variable is taken out so
+    /// a logged value can only have come from terminus.
     fn command_at(&self, exe: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(exe);
         command
             .args(args)
+            .env("PATH", &self.path_dir)
+            .env_remove(NONESSENTIAL_TRAFFIC)
             .env("TERMINUS_BIN_DIR", &self.bin_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("TERMINUS_DATA_DIR", self.root.join("data"))
             .env("TERMINUS_CONFIG_DIR", self.root.join("config"))
             .env("HOME", &self.root);
         command
+    }
+
+    /// Put a fake `claude` on the fixture's `PATH` that prints `stderr` and
+    /// exits with `status`.
+    fn fake_claude(&self, stderr: &str, status: i32) {
+        testkit::fake_claude(&self.path_dir, &self.claude_log(), stderr, status);
+    }
+
+    fn claude_log(&self) -> PathBuf {
+        self.root.join("claude.log")
     }
 
     /// Run with stdin at end of file, which is what a script that did not
@@ -378,12 +407,12 @@ fn install_places_this_build_at_the_stable_path() {
     assert!(first.status.success(), "{}", text(&first));
 
     let stable = fixture.stable();
-    let version = Command::new(&stable).arg("--version").output().unwrap();
-    assert!(version.status.success(), "{}", text(&version));
-    let ours = Command::new(env!("CARGO_BIN_EXE_terminus"))
-        .arg("--version")
+    let version = fixture
+        .command_at(&stable, &["--version"])
         .output()
         .unwrap();
+    assert!(version.status.success(), "{}", text(&version));
+    let ours = fixture.command(&["--version"]).output().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&version.stdout),
         String::from_utf8_lossy(&ours.stdout),
