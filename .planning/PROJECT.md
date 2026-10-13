@@ -18,7 +18,7 @@ The verbatim transcript is the record: every session archived losslessly and per
 
 **v0.0.1, opened 2026-10-12.**
 
-Five phases. Four bring Terminus in line with Baley's ADR 0038 and 0039: no model calls and so no API keys and no network use, Linux and macOS only with the npm package removed, an install that asks nothing and registers the MCP server through `claude mcp`, and a one-command installer script. The fifth writes the README the public repository does not have yet. Updates come in a later cycle, with the signing Baley's release design (#14) owns.
+Six phases. Four bring Terminus in line with Baley's ADR 0038 and 0039: no model calls and so no API keys and no network use, Linux and macOS only with the npm package removed, an install that asks nothing and registers the MCP server through `claude mcp`, and a one-command installer script. The fifth points that script at GitHub releases by default, and the sixth writes the README the public repository does not have yet. Updates come in a later cycle, with the signing Baley's release design (#14) owns.
 
 No release is published until the update feature is built. Version numbers started over with the rename: Verbatim's tags were local test builds and were never released (now `verbatim-v0.1.0` and `verbatim-v0.1.1`), so unreleased cycles are 0.0.x and the first release will be 0.1.0. v0.0.1 is merged but not released.
 

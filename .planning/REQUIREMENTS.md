@@ -22,6 +22,7 @@ written, because they record what shipped then.
 - **INST-10**: `terminus install` asks nothing. It applies its defaults, has no confirmation and no `--yes`, and ends with a receipt listing every change, the backfill estimate, and the current `cleanupPeriodDays` with what a low value loses and the line that raises it. It never changes `cleanupPeriodDays` or `autoCompactEnabled`.
 - **INST-11**: Terminus never writes `~/.claude.json`. Install places the MCP entry with `claude mcp add-json --scope user`, runs nothing when the entry is already correct, and reports the install incomplete with the exact command when `claude` is missing or fails. Uninstall removes the entry with `claude mcp remove`.
 - **INST-12**: One command installs Terminus. `install.sh`, given a source URL, downloads the manifest and binary for the machine's system and architecture, checks the SHA-256 in a `verify_download` step before placing anything, stores each version in its own folder behind the stable path `~/.local/bin/terminus` so a running session keeps its binary, and ends by running `terminus install`.
+- **INST-13**: `install.sh` downloads from the GitHub releases on crenshawdev/terminus by default. With no argument it fetches `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>` from `https://github.com/crenshawdev/terminus/releases/latest/download`, and one `https://` argument overrides that source. The whole install is `curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh`.
 
 ### Docs (DOC)
 

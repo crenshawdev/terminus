@@ -10,7 +10,8 @@ The archive is the product, so it is built first and everything else is built on
 - [x] **Phase 2: Linux and macOS Only, No npm** - the npm package and every Windows code path go, and a Windows build fails at compile time
 - [x] **Phase 3: Install Asks Nothing** - `terminus install` applies its defaults without a question, registers through `claude mcp`, and ends with a receipt
 - [x] **Phase 4: One-Command Installer** - `install.sh` downloads, checks and stores a version behind the stable path, then runs `terminus install`
-- [ ] **Phase 5: README** - a README at the repo root for someone who has never heard of Terminus
+- [ ] **Phase 5: Install from GitHub Releases** - `install.sh` downloads from the GitHub releases by default, so the whole install is one curl line piped into `sh`
+- [ ] **Phase 6: README** - a README at the repo root for someone who has never heard of Terminus
 
 ## Phase Details
 
@@ -61,9 +62,20 @@ The archive is the product, so it is built first and everything else is built on
 5. A local build can still be installed without publishing anything.
 6. Qualified on Linux. macOS stays unverified until it is run on a Mac.
 
-### Phase 5: README
-**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, and what it refuses to do. Last, because it describes the installer from Phase 4 and the platform support from Phase 2.
+### Phase 5: Install from GitHub Releases
+**Goal:** `install.sh` downloads from the GitHub releases on crenshawdev/terminus by default, so the whole install is one curl line piped into `sh`. A GitHub release holds no folders, so a release carries two flat files per platform: `terminus-<os>-<arch>`, and `terminus-<os>-<arch>.manifest` with the same two lines as today. Only the argument handling and the two downloads change. The checksum check, the version folders and the link stay as Phase 4 built them. Publishing a release and signing stay out. Before the README, so the README describes the finished script.
 **Depends on:** Phase 4
+**Requirements:** INST-13
+**Success Criteria:**
+1. With no argument, `install.sh` fetches `<default>/terminus-<os>-<arch>.manifest` and `<default>/terminus-<os>-<arch>`, where `<default>` is `https://github.com/crenshawdev/terminus/releases/latest/download`.
+2. One `https://` argument replaces the default source, and the same two file names are fetched under it. A non-https argument, or more than one argument, is refused.
+3. `cat install.sh | sh` installs with no argument, and `cat install.sh | sh -s -- https://<source>` passes a source.
+4. A SHA-256 mismatch is still refused before anything is placed, and the version folders and the link behave as they did in Phase 4.
+5. The Phase 4 tests pass against the flat names, `sh -n install.sh` passes, and the full suite passes.
+
+### Phase 6: README
+**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, and what it refuses to do. Last, because it describes the installer from Phases 4 and 5 and the platform support from Phase 2.
+**Depends on:** Phase 5
 **Requirements:** DOC-01
 **Success Criteria:**
 1. The README opens on the reader's problem and what Terminus does about it, before any mechanism.
