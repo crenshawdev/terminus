@@ -514,6 +514,6 @@ one object per check.
 - `doctor` writes nothing anywhere: no file, no directory, on any path,
   including the data directory it reports as absent.
 
-`install` and `uninstall` deliberately have no `--json` (D-24). They show a diff
-and ask a question, and a single JSON document on stdout cannot be both of
-those things.
+`install` and `uninstall` deliberately have no `--json` (D-24). Install prints a
+receipt written for a person, and uninstall asks a question before `--purge`
+deletes the archive, which a single JSON document on stdout cannot do.

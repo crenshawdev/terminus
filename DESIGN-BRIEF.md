@@ -99,7 +99,7 @@ No stored preview column — search results decompress the hit's block on demand
 - `PRAGMA integrity_check` plus incremental blob verification during ingest.
 - Online backup / `VACUUM INTO` for consistent snapshots without stopping ingest.
 - Rolling snapshots on by default.
-- Upstream transcripts are a second recovery path — hence the install-time offer to raise `cleanupPeriodDays` (Claude Code default is 30 days).
+- Upstream transcripts are a second recovery path, and Claude Code deletes them after `cleanupPeriodDays` (default 30 days). The install receipt shows the current value, says that transcripts older than it are already gone, and prints the line that raises it to 3650. Terminus never changes the setting itself.
 
 ---
 
@@ -389,15 +389,16 @@ Secondary: GitHub releases, Homebrew, deb/rpm.
 
 ### `terminus install`
 
-1. Detect and canonicalize config roots; report if more than one resolves.
-2. Ask for the data directory (default shown).
-3. Show the exact `settings.json` diff, back up the file, confirm once. Merge into the existing `hooks` object, atomic temp + rename, idempotent.
-4. Register the MCP server (stdio, same binary path, same merge rules).
-5. If `cleanupPeriodDays` is low, explain that transcripts are the recovery path and **offer** to raise it.
-6. Estimate the backfill (sessions, size, time), then run it detached, chunked, resumable, with bounded parallelism. Install returns immediately.
-7. Print what changed, where data lives, how to undo it — plus the auto-compact recommendation.
+Install asks nothing. It applies its defaults, never reads stdin and takes no arguments; any argument is misuse and exits 2.
 
-`--yes` accepts defaults for scripted installs.
+1. Detect and canonicalize config roots; report if more than one resolves.
+2. Merge the four hook entries into the existing `hooks` object of `settings.json`: atomic temp + rename, idempotent, with a one-time backup of the file as it was before install first changed it. A file not in the two-space format `JSON.stringify(value, null, 2)` writes is rewritten in full, and the backup holds the original bytes.
+3. Place the MCP entry with `claude mcp add-json --scope user terminus '<JSON>'`: stdio, the stable path as `command`, and `args` of `["mcp"]`. Install reads `.mcpServers.terminus` in `~/.claude.json` and never writes that file, so Claude Code stays its only writer.
+   - An entry already in that shape runs no `claude`. An entry in any other shape is removed with `claude mcp remove --scope user terminus` and then added again. Keys the user added beside the three, such as `env`, are carried into the new entry.
+   - `claude` is found on `PATH` and run by absolute path, with no shell, stdin at null, a 30-second deadline and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, so wiring Terminus up opens no network connection.
+   - When `claude` is missing, times out or exits non-zero, or `~/.claude.json` cannot be read, the install is incomplete. The binary, the hooks and the backfill still go ahead, the receipt prints the exact command that finishes the registration, and install exits non-zero.
+4. Print the receipt: every file changed (the binary, `settings.json` and its backup, the MCP entry), where data lives, the config roots, and how to undo it with `terminus uninstall`. It also shows the current `cleanupPeriodDays`, says that transcripts older than it are already gone, and prints the line that raises it, then gives the auto-compact recommendation. Install changes neither setting.
+5. Last, estimate the backfill (sessions, size, time), add the estimate and `terminus status`, where to watch it, to the end of the receipt, and run it detached, chunked, resumable, with bounded parallelism. Install returns immediately.
 
 Hooks go in **user scope** — terminus is global, one store across all projects.
 
