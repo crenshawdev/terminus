@@ -71,11 +71,7 @@ fn hook() -> Hook {
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
     std::fs::create_dir_all(&bin).unwrap();
 
-    let exe = bin.join(if cfg!(windows) {
-        "terminus.exe"
-    } else {
-        "terminus"
-    });
+    let exe = bin.join("terminus");
     // `fs::copy` carries the permission bits, so the copy is executable. The
     // guard is what keeps a sibling test's fork out of the window where this
     // destination is open for writing (see [`COPYING`]).

@@ -96,11 +96,7 @@ fn fixture() -> Fixture {
 
 impl Fixture {
     fn stable(&self) -> PathBuf {
-        self.bin_dir.join(if cfg!(windows) {
-            "terminus.exe"
-        } else {
-            "terminus"
-        })
+        self.bin_dir.join("terminus")
     }
 
     fn settings(&self) -> PathBuf {
@@ -124,8 +120,7 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("TERMINUS_DATA_DIR", self.data_dir())
             .env("TERMINUS_CONFIG_DIR", self.root.join("config"))
-            .env("HOME", &self.root)
-            .env("USERPROFILE", &self.root);
+            .env("HOME", &self.root);
         command
     }
 
