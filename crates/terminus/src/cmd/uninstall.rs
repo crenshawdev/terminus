@@ -86,7 +86,7 @@ pub fn run(options: Options) -> Result<(), Failure> {
     // this command exists for.
     let mut ok = clean(&targets::settings_path()?, &stable);
     ok &= unregister(&targets::claude_json_path()?);
-    ok &= unplace(&stable);
+    ok &= unplace(&stable, &versions);
 
     println!("  versions        {}", versions.display());
     if std::fs::symlink_metadata(&versions).is_ok() {
@@ -363,13 +363,10 @@ fn unregister(path: &Path) -> bool {
 ///
 /// `remove_file` takes the link and not the file it names. A marked plain file
 /// an older install left there goes the same way.
-fn unplace(stable: &Path) -> bool {
+fn unplace(stable: &Path, versions: &Path) -> bool {
     println!("  {}", stable.display());
     match binary::occupant(stable) {
-        Ok(binary::Occupant::Vacant) => {
-            println!("    not there: nothing to remove");
-            true
-        }
+        Ok(binary::Occupant::Vacant) => unplace_dangling(stable, versions),
         Ok(binary::Occupant::Ours) => match std::fs::remove_file(stable) {
             Ok(()) => {
                 println!("    removed");
@@ -386,6 +383,52 @@ fn unplace(stable: &Path) -> bool {
         }
         Err(failure) => {
             println!("    left alone: {}", detail(failure));
+            false
+        }
+    }
+}
+
+/// What `occupant` calls vacant is nothing at all or a link to nothing.
+///
+/// A link to nothing is terminus's when it points into the versions folder,
+/// which is what is left after that folder is deleted, the same rule
+/// `install.sh` uses. Any other is left where it is.
+fn unplace_dangling(stable: &Path, versions: &Path) -> bool {
+    match std::fs::symlink_metadata(stable) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("    not there: nothing to remove");
+            return true;
+        }
+        Err(e) => {
+            println!("    left alone: {e}");
+            return false;
+        }
+        Ok(_) => {}
+    }
+    let target = match std::fs::read_link(stable) {
+        Ok(target) => target,
+        Err(e) => {
+            println!("    left alone: the link could not be read: {e}");
+            return false;
+        }
+    };
+    if !binary::in_versions(&target, versions) {
+        println!(
+            "    left alone: a link to {}, which is not there and is outside the versions folder",
+            target.display()
+        );
+        return true;
+    }
+    match std::fs::remove_file(stable) {
+        Ok(()) => {
+            println!(
+                "    removed: a link to {}, which is not there",
+                target.display()
+            );
+            true
+        }
+        Err(e) => {
+            println!("    could not be removed: {e}");
             false
         }
     }

@@ -636,6 +636,68 @@ fn an_unmarked_file_at_the_stable_path_is_reported_and_kept() {
     );
 }
 
+/// Deleting the versions folder leaves the link pointing at nothing, and that
+/// link is still install's to take out.
+#[test]
+fn a_link_left_dangling_by_a_deleted_versions_folder_is_removed() {
+    let fixture = fixture();
+    fixture.install();
+    std::fs::remove_dir_all(
+        fixture
+            .root
+            .join(".local/lib/crenshawdev/terminus/versions"),
+    )
+    .unwrap();
+
+    let output = fixture.uninstall();
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        text(&output)
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(fixture.stable())
+            .map(|_| ())
+            .map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::NotFound),
+        "the dangling link was left at the stable path:\n{}",
+        text(&output)
+    );
+    assert!(
+        !out(&output).contains("nothing to remove"),
+        "uninstall said nothing was there:\n{}",
+        text(&output)
+    );
+}
+
+/// A link to nothing outside the versions folder is not one install made, so
+/// uninstall reports it and keeps it.
+#[test]
+fn a_dangling_link_outside_the_versions_folder_is_reported_and_kept() {
+    let fixture = fixture();
+    fixture.install();
+    let elsewhere = fixture.root.join("elsewhere/terminus");
+    std::fs::remove_file(fixture.stable()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, fixture.stable()).unwrap();
+
+    let output = fixture.uninstall();
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        text(&output)
+    );
+    assert_eq!(
+        std::fs::read_link(fixture.stable()).unwrap(),
+        elsewhere,
+        "uninstall removed or changed a link it did not make"
+    );
+    assert!(
+        out(&output).contains("outside the versions folder"),
+        "uninstall did not say why it kept the link:\n{}",
+        text(&output)
+    );
+}
+
 /// Uninstall is human-only: `--json` is an argument it does not have (D-24).
 #[test]
 fn uninstall_rejects_json() {

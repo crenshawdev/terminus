@@ -217,18 +217,28 @@ pub fn place(stable: &Path, versions: &Path) -> Result<PathBuf, Failure> {
 /// manifest.
 fn linked_to(stable: &Path, versions: &Path, source: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
-    use std::path::Component;
 
     let target = std::fs::read_link(stable).ok()?;
-    let mut rest = target.strip_prefix(versions).ok()?.components();
-    let (Some(Component::Normal(_)), Some(Component::Normal(_)), None) =
-        (rest.next(), rest.next(), rest.next())
-    else {
+    if !in_versions(&target, versions) {
         return None;
-    };
+    }
     let linked = std::fs::metadata(&target).ok()?;
     let running = std::fs::metadata(source).ok()?;
     (linked.dev() == running.dev() && linked.ino() == running.ino()).then_some(target)
+}
+
+/// Whether `target` is a file in a folder directly under the versions folder.
+pub fn in_versions(target: &Path, versions: &Path) -> bool {
+    use std::path::Component;
+
+    let Ok(rest) = target.strip_prefix(versions) else {
+        return false;
+    };
+    let mut rest = rest.components();
+    matches!(
+        (rest.next(), rest.next(), rest.next()),
+        (Some(Component::Normal(_)), Some(Component::Normal(_)), None)
+    )
 }
 
 /// Put `source`'s bytes at `dest`, unless they are already there.
