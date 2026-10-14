@@ -8,8 +8,6 @@
       `#![cfg(feature = "testkit")]`, and a bare `cargo test --workspace` skips
       `crates/terminus/tests/mcp.rs`, `recall_cli.rs` (49 tests) and
       `datamove.rs`, gated the same way on the `terminus` package.
-- [ ] (phase 3) `cmd/json.rs` Document::emit uses println!, which panics with exit 101 on a closed stdout pipe; the human path has broken_pipe and the JSON path does not
-- [ ] (phase 3) `cmd/show.rs` a closed stdout in human mode maps to Failure::Silent (exit 1), indistinguishable from an operational failure under pipefail
 - [x] (phase 4) The npm shim does not forward signals to the child: spawnSync blocks the event loop, so a SIGTERM aimed at the shim's own PID kills node and orphans the binary. Ctrl-C and job control signal the whole process group and are unaffected. risk_surface review finding, adjudicated downgraded (medium). Closed 2026-10-13: no longer applicable, because phase 2 removed the npm package.
 - [ ] (phase 4) Hoist pass::record_pass and pass::walk's per-file failure arm into ingest/mod.rs (or make them pub(crate)) so pass and backfill share one runs-row writer and one skip rule. Needs a plan whose lease covers crates/verbatim-core/src/ingest/pass.rs.
 - [ ] (phase 4) The four-worker backfill pipeline is only 8% faster than the sequential pass on the real corpus (49,089 ms vs 53,007 ms). The remaining cost is the single SQLite writer's: batch derived-row inserts, or move derive_turn's text expansion and entity extraction onto the workers. Measurement-led task, not a guess.
