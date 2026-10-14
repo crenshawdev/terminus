@@ -1,6 +1,6 @@
 # State
 
 Phase: 6 of 8 (Signed Install)
-Status: context gathered
-Next: /cad-plan 6
+Status: planned
+Next: /cad-execute 6
 Updated: 2026-10-14
