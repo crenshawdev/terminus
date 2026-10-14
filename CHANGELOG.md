@@ -46,6 +46,11 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   stable path holding a file that is not a Terminus build, leaving it as it is.
 - `install.sh`'s `curl` download is the one network use. The Terminus binary
   opens no network connection.
+- `terminus verify` names the block of a failure as well as the session. A
+  failure's line reads `<session_key>: block N: <detail>`, and under `--json`
+  each failure carries `block`, the block's number. A failure about the whole
+  session, such as a session checksum that no longer matches the block hashes,
+  has no `block N:` in its line and `block` is `null`.
 
 ### Changed
 
@@ -109,6 +114,27 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   instead of `terminus install`.
 - A `settings.json` that is not in the two-space format is rewritten in full
   without a question, and its backup holds the original bytes.
+- Each session's archive is stored as numbered blocks, one row per block in a
+  `blocks` table, instead of one blob in `sessions.blob`. A row holds the
+  block's zstd-compressed bytes and a BLAKE3 hash of its uncompressed bytes,
+  and the session checksum in `session_meta` is a BLAKE3 hash over the block
+  hashes in order.
+- The block size is recorded per session, in `session_meta.block_size`, and is
+  64 KB.
+- An append rewrites at most the session's last block and adds rows after it.
+  It checks the stored block hashes against the session checksum and the last
+  block against its own hash, and reads no other block. Reading a turn fetches
+  and decompresses only the blocks its range covers.
+- `terminus usage` counts a session's archive bytes as the sum of its block
+  rows' lengths.
+- The archive format is now 2. A store written by an earlier build is refused
+  by every command that opens it, `terminus install` included, which exits
+  non-zero, and until it is replaced the hooks archive nothing. The message
+  gives the clean install: move the data folder and the current binary aside,
+  then rerun `install.sh`. The refused store is not changed and there is no
+  conversion. The new store holds the sessions whose transcripts are still on
+  disk, and its injection decision log and labels start empty; the folder moved
+  aside keeps the rest.
 
 ### Removed
 

@@ -54,7 +54,8 @@ One mechanism: **SQLite** via `rusqlite` with the `bundled` feature (vendored C 
 
 | Table | Role |
 |---|---|
-| `sessions` | session_id → compressed, block-framed blob + checksum |
+| `sessions` | session_key → session_no |
+| `blocks` | (session_no, block_no) → zstd-compressed bytes + BLAKE3 hash of the uncompressed bytes |
 | `session_meta` | project, cwd, branch, times, source, final?, evicted?, parent, continues-from |
 | `turns` | turn_seq, kind, tool, ts, offset/len into the blob |
 | `turns_fts` | FTS5 over expanded turn text. Contentless (`content=''`, `contentless_delete=1`). Derived, droppable |
@@ -70,7 +71,7 @@ Blob write, turn rows, FTS rows, entities and watermark **all commit in one tran
 
 ### Blob format
 
-Header (format version, codec, block size, block offset table) followed by 64 KB zstd-compressed blocks. Reading one turn decompresses one block, not the whole session.
+Each session's stream is cut into blocks of the size its `session_meta` row records, 64 KB today. Each block is compressed with zstd on its own and stored as one row in `blocks` with its hash. Reading one turn fetches and decompresses only the blocks its range covers, and an append rewrites at most the last block.
 
 **Compression is on by default.** Measured corpus: 895 MB / 1,896 sessions / 25 days ≈ 13 GB/year uncompressed for very heavy use; ~2 GB/year compressed. A typical user is well under that.
 
@@ -91,12 +92,12 @@ No stored preview column — search results decompress the hit's block on demand
 
 `sessions` is truth. Turns, FTS, entities and paths are derived and rebuildable by replaying blobs. `decisions` and `labels` are kept, not rebuilt: what an injector decided at prompt time is in no blob. `observations` is kept too: its facts come off the session blob, and retention eviction empties that blob, so an evicted session's observation cannot be recomputed.
 
-**The archive table never migrates.** A store format bump rebuilds derived tables only. This is the property that prevents claude-mem's 49-migration situation.
+**The archive tables never migrate.** A store in an older archive format is refused with the clean-install steps (move the data folder and the binary aside, rerun `install.sh`), a store in a newer one is refused with a message to upgrade, and nothing converts either. Only a derived schema that differs from the binary's rebuilds the derived tables. This is the property that prevents claude-mem's 49-migration situation.
 
 ### Durability
 
-- Per-blob checksums in `session_meta`, independent of SQLite's own integrity checks, so corruption localizes to named sessions rather than "the store is gone".
-- `PRAGMA integrity_check` plus incremental blob verification during ingest.
+- A BLAKE3 hash per block, and a session checksum over the block hashes in `session_meta`, independent of SQLite's own integrity checks, so corruption is pinned to a named session and block rather than "the store is gone".
+- `PRAGMA integrity_check`, plus what each append checks: the stored block hashes against the session checksum, and the tail block against its own hash. Complete blocks are neither read nor rewritten.
 - Online backup / `VACUUM INTO` for consistent snapshots without stopping ingest.
 - Rolling snapshots on by default.
 - Upstream transcripts are a second recovery path, and Claude Code deletes them after `cleanupPeriodDays` (default 30 days). The install receipt shows the current value, says that transcripts older than it are already gone, and prints the line that raises it to 3650. Terminus never changes the setting itself.
@@ -127,8 +128,8 @@ No daemon, no systemd/launchd/Task Scheduler. The hook spawn is the scheduler.
 1. Try-lock (`flock`). Held → exit 0 immediately. No waiting, no retry storms.
 2. Read watermarks.
 3. Tail each transcript to the last complete record; skip excluded projects.
-4. Build session blob, compress.
-5. Commit blob + turns + FTS + entities + watermark in one transaction.
+4. Cut the stream into blocks, compress each one.
+5. Commit the new block rows, the replaced tail row, turns, FTS, entities and watermark in one transaction.
 6. Apply retention if configured; compact if needed.
 7. Re-check for new work; loop. Else exit, bounded by a max wall clock.
 
@@ -453,15 +454,15 @@ Recommend disabling; never change it. With terminus, compaction burns tokens to 
 | `terminus status` | sizes, counts, watermarks, last ingest run and error |
 | `terminus search` / `show` / `sessions` | terminal recall |
 | `terminus ingest` | manual catch-up |
-| `terminus reindex` | rebuild derived tables from blobs |
-| `terminus verify` | walk blobs, check checksums, report bad session ids |
+| `terminus reindex` | rebuild derived tables from the block rows |
+| `terminus verify` | check every block against its hash and each session checksum, name the session and block of a failure |
 | `terminus compact` | reclaim freed space |
 | `terminus usage` | bytes per project and month |
 | `terminus data move <path>` | relocate the store safely |
 | `terminus export` | portable output for backup or migration |
 | `terminus doctor` | read-only health report |
 | `terminus install` / `uninstall` | wiring |
-| `terminus observations regenerate [--since]` | recompute stored observations from their blobs |
+| `terminus observations regenerate [--since]` | recompute stored observations from the archived block rows |
 | `terminus mcp` | stdio MCP server |
 
 Contract: human-readable by default, `--json` on every data command with a stable shape. Errors to stderr, data to stdout. Exit `0` success, `1` operational failure, `2` misuse — never non-zero for "no results". No colour when stdout isn't a TTY; honour `NO_COLOR`. Quiet unless attached to a TTY.
@@ -495,7 +496,7 @@ No mocking SQLite — real temp databases throughout.
 ## 16. Versioning, licensing, repo
 
 - **0.0.1 onward. 1.0 only when the full feature set has landed.** Agile increments.
-- **Store format version is a separate integer** in `meta`. The binary refuses a newer format than it knows; an older one rebuilds derived tables. A product bump never implies a store rebuild.
+- **Store format version is a separate integer** in `meta`. The binary refuses a store whose archive format differs from its own, newer or older, and a derived schema that differs from its own rebuilds the derived tables. A product bump never implies a store rebuild.
 - **Apache-2.0.** Source must be public — nobody installs a closed binary that reads every keystroke of their work. Apache over MIT for the explicit patent grant. AGPL is a documented negative signal in this category and its network clause protects nothing here. All dependencies are permissive (SQLite public domain, rusqlite MIT, zstd BSD, rayon MIT/Apache).
 - **Public OSS** — an explicit override of the private-by-default rule, scoped to this project.
 - `origin` is the self-hosted repo and the only remote. Publishing elsewhere is handled outside this project.

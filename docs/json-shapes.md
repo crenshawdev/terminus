@@ -34,7 +34,7 @@ and a hand-rolled writer fails on exactly the turns most worth reading.
 | Code | Meaning |
 |---|---|
 | 0 | Success, **including an empty result set**. A query that matched nothing is a successful answer to a question with no matches. |
-| 1 | Operational failure: the work was attempted and did not succeed. `verify` found a corrupt blob, `reindex` skipped a session, the store could not be read. |
+| 1 | Operational failure: the work was attempted and did not succeed. `verify` found a corrupt block, `reindex` skipped a session, the store could not be read, the store is in an archive format this build refuses. |
 | 2 | Misuse: the command line does not name work that could be attempted. An unknown flag, an unknown subcommand, a non-numeric turn id, a malformed `--since`. |
 
 A caller that parses `ok` and a caller that checks the exit code never
@@ -42,9 +42,9 @@ disagree. `verify --json` on a damaged store writes its document **and** exits
 1; the document is the evidence and the code is the verdict.
 
 **One case writes no document:** a failure raised before the command reached its
-own answer - a store from the future, an unresolvable data directory - is
-reported on stderr with exit 1 and stdout stays empty. The command never got far
-enough to know `--json` had been asked for. Empty stdout with a non-zero exit is
+own answer - a store in an archive format this build refuses, an unresolvable
+data directory - is reported on stderr with exit 1 and stdout stays empty. The
+command never got far enough to know `--json` had been asked for. Empty stdout with a non-zero exit is
 therefore part of the contract, and a caller must check the exit code before it
 parses.
 
@@ -165,8 +165,15 @@ data on stdout, the counts and the warnings on stderr.
 ### `verify`
 
 ```json
-{"checked": 11, "failures": [{"session_key": "...", "detail": "..."}]}
+{"checked": 11, "failures": [{"session_key": "...", "block": 3, "detail": "..."}]}
 ```
+
+- Each failure carries `block`: the number of the failing block, or `null` for a
+  failure about the whole session, such as a session checksum that no longer
+  matches the block hashes while every block matches its own hash.
+- Without `--json`, each failure is one line on stdout,
+  `<session_key>: block N: <detail>`, or `<session_key>: <detail>` when `block`
+  is `null`.
 
 Exits 1 when `failures` is non-empty, with the document still written.
 
@@ -405,12 +412,13 @@ and to nothing else. That is the whole design, and reading one against the
 other's total is the mistake it exists to prevent.
 
 - The ARCHIVE table is `by_project` and `by_month`. The bytes in each add up to
-  `archive_bytes`, which is `sum(length(sessions.blob))` over the sessions a
-  read path may see - and **not** to `file_bytes`. On the live store measured
-  2026-08-22 the file is 1,103,396,864 bytes against 465,985,120 of archive,
-  2.4x everything the projects account for; the rest is the derived tables, and
-  attributing them to projects pro-rata would make every per-project number an
-  estimate rather than a measurement.
+  `archive_bytes`, which is the sum of each session's block byte lengths
+  (`length(bytes)` over its `blocks` rows) over the sessions a read path may
+  see - and **not** to `file_bytes`. On the live store measured 2026-08-22 the
+  file is 1,103,396,864 bytes against 465,985,120 of archive, 2.4x everything
+  the projects account for; the rest is the derived tables, and attributing them
+  to projects pro-rata would make every per-project number an estimate rather
+  than a measurement.
 - A session with no `project` and a session with no `first_turn_at` each get a
   bucket whose key is `null`. They are counted and their bytes are inside the
   totals: a null quietly dropped is a total that no longer reconciles, and the
