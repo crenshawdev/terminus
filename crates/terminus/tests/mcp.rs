@@ -1561,6 +1561,23 @@ fn an_excluded_project_is_never_named_to_a_client_at_the_default_scope() {
         "recall_context confirmed the id belongs to an excluded project: {rendered}"
     );
 
+    // And at `*`, where the scope arm stands aside and only the exclusion arm
+    // can refuse the id.
+    for (tool, args) in [
+        ("recall_get", serde_json::json!({ "turn_ids": ids, "project": "*" })),
+        ("recall_context", serde_json::json!({ "turn_id": ids[0], "project": "*" })),
+    ] {
+        let rendered = bench.call(&alpha, tool, args).to_string();
+        assert!(
+            !rendered.contains(&excluded_name),
+            "{tool} at * named the excluded project: {rendered}"
+        );
+        assert!(
+            !rendered.contains("excluded by config"),
+            "{tool} at * confirmed the id belongs to an excluded project: {rendered}"
+        );
+    }
+
     // The control: an id that is simply not archived answers the same way, so
     // "excluded" and "absent" are indistinguishable from outside.
     let absent = bench.call(&alpha, "recall_context", serde_json::json!({"turn_id": 1}));

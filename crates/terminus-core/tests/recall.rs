@@ -1522,7 +1522,9 @@ fn a_window_stops_at_the_session_boundary() {
     }
 }
 
-/// A turn of an excluded project has no window, and says why.
+/// A turn of an excluded project has no window, and at `*` its reason is the
+/// one an unarchived turn gets: naming the project would confirm the turn
+/// exists and say what the excluded project is called.
 #[test]
 fn a_window_into_an_excluded_project_is_empty_with_a_reason() {
     let bench = bench();
@@ -1538,9 +1540,7 @@ fn a_window_into_an_excluded_project_is_empty_with_a_reason() {
     assert!(hidden.turns.is_empty());
     assert_eq!(
         hidden.reason,
-        Some(Reason::ProjectExcluded {
-            project: alpha_key.clone()
-        })
+        Some(Reason::NoSuchTurn { turn_id: anchor })
     );
 
     // And a turn that is not archived at all is a reason too, not a panic.
@@ -2236,7 +2236,9 @@ fn a_get_is_scoped_like_a_search_is() {
     );
 }
 
-/// A turn of an excluded project is absent with the exclusion as its reason.
+/// A turn of an excluded project is absent, and at `*` its reason is the one an
+/// unarchived id gets, so the answer neither confirms the id nor names the
+/// project.
 ///
 /// The read half of ING-08 through this door too: exclusion applies on every
 /// read path, and `recall_get` is the one that would hand back the whole record
@@ -2253,11 +2255,9 @@ fn a_get_of_an_excluded_projects_turn_is_absent_with_a_reason() {
     let fetched = scoped_fetch(&conn, &[&excluded], &Scope::Everything, &[id]);
     assert!(fetched.records.is_empty(), "{fetched:?}");
     assert_eq!(fetched.absent.len(), 1, "{fetched:?}");
-    assert!(
-        matches!(
-            fetched.absent[0].reason,
-            Reason::ProjectExcluded { ref project } if project == &excluded
-        ),
+    assert_eq!(
+        fetched.absent[0].reason,
+        Reason::NoSuchTurn { turn_id: id },
         "{fetched:?}"
     );
     assert_eq!(

@@ -145,15 +145,12 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
             continue;
         };
 
-        // Scope FIRST, then exclusion. Both arms refuse the id; only one of
-        // them names a path. An excluded project is also outside the caller's
-        // scope at every scope but `*`, so checking exclusion first answered
-        // "<absolute path> is excluded by config" for an id the caller was
-        // never entitled to hear about - confirming both that the id exists and
-        // what the excluded project is called. Ids are densely enumerable
-        // (`session_no << 24 | turn_seq`), so that reason mapped every excluded
-        // project's name and live id ranges, one call at a time, with no
-        // argument a client had to pass to reach it.
+        // Both arms answer `NoSuchTurn`, and neither names a path. Ids are
+        // densely enumerable (`session_no << 24 | turn_seq`), so a reason that
+        // named the excluded project - or any reason of its own - would confirm
+        // the id exists and, swept one call at a time, map every excluded
+        // project's name and live id ranges. At the default scope the scope arm
+        // catches those ids first; at `*` only the exclusion arm stands.
         if let Some(wanted_project) = scoped.project() {
             if row.project.as_deref() != Some(wanted_project) {
                 fetched.absent.push(Absent {
@@ -172,13 +169,7 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
         {
             fetched.absent.push(Absent {
                 turn_id: id,
-                reason: Reason::ProjectExcluded {
-                    project: row
-                        .project
-                        .clone()
-                        .or_else(|| row.pre_worktree.clone())
-                        .unwrap_or_default(),
-                },
+                reason: Reason::NoSuchTurn { turn_id: id },
             });
             continue;
         }

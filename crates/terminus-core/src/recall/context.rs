@@ -79,8 +79,8 @@ impl Window {
 /// The turns around `anchor`, `before` of them earlier and `after` later.
 ///
 /// Exclusion is applied on the same projection the search scopes through
-/// (D-21): a turn of an excluded project returns an empty window with a reason,
-/// because a context call that answered would be the read-path half of
+/// (D-21): a turn of an excluded project returns an empty window answered as
+/// `NoSuchTurn`, because a context call that answered would be the read-path half of
 /// exclusion leaking through a second door.
 pub fn window(
     conn: &Connection,
@@ -122,11 +122,9 @@ pub fn window(
         .optional()?;
     let (project, pre_worktree, continues_from) = meta.unwrap_or((None, None, None));
 
-    // Scope FIRST, then exclusion - the order is the finding, not a style
-    // choice. Both arms refuse the anchor; only one of them names a path, and
-    // an excluded project is outside the caller's scope at every scope but
-    // `*`, so checking exclusion first answered "<absolute path> is excluded by
-    // config" for a turn the caller was never entitled to hear about.
+    // Both arms refuse the anchor as `NoSuchTurn`, and neither names a path:
+    // naming the excluded project, at `*` or anywhere, would confirm the turn
+    // exists and say what the project is called.
     //
     // The scoping half of the same door. RCL-10 auto-scopes all three MCP
     // tools to the current project with `project: "*"` opting out, and this is
@@ -153,9 +151,7 @@ pub fn window(
     if hidden(&project, scoped.excluded_projects())
         || hidden(&pre_worktree, scoped.excluded_pre_worktree())
     {
-        return Ok(Window::nothing(Reason::ProjectExcluded {
-            project: project.or(pre_worktree).unwrap_or_default(),
-        }));
+        return Ok(Window::nothing(Reason::NoSuchTurn { turn_id: anchor }));
     }
 
     let low = seq - before.min(MAX_CONTEXT_SIDE) as i64;
