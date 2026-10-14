@@ -1,0 +1,124 @@
+{
+  "status": "gaps",
+  "score": "6/9",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "With no argument, run as a file and piped into sh, install.sh requests exactly <default>/terminus-<os>-<arch>.manifest then <default>/terminus-<os>-<arch>, with <default> https://github.com/crenshawdev/terminus/releases/latest/download, and the install finishes",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "install.sh:122-123 sets the default when $# is 0; install.sh:179-182 fetch $source/terminus-$os-$arch.manifest and $source/terminus-$os-$arch. Named tests passed here: no_source_downloads_from_the_github_releases::sh and a_piped_script_with_no_source_downloads_from_the_github_releases::sh. The value is traced end to end: the default enters at install.sh:123 and lands in the fake curl's log, which the test compares to the literal URLs in default_urls (install_script.rs:700-706); the served bytes land at versions/1.0.0/terminus and the stable link through assert_linked (install_script.rs:465-475). Fixture::piped (install_script.rs:418-436) writes the script into the shell's stdin pipe and closes it."
+    },
+    {
+      "n": 2,
+      "truth": "The script piped into sh -s -- https://<server> installs from that server's flat names; an http:// argument and a two-argument run each exit non-zero with the stable path and versions folder unchanged",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "install.sh:122-126 checks the count before $1 is read. Named tests passed here: a_piped_script_installs_from_its_source::sh (real curl against s_server, assert_linked), an_http_source_is_refused::sh and two_sources_are_refused::sh (assert_refused at install_script.rs:568-577 compares the stable path, the versions tree and both Claude files and checks that no claude call was made). Spot-check with env -i: `sh install.sh http://example.invalid` printed 'terminus: the source must start with https://' and exited 1; `sh -x install.sh https://a.invalid https://b.invalid` traced only `case $#` and the fail call, printed 'terminus: usage: sh install.sh [https://<source>]' and exited 1."
+    },
+    {
+      "n": 3,
+      "truth": "A failed manifest download exits non-zero with 'manifest download failed: <url>', a failed binary download with 'binary download failed: <url>', and neither changes the stable path or versions folder",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "install.sh:179-182. Named tests passed here: a_failed_manifest_download_is_refused::sh and a_failed_binary_download_is_refused::sh. The fake curl exits 22 for the named file (install_script.rs:516-538), and assert_download_refused (install_script.rs:742-753) runs assert_refused and checks stderr for the full default URL from default_urls."
+    },
+    {
+      "n": 4,
+      "truth": "A copy of install.sh cut off at any line break before its last line, piped into sh, changes nothing under HOME",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "Spot-check (no committed test, as plan 1 chose): for n=1..251 (install.sh has 252 lines), `head -n $n install.sh | env -i HOME=<absolute scratch> PATH=/usr/bin:/bin <shell> -x -s -- https://127.0.0.1:9`, under /bin/sh (bash) and /usr/bin/dash. Result: HOME had 0 entries and 0 trace lines named uname, mktemp or curl in both shells. Control on the whole script: 6 such trace lines under sh and 4 under dash, so the check can fail. Body is main() at install.sh:121-250, called once as `main \"$@\"` at install.sh:252."
+    },
+    {
+      "n": 5,
+      "truth": "A SHA-256 mismatch is still refused before anything is placed, and the checksum check, version folders and link are as Phase 4 built them",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "Named tests passed here: a_digest_that_does_not_match_is_refused::sh (assert_refused: snapshot unchanged), shasum_computes_the_digest_when_sha256sum_is_missing::sh and successive_installs_keep_every_version::sh. `git diff -w fc20d98 HEAD -- install.sh` changes only the header comment, valid_utf8 (rewritten over od), the argument case, the main wrapper and the two curl URLs; verify_download (install.sh:84-88), stage (112-119), the manifest parsing and the link (229-237) are unchanged. The marker= line stays at column 0 (install.sh:17), and cmd::install::binary::tests::install_sh_holds_the_same_marker passed when run by name."
+    },
+    {
+      "n": 6,
+      "truth": "The Phase 4 install.sh tests pass against the flat names under /bin/sh and dash, sh -n and dash -n pass, and cargo test --workspace --all-features passes",
+      "status": "UNCERTAIN",
+      "uat_item": 6,
+      "evidence": "Not run, as the dispatch directed for this human-verify item. What was observed: the test binary lists 40 tests, 20 named ::sh and 20 named ::dash (install_script.rs:205-219, 971-992); the 10 ::sh tests run for items 1 to 5 passed; dash 0.5.13.4 is now installed at /usr/bin/dash. The ::dash half, both -n checks and the workspace suite were not run here."
+    },
+    {
+      "n": 7,
+      "truth": "The CHANGELOG Unreleased entry and DESIGN-BRIEF section 13 show the curl line, the optional https:// source and the flat names, no longer mention <source>/<os>-<arch>/manifest, and still say no release is published yet",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "CHANGELOG.md:17 is the curl line, :20 names terminus-<os>-<arch>.manifest and terminus-<os>-<arch>, :24 has `sh -s -- https://<source>`, :30 says 'No release is published'. DESIGN-BRIEF.md:381 has the curl line, `sh -s -- https://<source>` and 'No release is published yet.'; :383 is 'Secondary: Homebrew, deb/rpm.'; :395, under ### Binary layout in section 13, names both flat files. `grep -n '<os>-<arch>/\\|sh install.sh https' CHANGELOG.md DESIGN-BRIEF.md` printed nothing."
+    },
+    {
+      "n": 8,
+      "truth": "SUMMARY claim: a cut-off loop over every byte length left HOME empty and ran no uname, mktemp or curl",
+      "status": "FAILED",
+      "uat_item": null,
+      "evidence": "Plan 1's report (reports/plan-1.md) ran `head -n` line cuts n=1..243, not byte cuts. Spot-check of the last line's byte cuts with `head -c $n | env -i HOME=relative ... <shell> -x -s -- https://127.0.0.1:9`: at 9642 and 9643 of 9648 bytes (the last line read as `main` and `main `), both /bin/sh and dash trace `+ source=https://github.com/crenshawdev/terminus/releases/latest/download`, so main runs with no arguments and drops the source passed after -s --. Cuts at `m`, `ma`, `mai` are 'not found', and cuts inside the quotes are syntax errors."
+    },
+    {
+      "n": 9,
+      "truth": "Under dash, install.sh builds its versions and stable paths from HOME's exact bytes",
+      "status": "FAILED",
+      "uat_item": null,
+      "evidence": "The HOME component loop (install.sh:141-151) was probed alone with HOME bytes 2f 74 6d 70 2f 78 c4 82 79. /bin/sh in both locales and dash with LANG=en_US.UTF-8 return the same bytes. dash 0.5.13.4 started with no LANG (env -i) returns 2f 74 6d 70 2f 78 c4 81 81 82 79, so versions, stable_folder and stable (install.sh:152-154) point outside the real HOME. SUMMARY.md Open items reports this and leaves it to the owner. Byte 0x82 ends common letters such as U+0142 (c5 82). Debian and Ubuntu ship dash 0.5.12, which was not measured."
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "No argument downloads from the GitHub releases",
+      "evidence": "install.sh:122-123,179-182; no_source_downloads_from_the_github_releases::sh and a_piped_script_with_no_source_downloads_from_the_github_releases::sh passed. The fake curl's log equals the two literal default URLs in order, the run exits 0, and assert_linked holds for 1.0.0."
+    },
+    {
+      "k": 2,
+      "name": "A piped https source installs; http and two arguments are refused",
+      "evidence": "a_piped_script_installs_from_its_source::sh, an_http_source_is_refused::sh and two_sources_are_refused::sh passed; assert_refused checks the stable path and versions tree are unchanged. Spot-checks: an http:// argument prints 'the source must start with https://' and two https:// arguments print only the usage line, both exiting 1."
+    },
+    {
+      "k": 3,
+      "name": "Both download failures are refused with the URL tried",
+      "evidence": "install.sh:179-182; a_failed_manifest_download_is_refused::sh and a_failed_binary_download_is_refused::sh passed. stderr holds 'manifest download failed: <default>/terminus-<platform>.manifest' and 'binary download failed: <default>/terminus-<platform>', with the snapshot unchanged."
+    },
+    {
+      "k": 4,
+      "name": "A cut-off script changes nothing",
+      "evidence": "Every line-break cut n=1..251, piped into /bin/sh -x and dash -x with an absolute scratch HOME and source https://127.0.0.1:9, left HOME empty and traced no uname, mktemp or curl. A control run of the whole script traced 6 (sh) and 4 (dash) such lines."
+    },
+    {
+      "k": 5,
+      "name": "A checksum mismatch is still refused",
+      "evidence": "a_digest_that_does_not_match_is_refused::sh passed (assert_refused: nothing placed). `git diff -w fc20d98 HEAD -- install.sh` leaves verify_download, stage and the link untouched."
+    },
+    {
+      "k": 7,
+      "name": "CHANGELOG and DESIGN-BRIEF show the new install",
+      "evidence": "CHANGELOG.md:17,20,24,30 and DESIGN-BRIEF.md:381,383,395 carry the curl line, sh -s -- https://<source>, the flat names and 'No release is published'. The grep for '<os>-<arch>/' and 'sh install.sh https' in both files is empty."
+    }
+  ],
+  "gaps": [
+    {
+      "name": "A cut in the middle of the last line drops a passed source",
+      "reason": "behavior wrong - SUMMARY.md's goal check says the cut-off loop covered every byte length, but only line breaks were tested, and two byte cuts run main with no arguments",
+      "evidence": "install.sh:252 is `main \"$@\"`. Piped through `sh -s -- https://127.0.0.1:9` and cut at byte 9642 or 9643 of 9648 (`main`, `main `), both /bin/sh and dash trace `source=https://github.com/crenshawdev/terminus/releases/latest/download`. A `curl ... | sh -s -- https://<source>` download cut there installs from the GitHub default instead, still checksum-verified. With no argument the cut is harmless, because `main` and `main \"$@\"` do the same thing. AC4 covers line breaks only, and the SUMMARY.md goal check overstates it.",
+      "severity": "minor",
+      "missing": "Owner's call. Either make every prefix of the last line fail, for example by passing a trailing sentinel argument that main checks and removes so that `main` and `main \"$@\"` on their own are refused, or correct SUMMARY.md's goal check to say every line break rather than every byte length."
+    },
+    {
+      "name": "dash in a C locale corrupts a HOME holding byte 0x82",
+      "reason": "behavior wrong - dash 0.5.13.4, started with no LANG, inserts 0x81 bytes before 0x82 in parameter-expansion results, so install.sh builds its paths outside the real HOME",
+      "evidence": "install.sh:141-154. The probe with HOME bytes ...c4 82... returns ...c4 81 81 82... under `env -i dash`, and the same bytes under /bin/sh and under dash with LANG=en_US.UTF-8. valid_utf8 (install.sh:26-52) accepts that HOME, so the run continues on the altered path. No committed test feeds a non-ASCII HOME (SUMMARY.md Open items). Debian and Ubuntu's dash 0.5.12 was not measured.",
+      "severity": "minor",
+      "missing": "Owner's decision from SUMMARY.md Open items: either work around it in install.sh, or refuse a HOME holding byte 0x82 with a clear message (valid_utf8 already reads HOME's bytes through od, so it can see 130). Add a committed ::dash test that feeds such a HOME."
+    }
+  ],
+  "human_checks": [
+    {
+      "name": "From /code/terminus, run `sh -n install.sh && dash -n install.sh`, then `cargo test -p terminus --test install_script`, then `cargo test --workspace --all-features`",
+      "expected": "Both -n checks exit 0. The install_script run reports 40 passed and 0 failed (20 ::sh, 20 ::dash). The workspace suite passes with 0 failed (plan 2's report recorded 812 passed).",
+      "why_human": "Not a limit of the model. The dispatching agent tagged this item human-verify (needs dash) and told the verifier not to run it as a machine check, so it was not run. Nothing here is irreversible or out of reach: dash 0.5.13.4 is now installed at /usr/bin/dash, so the walk can run these commands itself."
+    }
+  ]
+}

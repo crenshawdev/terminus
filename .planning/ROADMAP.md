@@ -10,7 +10,7 @@ The archive is the product, so it is built first and everything else is built on
 - [x] **Phase 2: Linux and macOS Only, No npm** - the npm package and every Windows code path go, and a Windows build fails at compile time
 - [x] **Phase 3: Install Asks Nothing** - `terminus install` applies its defaults without a question, registers through `claude mcp`, and ends with a receipt
 - [x] **Phase 4: One-Command Installer** - `install.sh` downloads, checks and stores a version behind the stable path, then runs `terminus install`
-- [ ] **Phase 5: Install from GitHub Releases** - `install.sh` downloads from the GitHub releases by default, so the whole install is one curl line piped into `sh`
+- [x] **Phase 5: Install from GitHub Releases** - `install.sh` downloads from the GitHub releases by default, so the whole install is one curl line piped into `sh`
 - [ ] **Phase 6: README** - a README at the repo root for someone who has never heard of Terminus
 
 ## Phase Details
