@@ -654,6 +654,46 @@ fn after_one_ingest_the_store_and_the_last_run_are_reported() {
     );
 }
 
+/// A last run with routine notes and no error is a healthy run.
+///
+/// `doctor` flags any non-null `runs.error`, and labels written and sessions
+/// retention evicted used to land there, so it failed after ordinary use with
+/// injection on. They are `runs.notes` now, and this pins that `doctor` reads
+/// them as nothing wrong.
+#[test]
+fn a_last_run_with_only_notes_is_ok() {
+    let fixture = fixture();
+    fixture.install();
+
+    let project = fixture.claude_dir.join("projects").join("-data-code-x");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("44444444-4444-4444-8444-444444444444.jsonl"),
+        terminus_core::testkit::fixture_bytes("session-basic.jsonl"),
+    )
+    .unwrap();
+    let ingest = fixture.run(&["ingest"]);
+    assert!(ingest.status.success(), "ingest failed: {}", text(&ingest));
+    rusqlite::Connection::open(
+        fixture
+            .root
+            .join("data")
+            .join(terminus_core::store::DB_FILE_NAME),
+    )
+    .unwrap()
+    .execute(
+        "UPDATE runs SET error = NULL,
+             notes = 'labelled 1 hit\nretention evicted 1 session(s)'
+         WHERE id = (SELECT max(id) FROM runs)",
+        [],
+    )
+    .unwrap();
+
+    let (code, report) = fixture.doctor();
+    assert_eq!(code, Some(0), "{}", report.whole);
+    assert_eq!(report.state("last_run"), "ok", "{}", report.whole);
+}
+
 /// Every name directly inside `dir`, sorted.
 fn entries(dir: &Path) -> Vec<String> {
     let mut found: Vec<String> = std::fs::read_dir(dir)

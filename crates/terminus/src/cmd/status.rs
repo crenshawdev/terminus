@@ -49,7 +49,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
     } else {
         Some(read(conn.query_row(
             "SELECT started_at, coalesce(duration_ms, 0), files_seen, files_committed,
-                    files_failed, bytes_read, turns_added, error
+                    files_failed, bytes_read, turns_added, error, notes
              FROM runs ORDER BY id DESC LIMIT 1",
             [],
             |r| {
@@ -62,6 +62,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
                     bytes_read: r.get(5)?,
                     turns_added: r.get(6)?,
                     error: r.get(7)?,
+                    notes: r.get(8)?,
                 })
             },
         ))?)
@@ -92,6 +93,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
                         "bytes_read": run.bytes_read,
                         "turns_added": run.turns_added,
                         "error": run.error,
+                        "notes": run.notes,
                     }),
                 },
             )
@@ -135,9 +137,16 @@ pub fn run(json: bool) -> Result<(), Failure> {
     );
     outln!("  bytes read   {}", run.bytes_read);
     outln!("  turns added  {}", run.turns_added);
+    // What the pass did, then what went wrong, each in full: these are the only
+    // account of that pass there is. Apart, so a routine line never reads as a
+    // failure.
+    if let Some(notes) = &run.notes {
+        outln!("  notes");
+        for line in notes.lines() {
+            outln!("    {line}");
+        }
+    }
     if let Some(error) = &run.error {
-        // In full, every line of it. This is the only account of what that pass
-        // skipped and why.
         outln!("  error");
         for line in error.lines() {
             outln!("    {line}");
@@ -156,6 +165,7 @@ struct Run {
     bytes_read: i64,
     turns_added: i64,
     error: Option<String>,
+    notes: Option<String>,
 }
 
 /// The store's footprint: the database and its WAL sidecars together, because

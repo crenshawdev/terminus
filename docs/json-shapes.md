@@ -155,12 +155,16 @@ data on stdout, the counts and the warnings on stderr.
  "watermarks": 11, "watermark_bytes": 34012, "excluded": ["/abs/path/private"],
  "last_run": {"started_at": "...", "duration_ms": 12, "files_seen": 11,
               "files_committed": 11, "files_failed": 0, "bytes_read": 34012,
-              "turns_added": 47, "error": null}}
+              "turns_added": 47, "error": null, "notes": null}}
 ```
 
 - The same numbers the human output prints. `size_bytes` counts the database and
   its WAL sidecars together.
 - `last_run` is null on a store no pass has ever written to.
+- `error` holds what went wrong on that pass, one line each: a file skipped, a
+  watermark repaired, a step that could not run. `notes` holds what a healthy
+  pass did worth saying, such as labels written and sessions retention evicted.
+  Each is null when there is nothing to say, and `doctor` flags only `error`.
 
 ### `verify`
 

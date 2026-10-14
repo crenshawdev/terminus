@@ -135,6 +135,11 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   conversion. The new store holds the sessions whose transcripts are still on
   disk, and its injection decision log and labels start empty; the folder moved
   aside keeps the rest.
+- What a healthy ingest pass did, such as labels written and sessions retention
+  evicted, is recorded apart from what went wrong. `terminus status` prints it
+  under `notes` rather than `error`, `status --json` carries `notes` beside
+  `error` in `last_run`, and `terminus doctor` no longer reports a problem for a
+  pass that only did routine work.
 
 ### Removed
 

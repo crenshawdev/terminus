@@ -64,7 +64,7 @@ One mechanism: **SQLite** via `rusqlite` with the `bundled` feature (vendored C 
 | `watermarks` | transcript path → byte offset |
 | `observations` | per finalized session: mechanical facts off the blob, kept rather than rebuilt |
 | `decisions`, `labels` | injection decision log + replay outcomes |
-| `runs` | last N ingest runs: timestamp, duration, counts, error |
+| `runs` | last N ingest runs: timestamp, duration, counts, error (what went wrong), notes (what a healthy pass did, such as labels written and sessions retention evicted) |
 | `meta` | store format version, compression flag |
 
 Blob write, turn rows, FTS rows, entities and watermark **all commit in one transaction**. Nothing can be out of sync.
