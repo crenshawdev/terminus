@@ -429,8 +429,8 @@ fn a_non_transcript_jsonl_archives_with_no_turns() {
     assert_eq!(turns, 0);
 }
 
-/// The checksum in `session_meta` is BLAKE3 over the uncompressed session bytes
-/// (D-06), and the append path is handed it to verify before it writes.
+/// The checksum in `session_meta` is BLAKE3 over the BLAKE3 of each 64 KB block
+/// of the uncompressed stream, in order, and the append path checks it first.
 #[test]
 fn the_stored_checksum_is_blake3_over_the_uncompressed_stream() {
     let bench = bench();
@@ -446,7 +446,11 @@ fn the_stored_checksum_is_blake3_over_the_uncompressed_stream() {
         )
         .unwrap();
     let source = std::fs::read(&path).unwrap();
-    assert_eq!(checksum, blake3::hash(&source).as_bytes().to_vec());
+    let hashes: Vec<u8> = source
+        .chunks(65_536)
+        .flat_map(|block| *blake3::hash(block).as_bytes())
+        .collect();
+    assert_eq!(checksum, blake3::hash(&hashes).as_bytes().to_vec());
     assert_eq!(len, source.len() as i64);
 }
 
@@ -475,6 +479,7 @@ fn a_pass_moves_the_session_its_turns_and_its_watermark_together() {
         moved,
         vec![
             "sessions",
+            "blocks",
             "session_meta",
             "turns",
             "turns_fts",

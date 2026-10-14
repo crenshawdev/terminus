@@ -4,17 +4,16 @@
 //! own. Compaction is **append-only**: Claude Code writes the boundary into the
 //! same transcript, at the end, under the same session id
 //! (`DESIGN-BRIEF.md:114`). So the case is not "ingest a file with a boundary in
-//! it" - it is "a session that has already been archived, whose blob and turn
+//! it" - it is "a session that has already been archived, whose block rows and turn
 //! rows are already committed, grows one more record", and the archive must
 //! come out of that with the boundary recorded and *nothing that was already
 //! there* disturbed.
 //!
-//! Byte-identity is asserted at the block level rather than on the blob as a
-//! whole, because those are different claims. A blob's header and block table
-//! are rewritten on every append (`blob::writer::finish_parts` moves every
-//! block's absolute offset when the table grows), so the blob's bytes are
-//! *expected* to differ. What must not differ is a completed block: those are
-//! immutable once committed (D-07) and copied across untouched.
+//! Byte-identity is asserted per block row rather than on the session as a
+//! whole, because those are different claims. An append rewrites the partial
+//! tail row and adds rows after it, so the session's rows are *expected* to
+//! differ there. What must not differ is a completed block: those are
+//! immutable once committed (D-07) and never written again.
 //!
 //! The second half of the file is D-13, which is the same premise inverted: the
 //! file underneath an archived session got *shorter*. Both belong here because
@@ -31,7 +30,7 @@ use rusqlite::Connection;
 use terminus_core::config::Config;
 use terminus_core::ingest::pass;
 use terminus_core::store::{schema, Store, DB_FILE_NAME};
-use terminus_core::{blob, ingest, reindex, testkit, verify};
+use terminus_core::{ingest, reindex, testkit, verify};
 
 /// A transcript large enough to fill at least one 64 KB block, so
 /// "every completed block is byte-identical" is a claim about something.
@@ -86,31 +85,47 @@ impl Bench {
     }
 }
 
-/// The compressed bytes of every **completed** block of a session's blob.
+/// One block row as stored: `(block_no, compressed bytes, hash)`.
+type BlockRow = (i64, Vec<u8>, Vec<u8>);
+
+/// Every block row of a session, in `block_no` order, read straight out of
+/// the table.
+fn block_rows(conn: &Connection, session_key: &str) -> Vec<BlockRow> {
+    conn.prepare(
+        "SELECT b.block_no, b.bytes, b.hash
+           FROM blocks b JOIN sessions s USING (session_no)
+          WHERE s.session_key = ?1 ORDER BY b.block_no",
+    )
+    .unwrap()
+    .query_map([session_key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// `(uncompressed_len, block_size)` as `session_meta` records them.
+fn layout(conn: &Connection, session_key: &str) -> (u64, u64) {
+    conn.query_row(
+        "SELECT uncompressed_len, block_size FROM session_meta WHERE session_key = ?1",
+        [session_key],
+        |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+    )
+    .unwrap()
+}
+
+/// The compressed bytes of every **completed** block of a session.
 ///
 /// The trailing partial block is excluded on purpose: it is the one block an
 /// append is allowed to rewrite (D-07), and including it would make the
 /// assertion demand something the format explicitly does not promise.
 fn completed_blocks(conn: &Connection, session_key: &str) -> Vec<Vec<u8>> {
-    let raw = raw_blob(conn, session_key);
-    let header = blob::BlobHeader::parse(&raw).unwrap();
-    let complete = (header.uncompressed_len / u64::from(header.block_size)) as usize;
-    header.blocks[..complete]
-        .iter()
-        .map(|entry| {
-            let from = entry.compressed_offset as usize;
-            raw[from..from + entry.compressed_len as usize].to_vec()
-        })
+    let (len, block_size) = layout(conn, session_key);
+    let complete = (len / block_size) as usize;
+    block_rows(conn, session_key)
+        .into_iter()
+        .take(complete)
+        .map(|(_, bytes, _)| bytes)
         .collect()
-}
-
-fn raw_blob(conn: &Connection, session_key: &str) -> Vec<u8> {
-    conn.query_row(
-        "SELECT blob FROM sessions WHERE session_key = ?1",
-        [session_key],
-        |r| r.get(0),
-    )
-    .unwrap()
 }
 
 type TurnRowValues = (i64, i64, String, Option<String>, i64, i64);
@@ -167,7 +182,7 @@ fn drop_derived(conn: &Connection) {
 /// AC4 in full.
 ///
 /// Ingest a transcript, remember every turn row and the exact bytes of every
-/// completed blob block, append a real boundary record, re-run ingest: one
+/// completed block row, append a real boundary record, re-run ingest: one
 /// boundary row carrying that record's `compactMetadata` bytes verbatim, every
 /// pre-existing turn row unchanged, every completed block byte-identical.
 #[test]
@@ -177,7 +192,7 @@ fn appending_a_boundary_records_it_and_disturbs_nothing_already_archived() {
 
     let turns_before = turn_rows(&conn);
     let blocks_before = completed_blocks(&conn, &bench.session_key);
-    let stream_before = blob::read_all(&raw_blob(&conn, &bench.session_key)).unwrap();
+    let stream_before = testkit::stream(&conn, &bench.session_key).unwrap();
     assert!(
         !turns_before.is_empty() && blocks_before.len() >= 3,
         "the fixture must archive turns and fill several blocks: {} turns, {} blocks",
@@ -211,7 +226,7 @@ fn appending_a_boundary_records_it_and_disturbs_nothing_already_archived() {
     );
 
     // It is keyed on the turn that IS the boundary: reading that turn out of
-    // the blob returns the record that was appended (D-21).
+    // the archive returns the record that was appended (D-21).
     let (bytes, _) = testkit::read_turn(&conn, *turn_id);
     assert_eq!(bytes, line, "the boundary row names the wrong turn");
 
@@ -233,11 +248,11 @@ fn appending_a_boundary_records_it_and_disturbs_nothing_already_archived() {
     assert_eq!(
         &blocks_after[..blocks_before.len()],
         &blocks_before[..],
-        "a completed blob block was rewritten"
+        "a completed block row was rewritten"
     );
 
     // And the stream the archive holds still starts with exactly what it held.
-    let stream_after = blob::read_all(&raw_blob(&conn, &bench.session_key)).unwrap();
+    let stream_after = testkit::stream(&conn, &bench.session_key).unwrap();
     assert_eq!(&stream_after[..stream_before.len()], &stream_before[..]);
     assert_eq!(
         &stream_after[stream_before.len()..],
@@ -246,7 +261,7 @@ fn appending_a_boundary_records_it_and_disturbs_nothing_already_archived() {
 }
 
 /// The boundary row is derived, so a rebuild that drops every derived table
-/// must reproduce it from the blob alone - same turn id, same bytes.
+/// must reproduce it from the block rows alone - same turn id, same bytes.
 ///
 /// This is the property `reindex` would silently break by forgetting to carry
 /// the parser's two new fields into its own `TurnRow`: every count would still
@@ -367,25 +382,77 @@ fn a_session_that_never_compacted_has_no_boundary_row() {
 fn the_completed_block_helper_excludes_only_the_partial_tail() {
     let bench = bench(BIG_FIXTURE);
     let conn = bench.conn();
-    let raw = raw_blob(&conn, &bench.session_key);
-    let header = blob::BlobHeader::parse(&raw).unwrap();
+    let (len, block_size) = layout(&conn, &bench.session_key);
+    let rows = block_rows(&conn, &bench.session_key);
 
     let complete = completed_blocks(&conn, &bench.session_key).len();
+    assert_eq!(complete as u64, len / block_size);
     assert_eq!(
-        header.blocks.len(),
-        complete
-            + usize::from(
-                !header
-                    .uncompressed_len
-                    .is_multiple_of(u64::from(header.block_size)),
-            ),
-        "the helper's split does not match the block table"
+        rows.len(),
+        complete + usize::from(!len.is_multiple_of(block_size)),
+        "the helper's split does not match the session's length and block size"
     );
     assert!(
         complete > 0,
         "the fixture must fill at least one whole block"
     );
     assert_eq!(Path::new(&bench.session_key), bench.transcript);
+}
+
+/// AC1: an append writes its new rows and rewrites at most the old last row,
+/// and the pass fetches the bytes of at most that one row.
+///
+/// The row comparison alone cannot catch an append that rewrote every row:
+/// zstd is deterministic, so rewritten rows come out identical. The read count
+/// can, because rewriting a row needs its bytes first.
+#[test]
+fn an_append_rewrites_at_most_the_tail_row_and_reads_no_other() {
+    let bench = bench(BIG_FIXTURE);
+    let conn = bench.conn();
+    let before = block_rows(&conn, &bench.session_key);
+    let (len, block_size) = layout(&conn, &bench.session_key);
+    assert!(
+        before.len() >= 3,
+        "the fixture must be a session of at least three blocks: {}",
+        before.len()
+    );
+    let ended_mid_block = !len.is_multiple_of(block_size);
+
+    // The fixture's own 205 KB record again, which carries the stream across
+    // several more blocks.
+    let fixture = std::fs::read(&bench.transcript).unwrap();
+    let big = fixture.split(|b| *b == b'\n').next().unwrap().to_vec();
+    bench.append_line(&big);
+    let pass = match bench.ingest() {
+        ingest::Outcome::Committed(pass) => pass,
+        other => panic!("the appended record must commit: {other:?}"),
+    };
+    let after = block_rows(&conn, &bench.session_key);
+
+    let last = before.len() - 1;
+    assert_eq!(
+        &after[..last],
+        &before[..last],
+        "a row before the old last one changed"
+    );
+    assert_eq!(after[last].0, before[last].0);
+    assert_eq!(
+        after[last] != before[last],
+        ended_mid_block,
+        "the old last row must change exactly when the stream ended mid-block"
+    );
+    assert!(after.len() > before.len(), "the append added no row");
+    for (i, row) in after.iter().enumerate().skip(before.len()) {
+        assert_eq!(row.0, i as i64, "the new rows are numbered on from the old");
+    }
+    assert!(
+        pass.block_rows_read <= 1,
+        "the pass fetched {} existing rows, more than the tail",
+        pass.block_rows_read
+    );
+    assert!(verify::verify(&Store::open(&bench.data_dir).unwrap())
+        .unwrap()
+        .is_ok());
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +462,7 @@ fn the_completed_block_helper_excludes_only_the_partial_tail() {
 // The same premise as AC4 above, inverted. A compaction appends, so an archived
 // session's file growing is normal and the archive follows it. A file that
 // shrank is not that session's file any more, and there is no way to tell which
-// of its bytes are still the ones the blob holds. So the pass refuses, and the
+// of its bytes are still the ones the archive holds. So the pass refuses, and the
 // refusal is the feature: re-reading from offset 0 would overwrite archived
 // bytes on the strength of an append-only property observed over one 25-day
 // corpus rather than documented anywhere.
@@ -484,12 +551,12 @@ impl Tree {
     fn archived(&self, path: &Path) -> (Vec<u8>, Vec<u8>, i64, Vec<TurnRowValues>) {
         let conn = self.conn();
         let key = self.key(path);
-        let (blob, checksum): (Vec<u8>, Vec<u8>) = conn
+        let blob = testkit::stored(&conn, &key);
+        let checksum: Vec<u8> = conn
             .query_row(
-                "SELECT s.blob, m.checksum FROM sessions s
-                 JOIN session_meta m USING (session_key) WHERE s.session_key = ?1",
+                "SELECT checksum FROM session_meta WHERE session_key = ?1",
                 [&key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .unwrap();
         let watermark: i64 = conn
@@ -584,9 +651,9 @@ fn a_transcript_shorter_than_its_watermark_is_skipped_and_flagged() {
         second.failures[0].1
     );
 
-    // Nothing archived moved: not the blob, not the checksum, not the turn
+    // Nothing archived moved: not a block row, not the checksum, not the turn
     // rows, and above all not the watermark - a re-ingest from offset 0 would
-    // have reset it and rewritten the blob from the surviving half.
+    // have reset it and rewritten the session from the surviving half.
     assert_eq!(
         tree.archived(&tree.subject),
         before,
@@ -682,7 +749,7 @@ fn a_flagged_transcript_that_grows_again_is_ingested_and_cleared() {
 /// different. Clearing the flag on that would append at the stale offset, so the
 /// archived stream would carry the first half of one file, a hole, and a
 /// fragment of a record - permanently, with `verify` reporting it clean because
-/// the blob still matches its own checksum.
+/// the session still matches its own checksum.
 #[test]
 fn a_transcript_rewritten_under_its_watermark_stays_flagged() {
     let tree = tree();

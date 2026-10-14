@@ -105,9 +105,15 @@ fn turn_coordinates_are_uncompressed_stream_coordinates() {
 fn sessions_carries_a_stable_integer_surrogate() {
     let (_dir, store) = fresh();
     let cols = columns(store.conn(), "sessions");
-    assert!(cols.contains("session_key"));
-    assert!(cols.contains("session_no"));
-    assert!(cols.contains("blob"));
+    let expected: BTreeSet<String> = ["session_key", "session_no"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(cols, expected, "sessions keeps exactly its two columns");
+    assert!(
+        names(store.conn(), "table").contains("blocks"),
+        "the block table exists"
+    );
 }
 
 #[test]

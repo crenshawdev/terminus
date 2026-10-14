@@ -10,7 +10,7 @@
 use rusqlite::Connection;
 
 use crate::error::Result;
-use crate::store::Store;
+use crate::store::{archive, Store};
 
 /// What one retention step did, and what it could not do.
 ///
@@ -19,15 +19,15 @@ use crate::store::Store;
 /// `runs.error` is read by a human and a hundred keys is not a report.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Applied {
-    /// Sessions whose blob was emptied.
+    /// Sessions whose block rows were deleted.
     pub evicted: Vec<String>,
     /// Sessions removed from the store entirely.
     pub deleted: Vec<String>,
     /// Deletions that took an `observations` row with them.
     ///
     /// Counted and said out loud because it is the one thing a delete destroys
-    /// that no rebuild reproduces: an observation's facts come off the session
-    /// blob, and the delete takes the blob too, which is why `reindex`
+    /// that no rebuild reproduces: an observation's facts come off the session's
+    /// block rows, and the delete takes those too, which is why `reindex`
     /// deliberately does not touch that table (phase 7 D-02).
     pub observations_lost: usize,
     /// Eligible sessions the per-pass bound left for the next pass.
@@ -63,8 +63,8 @@ impl Applied {
             let mut line = format!("retention deleted {} session(s)", self.deleted.len());
             if self.observations_lost > 0 {
                 line.push_str(&format!(
-                    ", removing {} observation row(s) with them - the session's blob went too, \
-                     so no rebuild reproduces them",
+                    ", removing {} observation row(s) with them - the session's archive went \
+                     too, so no rebuild reproduces them",
                     self.observations_lost
                 ));
             }
@@ -116,10 +116,10 @@ pub fn apply(store: &mut Store, selection: &super::Selection) -> Applied {
     out
 }
 
-/// Empty one session's blob and mark it evicted (RET-02).
+/// Delete one session's block rows and mark it evicted (RET-02, D-09).
 ///
-/// `x''` and never a null: `sessions.blob` is declared `BLOB NOT NULL` in
-/// `crate::store::schema`, so the column takes zero bytes instead.
+/// The `sessions` row stays, so `session_no` and every derived row keyed on
+/// it stay too.
 ///
 /// **`checksum` and `uncompressed_len` are left exactly as they are.** They
 /// describe the bytes this session HAD, which is what makes an eviction
@@ -129,10 +129,7 @@ pub fn apply(store: &mut Store, selection: &super::Selection) -> Applied {
 /// forever.
 fn evict_one(conn: &mut Connection, session_key: &str) -> Result<()> {
     let tx = conn.transaction()?;
-    tx.execute(
-        "UPDATE sessions SET blob = x'' WHERE session_key = ?1",
-        [session_key],
-    )?;
+    archive::remove(&tx, session_key)?;
     tx.execute(
         "UPDATE session_meta SET is_evicted = 1 WHERE session_key = ?1",
         [session_key],
@@ -150,13 +147,14 @@ fn evict_one(conn: &mut Connection, session_key: &str) -> Result<()> {
 /// pragma comment there says - `reindex` records the same fact and drops in
 /// reverse for the same reason. `paths`, `entities` and `compaction_boundaries`
 /// hang off `turns(id)`; `turns_fts` is contentless with `rowid` IS `turns.id`;
-/// `observations` and `session_meta` hang off `sessions(session_key)`.
+/// `observations` and `session_meta` hang off `sessions(session_key)`, and
+/// `blocks` off `sessions(session_no)`.
 ///
 /// **`decisions` and `labels` are deliberately untouched.** `decisions` is
 /// keyed on `session_id` with no declared reference and `labels.turn_id`
 /// carries no foreign key on purpose (phase 6 D-03), and FEED-03's replay
 /// history has to survive a deletion - it is the record of what injection
-/// decided, which no blob ever contained and no reingest can rebuild.
+/// decided, which the archive never contained and no reingest can rebuild.
 ///
 /// The watermark goes last, keyed on the session key: `watermarks` is keyed on
 /// the transcript path, and the session key IS that path (`recover::recover`
@@ -183,6 +181,7 @@ fn delete_one(conn: &mut Connection, session_key: &str) -> Result<bool> {
         "DELETE FROM session_meta WHERE session_key = ?1",
         [session_key],
     )?;
+    archive::remove(&tx, session_key)?;
     tx.execute("DELETE FROM sessions WHERE session_key = ?1", [session_key])?;
     tx.execute(
         "DELETE FROM watermarks WHERE transcript_path = ?1",

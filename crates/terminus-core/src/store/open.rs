@@ -9,16 +9,21 @@ use crate::error::{Error, Result};
 
 /// The archive format this build writes and understands.
 ///
-/// Bumped only when the bytes in `sessions` change meaning. The archive table
-/// never migrates (`DESIGN-BRIEF.md:94`) and there is no conversion, so a store
+/// Bumped only when the archived bytes change meaning. The archive tables never
+/// migrate (`DESIGN-BRIEF.md:94`) and there is no conversion, so a store
 /// written in an older format is refused ([`Error::ArchiveFormatTooOld`]) rather
 /// than rebuilt: a rebuild would read the old bytes as the new format and fail
 /// every session.
-pub const ARCHIVE_FORMAT: i64 = 1;
+///
+/// 2 as of v0.0.1 phase 7: a session is numbered block rows in `blocks`, each
+/// with its compressed bytes and a BLAKE3 hash of its uncompressed bytes, and
+/// `session_meta` holds the block size and a checksum over those hashes. Format
+/// 1 kept the whole session as one blob in a `sessions.blob` column.
+pub const ARCHIVE_FORMAT: i64 = 2;
 
 /// The derived-table schema this build writes.
 ///
-/// Bumped whenever anything rebuildable from the blobs changes shape: `turns`,
+/// Bumped whenever anything rebuildable from the archive changes shape: `turns`,
 /// `compaction_boundaries`, `turns_fts`, `entities`, `paths`. Two integers
 /// rather than one, because one cannot tell "derived tables need a rebuild"
 /// from "the archive itself changed" (D-09).
@@ -36,12 +41,12 @@ pub const ARCHIVE_FORMAT: i64 = 1;
 ///
 /// 4 as of v0.1.1 phase 1 (D-03): `turns` gained `is_typed`, the per-turn
 /// discriminator INJ-07's resume brief reads. The bump is what makes
-/// [`crate::reindex::reindex`] the blob-only backfill that fills the column on
+/// [`crate::reindex::reindex`] the archive-only backfill that fills the column on
 /// a store an earlier build wrote - the bring-forward `ALTER` adds it empty, and
 /// nothing else would ever populate a turn already archived. Note the naming
 /// collision: `crate::ingest::backfill` is the parallel transcript-reading pass
 /// and is NOT this mechanism; it reads the files on disk, and this reads only
-/// `sessions.blob`.
+/// the archive.
 pub const DERIVED_SCHEMA: i64 = 4;
 
 /// The store file inside the data directory.
@@ -756,7 +761,7 @@ fn read_versions(conn: &Connection, path: &Path) -> Result<Option<RebuildRequire
 
     let outcome = if store_derived != DERIVED_SCHEMA {
         // A *newer* derived_schema lands here too, and deliberately: derived
-        // tables are rebuildable from the blobs by definition, so rebuilding
+        // tables are rebuildable from the archive by definition, so rebuilding
         // them down to this build's shape is always available. Only the archive
         // can be too new to read.
         Some(RebuildRequired {

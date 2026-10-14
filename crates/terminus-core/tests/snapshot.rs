@@ -122,7 +122,7 @@ fn a_snapshot_taken_mid_pass_opens_verifies_and_excludes_the_uncommitted_session
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
     tx.execute(
-        "INSERT INTO sessions (session_key, session_no, blob) VALUES ('mid-pass', 9999, x'00')",
+        "INSERT INTO sessions (session_key, session_no) VALUES ('mid-pass', 9999)",
         [],
     )
     .unwrap();

@@ -1,9 +1,12 @@
-//! Walking every blob against the checksum recorded for it (STOR-03).
+//! Walking every session's archive against the checksum recorded for it
+//! (STOR-03).
 //!
-//! D-06 fixes what is compared: BLAKE3 over the **uncompressed** session bytes,
+//! D-06 fixes what is compared: hashes over the **uncompressed** session bytes,
 //! held in `session_meta`, so neither a codec-level bug nor a format bump
 //! invalidates a stored checksum and `verify` can still tell corruption from a
-//! decoder change.
+//! decoder change. Since phase 7 (D-04) the checksum is BLAKE3 over each
+//! block's BLAKE3, in `block_no` order, with the blocks cut at the session's
+//! own block size.
 //!
 //! D-16 fixes what is *not* compared: `PRAGMA integrity_check` belongs to
 //! `doctor` (INST-06, phase 4). A page-level complaint carries no session
@@ -15,12 +18,12 @@
 //! bytes the archive holds. It is read off `session_meta.transcript_diverged`,
 //! which the pass sets against exactly one session, so it is attributed by
 //! `session_key` like every other failure here and names no other. It is a
-//! statement about the *file*, not about the blob - the blob is intact, and
-//! saying so is most of the message.
+//! statement about the *file*, not about the archive - the archive is intact,
+//! and saying so is most of the message.
 //!
 //! Phase 8 adds one *silence*, on the same terms: a session
-//! `session_meta.is_evicted` marks (RET-02, D-03) holds a deliberately emptied
-//! blob, so there is nothing to decompress and nothing to hash. It is counted
+//! `session_meta.is_evicted` marks (RET-02, D-03) has had its block rows
+//! deleted on purpose, so there is nothing to decompress and nothing to hash. It is counted
 //! and it is never a failure. The divergence check stays independent of it,
 //! exactly as it is independent of the checksum verdict - "the file on disk is
 //! shorter than what was archived" is a statement about the FILE, and an
@@ -37,6 +40,7 @@
 
 use rusqlite::Connection;
 
+use crate::blob::block;
 use crate::error::Result;
 use crate::store::{archive, Store};
 
@@ -77,10 +81,10 @@ impl Report {
     }
 }
 
-/// Check every session's blob against its recorded checksum.
+/// Check every session's archive against its recorded checksum.
 ///
-/// A blob that fails to decompress is a failure for *that* session and never an
-/// abort: a second corrupt session must still be reported, which is the whole
+/// A session that fails to decompress is a failure for *that* session and never
+/// an abort: a second corrupt session must still be reported, which is the whole
 /// difference between "these two sessions are damaged" and "the store is gone"
 /// (`DESIGN-BRIEF.md:98`).
 pub fn verify(store: &Store) -> Result<Report> {
@@ -101,9 +105,11 @@ fn walk(conn: &Connection) -> Result<Report> {
     // Keys and metadata first, streams one at a time, for the memory bound
     // `reindex` documents: selecting every stream in one statement holds as
     // much of the archive as the cursor has reached.
-    let sessions: Vec<(String, Option<Vec<u8>>, bool, bool)> = conn
+    type Row = (String, Option<Vec<u8>>, bool, bool, Option<i64>);
+    let sessions: Vec<Row> = conn
         .prepare(
-            "SELECT s.session_key, m.checksum, m.transcript_diverged, m.is_evicted
+            "SELECT s.session_key, m.checksum, m.transcript_diverged, m.is_evicted,
+                    m.block_size
              FROM sessions s LEFT JOIN session_meta m USING (session_key)
              ORDER BY s.session_key",
         )?
@@ -113,22 +119,23 @@ fn walk(conn: &Connection) -> Result<Report> {
                 r.get::<_, Option<Vec<u8>>>(1)?,
                 r.get::<_, Option<i64>>(2)?.unwrap_or(0) != 0,
                 r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
+                r.get::<_, Option<i64>>(4)?,
             ))
         })?
         .collect::<std::result::Result<_, _>>()?;
 
     let mut report = Report::default();
-    for (session_key, expected, diverged, evicted) in sessions {
+    for (session_key, expected, diverged, evicted, block_size) in sessions {
         report.checked += 1;
-        // Counted, and never a failure. An evicted session's blob was emptied
-        // on purpose (RET-02, phase 8 D-03), so it has no header to find and
-        // would report every one of them as "does not decompress" -
+        // Counted, and never a failure. An evicted session's block rows were
+        // deleted on purpose (RET-02, phase 8 D-03), so it has no block to
+        // find and would report every one of them as "does not decompress" -
         // which is the confusion the divergence arm above exists to prevent,
         // arriving from the other side. The count still moves because the walk
         // did visit the session and can say what it is; the check is what has
         // nothing left to check.
         if !evicted {
-            if let Err(detail) = check(conn, &session_key, expected.as_deref())? {
+            if let Err(detail) = check(conn, &session_key, expected.as_deref(), block_size)? {
                 report.failures.push(Failure {
                     session_key: session_key.clone(),
                     detail,
@@ -136,7 +143,7 @@ fn walk(conn: &Connection) -> Result<Report> {
             }
         }
         // Independent of the checksum verdict, not an alternative to it. A
-        // session can have both a diverged transcript and a damaged blob, and
+        // session can have both a diverged transcript and a damaged archive, and
         // collapsing them would report the lesser fact and hide the graver one.
         if diverged {
             report.failures.push(Failure {
@@ -155,10 +162,11 @@ fn check(
     conn: &Connection,
     session_key: &str,
     expected: Option<&[u8]>,
+    block_size: Option<i64>,
 ) -> Result<std::result::Result<(), String>> {
     let Some(expected) = expected else {
-        // The archive is two tables written in one transaction (STOR-02), so a
-        // blob with no metadata row is not a state ingest can produce.
+        // The archive's tables are written in one transaction (STOR-02), so a
+        // session with no metadata row is not a state ingest can produce.
         return Ok(Err(
             "no session_meta row, so there is no checksum to check it against".into(),
         ));
@@ -168,12 +176,20 @@ fn check(
         Ok(stream) => stream,
         Err(e) => return Ok(Err(format!("blob does not decompress: {e}"))),
     };
-    let actual = blake3::hash(&stream);
-    if actual.as_bytes().as_slice() != expected {
+    let size = match archive::block_size(block_size) {
+        Ok(size) => size as usize,
+        Err(e) => return Ok(Err(e.to_string())),
+    };
+    let hashes: Vec<[u8; 32]> = stream
+        .chunks(size)
+        .map(|chunk| *blake3::hash(chunk).as_bytes())
+        .collect();
+    let actual = block::checksum(&hashes);
+    if actual.as_slice() != expected {
         return Ok(Err(format!(
             "checksum mismatch: expected {}, found {}",
             hex(expected),
-            actual.to_hex()
+            hex(&actual)
         )));
     }
     Ok(Ok(()))

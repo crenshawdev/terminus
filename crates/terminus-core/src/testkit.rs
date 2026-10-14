@@ -427,29 +427,37 @@ pub fn query_set_json(conn: &rusqlite::Connection) -> String {
     out
 }
 
-/// A digest over every `sessions` and `session_meta` row.
+/// A digest over every `sessions`, `blocks` and `session_meta` row.
 ///
 /// The archive is what a rebuild must not touch, so it gets a comparison of its
 /// own rather than being inferred from the derived tables looking right.
 pub fn archive_digest(conn: &rusqlite::Connection) -> String {
     let mut hasher = blake3::Hasher::new();
-    let mut statement = conn
-        .prepare(
-            "SELECT s.session_key, s.session_no, s.blob, m.session_id, m.transcript_path,
-                    m.checksum, m.uncompressed_len, m.continues_from, m.first_turn_at,
-                    m.last_turn_at, m.cwd, m.branch
-             FROM sessions s LEFT JOIN session_meta m USING (session_key)
-             ORDER BY s.session_no",
-        )
-        .expect("prepare the archive scan");
-    let mut rows = statement.query([]).expect("run the archive scan");
-    while let Some(row) = rows.next().expect("read an archive row") {
-        for column in 0..12 {
-            let value: rusqlite::types::Value = row.get(column).expect("read an archive column");
-            hasher.update(format!("{value:?}\u{1f}").as_bytes());
+    let mut digest = |sql: &str, columns: usize| {
+        let mut statement = conn.prepare(sql).expect("prepare the archive scan");
+        let mut rows = statement.query([]).expect("run the archive scan");
+        while let Some(row) = rows.next().expect("read an archive row") {
+            for column in 0..columns {
+                let value: rusqlite::types::Value =
+                    row.get(column).expect("read an archive column");
+                hasher.update(format!("{value:?}\u{1f}").as_bytes());
+            }
+            hasher.update(b"\x1e");
         }
-        hasher.update(b"\x1e");
-    }
+        hasher.update(b"\x1d");
+    };
+    digest(
+        "SELECT s.session_key, s.session_no, m.session_id, m.transcript_path,
+                m.checksum, m.uncompressed_len, m.continues_from, m.first_turn_at,
+                m.last_turn_at, m.cwd, m.branch, m.block_size
+         FROM sessions s LEFT JOIN session_meta m USING (session_key)
+         ORDER BY s.session_no",
+        12,
+    );
+    digest(
+        "SELECT session_no, block_no, bytes, hash FROM blocks ORDER BY session_no, block_no",
+        4,
+    );
     hasher.finalize().to_hex().to_string()
 }
 
@@ -491,74 +499,141 @@ pub fn read_turn(conn: &rusqlite::Connection, turn_id: i64) -> (Vec<u8>, usize) 
 }
 
 // The archive as the tests read it. Every helper below uses its own SQL and
-// the blob format directly, and never `store::archive`: a test that checks a
+// the block codec directly, and never `store::archive`: a test that checks a
 // product number against what is stored would otherwise be checking the
 // product's read path against itself.
 
-/// One session's stored archive bytes, for comparing two reads or two stores
-/// with `==`.
-pub fn stored(conn: &rusqlite::Connection, session_key: &str) -> Vec<u8> {
+/// One session's `session_no`. Panics when it has no `sessions` row.
+fn session_no(conn: &rusqlite::Connection, session_key: &str) -> i64 {
     conn.query_row(
-        "SELECT blob FROM sessions WHERE session_key = ?1",
+        "SELECT session_no FROM sessions WHERE session_key = ?1",
         [session_key],
         |r| r.get(0),
     )
-    .unwrap_or_else(|e| panic!("stored bytes of {session_key}: {e}"))
+    .unwrap_or_else(|e| panic!("no sessions row for {session_key}: {e}"))
 }
 
-/// How many archive bytes one session has stored.
+/// One session's block rows, `(block_no, bytes, hash)` in `block_no` order.
+fn block_rows(conn: &rusqlite::Connection, session_key: &str) -> Vec<(i64, Vec<u8>, Vec<u8>)> {
+    let session_no = session_no(conn, session_key);
+    conn.prepare("SELECT block_no, bytes, hash FROM blocks WHERE session_no = ?1 ORDER BY block_no")
+        .expect("prepare the block scan")
+        .query_map([session_no], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("run the block scan")
+        .map(|r| r.expect("read a block row"))
+        .collect()
+}
+
+/// One session's stored archive: every block row's number, bytes and hash, in
+/// order, for comparing two reads or two stores with `==`.
+pub fn stored(conn: &rusqlite::Connection, session_key: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (block_no, bytes, hash) in block_rows(conn, session_key) {
+        out.extend_from_slice(&block_no.to_le_bytes());
+        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&bytes);
+        out.extend_from_slice(&(hash.len() as u64).to_le_bytes());
+        out.extend_from_slice(&hash);
+    }
+    out
+}
+
+/// How many archive bytes one session has stored: its block rows' lengths,
+/// summed.
 pub fn stored_len(conn: &rusqlite::Connection, session_key: &str) -> i64 {
+    let session_no = session_no(conn, session_key);
     conn.query_row(
-        "SELECT length(blob) FROM sessions WHERE session_key = ?1",
-        [session_key],
+        "SELECT coalesce(sum(length(bytes)), 0) FROM blocks WHERE session_no = ?1",
+        [session_no],
         |r| r.get(0),
     )
     .unwrap_or_else(|e| panic!("stored length of {session_key}: {e}"))
 }
 
-/// Every session's stored archive bytes, summed over the whole store in one
-/// statement.
+/// Every block row's length, summed over the whole store in one statement.
 pub fn stored_total(conn: &rusqlite::Connection) -> i64 {
     conn.query_row(
-        "SELECT coalesce(sum(length(blob)), 0) FROM sessions",
+        "SELECT coalesce(sum(length(bytes)), 0) FROM blocks",
         [],
         |r| r.get(0),
     )
     .unwrap_or_else(|e| panic!("sum the stored archive: {e}"))
 }
 
-/// One session's whole uncompressed stream, or the error its stored bytes give.
+/// One session's block size and stream length as `session_meta` records them.
+fn layout(conn: &rusqlite::Connection, session_key: &str) -> (Option<i64>, Option<i64>) {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT block_size, uncompressed_len FROM session_meta WHERE session_key = ?1",
+        [session_key],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .unwrap_or_else(|e| panic!("layout of {session_key}: {e}"))
+    .unwrap_or((None, None))
+}
+
+/// One session's whole uncompressed stream, or the error its stored rows give.
 pub fn stream(conn: &rusqlite::Connection, session_key: &str) -> crate::Result<Vec<u8>> {
-    crate::blob::read_all(&stored(conn, session_key))
+    let rows = block_rows(conn, session_key);
+    let (block_size, len) = layout(conn, session_key);
+    let bad = |detail: &str| crate::Error::BlobFormat {
+        detail: format!("{session_key}: {detail}"),
+    };
+    let block_size = u32::try_from(block_size.ok_or_else(|| bad("no block size"))?)
+        .map_err(|_| bad("block size out of range"))?;
+    let len = u64::try_from(len.ok_or_else(|| bad("no stream length"))?)
+        .map_err(|_| bad("negative stream length"))?;
+    let reader = crate::blob::BlockReader::new(block_size, len)?;
+    reader.read_range(0, len, |block_no| {
+        rows.get(block_no as usize)
+            .filter(|(no, _, _)| *no == block_no as i64)
+            .map(|(_, bytes, _)| bytes.as_slice())
+    })
 }
 
 /// Damage one session's stored bytes so they no longer decode.
 ///
-/// Every compressed byte is zeroed and the header is left alone, so the
-/// failure lands where bit-rot would, in the decompressor.
+/// Every compressed byte of every row is zeroed and every stored hash is left
+/// alone, so the failure lands where bit-rot would, in the decompressor.
 pub fn damage(conn: &rusqlite::Connection, session_key: &str) {
-    let mut bytes = stored(conn, session_key);
-    let header = crate::blob::BlobHeader::parse(&bytes)
-        .unwrap_or_else(|e| panic!("{session_key} has no header to damage behind: {e}"));
-    let payload = header
-        .blocks
-        .first()
-        .unwrap_or_else(|| panic!("{session_key} has no block to damage"))
-        .compressed_offset as usize;
-    bytes[payload..].fill(0);
-    put_stored(conn, session_key, &bytes);
+    let session_no = session_no(conn, session_key);
+    let changed = conn
+        .execute(
+            "UPDATE blocks SET bytes = zeroblob(length(bytes)) WHERE session_no = ?1",
+            [session_no],
+        )
+        .unwrap_or_else(|e| panic!("damage {session_key}: {e}"));
+    assert!(changed > 0, "{session_key} has no block to damage");
 }
 
-/// Replace one session's stream with `stream`, validly encoded, and leave its
-/// metadata alone.
+/// Replace one session's stream with `stream`, validly encoded at the session's
+/// block size, and leave its metadata alone.
 pub fn rewrite_stream(conn: &rusqlite::Connection, session_key: &str, stream: &[u8]) {
-    let written = crate::blob::write(stream).expect("encode the replacement stream");
-    put_stored(conn, session_key, &written.bytes);
+    let session_no = session_no(conn, session_key);
+    let block_size = layout(conn, session_key)
+        .0
+        .map_or(crate::blob::BLOCK_SIZE as u32, |size| size as u32);
+    let blocks = crate::blob::block::cut(stream, block_size, 0).expect("encode the replacement");
+    clear_blocks(conn, session_no);
+    for block in blocks {
+        conn.execute(
+            "INSERT INTO blocks (session_no, block_no, bytes, hash) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                session_no,
+                block.block_no as i64,
+                block.bytes,
+                block.hash.as_slice()
+            ],
+        )
+        .unwrap_or_else(|e| panic!("rewrite {session_key}: {e}"));
+    }
 }
 
-/// Empty one session and mark it evicted, the way retention evicts one.
+/// Delete one session's block rows and mark it evicted, the way retention
+/// evicts one.
 pub fn evict(conn: &rusqlite::Connection, session_key: &str) {
-    put_stored(conn, session_key, &[]);
+    clear_blocks(conn, session_no(conn, session_key));
     let changed = conn
         .execute(
             "UPDATE session_meta SET is_evicted = 1 WHERE session_key = ?1",
@@ -568,8 +643,9 @@ pub fn evict(conn: &rusqlite::Connection, session_key: &str) {
     assert_eq!(changed, 1, "no session_meta row for {session_key}");
 }
 
-/// Insert a `sessions` row holding `bytes` as its stored archive, with no
-/// metadata. For tests that plant sessions rather than ingest them.
+/// Insert a `sessions` row holding `bytes` as its one block row, with no
+/// metadata, or no block row at all when `bytes` is empty. For tests that plant
+/// sessions rather than ingest them.
 pub fn plant_session(
     conn: &rusqlite::Connection,
     session_key: &str,
@@ -577,20 +653,22 @@ pub fn plant_session(
     bytes: &[u8],
 ) {
     conn.execute(
-        "INSERT INTO sessions (session_key, session_no, blob) VALUES (?1, ?2, ?3)",
-        rusqlite::params![session_key, session_no, bytes],
+        "INSERT INTO sessions (session_key, session_no) VALUES (?1, ?2)",
+        rusqlite::params![session_key, session_no],
     )
     .unwrap_or_else(|e| panic!("plant {session_key}: {e}"));
+    if !bytes.is_empty() {
+        conn.execute(
+            "INSERT INTO blocks (session_no, block_no, bytes, hash) VALUES (?1, 0, ?2, ?3)",
+            rusqlite::params![session_no, bytes, blake3::hash(bytes).as_bytes().as_slice()],
+        )
+        .unwrap_or_else(|e| panic!("plant a block for {session_key}: {e}"));
+    }
 }
 
-fn put_stored(conn: &rusqlite::Connection, session_key: &str, bytes: &[u8]) {
-    let changed = conn
-        .execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![bytes, session_key],
-        )
-        .unwrap_or_else(|e| panic!("store bytes for {session_key}: {e}"));
-    assert_eq!(changed, 1, "no sessions row for {session_key}");
+fn clear_blocks(conn: &rusqlite::Connection, session_no: i64) {
+    conn.execute("DELETE FROM blocks WHERE session_no = ?1", [session_no])
+        .unwrap_or_else(|e| panic!("clear the blocks of session {session_no}: {e}"));
 }
 
 /// SplitMix64. A test that generates its own inputs has to be reproducible

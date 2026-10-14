@@ -200,7 +200,7 @@ fn an_unparseable_record_projects_to_nothing() {
     let store = terminus_core::Store::open(dir.path()).unwrap();
     let conn = store.conn();
     conn.execute(
-        "INSERT INTO sessions (session_key, session_no, blob) VALUES ('k', 0, x'00')",
+        "INSERT INTO sessions (session_key, session_no) VALUES ('k', 0)",
         [],
     )
     .unwrap();
@@ -753,7 +753,7 @@ fn a_turn_writes_no_more_entities_than_the_cap_and_the_same_ones_twice() {
     let store = terminus_core::Store::open(dir.path()).unwrap();
     let conn = store.conn();
     conn.execute(
-        "INSERT INTO sessions (session_key, session_no, blob) VALUES ('k', 0, x'00')",
+        "INSERT INTO sessions (session_key, session_no) VALUES ('k', 0)",
         [],
     )
     .unwrap();

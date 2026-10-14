@@ -1,18 +1,18 @@
 //! Every table phase 1 needs, in one place, applied when a store is initialized.
 //!
-//! Two groups, and the split is the whole architecture. `sessions` and
-//! `session_meta` are the archive: the blob is truth and the archive table
-//! never migrates (`DESIGN-BRIEF.md:94`). `turns`, `turns_fts`, `entities`,
-//! `paths` are derived and rebuildable from the blobs alone, which is what lets
-//! a format bump rebuild rather than migrate. `watermarks`, `runs` and `meta`
-//! are operational state.
+//! Two groups, and the split is the whole architecture. `sessions`, `blocks`
+//! and `session_meta` are the archive: the block rows are truth and the archive
+//! tables never migrate (`DESIGN-BRIEF.md:94`). `turns`, `turns_fts`,
+//! `entities`, `paths` are derived and rebuildable from the block rows alone,
+//! which is what lets a derived-schema bump rebuild rather than migrate.
+//! `watermarks`, `runs` and `meta` are operational state.
 //!
 //! `decisions` and `labels` join the archive group in phase 6 (D-03): a logged
-//! injection decision is prompt-time state the blobs do not contain, so it is
-//! kept rather than rebuilt, and a `reindex` must never drop it. `observations`
-//! joins it in phase 7 (D-02): its facts come off the session blob, and
-//! retention eviction empties that blob, so an evicted session's observation
-//! cannot be recomputed.
+//! injection decision is prompt-time state the archive does not contain, so it
+//! is kept rather than rebuilt, and a `reindex` must never drop it.
+//! `observations` joins it in phase 7 (D-02): its facts come off the session's
+//! archived stream, and retention eviction deletes that stream's block rows, so
+//! an evicted session's observation cannot be recomputed.
 
 /// Bits of a turn id reserved for the per-session turn ordinal.
 ///
@@ -54,21 +54,40 @@ pub fn split_turn_id(id: i64) -> (i64, i64) {
 
 /// The tables and indexes a store carries.
 ///
-/// Foreign keys are declared for documentation and are deliberately not
-/// enforced: `PRAGMA foreign_keys` stays off, because `reindex` drops the
-/// derived children wholesale and enforcement would only dictate a drop order.
-/// Nothing relies on the database rejecting an orphan; ingest writes parent and
-/// child inside one transaction (STOR-02), which is the stronger guarantee.
+/// Foreign keys are enforced: the bundled SQLite is built with
+/// `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`, so a child row goes in after its parent
+/// and comes out before it, and `reindex` drops the derived children first.
+/// Ingest also writes parent and child inside one transaction (STOR-02).
 pub const CREATE_SQL: &str = "\
 -- ARCHIVE. Truth. Never migrated, only ever appended to.
 
 -- Keyed on the transcript FILE identity, never on the record's session id:
 -- 812 sidecar files report their parent's sessionId, so keying on that would
--- overwrite a parent session's blob with a 3 KB agent transcript (D-01).
+-- write a 3 KB agent transcript over a parent session's archive (D-01).
 CREATE TABLE IF NOT EXISTS sessions (
     session_key TEXT    PRIMARY KEY,
-    session_no  INTEGER NOT NULL UNIQUE,
-    blob        BLOB    NOT NULL
+    session_no  INTEGER NOT NULL UNIQUE
+);
+
+-- A session's stream, cut into `session_meta.block_size` uncompressed bytes per
+-- block, one row per block, each compressed on its own (phase 7 D-03). `hash` is
+-- BLAKE3 over the block's UNCOMPRESSED bytes (D-04), so a later zstd that
+-- encodes a block differently fails no hash, and `session_meta.checksum` is
+-- BLAKE3 over these hashes in `block_no` order.
+--
+-- An append rewrites at most the last row and adds rows after it; every other
+-- row is never written again. A rowid table at SQLite's default page size,
+-- measured against `WITHOUT ROWID` and larger pages on a copy of a real store:
+-- it made the smallest file, the smallest append and the fastest point read.
+--
+-- Rows go in after their `sessions` row and come out before it. The reference
+-- is enforced (see `reindex`'s drop order), so the other order fails.
+CREATE TABLE IF NOT EXISTS blocks (
+    session_no INTEGER NOT NULL REFERENCES sessions(session_no),
+    block_no   INTEGER NOT NULL,
+    bytes      BLOB    NOT NULL,
+    hash       BLOB    NOT NULL,
+    PRIMARY KEY (session_no, block_no)
 );
 
 CREATE TABLE IF NOT EXISTS session_meta (
@@ -77,6 +96,11 @@ CREATE TABLE IF NOT EXISTS session_meta (
     transcript_path   TEXT    NOT NULL,
     checksum          BLOB    NOT NULL,
     uncompressed_len  INTEGER NOT NULL,
+    -- Uncompressed bytes per block for this session (phase 7 D-05), written on
+    -- the session's first archive and never changed. Per session, so a later
+    -- block size applies to new sessions without rewriting old ones. Nullable
+    -- only so a hand-planted row needs no value; ingest always writes one.
+    block_size        INTEGER,
     continues_from    TEXT,
     first_turn_at     TEXT,
     last_turn_at      TEXT,
@@ -111,9 +135,9 @@ CREATE TABLE IF NOT EXISTS session_meta (
     -- Null is `full`: it is what every row written before this column existed
     -- means, and those rows were all written by a binary that had no other mode.
     -- The column reads `full` only while EVERY append to the session has been
-    -- full - `blob::append` copies completed blocks across untouched, so bytes
-    -- written under an earlier mode are never revisited and a store whose mode
-    -- changes mid-life holds a mix inside one blob.
+    -- full - an append never rewrites a completed block, so bytes written under
+    -- an earlier mode are never revisited and a store whose mode changes
+    -- mid-life holds a mix inside one session.
     --
     -- Declared last, and appended last in `BRING_FORWARD_COLUMNS`, which is that
     -- constant's own rule: `ALTER TABLE ADD COLUMN` appends, so a column placed
@@ -141,7 +165,7 @@ CREATE INDEX IF NOT EXISTS idx_session_meta_project
 -- One `UserPromptSubmit` decision, non-fires included (FEED-01). Archival, and
 -- deliberately NOT in `DERIVED_TABLES`: a decision records prompt-time state -
 -- what the prompt named, what the index answered, which thresholds were in
--- force, what was suppressed - that no blob replay can reconstruct, so a
+-- force, what was suppressed - that no archive replay can reconstruct, so a
 -- `reindex` that dropped it would silently delete the entire history FEED-03's
 -- replay diff and FEED-04's precision are computed over (D-03, a recorded
 -- divergence from `DESIGN-BRIEF.md:92`).
@@ -209,10 +233,10 @@ CREATE TABLE IF NOT EXISTS labels (
 CREATE INDEX IF NOT EXISTS idx_labels_decision ON labels(decision_id);
 
 -- One session's account of itself (OBS-01..OBS-04). Archival, and deliberately
--- NOT in `DERIVED_TABLES` (phase 7 D-02). The facts come off the session blob,
--- and retention eviction empties that blob, so an evicted session's observation
--- cannot be recomputed and a `reindex` that dropped this table would lose it for
--- good. `terminus observations regenerate` (OBS-07) is the only rebuild path.
+-- NOT in `DERIVED_TABLES` (phase 7 D-02). The facts come off the session's
+-- archived stream, and retention eviction deletes its block rows, so an evicted
+-- session's observation cannot be recomputed and a `reindex` that dropped this
+-- table would lose it for good. `terminus observations regenerate` (OBS-07) is the only rebuild path.
 --
 -- `mechanical` is one JSON document rather than a column per fact, the way
 -- `decisions` carries its list-shaped fields: nothing joins on them and they
@@ -226,12 +250,13 @@ CREATE TABLE IF NOT EXISTS observations (
     mechanical     TEXT
 );
 
--- DERIVED. Rebuildable from the blobs alone; dropped and recreated by reindex.
+-- DERIVED. Rebuildable from the block rows alone; dropped and recreated by
+-- reindex.
 
 -- stream_offset and byte_len address the UNCOMPRESSED session stream, never
--- the compressed blob (D-04). The blob header owns the translation, so a
--- future block-size change re-blobs and rewrites no turn row - which is the
--- point of an archive table that never migrates.
+-- the compressed block rows (D-04). The session's block size turns an offset
+-- into block numbers, so a later block-size change rewrites no turn row - which
+-- is the point of an archive that never migrates.
 CREATE TABLE IF NOT EXISTS turns (
     id            INTEGER PRIMARY KEY,
     session_key   TEXT    NOT NULL REFERENCES sessions(session_key),
@@ -282,7 +307,7 @@ CREATE TABLE IF NOT EXISTS compaction_boundaries (
     metadata BLOB
 );
 
--- content='' because the text lives in the blob and storing it twice would
+-- content='' because the text lives in the archive and storing it twice would
 -- double the store; contentless_delete=1 because re-deriving a turn deletes
 -- and reinserts at a known rowid, which is what makes a rebuild idempotent by
 -- construction rather than by a uniqueness check (D-10). rowid IS turns.id.
@@ -346,6 +371,8 @@ CREATE TABLE IF NOT EXISTS meta (
 /// The tables a store carries, excluding FTS5's shadow tables.
 pub const TABLES: &[&str] = &[
     "sessions",
+    // Archive, never derived: `reindex` must never drop it (phase 7 D-03).
+    "blocks",
     "session_meta",
     // Both reach an already-initialized store through `bring_forward`'s
     // missing-table arm on the next `Store::open`, which is what lets phase 6
@@ -366,13 +393,13 @@ pub const TABLES: &[&str] = &[
     "meta",
 ];
 
-/// The derived tables `reindex` drops and rebuilds from the blobs (STOR-04).
-/// `sessions` and `session_meta` are absent by design, and so are `decisions`
-/// and `labels`: nothing in a blob can reconstruct what an injector decided at
-/// prompt time (D-03). `observations` is absent too (phase 7 D-02): its facts
-/// come off the session blob, and retention eviction empties that blob, so a
-/// `reindex` that dropped the table could not recompute an evicted session's
-/// row.
+/// The derived tables `reindex` drops and rebuilds from the block rows
+/// (STOR-04). `sessions`, `blocks` and `session_meta` are absent by design, and
+/// so are `decisions` and `labels`: nothing in the archive can reconstruct what
+/// an injector decided at prompt time (D-03). `observations` is absent too
+/// (phase 7 D-02): its facts come off the session's archived stream, and
+/// retention eviction deletes its block rows, so a `reindex` that dropped the
+/// table could not recompute an evicted session's row.
 ///
 /// In creation order, because `reindex` drops in reverse: a boundary row
 /// references `turns(id)`, so `compaction_boundaries` sits **after** `turns`
