@@ -21,13 +21,17 @@ pub struct Ranges {
     /// One entry per range asked for, in the same order. A range that would
     /// not read fails alone.
     pub bytes: Vec<Result<Vec<u8>>>,
-    /// Blocks decompressed to cut every range.
+    /// Block rows fetched from the database, each once however many ranges
+    /// need it (D-14).
+    pub rows_fetched: usize,
+    /// Blocks decompressed to cut every range, each once however many ranges
+    /// need it.
     pub blocks_decompressed: usize,
 }
 
-/// Read `(stream_offset, byte_len)` ranges out of one session, fetching only
-/// the block rows those ranges cover, each row once however many ranges need
-/// it (D-13, D-20).
+/// Read `(stream_offset, byte_len)` ranges out of one session, fetching and
+/// decompressing only the block rows those ranges cover, each row once however
+/// many ranges need it (D-13, D-20).
 ///
 /// `None` when the session has no `sessions` row. A session whose layout will
 /// not read fails every range rather than the call, and a missing row or a
@@ -37,10 +41,10 @@ pub fn ranges(
     session_key: &str,
     wanted: &[(u64, u64)],
 ) -> Result<Option<Ranges>> {
-    let Some((session_no, reader)) = layout(conn, session_key)? else {
+    let Some((session_no, layout)) = layout(conn, session_key)? else {
         return Ok(None);
     };
-    let reader = match reader {
+    let (block_size, reader) = match layout {
         Ok(reader) => reader,
         Err(e) => {
             let detail = e.to_string();
@@ -54,6 +58,7 @@ pub fn ranges(
                 .collect();
             return Ok(Some(Ranges {
                 bytes,
+                rows_fetched: 0,
                 blocks_decompressed: 0,
             }));
         }
@@ -94,16 +99,41 @@ pub fn ranges(
         }
     }
 
+    // Decompressed on first use and kept, so hits that share a block cost one
+    // decompression. A failure is kept as its message and fails every range
+    // that needs that block.
+    let mut plain: BTreeMap<u64, std::result::Result<Vec<u8>, String>> = BTreeMap::new();
     let bytes = wanted
         .iter()
         .map(|&(offset, len)| {
-            reader.read_range(offset, len, |block_no| {
-                rows.get(&block_no).map(Vec::as_slice)
-            })
+            let end = offset + len;
+            let mut out = Vec::new();
+            for block_no in reader.blocks(offset, len)? {
+                let block = plain.entry(block_no).or_insert_with(|| {
+                    let compressed = rows
+                        .get(&block_no)
+                        .ok_or_else(|| format!("block {block_no} is missing"))?;
+                    reader
+                        .decompress(block_no, compressed)
+                        .map_err(|e| match e {
+                            Error::BlobFormat { detail } => detail,
+                            other => other.to_string(),
+                        })
+                });
+                let block = block.as_deref().map_err(|detail| Error::BlobFormat {
+                    detail: detail.to_owned(),
+                })?;
+                let start = block_no * block_size;
+                let from = offset.saturating_sub(start) as usize;
+                let to = (end - start).min(block.len() as u64) as usize;
+                out.extend_from_slice(&block[from..to]);
+            }
+            Ok(out)
         })
         .collect();
     Ok(Some(Ranges {
         bytes,
+        rows_fetched: rows.len(),
         blocks_decompressed: reader.blocks_decompressed(),
     }))
 }
@@ -116,10 +146,10 @@ pub fn ranges(
 /// row, a block that will not decode, no recorded layout - which callers report
 /// against that session and keep going.
 pub fn stream(conn: &Connection, session_key: &str) -> Result<Result<Vec<u8>>> {
-    let (session_no, reader) =
+    let (session_no, layout) =
         layout(conn, session_key)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-    let reader = match reader {
-        Ok(reader) => reader,
+    let reader = match layout {
+        Ok((_, reader)) => reader,
         Err(e) => return Ok(Err(e)),
     };
     let rows = numbered_rows(conn, session_no)?;
@@ -314,9 +344,13 @@ pub(crate) fn remove(conn: &Connection, session_key: &str) -> Result<usize> {
     )?)
 }
 
-/// A session's number and a reader over its recorded layout, or `None` when
-/// there is no `sessions` row. The inner error is a layout that will not read.
-fn layout(conn: &Connection, session_key: &str) -> Result<Option<(i64, Result<BlockReader>)>> {
+/// A session's block size and a reader over its stream, or why its recorded
+/// layout will not read.
+type Layout = Result<(u64, BlockReader)>;
+
+/// A session's number and its [`Layout`], or `None` when there is no
+/// `sessions` row.
+fn layout(conn: &Connection, session_key: &str) -> Result<Option<(i64, Layout)>> {
     let row: Option<(i64, Option<i64>, Option<i64>)> = conn
         .prepare_cached(
             "SELECT s.session_no, m.block_size, m.uncompressed_len
@@ -328,7 +362,7 @@ fn layout(conn: &Connection, session_key: &str) -> Result<Option<(i64, Result<Bl
     Ok(row.map(|(session_no, block_size, len)| (session_no, reader(block_size, len))))
 }
 
-fn reader(block_size: Option<i64>, uncompressed_len: Option<i64>) -> Result<BlockReader> {
+fn reader(block_size: Option<i64>, uncompressed_len: Option<i64>) -> Layout {
     let Some(len) = uncompressed_len else {
         return Err(Error::BlobFormat {
             detail: "no session_meta row, so no stream length".into(),
@@ -338,7 +372,7 @@ fn reader(block_size: Option<i64>, uncompressed_len: Option<i64>) -> Result<Bloc
     let len = u64::try_from(len).map_err(|_| Error::BlobFormat {
         detail: format!("stream length {len} is negative"),
     })?;
-    BlockReader::new(block_size, len)
+    Ok((u64::from(block_size), BlockReader::new(block_size, len)?))
 }
 
 /// Every row's bytes for one session, in `block_no` order.

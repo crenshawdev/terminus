@@ -265,8 +265,8 @@ pub struct Hit {
 pub struct Response {
     pub hits: Vec<Hit>,
     pub reason: Option<Reason>,
-    /// How many session blobs the excerpts materialized. An instrument, not an
-    /// answer: see [`crate::recall::excerpt::Reads`].
+    /// Block rows the excerpts fetched and blocks they decompressed. An
+    /// instrument, not an answer: see [`crate::recall::excerpt::Reads`].
     pub reads: excerpt::Reads,
 }
 

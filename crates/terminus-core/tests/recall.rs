@@ -172,6 +172,40 @@ impl Bench {
         Config::load_from(&dir).unwrap()
     }
 
+    /// A session of at least three blocks: one record whose text is
+    /// `SPANNING_WORD` and then filler past three blocks, and two short records
+    /// after it, each carrying a word of its own.
+    fn spanning(&self) -> PathBuf {
+        let texts = [
+            format!("{SPANNING_WORD} {}", "filler ".repeat(30_000)),
+            format!("{INSIDE_WORD} is a short record"),
+            "and another short record".to_owned(),
+        ];
+        let mut body = String::new();
+        for (n, text) in texts.iter().enumerate() {
+            let line = serde_json::json!({
+                "parentUuid": null,
+                "isSidechain": false,
+                "cwd": self.work.join("spanning").to_string_lossy(),
+                "sessionId": "99999999-9999-4999-8999-999999999999",
+                "type": "user",
+                "uuid": format!("ffffffff-0000-4000-8000-{n:012}"),
+                "timestamp": format!("2026-08-12T23:00:{n:02}.000Z"),
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+            });
+            body.push_str(&line.to_string());
+            body.push('\n');
+        }
+        let path = self.archive(SPANNING, &body);
+        let key = path.canonicalize().unwrap().to_string_lossy().into_owned();
+        let rows = testkit::block_count(&self.conn(), &key);
+        assert!(
+            rows >= 3,
+            "{SPANNING} must be at least three blocks: {rows}"
+        );
+        path
+    }
+
     fn archive(&self, name: &str, body: &str) -> PathBuf {
         let path = self.work.join(name);
         std::fs::write(&path, body).unwrap();
@@ -182,6 +216,11 @@ impl Bench {
         path
     }
 }
+
+/// [`Bench::spanning`]'s file name and the words its first two records carry.
+const SPANNING: &str = "spanning.jsonl";
+const SPANNING_WORD: &str = "pangolinspan";
+const INSIDE_WORD: &str = "aardvarkinside";
 
 /// The turn ids one FTS5 expression returns, or the error it raised.
 ///
@@ -1193,11 +1232,8 @@ fn every_hit_carries_an_excerpt_from_the_blob() {
     }
 }
 
-/// D-20: several hits from one session read that session's blob once.
-///
-/// Whole-blob materialization is what this bounds, not decompression: the
-/// `blob` feature that would give the reader incremental I/O is deliberately
-/// not enabled, and one archived session reaches 10.1 MB uncompressed.
+/// D-20: several hits from one session fetch and decompress each block row
+/// they cover once, not once per hit.
 #[test]
 fn one_session_is_read_once_however_many_hits_it_answered() {
     let bench = bench();
@@ -1217,7 +1253,47 @@ fn one_session_is_read_once_however_many_hits_it_answered() {
         "this query needs several hits in one session to be about anything: {:?}",
         response.hits
     );
-    assert_eq!(response.reads.blobs, sessions.len());
+    let ids: Vec<i64> = response.hits.iter().map(|hit| hit.turn_id).collect();
+    let covered = testkit::covered_blocks(&conn, &ids);
+    assert!(covered < response.hits.len(), "no two hits share a row");
+    assert_eq!(response.reads.block_rows, covered, "{:?}", response.reads);
+    assert_eq!(response.reads.blocks_decompressed, covered);
+}
+
+/// AC2 for excerpts: a turn inside one block of a session of three or more
+/// fetches that one row and decompresses that one block.
+#[test]
+fn an_excerpt_of_a_turn_inside_one_block_reads_one_row() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let response = answer(&conn, &[], Scope::Everything, INSIDE_WORD);
+    assert_eq!(response.hits.len(), 1, "{:?}", response.hits);
+    assert!(!response.hits[0].excerpt.is_empty());
+    assert_eq!(
+        testkit::covered_blocks(&conn, &[response.hits[0].turn_id]),
+        1
+    );
+    assert_eq!(response.reads.block_rows, 1, "{:?}", response.reads);
+    assert_eq!(response.reads.blocks_decompressed, 1);
+}
+
+/// AC2 for excerpts: a turn spanning k blocks fetches k rows and decompresses
+/// k blocks, and no other row of its session.
+#[test]
+fn an_excerpt_of_a_turn_spanning_k_blocks_reads_k_rows() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let response = answer(&conn, &[], Scope::Everything, SPANNING_WORD);
+    assert_eq!(response.hits.len(), 1, "{:?}", response.hits);
+    assert!(response.hits[0].excerpt.contains(SPANNING_WORD));
+    let k = testkit::covered_blocks(&conn, &[response.hits[0].turn_id]);
+    assert!(k >= 3, "the turn must span three or more blocks: {k}");
+    assert_eq!(response.reads.block_rows, k, "{:?}", response.reads);
+    assert_eq!(response.reads.blocks_decompressed, k);
 }
 
 /// A long turn is cut down, with the cut marked and the match inside the
@@ -1789,15 +1865,11 @@ fn scoped_fetch(
     get::records(conn, &config(exclusions), scope, ids).unwrap()
 }
 
-/// D-20: ids spanning three sessions cost three blob reads, not one per id.
-///
-/// The counter is the assertion, and it has to be: the block counter reports
-/// one block decompressed for a single-turn read whether the session was read
-/// once or six times, so phase 1's AC1 stays green either way. Two
-/// ids are taken from one session precisely so "one read per session" and "one
-/// read per id" give different numbers.
+/// D-20: ids across three sessions fetch each covering row once, not once per
+/// id. Two ids are taken from one session and one block precisely so "one
+/// fetch per row" and "one fetch per id" give different numbers.
 #[test]
-fn ids_across_three_sessions_read_three_blobs() {
+fn ids_across_three_sessions_fetch_each_covering_row_once() {
     let bench = bench();
     let conn = bench.conn();
 
@@ -1811,10 +1883,13 @@ fn ids_across_three_sessions_read_three_blobs() {
 
     assert_eq!(fetched.records.len(), 4, "{fetched:?}");
     assert!(fetched.absent.is_empty(), "{fetched:?}");
+    let covered = testkit::covered_blocks(&conn, &ids);
+    assert_eq!(covered, 3, "the two session-recall ids must share a row");
     assert_eq!(
-        fetched.reads.blobs, 3,
-        "four ids across three sessions must cost three blob reads: {fetched:?}"
+        fetched.reads.block_rows, covered,
+        "four ids over three rows must fetch three rows: {fetched:?}"
     );
+    assert_eq!(fetched.reads.blocks_decompressed, covered);
 
     // Answered in the order they were asked for, which is what makes the output
     // of `terminus show a b c` readable.
@@ -1961,7 +2036,7 @@ fn the_knob_filters_the_body_and_leaves_the_archived_line_alone() {
 /// failed read allowed to look like an eviction would report silent data loss as
 /// retention working correctly.
 #[test]
-fn an_evicted_session_returns_the_record_flagged_and_reads_no_blob() {
+fn an_evicted_session_returns_the_record_flagged_and_reads_none_of_its_rows() {
     let bench = bench();
     let conn = bench.conn();
 
@@ -1990,10 +2065,12 @@ fn an_evicted_session_returns_the_record_flagged_and_reads_no_blob() {
     assert!(!kept.body_evicted, "{kept:?}");
     assert!(kept.body.is_some());
 
-    // One blob read, for the one session that still has a body to read.
+    // Only the intact record's rows, for the one session that still has a
+    // body to read.
     assert_eq!(
-        fetched.reads.blobs, 1,
-        "the evicted session's blob was read anyway: {fetched:?}"
+        fetched.reads.block_rows,
+        testkit::covered_blocks(&conn, &[intact]),
+        "the evicted session's rows were read anyway: {fetched:?}"
     );
 }
 
@@ -2022,8 +2099,11 @@ fn an_unknown_id_is_a_reason_and_not_an_error() {
         }],
         "{fetched:?}"
     );
-    // No blob was read for it either.
-    assert_eq!(fetched.reads.blobs, 1);
+    // No row was read for it either.
+    assert_eq!(
+        fetched.reads.block_rows,
+        testkit::covered_blocks(&conn, &[known])
+    );
 }
 
 /// The same id twice is answered once.
@@ -2035,7 +2115,43 @@ fn a_repeated_id_is_answered_once() {
 
     let fetched = fetch(&conn, &[], &[id, id, id]);
     assert_eq!(fetched.records.len(), 1, "{fetched:?}");
-    assert_eq!(fetched.reads.blobs, 1);
+    assert_eq!(
+        fetched.reads.block_rows,
+        testkit::covered_blocks(&conn, &[id])
+    );
+}
+
+/// AC2 for `recall_get`: a record inside one block of a session of three or
+/// more fetches that one row and decompresses that one block.
+#[test]
+fn a_get_of_a_turn_inside_one_block_reads_one_row() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let id = turn_at(&conn, SPANNING, 1);
+    assert_eq!(testkit::covered_blocks(&conn, &[id]), 1);
+    let fetched = fetch(&conn, &[], &[id]);
+    assert!(fetched.records[0].body.is_some(), "{fetched:?}");
+    assert_eq!(fetched.reads.block_rows, 1, "{:?}", fetched.reads);
+    assert_eq!(fetched.reads.blocks_decompressed, 1);
+}
+
+/// AC2 for `recall_get`: a record spanning k blocks fetches k rows and
+/// decompresses k blocks.
+#[test]
+fn a_get_of_a_turn_spanning_k_blocks_reads_k_rows() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let id = turn_at(&conn, SPANNING, 0);
+    let k = testkit::covered_blocks(&conn, &[id]);
+    assert!(k >= 3, "the turn must span three or more blocks: {k}");
+    let fetched = fetch(&conn, &[], &[id]);
+    assert!(fetched.records[0].body.is_some(), "{fetched:?}");
+    assert_eq!(fetched.reads.block_rows, k, "{:?}", fetched.reads);
+    assert_eq!(fetched.reads.blocks_decompressed, k);
 }
 
 /// RCL-10 auto-scopes all three tools, and ids are densely enumerable, so a get
@@ -2079,7 +2195,11 @@ fn a_get_is_scoped_like_a_search_is() {
             reason: Reason::NoSuchTurn { turn_id: id },
         }]
     );
-    assert_eq!(across.reads.blobs, 0, "an out-of-scope id read a blob");
+    assert_eq!(
+        across.reads,
+        Default::default(),
+        "an out-of-scope id read a row"
+    );
 }
 
 /// A turn of an excluded project is absent with the exclusion as its reason.
@@ -2106,5 +2226,9 @@ fn a_get_of_an_excluded_projects_turn_is_absent_with_a_reason() {
         ),
         "{fetched:?}"
     );
-    assert_eq!(fetched.reads.blobs, 0, "an excluded turn read a blob");
+    assert_eq!(
+        fetched.reads,
+        Default::default(),
+        "an excluded turn read a row"
+    );
 }

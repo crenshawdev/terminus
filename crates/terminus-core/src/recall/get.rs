@@ -8,19 +8,15 @@
 //! that hands the truth back unaltered - unless `[privacy] redact_recall` says
 //! otherwise, and then only for this answer: see [`Record::body`].
 //!
-//! **One blob per session per request (D-20).** rusqlite's incremental blob I/O
-//! sits behind a `blob` feature this workspace does not enable, so reading one
-//! turn materializes that session's whole compressed blob - up to 10.1 MB
-//! uncompressed (phase 1 D-05). Ids are therefore grouped by `session_key` and
-//! each session's blob is selected once, which bounds the cost per request
-//! without eliminating it. The block counter at [`archive::Ranges`]
-//! would report one block decompressed either way, so the number that says this
-//! worked is [`Fetched::reads`] and not that one.
+//! **Only the covering block rows, once per request (D-13, D-20).** Each
+//! record reads only the block rows its range covers. Ids are grouped by
+//! `session_key`, so a row two records share is fetched and decompressed once,
+//! and [`Fetched::reads`] counts both.
 //!
-//! **An evicted body is read off the column, never off a failed blob read
+//! **An evicted body is read off the column, never off a failed read
 //! (D-08).** `session_meta.is_evicted` stays null until retention lands in
 //! phase 8, and it is the only thing that produces [`Record::body_evicted`].
-//! A blob that will not decompress is what `terminus verify` exists to report;
+//! A block that will not decompress is what `terminus verify` exists to report;
 //! letting it look like an eviction would report silent data loss as retention
 //! working correctly.
 
@@ -62,10 +58,10 @@ pub struct Record {
     /// never touched, and the same read with the knob absent still returns the
     /// stored line unchanged (phase 4 D-04).
     ///
-    /// `None` when the body was not read: the session is evicted, or the blob
+    /// `None` when the body was not read: the session is evicted, or its blocks
     /// would not give the range up.
     pub body: Option<Vec<u8>>,
-    /// The session's body has been evicted by retention (D-08). No blob read
+    /// The session's body has been evicted by retention (D-08). No block read
     /// was attempted for this record.
     pub body_evicted: bool,
 }
@@ -90,7 +86,7 @@ pub struct Fetched {
     /// Set when the whole request could return nothing, whatever the ids were -
     /// the scope itself is empty or excluded.
     pub reason: Option<Reason>,
-    /// How many session blobs this request materialized.
+    /// Block rows this request fetched and blocks it decompressed.
     pub reads: Reads,
 }
 
@@ -136,8 +132,8 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
     let rows = rows_for(conn, &wanted)?;
 
     let mut fetched = Fetched::default();
-    // `(record index, stream_offset, byte_len)` per session, so each blob is
-    // opened once and every range wanted out of it is cut from the one copy.
+    // `(record index, stream_offset, byte_len)` per session, so each covering
+    // row is fetched once and every range wanted out of it is cut from it.
     let mut by_session: BTreeMap<String, Vec<(usize, i64, i64)>> = BTreeMap::new();
 
     for id in wanted {
@@ -199,7 +195,7 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
             body: None,
             body_evicted: row.evicted,
         });
-        // The evicted arm reads no blob at all, which is the difference between
+        // The evicted arm reads no row at all, which is the difference between
         // "this body is gone" and "this body would not decompress".
         if !row.evicted {
             by_session
@@ -222,14 +218,15 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
             .iter()
             .map(|&(_, offset, len)| (offset as u64, len as u64))
             .collect();
-        let read = archive::ranges(conn, &session_key, &wanted).ok().flatten();
-        fetched.reads.blobs += 1;
-        let Some(read) = read else { continue };
+        let Some(read) = archive::ranges(conn, &session_key, &wanted).ok().flatten() else {
+            continue;
+        };
+        fetched.reads.add(&read);
         // Damage is `terminus verify`'s to report. Here it costs this record
         // its body and leaves every other record of the request intact.
         for ((index, _, _), bytes) in ranges.into_iter().zip(read.bytes) {
             if let Ok(bytes) = bytes {
-                // The knob-off arm is the blob's own bytes with no conversion at
+                // The knob-off arm is the archive's own bytes with no conversion at
                 // all, not a round trip that happens to be lossless: this is the
                 // read whose whole claim is byte-exactness, and a `String` step
                 // taken unconditionally would make that claim depend on the

@@ -607,6 +607,30 @@ pub fn damage(conn: &rusqlite::Connection, session_key: &str) {
     assert!(changed > 0, "{session_key} has no block to damage");
 }
 
+/// How many distinct block rows the turns' `stream_offset` and `byte_len`
+/// cover, at each session's recorded block size: the most a read of exactly
+/// those turns may fetch (D-13). A repeated id counts once.
+pub fn covered_blocks(conn: &rusqlite::Connection, turn_ids: &[i64]) -> usize {
+    let mut covered = std::collections::BTreeSet::new();
+    for id in turn_ids {
+        let (session_key, offset, len, block_size): (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT t.session_key, t.stream_offset, t.byte_len, m.block_size
+                   FROM turns t JOIN session_meta m USING (session_key)
+                  WHERE t.id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap_or_else(|e| panic!("turn {id}: {e}"));
+        if len > 0 {
+            for block_no in offset / block_size..=(offset + len - 1) / block_size {
+                covered.insert((session_key.clone(), block_no));
+            }
+        }
+    }
+    covered.len()
+}
+
 /// How many block rows one session has.
 pub fn block_count(conn: &rusqlite::Connection, session_key: &str) -> usize {
     block_rows(conn, session_key).len()

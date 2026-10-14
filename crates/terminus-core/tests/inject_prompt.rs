@@ -346,16 +346,12 @@ fn a_prompt_naming_a_stored_path_fires_on_the_turn_that_stored_it() {
         !fired.hits[0].excerpt.is_empty(),
         "a turn injected with no text under it says nothing"
     );
-    assert_eq!(
-        fired.reads.blobs, 1,
-        "one turn from one session is one blob: {:?}",
-        fired.reads
-    );
+    assert_reads_cover(&bench, &fired);
 
     // The same prompt with the path taken out of it (AC3's other half).
     let silent = bench.fired(&cwd, "what changed");
     assert!(silent.hits.is_empty(), "{silent:?}");
-    assert_eq!(silent.reads.blobs, 0);
+    assert_eq!(silent.reads, Default::default());
 }
 
 /// AC7: a prompt whose only match is free text fires on nothing, and pays for
@@ -366,7 +362,7 @@ fn a_prompt_naming_a_stored_path_fires_on_the_turn_that_stored_it() {
 /// found, not a query that found nothing. A score cutoff would have injected
 /// it: it is the only hit there is, at rank 1.
 #[test]
-fn a_free_text_only_match_fires_on_nothing_and_reads_no_blob() {
+fn a_free_text_only_match_fires_on_nothing_and_reads_no_block() {
     let bench = bench();
     let cwd = bench.project();
     bench.archive(
@@ -381,8 +377,9 @@ fn a_free_text_only_match_fires_on_nothing_and_reads_no_blob() {
     let fired = bench.fired(&cwd, raw);
     assert!(fired.hits.is_empty(), "{fired:?}");
     assert_eq!(
-        fired.reads.blobs, 0,
-        "a prompt that injected nothing decompressed a session: {:?}",
+        fired.reads,
+        Default::default(),
+        "a prompt that injected nothing read a block: {:?}",
         fired.reads
     );
 
@@ -418,7 +415,21 @@ fn at_most_three_turns_are_ever_injected() {
 
     let fired = bench.fired(&cwd, raw);
     assert_eq!(fired.hits.len(), prompt::MAX_TURNS, "{fired:?}");
-    assert_eq!(fired.reads.blobs, 1, "one session, one blob");
+    assert_reads_cover(&bench, &fired);
+}
+
+/// The fired turns' reads fetched exactly the block rows those turns cover,
+/// and decompressed each of them once (D-13, D-14).
+fn assert_reads_cover(bench: &Bench, fired: &prompt::Fired) {
+    let ids: Vec<i64> = fired.hits.iter().map(|hit| hit.turn_id).collect();
+    let covered = testkit::covered_blocks(&bench.conn(), &ids);
+    assert!(covered > 0, "{fired:?}");
+    assert_eq!(fired.reads.block_rows, covered, "{:?}", fired.reads);
+    assert_eq!(
+        fired.reads.blocks_decompressed, covered,
+        "{:?}",
+        fired.reads
+    );
 }
 
 /// The ranked hits one prompt's candidates return, with no threshold applied.
@@ -523,7 +534,7 @@ fn two_entities_on_one_turn_fire_from_below_the_top_three() {
         "the corroborated turn is the whole of what should have fired"
     );
     assert!(!injected.contains(&single));
-    assert_eq!(fired.reads.blobs, 1);
+    assert_reads_cover(&bench, &fired);
 }
 
 /// A config whose `[injection] prompt_chars` is what the test says, loaded
