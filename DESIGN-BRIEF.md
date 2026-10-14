@@ -378,7 +378,7 @@ Prefix match on canonicalized paths, case-insensitive on macOS. A repo-local mar
 
 ## 13. Install and packaging
 
-**There is no npm channel.** The npm package was removed. `install.sh` is the one-command installer, run as `curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh`. It downloads from the GitHub releases on crenshawdev/terminus, and one `https://` source replaces them when the line ends in `sh -s -- https://<source>` instead of `sh`. No release is published yet.
+**There is no npm channel.** The npm package was removed. `install.sh` is the one-command installer, run as `curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh`. It downloads from the GitHub releases on crenshawdev/terminus, and one `https://` source replaces them when the line ends in `sh -s -- https://<source>` instead of `sh`. It refuses any release whose signature does not verify against the crenshawdev release key pinned in the script. No release is published yet.
 
 Secondary: Homebrew, deb/rpm.
 
@@ -392,7 +392,7 @@ The versions folder sits under HOME and outside the data directory. The data dir
 
 A version gets there one of two ways:
 
-- `install.sh` downloads `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>` for the machine, from the GitHub releases by default or from the given source, checks the binary's SHA-256 in `verify_download`, stages it in the folder for the manifest's version through a temporary file and `mv`, and moves a temporary link over the stable path with `mv -f`. It ends by running `~/.local/bin/terminus install`.
+- `install.sh` downloads `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>.manifest.sig` for the machine, from the GitHub releases by default or from the given source, and verifies the signature before it reads the manifest (see Release signature below). Only then does it download `terminus-<os>-<arch>`, check the binary's SHA-256 in `verify_download`, stage it in the folder for the manifest's version through a temporary file and `mv`, and moves a temporary link over the stable path with `mv -f`. It ends by running `~/.local/bin/terminus install`.
 - `terminus install` run from anywhere else stores its own binary under its own version and points the link at it. A local build is installed with `cargo build --release && target/release/terminus install`. Run from the file the link already names, as `install.sh`'s last step is, it changes neither the link nor the file.
 
 Both replace what is at the stable path only when nothing is there or it carries the Terminus marker, a fixed string every build holds, directly or through a link, so a plain-file install from before the link becomes the link. A link to nothing counts as nothing to `terminus install`, and to `install.sh` only when it points into the versions folder. Anything else is refused and left as it is.
@@ -400,6 +400,16 @@ Both replace what is at the stable path only when nothing is there or it carries
 A version folder that already holds the same bytes is left alone. One holding different bytes, which is what a rebuild at the same version finds, gets the new file renamed over it, and a process running the old file keeps its inode. Old version folders are never deleted and nothing prunes them, so a running session's MCP server and the ingest its hook spawned keep their file.
 
 Uninstall removes the link and leaves the versions folder, printing its path.
+
+### Release signature
+
+A release's manifest carries an OpenSSH signature (SSHSIG) made with the crenshawdev release key, an Ed25519 key, under the namespace `terminus-release`. `install.sh` holds the key's public line once, as a literal. It writes the allowed-signers line `crenshawdev-release <pinned key>` from that literal into its `mktemp -d` folder, then runs `ssh-keygen -Y verify -f <that file> -I crenshawdev-release -n terminus-release -s <manifest.sig>` with the manifest on stdin. Nothing is read from HOME or `~/.ssh`, so a key listed in `~/.ssh/allowed_signers` counts for nothing. Any non-zero exit is a refusal, and the binary is never downloaded. The script does not check `ssh-keygen`'s version, so one too old for `-Y` fails closed.
+
+`ssh-keygen`'s output is dropped, and the script prints its own reason on stderr. A missing signature is a download failure, `signature download failed: <url>`. A signature made by another key or under another namespace, a manifest changed after signing, and anything else `ssh-keygen` refuses all print `the manifest does not verify against the pinned crenshawdev release key`.
+
+`ssh-keygen` is required. The script checks for it with `command -v` before any download, and when it is missing names `openssh-client` (Debian, Ubuntu), `openssh-clients` (Fedora) and `openssh` (Arch).
+
+Nothing overrides the key. It is never fetched, and no argument, setting or environment variable changes it, so every source, the `https://` argument included, must serve a signature made with it. There is no unsigned mode. An update is a rerun of the same command, so it gets the same check.
 
 ### `terminus install`
 
