@@ -21,26 +21,34 @@ fail() {
     exit 1
 }
 
+# The bytes come from od as numbers. dash takes its locale once at startup, so
+# under a UTF-8 locale the LC_ALL=C above never reaches its own patterns.
 valid_utf8() (
-    remaining=$1
-    ascii=$(printf '[\001-\177]')
-    continuation=$(printf '[\200-\277]')
-    two=$(printf '[\302-\337]')
-    three=$(printf '[\341-\354\356-\357]')
-    four=$(printf '[\361-\363]')
-    while [ -n "$remaining" ]; do
-        case $remaining in
-            $ascii*) remaining=${remaining#?} ;;
-            $two$continuation*) remaining=${remaining#??} ;;
-            $(printf '\340[\240-\277]')$continuation* | \
-            $three$continuation$continuation* | \
-            $(printf '\355[\200-\237]')$continuation*) remaining=${remaining#???} ;;
-            $(printf '\360[\220-\277]')$continuation$continuation* | \
-            $four$continuation$continuation$continuation* | \
-            $(printf '\364[\200-\217]')$continuation$continuation*) remaining=${remaining#????} ;;
-            *) return 1 ;;
-        esac
+    bytes=$(printf '%s' "$1" | od -An -v -tu1) || return 1
+    need=0 low=128 high=191
+    for byte in $bytes; do
+        if [ "$need" -gt 0 ]; then
+            [ "$byte" -ge "$low" ] && [ "$byte" -le "$high" ] || return 1
+            need=$((need - 1)) low=128 high=191
+        elif [ "$byte" -lt 128 ]; then
+            :
+        elif [ "$byte" -lt 194 ]; then
+            return 1
+        elif [ "$byte" -lt 224 ]; then
+            need=1
+        elif [ "$byte" -lt 240 ]; then
+            need=2
+            [ "$byte" -ne 224 ] || low=160
+            [ "$byte" -ne 237 ] || high=159
+        elif [ "$byte" -lt 245 ]; then
+            need=3
+            [ "$byte" -ne 240 ] || low=144
+            [ "$byte" -ne 244 ] || high=143
+        else
+            return 1
+        fi
     done
+    [ "$need" -eq 0 ]
 )
 
 valid_version() (

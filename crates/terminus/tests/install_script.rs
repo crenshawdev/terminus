@@ -1,5 +1,10 @@
-//! `install.sh` run end to end: real `sh`, `curl`, `sha256sum` and `mktemp`
-//! against a local HTTPS server, ending in a real `terminus install`.
+//! `install.sh` run end to end under `/bin/sh` and under dash, with real
+//! `curl`, `sha256sum` and `mktemp` against a local HTTPS server, ending in a
+//! real `terminus install`.
+//!
+//! Each test runs once per shell, as `<test>::sh` and `<test>::dash`, because
+//! `curl | sh` runs under dash on Debian and Ubuntu and `/bin/sh` here is bash.
+//! Without dash on `PATH` every dash test fails; none is skipped.
 //!
 //! The server is `openssl s_server -WWW` with a certificate made for each test
 //! and named by `CURL_CA_BUNDLE`, so the script stays https-only. The served
@@ -29,7 +34,8 @@ use std::time::{Duration, Instant};
 use terminus_core::testkit::{self, FakeCall};
 
 /// Every program `install.sh` runs that is not a shell builtin.
-const TOOLS: [&str; 11] = [
+const TOOLS: [&str; 12] = [
+    "od",
     "uname",
     "mktemp",
     "rm",
@@ -177,8 +183,46 @@ impl Drop for Server {
     }
 }
 
+/// The shell a test runs `install.sh` under.
+#[derive(Clone, Copy)]
+enum Shell {
+    Sh,
+    Dash,
+}
+
+impl Shell {
+    fn path(self) -> PathBuf {
+        match self {
+            Shell::Sh => PathBuf::from("/bin/sh"),
+            Shell::Dash => which("dash").expect(
+                "dash is not installed; the install.sh tests run under dash as well as /bin/sh and need it",
+            ),
+        }
+    }
+}
+
+/// Each test as `<test>::sh` and `<test>::dash`.
+macro_rules! both_shells {
+    ($($test:ident),* $(,)?) => {$(
+        mod $test {
+            #[test]
+            fn sh() {
+                super::$test(super::Shell::Sh)
+            }
+
+            #[test]
+            fn dash() {
+                super::$test(super::Shell::Dash)
+            }
+        }
+    )*};
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
+    /// The shell that runs `install.sh`. The fake tools and `copy_build`
+    /// stay on `/bin/sh`.
+    shell: PathBuf,
     root: PathBuf,
     home: PathBuf,
     claude_dir: PathBuf,
@@ -191,7 +235,8 @@ struct Fixture {
     server: Server,
 }
 
-fn fixture() -> Fixture {
+fn fixture(shell: Shell) -> Fixture {
+    let shell = shell.path();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let home = root.join("home");
@@ -206,6 +251,7 @@ fn fixture() -> Fixture {
     let server = Server::start(&root, &served);
     let mut fixture = Fixture {
         _dir: dir,
+        shell,
         tools: PathBuf::new(),
         root,
         home,
@@ -355,7 +401,8 @@ impl Fixture {
         std::fs::write(manifest, format!("version {version}\nsha256 {digest}\n")).unwrap();
     }
 
-    /// `/bin/sh install.sh <args>` with the default tools folder.
+    /// `install.sh <args>` under the test's shell, with the default tools
+    /// folder.
     fn command(&self, args: &[String]) -> Command {
         self.command_with(args, &self.tools)
     }
@@ -366,7 +413,7 @@ impl Fixture {
         command
     }
 
-    /// The script's bytes written into `/bin/sh`'s stdin pipe, which is then
+    /// The script's bytes written into the shell's stdin pipe, which is then
     /// closed, as `curl | sh` does. Any `args` go after `-s --`.
     fn piped(&self, args: &[String], tools: &Path) -> Output {
         use std::io::Write;
@@ -388,10 +435,10 @@ impl Fixture {
         child.wait_with_output().unwrap()
     }
 
-    /// `/bin/sh` with the cleared environment every run uses.
+    /// The test's shell with the cleared environment every run uses.
     fn shell(&self, tools: &Path) -> Command {
         let path = std::env::join_paths([&self.fake_dir, tools]).unwrap();
-        let mut command = Command::new("/bin/sh");
+        let mut command = Command::new(&self.shell);
         command
             .env_clear()
             .env("PATH", path)
@@ -599,9 +646,8 @@ fn walk(path: &Path, name: &Path, into: &mut Vec<(PathBuf, Entry)>) {
 
 /// A fake `claude` that exits 0: the run exits 0, the link points at the
 /// manifest's version, the hooks and the MCP entry name the stable path.
-#[test]
-fn one_run_installs_and_wires_claude_code() {
-    let fx = fixture();
+fn one_run_installs_and_wires_claude_code(shell: Shell) {
+    let fx = fixture(shell);
     let bytes = fx.serve("1.0.0", "");
     let output = fx.run();
     assert!(output.status.success(), "{}", text(&output));
@@ -635,9 +681,8 @@ fn one_run_installs_and_wires_claude_code() {
 
 /// No `claude` in either folder: the link is placed, and the receipt's
 /// "install incomplete" line is the script's non-zero exit.
-#[test]
-fn no_claude_exits_non_zero_after_the_link_is_placed() {
-    let fx = fixture();
+fn no_claude_exits_non_zero_after_the_link_is_placed(shell: Shell) {
+    let fx = fixture(shell);
     std::fs::remove_file(fx.fake_dir.join("claude")).unwrap();
     let bytes = fx.serve("1.0.0", "");
     let output = fx.run();
@@ -662,9 +707,8 @@ fn default_urls() -> Vec<String> {
 
 /// No argument: the two release URLs, manifest first, and the install
 /// finishes.
-#[test]
-fn no_source_downloads_from_the_github_releases() {
-    let fx = fixture();
+fn no_source_downloads_from_the_github_releases(shell: Shell) {
+    let fx = fixture(shell);
     let bytes = fx.serve("1.0.0", "");
     let tools = fx.curl_tools("");
     let output = fx.command_with(&[], &tools).output().unwrap();
@@ -674,9 +718,8 @@ fn no_source_downloads_from_the_github_releases() {
 }
 
 /// `curl | sh`: the same two release URLs, and the install finishes.
-#[test]
-fn a_piped_script_with_no_source_downloads_from_the_github_releases() {
-    let fx = fixture();
+fn a_piped_script_with_no_source_downloads_from_the_github_releases(shell: Shell) {
+    let fx = fixture(shell);
     let bytes = fx.serve("1.0.0", "");
     let tools = fx.curl_tools("");
     let output = fx.piped(&[], &tools);
@@ -686,9 +729,8 @@ fn a_piped_script_with_no_source_downloads_from_the_github_releases() {
 }
 
 /// `curl | sh -s -- https://<source>` installs from that source.
-#[test]
-fn a_piped_script_installs_from_its_source() {
-    let fx = fixture();
+fn a_piped_script_installs_from_its_source(shell: Shell) {
+    let fx = fixture(shell);
     let bytes = fx.serve("1.0.0", "");
     let output = fx.piped(&[fx.server.url()], &fx.tools);
     assert!(output.status.success(), "{}", text(&output));
@@ -697,8 +739,8 @@ fn a_piped_script_installs_from_its_source() {
 
 /// After 1.0.0 is installed, a no-argument run whose fake `curl` fails
 /// `failing` is refused, and stderr holds `message`.
-fn assert_download_refused(failing: &str, message: &str) {
-    let fx = fixture();
+fn assert_download_refused(shell: Shell, failing: &str, message: &str) {
+    let fx = fixture(shell);
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
     let tools = fx.curl_tools(failing);
@@ -710,17 +752,17 @@ fn assert_download_refused(failing: &str, message: &str) {
     );
 }
 
-#[test]
-fn a_failed_manifest_download_is_refused() {
+fn a_failed_manifest_download_is_refused(shell: Shell) {
     assert_download_refused(
+        shell,
         &format!("terminus-{}.manifest", platform()),
         &format!("manifest download failed: {}", default_urls()[0]),
     );
 }
 
-#[test]
-fn a_failed_binary_download_is_refused() {
+fn a_failed_binary_download_is_refused(shell: Shell) {
     assert_download_refused(
+        shell,
         &format!("terminus-{}", platform()),
         &format!("binary download failed: {}", default_urls()[1]),
     );
@@ -728,9 +770,8 @@ fn a_failed_binary_download_is_refused() {
 
 /// Without `sha256sum`, `shasum -a 256` computes the digest: the install
 /// succeeds, and a wrong manifest digest is refused with the real one named.
-#[test]
-fn shasum_computes_the_digest_when_sha256sum_is_missing() {
-    let fx = fixture();
+fn shasum_computes_the_digest_when_sha256sum_is_missing(shell: Shell) {
+    let fx = fixture(shell);
     let shasum = shasum();
     let tools = fx.tools_folder("tools-shasum", &["sha256sum"], &[("shasum", &shasum)]);
 
@@ -754,9 +795,8 @@ fn shasum_computes_the_digest_when_sha256sum_is_missing() {
 }
 
 /// The manifest names version A's digest, but the binary has other bytes.
-#[test]
-fn a_digest_that_does_not_match_is_refused() {
-    let fx = fixture();
+fn a_digest_that_does_not_match_is_refused(shell: Shell) {
+    let fx = fixture(shell);
     fx.install("1.0.0", "");
     let binary = fx.binary();
     let digest_a = sha256(&binary);
@@ -765,27 +805,24 @@ fn a_digest_that_does_not_match_is_refused() {
     fx.assert_refused(fx.command(&[fx.server.url()]));
 }
 
-#[test]
-fn an_unsupported_system_is_refused() {
-    let fx = fixture();
+fn an_unsupported_system_is_refused(shell: Shell) {
+    let fx = fixture(shell);
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
     let tools = fx.uname_tools("FreeBSD", "x86_64");
     fx.assert_refused(fx.command_with(&[fx.server.url()], &tools));
 }
 
-#[test]
-fn an_unsupported_architecture_is_refused() {
-    let fx = fixture();
+fn an_unsupported_architecture_is_refused(shell: Shell) {
+    let fx = fixture(shell);
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
     let tools = fx.uname_tools("Linux", "riscv64");
     fx.assert_refused(fx.command_with(&[fx.server.url()], &tools));
 }
 
-#[test]
-fn an_http_source_is_refused() {
-    let fx = fixture();
+fn an_http_source_is_refused(shell: Shell) {
+    let fx = fixture(shell);
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
     let source = fx.server.url().replacen("https://", "http://", 1);
@@ -793,9 +830,8 @@ fn an_http_source_is_refused() {
 }
 
 /// More than one source is refused before anything is read.
-#[test]
-fn two_sources_are_refused() {
-    let fx = fixture();
+fn two_sources_are_refused(shell: Shell) {
+    let fx = fixture(shell);
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
     fx.assert_refused(fx.command(&[fx.server.url(), fx.server.url()]));
@@ -803,9 +839,8 @@ fn two_sources_are_refused() {
 
 /// `terminus install` would point the hooks and the MCP entry into that
 /// folder while the script linked `~/.local/bin/terminus`.
-#[test]
-fn terminus_bin_dir_set_is_refused() {
-    let fx = fixture();
+fn terminus_bin_dir_set_is_refused(shell: Shell) {
+    let fx = fixture(shell);
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
     let mut command = fx.command(&[fx.server.url()]);
@@ -814,9 +849,8 @@ fn terminus_bin_dir_set_is_refused() {
 }
 
 /// Somebody else's program at the stable path.
-#[test]
-fn a_file_without_the_marker_is_refused() {
-    let fx = fixture();
+fn a_file_without_the_marker_is_refused(shell: Shell) {
+    let fx = fixture(shell);
     std::fs::create_dir_all(fx.stable().parent().unwrap()).unwrap();
     std::fs::write(fx.stable(), "#!/bin/sh\nexit 0\n").unwrap();
     fx.serve("1.0.0", "");
@@ -825,9 +859,8 @@ fn a_file_without_the_marker_is_refused() {
 
 /// A link to nothing is the script's to replace only when it points into the
 /// versions folder.
-#[test]
-fn a_dangling_link_outside_the_versions_folder_is_refused() {
-    let fx = fixture();
+fn a_dangling_link_outside_the_versions_folder_is_refused(shell: Shell) {
+    let fx = fixture(shell);
     std::fs::create_dir_all(fx.stable().parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(fx.root.join("elsewhere/terminus"), fx.stable()).unwrap();
     fx.serve("1.0.0", "");
@@ -864,9 +897,8 @@ impl Fixture {
 
 /// Installing B moves the link and leaves A's file exactly as it was, so a
 /// session started on A keeps running from it.
-#[test]
-fn successive_installs_keep_every_version() {
-    let fx = fixture();
+fn successive_installs_keep_every_version(shell: Shell) {
+    let fx = fixture(shell);
     let bytes_a = fx.install("1.0.0", "a");
     let file_a = fx.version_file("1.0.0");
     let inode_a = inode(&file_a);
@@ -893,9 +925,8 @@ fn successive_installs_keep_every_version() {
 
 /// A rebuild at the same version is renamed over that version's file; the
 /// same bytes again leave it alone.
-#[test]
-fn a_rebuild_at_the_same_version_replaces_its_file() {
-    let fx = fixture();
+fn a_rebuild_at_the_same_version_replaces_its_file(shell: Shell) {
+    let fx = fixture(shell);
     fx.install("3.0.0", "c");
     let first = inode(&fx.version_file("3.0.0"));
 
@@ -914,9 +945,8 @@ fn a_rebuild_at_the_same_version_replaces_its_file() {
 
 /// A plain-file install from before the link, carrying the marker, is
 /// replaced by the link.
-#[test]
-fn a_marked_plain_file_is_replaced_by_the_link() {
-    let fx = fixture();
+fn a_marked_plain_file_is_replaced_by_the_link(shell: Shell) {
+    let fx = fixture(shell);
     copy_build(&fx.stable(), "");
     let bytes = fx.serve("1.0.0", "");
     let output = fx.run();
@@ -926,9 +956,8 @@ fn a_marked_plain_file_is_replaced_by_the_link() {
 
 /// The link left behind when the versions folder was deleted is the script's
 /// to replace.
-#[test]
-fn a_dangling_link_into_the_versions_folder_is_replaced() {
-    let fx = fixture();
+fn a_dangling_link_into_the_versions_folder_is_replaced(shell: Shell) {
+    let fx = fixture(shell);
     fx.install("1.0.0", "a");
     std::fs::remove_dir_all(fx.versions()).unwrap();
     assert!(!fx.stable().exists() && fx.stable().is_symlink());
@@ -938,3 +967,26 @@ fn a_dangling_link_into_the_versions_folder_is_replaced() {
     assert!(output.status.success(), "{}", text(&output));
     fx.assert_linked("2.0.0", &bytes);
 }
+
+both_shells!(
+    one_run_installs_and_wires_claude_code,
+    no_claude_exits_non_zero_after_the_link_is_placed,
+    no_source_downloads_from_the_github_releases,
+    a_piped_script_with_no_source_downloads_from_the_github_releases,
+    a_piped_script_installs_from_its_source,
+    a_failed_manifest_download_is_refused,
+    a_failed_binary_download_is_refused,
+    shasum_computes_the_digest_when_sha256sum_is_missing,
+    a_digest_that_does_not_match_is_refused,
+    an_unsupported_system_is_refused,
+    an_unsupported_architecture_is_refused,
+    an_http_source_is_refused,
+    two_sources_are_refused,
+    terminus_bin_dir_set_is_refused,
+    a_file_without_the_marker_is_refused,
+    a_dangling_link_outside_the_versions_folder_is_refused,
+    successive_installs_keep_every_version,
+    a_rebuild_at_the_same_version_replaces_its_file,
+    a_marked_plain_file_is_replaced_by_the_link,
+    a_dangling_link_into_the_versions_folder_is_replaced,
+);
