@@ -1,0 +1,21 @@
+{
+  "auto_passed": 7,
+  "gaps": 0,
+  "added": 0,
+  "skipped": 0,
+  "rejected": 0,
+  "rejected_entries": [],
+  "skipped_entries": [
+    {
+      "list": "human_checks",
+      "reason": "already-recorded",
+      "item": 8,
+      "status": "pending",
+      "entry": {
+        "name": "Clean install on the owner's machine",
+        "expected": "On the owner's machine: `terminus verify` exits 0 and prints \"N session(s) checked, 0 failed\"; `sqlite3 -readonly ~/.local/share/terminus/terminus.db \"SELECT value FROM meta WHERE key='archive_format'\"` prints 2; N equals the count of transcripts still on disk on the install day (SUMMARY reports 1953); ~/terminus-format1/data still holds the old format-1 terminus.db. The 2026-10-05 format-1 binary was not saved, which the owner already accepted (SUMMARY deviation).",
+        "why_human": "Out-of-reach resource: it needs the owner's real store and the moved-aside folder (~/.local/share/terminus, ~/terminus-format1), which this verification was told not to touch, and the move it checks is a one-time, irreversible step already taken on that machine. No probe in the repository can reproduce it."
+      }
+    }
+  ]
+}

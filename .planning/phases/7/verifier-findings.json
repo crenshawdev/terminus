@@ -1,0 +1,121 @@
+{
+  "status": "needs_human",
+  "score": "9/10",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "A fresh store keeps each session as block rows: sessions holds only session_key and session_no, blocks holds one row per 64 KB block keyed (session_no, block_no) with bytes and a 32-byte hash, session_meta records block_size, and meta.archive_format is 2; a search over it returns the session's turns.",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "crates/terminus-core/src/store/schema.rs:66-69 (sessions, two columns), :85-91 (blocks, PRIMARY KEY (session_no, block_no)), :103 (session_meta.block_size), :372-375 (blocks in TABLES, not DERIVED_TABLES); crates/terminus-core/src/store/open.rs:22 (ARCHIVE_FORMAT = 2); ingest cuts a new session at BLOCK_SIZE (crates/terminus-core/src/ingest/mod.rs:361-363). Spot-check with target/debug/terminus at HEAD against an empty scratchpad TERMINUS_DATA_DIR (HOME isolated): `terminus ingest` exit 0; sqlite3 -readonly read archive_format=2, uncompressed_len 206282, block_size 65536, 4 rows (ceil(206282/65536)=4), every hash 32 bytes, PRAGMA table_info(sessions) = session_key, session_no only; `terminus search \"spans four blocks\"` from the session's cwd printed 1 hit with its excerpt, and `search --json large` returned turn_id 1 with excerpt \"that was a large one\"."
+    },
+    {
+      "n": 2,
+      "truth": "An append to a session of three or more blocks writes new rows and rewrites at most the last existing row; every other row is byte-identical; the pass fetches at most the tail row's bytes per walked file (all rows only for a session flagged diverged).",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "crates/terminus-core/src/blob/block.rs:119-203 (append checks hash list against checksum and tail against its hash, then cuts from block `complete`, so only the tail and new blocks are returned); crates/terminus-core/src/store/archive.rs:297-316 (non-diverged append_state selects block_no, hash for all rows and bytes of at most the tail row; rows_read = 0 or 1), :275-294 (every row only when every_row/diverged); :321-336 (write upserts only the blocks given); crates/terminus-core/src/ingest/mod.rs:952 (Existing::read calls append_state with `diverged`), :393 (Pass.block_rows_read), :503 (archive::write in the file's one transaction); every walk reaches Existing::read (ingest/mod.rs:164, ingest/backfill.rs:402). Test crates/terminus-core/tests/compaction.rs:409 an_append_rewrites_at_most_the_tail_row_and_reads_no_other passed in the full suite: asserts >=3 rows before, rows before the old last byte-identical, the old last changed exactly when the stream ended mid-block, new rows numbered on, block_rows_read <= 1, verify clean. Codec tests a_block_append_onto_a_boundary_recompresses_nothing and a_block_append_crossing_a_boundary_redoes_only_the_tail passed."
+    },
+    {
+      "n": 3,
+      "truth": "Reading one turn through the excerpt, get, context and brief readers fetches only the block rows the turn's stream_offset and byte_len cover, counted by Reads.block_rows, and decompresses only those.",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "All four readers go through crates/terminus-core/src/store/archive.rs:39-139 `ranges`, which selects rows only inside the merged covering spans (:85-100) and reports rows_fetched = rows.len() and blocks_decompressed (:134-138): recall/excerpt.rs:115-118, recall/get.rs:221-224, recall/context.rs:250-253, inject/brief.rs:559-562; Reads.block_rows at recall/excerpt.rs:57,64. The brief's test entry point session_start_reads (inject/brief.rs:99-114, cfg testkit) calls the same `render` the hook's session_start uses (:72-91). Tests passed in the full suite, each asserting block_rows == blocks_decompressed == testkit::covered_blocks (an independent offset/block_size computation, testkit.rs:613-632) on a session of >=3 rows: crates/terminus-core/tests/recall.rs:1266 an_excerpt_of_a_turn_inside_one_block_reads_one_row, :1285 an_excerpt_of_a_turn_spanning_k_blocks_reads_k_rows, :1366 a_context_window_of_a_turn_inside_one_block_reads_one_row, :1383 a_context_window_spanning_k_blocks_reads_k_rows, :2161 a_get_of_a_turn_inside_one_block_reads_one_row, :2177 a_get_of_a_turn_spanning_k_blocks_reads_k_rows; crates/terminus-core/tests/inject_brief.rs:258 the_brief_reads_only_the_row_its_two_quotes_sit_in, :289 the_brief_reads_the_union_of_the_rows_its_quotes_cover. `grep reads.blobs|pub blobs` finds nothing."
+    },
+    {
+      "n": 4,
+      "truth": "terminus verify names the session key and block number, in its text line and in a --json block field, for a changed block and for a block row deleted from the middle; a checksum that no longer matches the hashes is named with block null; every other session passes.",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "crates/terminus-core/src/verify.rs:178-241 (numbering, per-block decode and hash, session checksum over stored hashes; block-level failures carry Some(block_no), checksum None), :78-90 (render `<key>: block N: `); crates/terminus/src/cmd/verify.rs:26-40 (`block: failure.block` in --json). Tests passed in the full suite: crates/terminus-core/tests/verify.rs:440 a_changed_byte_in_a_middle_block_names_that_block_and_no_other_session, :462 a_deleted_middle_row_names_that_block_and_no_other_session, :495 an_altered_checksum_names_the_session_and_no_block (each over 4 sessions, asserting no other key appears); crates/terminus/tests/cli.rs:726 verify_names_the_damaged_block_in_text_and_json (changed byte: text `<key>: block 1: `, --json block 1; checksum: block null). The deleted-row --json case has no named CLI test, so it was spot-checked: in a scratchpad store with session-large-record (4 rows) and session-basic, `DELETE FROM blocks WHERE block_no=1` on the large session, then `terminus verify` exit 1 printed `<large key>: block 1: row is missing` plus a session-level checksum line, `2 session(s) checked, 1 failed`; `verify --json` gave failures [{block: 1}, {block: null}], both for the large key only. Before damage the same store verified `2 session(s) checked, 0 failed`, exit 0."
+    },
+    {
+      "n": 5,
+      "truth": "Every command that opens the store refuses a format-1 store with a non-zero exit and the clean-install steps, leaving the database and WAL byte-identical and creating no blocks table; hook still exits 0 and mcp answers with a reason.",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "crates/terminus-core/src/store/open.rs:754-760 (store_archive < ARCHIVE_FORMAT returns ArchiveFormatTooOld) inside read_versions, reached by gate at :157 before the writable Connection::open at :161 and bring_forward at :193, and by open_read_only at :268; message at crates/terminus-core/src/error.rs:64-77 names the data folder, the binary and install.sh; install recognizes it at crates/terminus/src/cmd/install/mod.rs:346 and exits Failure::Silent at :236. Tests passed in the full suite: crates/terminus/tests/cli.rs:291 every_command_refuses_a_format_one_store_and_leaves_it_untouched (19 invocations against a hand-built format-1 store with a hot WAL: each non-zero, doctor exactly 1, output names \"data folder\", \"terminus binary\", \"install.sh\", db and WAL byte-identical, no export destination, no blocks table, archive_format still 1); crates/terminus-core/tests/store_open.rs:332 an_older_archive_format_is_refused_by_both_opens_without_touching_the_store; crates/terminus/tests/install.rs:1484 an_older_archive_format_store_fails_the_install_with_the_steps. hook and mcp are excluded from that test, so they were spot-checked against a scratchpad format-1 store (sessions with a blob column, meta archive_format 1): `terminus hook SessionStart` exit 0, `terminus hook UserPromptSubmit` exit 0, `terminus mcp` answered a recall_search tools/call with isError false, hits [] and the refusal text with the three clean-install steps as `reason` (wiring: cmd/mcp/tools.rs:620 maps the open failure to Refused::archive); sha256 of terminus.db unchanged afterwards and the tables were still only sessions and meta."
+    },
+    {
+      "n": 6,
+      "truth": "On a format-2 store reindex gives the same query results, export writes each full-mode session byte-identical to its transcript with archive_format 2 in the manifest, usage archive bytes equal the sum of block row lengths, and cargo test --workspace --all-features passes including the crash harness at 20+ kill points.",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "One full run of `cargo test --workspace --all-features --no-fail-fast` at HEAD 58502b5 (HOME pointed at the scratchpad): 64 test binaries, 837 passed, 0 failed, 0 ignored, exit 0; git status identical before and after. Named results in that run: crates/terminus/tests/cli.rs:447 reindex_rebuilds_the_derived_tables_to_byte_identical_query_output ok; crates/terminus/tests/lifecycle.rs:579 an_export_is_the_archived_streams_byte_for_byte_with_a_manifest_over_them ok (compares each full-mode export to its transcript up to the watermark, :615-634, and asserts manifest archive_format == ARCHIVE_FORMAT == 2, :653-654); lifecycle.rs:374 both_archive_tables_and_the_footprint_each_reconcile_to_their_own_total ok (archive_bytes against testkit::stored_total, a SUM(length(bytes)) over blocks, testkit.rs:556); crash.rs killing_ingest_anywhere_leaves_a_store_that_converges and killing_a_tree_pass_converges_on_a_first_pass_and_on_an_append ok, plus both negative harness tests. Rerun by name with --nocapture: `single file: 23 kills, 19 of them interrupted the pass`; check_invariants (crash.rs:390-519) rejects any watermark past the bytes the committed blocks decode to. Spot-check on a scratchpad store: `terminus usage --json` archive_bytes 1843 = `SELECT sum(length(bytes)) FROM blocks` 1843; `terminus export` wrote both sessions cmp-identical to their transcripts and manifest archive_format 2. Usage code path: crates/terminus-core/src/store/archive.rs:221-229."
+    },
+    {
+      "n": 7,
+      "truth": "DESIGN-BRIEF.md, docs/json-shapes.md and the CHANGELOG.md Unreleased section describe block rows, the per-session block size, verify's block field and the refusal of an older archive format, and neither of the first two contains the exact phrases \"block-framed blob\" or \"rebuilds derived tables only\".",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "`grep -nE 'block-framed blob|rebuilds derived tables only' DESIGN-BRIEF.md docs/json-shapes.md` prints nothing (exit 1). DESIGN-BRIEF.md:57-58 (sessions and blocks rows), :73 (blocks of the size session_meta records, 64 KB today), :95 and :499 (older and newer archive formats refused with the clean-install steps), :98-99 (hash per block, checksum over hashes, what an append checks), :131-132 (ingest steps), :457-458 (reindex from block rows; verify names session and block), :465. docs/json-shapes.md:37 and :45 (exit 1 names a refused archive format), :168 and :175 (`block` field and `<session_key>: block N:` line), :414-415 (archive_bytes is the sum of block byte lengths). CHANGELOG.md Unreleased: verify's block and --json `block` field, block rows with hashes and checksum, per-session block_size at 64 KB, append and read cost, usage bytes, archive format 2 refused with the clean install and no conversion. Outside AC6's exact bar but still stale: DESIGN-BRIEF.md:432 says \"Store format bumps rebuild derived tables only\", which is now false for the archive format; :60, :65, :70, :72 (### Blob format heading), :93 and :341 and json-shapes.md:96, :120, :291-292 still say blob; the CLI usage text (crates/terminus/src/main.rs) still says verify checks \"every blob against its checksum\" and reindex rebuilds \"from the blobs\". All are listed in SUMMARY.md Open items, and PLAN-4 Notes put the usage text out of scope."
+    },
+    {
+      "n": 8,
+      "truth": "On the owner's machine, with the old data folder and binary moved aside, a clean install ingests every session whose transcript is still on disk, and terminus verify then reports no failure.",
+      "status": "UNCERTAIN",
+      "uat_item": 8,
+      "evidence": "Not machine-checked, by instruction: it needs the owner's real store under ~/.local/share/terminus and ~/terminus-format1, which this pass did not open. SUMMARY.md:22 and its Goal check claim 1953 sessions archived with 0 failed, `terminus verify` printing \"1953 session(s) checked, 0 failed\" and meta.archive_format 2, and record a deviation: the 2026-10-05 format-1 binary was not saved (SUMMARY.md:51)."
+    },
+    {
+      "n": 9,
+      "truth": "Each block's hash is BLAKE3 over its uncompressed bytes and the session checksum stored in session_meta.checksum is BLAKE3 over the block hashes in block_no order.",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "crates/terminus-core/src/blob/block.rs:63-69 (checksum over hashes), :77-93 (hash = blake3(chunk) over the uncompressed chunk); verify recomputes it the same way at verify.rs:223-239. Tests passed in the full suite: crates/terminus-core/tests/blob.rs:216 the_session_checksum_is_blake3_over_the_block_hashes; crates/terminus-core/tests/ingest.rs:435 the_stored_checksum_is_blake3_over_the_uncompressed_stream (stored checksum equals blake3 over blake3 of each 65,536-byte chunk of the transcript, computed in the test)."
+    },
+    {
+      "n": 10,
+      "truth": "The whole-session blob format is gone and there is no conversion path: no sessions.blob read or write, no BlobHeader, BlobReader, VBLB or finish_parts, and nothing rebuilds an older archive format.",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "`grep -rnE 'blob FROM|SET blob|\\bs\\.blob|length\\(s\\.blob\\)|BlobHeader|BlobReader|VBLB|finish_parts' crates/*/src crates/*/tests` prints nothing; crates/terminus-core/src/blob/ holds only mod.rs (49 lines) and block.rs; the only ArchiveFormatTooOld producer is the refusal at store/open.rs:755, and RebuildRequired arises only from a derived_schema mismatch (open.rs:763-775), covered by the passing test the_version_integers_move_with_the_rebuild. No TODO, FIXME, XXX, HACK, placeholder, todo!() or unimplemented!() was added under crates/ by the phase's commits (git diff b6c0036..HEAD)."
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "Cold start on an empty data folder",
+      "evidence": "Spot-check with target/debug/terminus at HEAD on an empty scratchpad TERMINUS_DATA_DIR: ingest exit 0; meta.archive_format 2; 206282 bytes at block_size 65536 stored as 4 blocks rows with 32-byte hashes; sessions has only session_key and session_no; `terminus search` from the session's cwd returned its turn with an excerpt. Schema at crates/terminus-core/src/store/schema.rs:66-91,103; ARCHIVE_FORMAT = 2 at store/open.rs:22."
+    },
+    {
+      "k": 2,
+      "name": "Append rewrites at most the tail block",
+      "evidence": "crates/terminus-core/tests/compaction.rs:409 an_append_rewrites_at_most_the_tail_row_and_reads_no_other passed (rows before the old last byte-identical, old last changed only if mid-block, new rows numbered on, Pass.block_rows_read <= 1). Code: blob/block.rs:119-203 cuts only from the tail; store/archive.rs:297-316 fetches only hashes plus at most the tail row, :275-294 every row only for a diverged session; every walk reaches Existing::read (ingest/mod.rs:164, ingest/backfill.rs:402)."
+    },
+    {
+      "k": 3,
+      "name": "Readers fetch only the blocks a turn covers",
+      "evidence": "Eight AC2 tests passed, each asserting block_rows == blocks_decompressed == testkit::covered_blocks on a >=3-block session: recall.rs:1266, :1285 (excerpt), :1366, :1383 (context), :2161, :2177 (get); inject_brief.rs:258, :289 (brief, through the same render the hook uses). All four readers call store/archive.rs:39-139 `ranges`, which selects only rows inside the covering spans."
+    },
+    {
+      "k": 4,
+      "name": "verify names the failing block",
+      "evidence": "Passed: tests/verify.rs:440 (changed byte, block 1), :462 (deleted middle row, block 1), :495 (altered checksum, block None, no 'block' in text), each naming no other of 4 sessions; cli.rs:726 verify_names_the_damaged_block_in_text_and_json (text `<key>: block 1: `, --json block 1, checksum block null). Spot-check of the deleted-row case at the CLI: text `<key>: block 1: row is missing`, --json block 1 plus a block-null checksum failure, only the damaged session named, exit 1."
+    },
+    {
+      "k": 5,
+      "name": "Every command refuses a format-1 store",
+      "evidence": "cli.rs:291 every_command_refuses_a_format_one_store_and_leaves_it_untouched passed: 19 invocations non-zero, clean-install steps named, terminus.db and WAL byte-identical, no blocks table, archive_format still 1. Gate at store/open.rs:754-760, run before the writable connection (:157 vs :161). Spot-check on a scratchpad format-1 store: hook SessionStart and UserPromptSubmit exit 0; mcp recall_search answered isError false with the refusal and its three steps as `reason`; terminus.db sha256 unchanged."
+    },
+    {
+      "k": 6,
+      "name": "reindex, export, usage and the full suite on format 2",
+      "evidence": "Full suite at HEAD: 837 passed, 0 failed across 64 binaries. Passed by name: cli.rs:447 reindex_rebuilds_the_derived_tables_to_byte_identical_query_output; lifecycle.rs:579 export byte-identical to transcripts with manifest archive_format 2; lifecycle.rs:374 usage archive_bytes reconciles to SUM(length(bytes)) over blocks; crash harness `single file: 23 kills, 19 of them interrupted the pass` with check_invariants rejecting any watermark past the committed blocks (crash.rs:390-519). Spot-check: usage archive_bytes 1843 = sum over blocks 1843; export cmp-identical, manifest archive_format 2."
+    },
+    {
+      "k": 7,
+      "name": "Docs describe block rows and the refused older format",
+      "evidence": "The exact phrases \"block-framed blob\" and \"rebuilds derived tables only\" appear in neither DESIGN-BRIEF.md nor docs/json-shapes.md. Block rows, per-session block size, verify's block and the refusal are at DESIGN-BRIEF.md:57-58, 73, 95, 98-99, 457-458, 499; docs/json-shapes.md:37, 45, 168, 175, 414-415; CHANGELOG.md Unreleased (block rows, block_size 64 KB, verify block field, archive format 2 refused with the clean install). Stale wording outside AC6's bar, already in SUMMARY Open items: DESIGN-BRIEF.md:432 \"Store format bumps rebuild derived tables only\" is now false for the archive format, and several \"blob\" mentions remain in both files and in the CLI usage text."
+    }
+  ],
+  "gaps": [],
+  "human_checks": [
+    {
+      "name": "Clean install on the owner's machine",
+      "expected": "On the owner's machine: `terminus verify` exits 0 and prints \"N session(s) checked, 0 failed\"; `sqlite3 -readonly ~/.local/share/terminus/terminus.db \"SELECT value FROM meta WHERE key='archive_format'\"` prints 2; N equals the count of transcripts still on disk on the install day (SUMMARY reports 1953); ~/terminus-format1/data still holds the old format-1 terminus.db. The 2026-10-05 format-1 binary was not saved, which the owner already accepted (SUMMARY deviation).",
+      "why_human": "Out-of-reach resource: it needs the owner's real store and the moved-aside folder (~/.local/share/terminus, ~/terminus-format1), which this verification was told not to touch, and the move it checks is a one-time, irreversible step already taken on that machine. No probe in the repository can reproduce it."
+    }
+  ]
+}
