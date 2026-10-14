@@ -1233,3 +1233,21 @@ both_shells!(
     a_marked_plain_file_is_replaced_by_the_link,
     a_dangling_link_into_the_versions_folder_is_replaced,
 );
+
+/// `install.sh` holds the pinned line once, as the `release_key` literal, so
+/// the swap in [`fixture`] replaces the one key the script trusts.
+#[test]
+fn install_sh_pins_the_release_key_once() {
+    let text = std::fs::read_to_string(script()).unwrap();
+    assert_eq!(
+        text.matches(PINNED_KEY).count(),
+        1,
+        "{}",
+        script().display()
+    );
+    let held: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("release_key="))
+        .collect();
+    assert_eq!(held, [format!("'{PINNED_KEY}'")], "{}", script().display());
+}
