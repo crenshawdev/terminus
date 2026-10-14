@@ -6,9 +6,6 @@
       `#![cfg(feature = "testkit")]` and exits 0: only `crates/terminus`'s
       dev-dependency turns `testkit` on, so a `-p`-scoped CI step is a green run
       over an almost empty test set. The release CI must not run it that way.
-- [ ] (phase 2) `verify`'s divergence message is length-only and now also fires
-      for a content-rewritten transcript, reporting a longer file as shorter.
-      The state never clears on its own.
 - [ ] (phase 3) `index/text.rs` MAX_BODY_BYTES does not bound the projected body: the newline separator is uncharged and `take` is 0 when the budget is below the next leaf's first char, so the short-circuit never fires
 - [ ] (phase 3) `index/entity.rs` path/command/symbol entity values carry no length bound; only `error` does
 - [ ] (phase 3) `index/entity.rs` splitting a command on `;&|<>()` cuts a real path containing one of them, and splitting on `|` multiplies BRE-escape debris (24.7% of unique Bash-derived path entities)
