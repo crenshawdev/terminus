@@ -24,6 +24,12 @@ written, because they record what shipped then.
 - **INST-12**: One command installs Terminus. `install.sh`, given a source URL, downloads the manifest and binary for the machine's system and architecture, checks the SHA-256 in a `verify_download` step before placing anything, stores each version in its own folder behind the stable path `~/.local/bin/terminus` so a running session keeps its binary, and ends by running `terminus install`.
 - **INST-13**: `install.sh` downloads from the GitHub releases on crenshawdev/terminus by default. With no argument it fetches `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>` from `https://github.com/crenshawdev/terminus/releases/latest/download`, and one `https://` argument overrides that source. The whole install is `curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh`.
 
+- **INST-14**: `install.sh` verifies an OpenSSH signature (SSHSIG, Ed25519, namespace `terminus-release`) over each manifest against a pinned public key before reading it. It refuses a missing or bad signature, and a machine without `ssh-keygen`. The key is never fetched, and nothing overrides it.
+
+### Release (REL)
+
+- **REL-01**: A tagged version produces a published GitHub release on crenshawdev/terminus that holds, for Linux and macOS on x86_64 and aarch64, `terminus-<os>-<arch>`, its manifest and the manifest's signature. CI builds, the owner signs on his own machine, and no workflow holds the key.
+
 ### Docs (DOC)
 
 - **DOC-01**: The repository has a `README.md` at its root, written for someone who has never heard of Terminus. It opens on the reader's problem and what Terminus does about it, gives the one-command install and how to install a local build, says Linux and macOS only, lists every command and every `terminus.toml` setting with its key and default, states what Terminus refuses to do (no model calls, no API keys, no network use at all), and names no command, path or key the code does not have.
