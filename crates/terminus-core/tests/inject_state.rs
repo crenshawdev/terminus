@@ -290,7 +290,11 @@ fn the_scratch_the_hook_writes_is_owner_only_and_so_is_what_holds_it() {
 
     assert!(populated().save(&data_dir, Some(SESSION)));
 
-    assert_eq!(mode(&data_dir), 0o700, "the data directory is not owner-only");
+    assert_eq!(
+        mode(&data_dir),
+        0o700,
+        "the data directory is not owner-only"
+    );
     assert_eq!(
         mode(&injection_dir(&data_dir)),
         0o700,

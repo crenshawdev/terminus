@@ -170,7 +170,11 @@ impl Bench {
             .prepare("SELECT transcript_path, byte_offset FROM watermarks ORDER BY 1")
             .unwrap()
             .query_map([], |r| {
-                Ok(format!("{}={}", r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                Ok(format!(
+                    "{}={}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?
+                ))
             })
             .unwrap()
             .map(Result::unwrap)
@@ -363,7 +367,10 @@ fn an_evicted_session_stays_listed_and_searchable_while_a_deleted_one_is_gone() 
     );
 
     bench.ingest();
-    assert!(!bench.archived(&doomed), "the deleted session is still there");
+    assert!(
+        !bench.archived(&doomed),
+        "the deleted session is still there"
+    );
     assert!(
         bench.archived(&evicted),
         "the deletion pass took the evicted session with it"

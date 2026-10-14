@@ -1607,7 +1607,10 @@ fn recall_search_refuses_the_retired_observation_kind_by_name() {
         "recall_search",
         json!({"query": "brillig", "project": "*", "kind": "observation"}),
     );
-    assert!(is_error, "the retired kind was answered as a search: {document}");
+    assert!(
+        is_error,
+        "the retired kind was answered as a search: {document}"
+    );
     assert_eq!(document["hits"], json!([]), "{document}");
     let reason = document["reason"].as_str().expect("a reason");
     assert!(

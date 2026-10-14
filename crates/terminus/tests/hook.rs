@@ -291,7 +291,9 @@ fn the_working_process_leaves_the_group_and_the_parentage_of_the_process_that_sp
         "nonsense parentage in the process table: {worker:?}"
     );
     assert!(
-        !ps().iter().any(|p| p.pid == worker.ppid && p.argv == hook.ingest_argv()),
+        !ps()
+            .iter()
+            .any(|p| p.pid == worker.ppid && p.argv == hook.ingest_argv()),
         "the ingest is still parented to the process that spawned it"
     );
 
@@ -333,8 +335,11 @@ fn an_ambient_environment_marker_cannot_divert_an_ordinary_invocation() {
          invocation was diverted"
     );
 
-    let unknown = output(hook.command(&["hook", "NotAnEvent"]).env(RETIRED_MARKER, "1"))
-        .expect("run terminus hook NotAnEvent");
+    let unknown = output(
+        hook.command(&["hook", "NotAnEvent"])
+            .env(RETIRED_MARKER, "1"),
+    )
+    .expect("run terminus hook NotAnEvent");
     assert_eq!(
         unknown.status.code(),
         Some(2),
@@ -712,7 +717,10 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
     // committed everything would prove nothing at all.
     let ingest = await_process(&hook.ingest_argv());
     let mid_pass = committed(&hook);
-    assert!(mid_pass < TREE, "the pass finished before the kill: {mid_pass}");
+    assert!(
+        mid_pass < TREE,
+        "the pass finished before the kill: {mid_pass}"
+    );
 
     let mut doomed = descendants(hook_pid, &ps());
     // The group, by its leader's negated pid - `process.kill(-pid)`.

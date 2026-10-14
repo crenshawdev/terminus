@@ -339,7 +339,10 @@ fn a_finalized_session_is_listed_with_every_obs_01_fact() {
         "raw",
         "tokens",
     ] {
-        assert!(row.get(column).is_none(), "{column} is still in the row: {row}");
+        assert!(
+            row.get(column).is_none(),
+            "{column} is still in the row: {row}"
+        );
     }
 
     let facts = &row["mechanical"];
