@@ -88,9 +88,9 @@ The archive is the product, so it is built first and everything else is built on
 5. No argument, setting or environment variable changes the pinned key.
 
 ### Phase 7: Blocks as rows
-**Goal:** Each session's archive is stored as numbered blocks, one row per block (`session_no`, `block_no`, bytes, hash), in place of one whole-session blob, with the session checksum a hash over the block hashes. Today `blob::append` reads and re-hashes the whole session stream (`blob/writer.rs:99`) and the upsert writes the whole blob back (`ingest/mod.rs:466`), so every append costs I/O in the session's full size, and one excerpt decompresses a whole session (`inject/prompt.rs:45`). With blocks, an append touches only the tail block, a read fetches only its blocks, and corruption is pinned to one block. No release ships until this phase is done. There is no conversion tool: an existing store is not converted, and the owner's store is rebuilt by a clean install. One can come later if it is needed.
+**Goal:** Each session's archive is stored as numbered blocks, one row per block (`session_no`, `block_no`, bytes, hash), in place of one whole-session blob, with the session checksum a hash over the block hashes. Today `blob::append` reads and re-hashes the whole session stream (`blob/writer.rs:99`) and the upsert writes the whole blob back (`ingest/mod.rs:466`), so every append costs I/O in the session's full size, and one excerpt loads the whole compressed session from the database, though it decompresses only the blocks its turn overlaps (`recall/excerpt.rs:98-118`). With blocks, an append touches only the tail block, a read fetches only its blocks, and corruption is pinned to one block. No release ships until this phase is done. There is no conversion tool: an existing store is not converted, and the owner's store is rebuilt by a clean install. One can come later if it is needed.
 **Depends on:** Phase 6
-**Requirements:** none yet; `/cad-context 7` writes them
+**Requirements:** STOR-08, STOR-09, STOR-10
 **Success Criteria:**
 1. An append writes the session's new blocks and rewrites at most its last block, whatever the session's size.
 2. An excerpt reads only the blocks that hold its turn.

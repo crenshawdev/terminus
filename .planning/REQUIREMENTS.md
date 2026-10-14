@@ -9,8 +9,8 @@ Scope comes from `DESIGN-BRIEF.md`, where every decision is settled unless marke
 
 Committed scope for v0.0.1. Each maps to exactly one roadmap phase. Several
 replace behaviour that shipped under v0.1.0 rows (INST-01, INST-02, INST-03,
-INST-04's offer, INST-05, INST-08); those rows stay under `## Shipped` as
-written, because they record what shipped then.
+INST-04's offer, INST-05, INST-08, STOR-01, STOR-03, STOR-05); those rows stay
+under `## Shipped` as written, because they record what shipped then.
 
 ### Privacy (PRIV)
 
@@ -25,6 +25,12 @@ written, because they record what shipped then.
 - **INST-13**: `install.sh` downloads from the GitHub releases on crenshawdev/terminus by default. With no argument it fetches `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>` from `https://github.com/crenshawdev/terminus/releases/latest/download`, and one `https://` argument overrides that source. The whole install is `curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh`.
 
 - **INST-14**: `install.sh` verifies an OpenSSH signature (SSHSIG, Ed25519, namespace `terminus-release`) over each manifest against a pinned public key before reading it. It refuses a missing or bad signature, and a machine without `ssh-keygen`. The key is never fetched, and nothing overrides it.
+
+### Storage (STOR)
+
+- **STOR-08**: A session's archive is stored as numbered block rows, one per block of the uncompressed stream, each holding its compressed bytes and a BLAKE3 hash of its uncompressed bytes. The block size is recorded per session, and the session checksum is a hash over the block hashes in order. An append writes the new blocks and rewrites at most the last one, and reading one turn fetches and decompresses only the blocks it covers.
+- **STOR-09**: `terminus verify` checks each non-evicted session's block numbering, each block's hash and the session checksum, and names the session key and block number of every failure.
+- **STOR-10**: The binary refuses a store whose archive format is older or newer than it knows, before it opens the store for writing, and the refusal names the clean-install steps. When only the derived schema is older, it rebuilds derived tables and never the archive table.
 
 ### Release (REL)
 
