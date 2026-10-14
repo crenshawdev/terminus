@@ -148,6 +148,7 @@
 - [ ] (phase 8) Several test files are `#![cfg(feature = "testkit")]`, so `cargo test --test <name>` without `--features testkit` compiles an empty binary and reports green. Some plans' `Verify:` commands are written in that vacuous form.
 - [ ] (phase 8) `verbatim data move` skips the `LOCK` file in the copy and creates an empty one at the destination: the file's contents carry no meaning, only the OS lock attached to it, and copying a locked file is a read Windows refuses.
 - [ ] Verbatim's MCP server does not speak MCP 2 (protocol 2026-07-28). Probed 2026-10-05 against verbatim 0.1.1 on Claude Code 2.1.289: `server/discover` answers -32601 method not found, so the server stays connected only because Claude Code falls back to the old `initialize` handshake. `initialize` also agrees to `2026-07-28` when asked (`crates/verbatim/src/cmd/mcp/mod.rs:64`) while `tools/list` carries no `ttlMs` or `cacheScope`, the shape Claude Code rejected in Baley's 2026-10-02 probe (fixed there in baley #175). Fix: answer `server/discover`, add the two fields at 2026-07-28, and stop offering 2026-07-28 from `initialize` until both land. Tool descriptions (73-126 chars) and the absent server instructions are under the 2,048-char cap. Scheduled with the Baley-conformance work once Baley ships, not before.
+- [ ] (phase 8) Change the license to MIT before release.
 
 
 ## Seeds
