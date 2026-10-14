@@ -607,6 +607,42 @@ pub fn damage(conn: &rusqlite::Connection, session_key: &str) {
     assert!(changed > 0, "{session_key} has no block to damage");
 }
 
+/// How many block rows one session has.
+pub fn block_count(conn: &rusqlite::Connection, session_key: &str) -> usize {
+    block_rows(conn, session_key).len()
+}
+
+/// Flip one byte in the middle of one block row's compressed bytes, leaving
+/// its hash and every other row alone.
+pub fn flip_block_byte(conn: &rusqlite::Connection, session_key: &str, block_no: i64) {
+    let session_no = session_no(conn, session_key);
+    let mut bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT bytes FROM blocks WHERE session_no = ?1 AND block_no = ?2",
+            rusqlite::params![session_no, block_no],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|e| panic!("block {block_no} of {session_key}: {e}"));
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0xff;
+    conn.execute(
+        "UPDATE blocks SET bytes = ?3 WHERE session_no = ?1 AND block_no = ?2",
+        rusqlite::params![session_no, block_no, bytes],
+    )
+    .unwrap_or_else(|e| panic!("flip a byte in block {block_no} of {session_key}: {e}"));
+}
+
+/// Delete one block row of one session.
+pub fn delete_block(conn: &rusqlite::Connection, session_key: &str, block_no: i64) {
+    let changed = conn
+        .execute(
+            "DELETE FROM blocks WHERE session_no = ?1 AND block_no = ?2",
+            rusqlite::params![session_no(conn, session_key), block_no],
+        )
+        .unwrap_or_else(|e| panic!("delete block {block_no} of {session_key}: {e}"));
+    assert_eq!(changed, 1, "{session_key} has no block {block_no}");
+}
+
 /// Replace one session's stream with `stream`, validly encoded at the session's
 /// block size, and leave its metadata alone.
 pub fn rewrite_stream(conn: &rusqlite::Connection, session_key: &str, stream: &[u8]) {

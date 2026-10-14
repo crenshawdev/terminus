@@ -159,6 +159,33 @@ fn decode_rows(reader: &BlockReader, rows: &[(i64, Vec<u8>)]) -> Result<Vec<u8>>
     })
 }
 
+/// One block row as stored, unchecked.
+#[derive(Debug)]
+pub struct Row {
+    pub block_no: i64,
+    pub bytes: Vec<u8>,
+    pub hash: Vec<u8>,
+}
+
+/// Every block row of one session as stored, in `block_no` order, with nothing
+/// checked. `verify` reads through this, because checking the rows is its job.
+pub fn rows(conn: &Connection, session_key: &str) -> Result<Vec<Row>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT b.block_no, b.bytes, b.hash
+           FROM blocks b JOIN sessions s USING (session_no)
+          WHERE s.session_key = ?1
+          ORDER BY b.block_no",
+    )?;
+    let rows = statement.query_map([session_key], |r| {
+        Ok(Row {
+            block_no: r.get(0)?,
+            bytes: r.get(1)?,
+            hash: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 /// Every session's stored archive bytes, by `session_key`: the sum of its
 /// block rows' lengths (D-17).
 pub fn stored_bytes(conn: &Connection) -> Result<BTreeMap<String, i64>> {

@@ -35,12 +35,28 @@ struct Bench {
 }
 
 fn bench() -> Bench {
+    bench_of(&FIXTURES)
+}
+
+/// The fixture the three AC3 kinds of damage go on: its first record alone
+/// runs past three blocks, so it has a middle block to damage.
+const BIG: &str = "session-large-record.jsonl";
+
+/// [`FIXTURES`] and [`BIG`], with `BIG`'s key last.
+fn big_bench() -> Bench {
+    let bench = bench_of(&[FIXTURES[0], FIXTURES[1], FIXTURES[2], BIG]);
+    let rows = testkit::block_count(&bench.conn(), &bench.keys[3]);
+    assert!(rows >= 3, "{BIG} must be at least three blocks: {rows}");
+    bench
+}
+
+fn bench_of(fixtures: &[&str]) -> Bench {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
 
-    let keys = FIXTURES
+    let keys = fixtures
         .iter()
         .map(|fixture| {
             let path = testkit::copy_fixture_into(fixture, &work);
@@ -85,7 +101,8 @@ impl Bench {
         assert_eq!(changed, 1, "no session_meta row for {key}");
     }
 
-    /// Empty a session's blob and mark it, exactly as `retention::apply` does.
+    /// Delete a session's block rows and mark it, exactly as `retention::apply`
+    /// does.
     ///
     /// A direct UPDATE for the reason `flag_divergence` is one: what retention
     /// does to reach this state is asserted in `tests/retention.rs`, and the
@@ -97,9 +114,9 @@ impl Bench {
     /// Replace a session's stream with different bytes, validly compressed.
     ///
     /// The other half of the corruption space: `damage` makes zstd refuse the
-    /// block, which would let a `verify` that never hashed anything
-    /// still pass AC3. This one decompresses perfectly and hashes differently,
-    /// so only the BLAKE3 comparison can catch it (D-06).
+    /// block, which would let a `verify` that never hashed anything still pass
+    /// AC3. This one writes fresh rows whose bytes match their own hashes, so
+    /// only the session checksum over those hashes can catch it (D-04).
     fn rewrite_the_stream(&self, key: &str) {
         let conn = self.conn();
         let mut stream = testkit::stream(&conn, key).unwrap();
@@ -173,7 +190,7 @@ fn a_sidecar_and_its_parent_are_told_apart() {
     assert!(!report.render().contains(&parent), "{}", report.render());
 }
 
-/// A blob that will not decompress is a failure for its own session and must
+/// A block that will not decompress is a failure for its own session and must
 /// not abort the walk, so the second corrupt session is still reported.
 #[test]
 fn two_corrupt_sessions_are_both_reported() {
@@ -200,19 +217,20 @@ fn two_corrupt_sessions_are_both_reported() {
     }
 }
 
-/// D-06 from the other side: only the BLAKE3 comparison catches a stream that
-/// decompresses cleanly to the wrong bytes.
+/// D-06 from the other side: only the session checksum catches rows that
+/// decompress cleanly to the wrong bytes and carry hashes of those bytes.
 #[test]
-fn a_valid_blob_holding_the_wrong_bytes_is_still_a_failure() {
+fn valid_rows_holding_the_wrong_bytes_are_still_a_failure() {
     let bench = bench();
     let corrupt = bench.keys[2].clone();
     bench.rewrite_the_stream(&corrupt);
 
-    // The premise: the replacement blob is perfectly readable.
-    testkit::stream(&bench.conn(), &corrupt).expect("the rewritten blob must decompress cleanly");
+    // The premise: the replacement rows are perfectly readable.
+    testkit::stream(&bench.conn(), &corrupt).expect("the rewritten rows must decompress cleanly");
 
     let report = verify::verify(&bench.store()).unwrap();
     assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].block, None, "{:?}", report.failures[0]);
     assert!(
         report.failures[0].detail.contains("checksum mismatch"),
         "{:?}",
@@ -231,7 +249,7 @@ fn the_report_never_mentions_integrity_check() {
     assert!(!report.render().contains("integrity_check"));
 }
 
-/// The archive is two tables written in one transaction, so a blob with no
+/// The archive's tables are written in one transaction, so a session with no
 /// metadata row is not a state ingest can produce - and it is not a state
 /// `verify` may pass over either.
 #[test]
@@ -287,21 +305,21 @@ fn the_divergence_says_the_archive_was_not_touched() {
     let text = report_text(&bench);
     assert!(text.contains("shorter"), "{text}");
     assert!(text.contains("archive was left untouched"), "{text}");
-    // Not a checksum complaint. The blob verified.
+    // Not a checksum complaint. The rows verified.
     assert!(!text.contains("checksum"), "{text}");
 }
 
 /// Two independent facts about one session, and the graver one is not hidden by
-/// the lesser. A diverged transcript says nothing about whether the blob is
+/// the lesser. A diverged transcript says nothing about whether the rows are
 /// intact, so a store where both are wrong must report both.
 #[test]
-fn a_diverged_session_with_a_damaged_blob_reports_both() {
+fn a_diverged_session_with_damaged_rows_reports_both() {
     let bench = bench();
     let broken = bench.keys[0].clone();
     bench.flag_divergence(&broken);
-    // `rewrite_the_stream` and not `damage`: the blob verdict wanted here is
-    // the checksum mismatch, and only a stream that decompresses reaches the
-    // hash.
+    // `rewrite_the_stream` and not `damage`: the verdict wanted here is the
+    // checksum mismatch, which `damage` leaves alone because it keeps every
+    // stored hash.
     bench.rewrite_the_stream(&broken);
 
     let report = verify::verify(&bench.store()).unwrap();
@@ -339,14 +357,13 @@ fn clearing_the_flag_makes_the_store_clean_again() {
     assert_eq!(report.render(), "");
 }
 
-/// D-03. An evicted session's blob was emptied on purpose, so `verify` counts
-/// it and says nothing about it - while a genuinely corrupt blob beside it is
-/// still named, and only it.
+/// D-03. An evicted session's block rows were deleted on purpose, so `verify`
+/// counts it and says nothing about it - while a genuinely corrupt session
+/// beside it is still named, and only it.
 ///
-/// Without the arm this is the failure mode: `blob::read_all` finds no header
-/// in zero bytes, every evicted session reports "blob does not decompress", and
-/// a store whose retention policy is doing exactly what it was told reads as
-/// wholesale corruption.
+/// Without the arm this is the failure mode: every block of every evicted
+/// session reports "row is missing", and a store whose retention policy is
+/// doing exactly what it was told reads as wholesale corruption.
 #[test]
 fn an_evicted_session_is_counted_and_never_named_while_a_corrupt_one_still_is() {
     let bench = bench();
@@ -355,7 +372,7 @@ fn an_evicted_session_is_counted_and_never_named_while_a_corrupt_one_still_is() 
     bench.evict(&evicted);
     bench.rewrite_the_stream(&corrupt);
 
-    // The premise: the emptied blob really is unreadable, so the arm is what
+    // The premise: the evicted rows really are gone, so the arm is what
     // keeps it out of the report rather than the bytes happening to survive.
     assert_eq!(testkit::stored_len(&bench.conn(), &evicted), 0);
     assert!(testkit::stream(&bench.conn(), &evicted).is_err());
@@ -396,7 +413,7 @@ fn a_store_of_evicted_sessions_verifies_clean() {
 
 /// The divergence check stays independent of the eviction arm, exactly as it is
 /// independent of the checksum verdict. "The file on disk is shorter than what
-/// was archived" is a statement about the FILE, and emptying the blob answers
+/// was archived" is a statement about the FILE, and deleting the rows answers
 /// nothing about the file.
 #[test]
 fn an_evicted_session_can_still_report_a_divergence() {
@@ -410,9 +427,97 @@ fn an_evicted_session_can_still_report_a_divergence() {
     assert_eq!(report.failures[0].session_key, both);
     let text = report.render();
     assert!(text.contains("archive was left untouched"), "{text}");
-    // And not a word about the blob, which is the arm doing its job underneath.
+    // And not a word about the rows, which is the arm doing its job underneath.
+    assert!(!text.contains("missing"), "{text}");
     assert!(!text.contains("does not decompress"), "{text}");
     assert!(!text.contains("checksum"), "{text}");
+}
+
+/// AC3, a changed byte: one middle block's compressed bytes are altered and
+/// its hash is not, so that block fails its own check and the session checksum
+/// over the untouched hashes still holds.
+#[test]
+fn a_changed_byte_in_a_middle_block_names_that_block_and_no_other_session() {
+    let bench = big_bench();
+    let key = bench.keys[3].clone();
+    testkit::flip_block_byte(&bench.conn(), &key, 1);
+
+    let report = verify::verify(&bench.store()).unwrap();
+    assert_eq!(report.checked, 4);
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(report.failures[0].session_key, key);
+    assert_eq!(report.failures[0].block, Some(1));
+
+    let text = report.render();
+    assert!(text.starts_with(&format!("{key}: block 1: ")), "{text}");
+    assert_eq!(text.lines().count(), 1, "{text}");
+    for other in others(&bench.keys, &[&key]) {
+        assert!(!text.contains(other.as_str()), "named {other}: {text}");
+    }
+}
+
+/// AC3, a deleted row: the gap is named by its block number. The checksum over
+/// the hashes left also fails, as a session-level line beside it.
+#[test]
+fn a_deleted_middle_row_names_that_block_and_no_other_session() {
+    let bench = big_bench();
+    let key = bench.keys[3].clone();
+    testkit::delete_block(&bench.conn(), &key, 1);
+
+    let report = verify::verify(&bench.store()).unwrap();
+    assert!(
+        report.failures.iter().all(|f| f.session_key == key),
+        "{:?}",
+        report.failures
+    );
+    let pinned: Vec<_> = report
+        .failures
+        .iter()
+        .filter(|f| f.block.is_some())
+        .collect();
+    assert_eq!(pinned.len(), 1, "{:?}", report.failures);
+    assert_eq!(pinned[0].block, Some(1));
+    assert!(pinned[0].detail.contains("missing"), "{:?}", pinned[0]);
+
+    let text = report.render();
+    assert!(
+        text.contains(&format!("{key}: block 1: row is missing\n")),
+        "{text}"
+    );
+    for other in others(&bench.keys, &[&key]) {
+        assert!(!text.contains(other.as_str()), "named {other}: {text}");
+    }
+}
+
+/// AC3, an altered checksum: every block still matches its own hash, so no one
+/// block is wrong and the failure names none (D-16).
+#[test]
+fn an_altered_checksum_names_the_session_and_no_block() {
+    let bench = big_bench();
+    let key = bench.keys[3].clone();
+    let changed = bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET checksum = zeroblob(32) WHERE session_key = ?1",
+            [&key],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+
+    let report = verify::verify(&bench.store()).unwrap();
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    assert_eq!(report.failures[0].session_key, key);
+    assert_eq!(report.failures[0].block, None);
+
+    let text = report.render();
+    assert!(
+        text.starts_with(&format!("{key}: checksum mismatch: ")),
+        "{text}"
+    );
+    assert!(!text.contains("block"), "{text}");
+    for other in others(&bench.keys, &[&key]) {
+        assert!(!text.contains(other.as_str()), "named {other}: {text}");
+    }
 }
 
 fn report_text(bench: &Bench) -> String {

@@ -127,7 +127,7 @@ fn verify_exits_zero_and_says_nothing_on_a_clean_store() {
     assert_eq!(stdout(&out), "", "a clean store names no session");
 }
 
-/// AC3. One byte flipped inside one session's blob: exit non-zero, that session
+/// AC3. One session's rows damaged: exit non-zero, that session
 /// named on stdout, no other session named.
 ///
 /// The two fixtures are D-01's colliding pair - the sidecar reports its
@@ -551,6 +551,47 @@ fn verify_json_names_the_corrupt_session_and_still_exits_one() {
         !document.to_string().contains(&parent),
         "the document named a session that verified: {document}"
     );
+}
+
+/// AC3 at the process boundary: a changed byte in a middle block is pinned to
+/// that block in the text line and in `--json`'s `block` field, and a checksum
+/// that no longer matches names the session with `block` null.
+#[test]
+fn verify_names_the_damaged_block_in_text_and_json() {
+    let bench = bench();
+    let other = bench.ingest("session-basic.jsonl");
+    let big = bench.ingest("session-large-record.jsonl");
+    assert!(testkit::block_count(&bench.conn(), &big) >= 3);
+
+    testkit::flip_block_byte(&bench.conn(), &big, 1);
+    let out = bench.run(&["verify"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with(&format!("{big}: block 1: ")), "{text}");
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(!text.contains(&other), "{text}");
+
+    let flipped = document(&bench.run(&["verify", "--json"]));
+    let failures = flipped["data"]["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1, "{flipped}");
+    assert_eq!(failures[0]["session_key"], big);
+    assert_eq!(failures[0]["block"], 1, "{flipped}");
+
+    // Undo the flip, then break only the checksum.
+    testkit::flip_block_byte(&bench.conn(), &big, 1);
+    bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET checksum = zeroblob(32) WHERE session_key = ?1",
+            [&big],
+        )
+        .unwrap();
+    let checksum = document(&bench.run(&["verify", "--json"]));
+    let failures = checksum["data"]["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1, "{checksum}");
+    assert_eq!(failures[0]["session_key"], big);
+    assert_eq!(failures[0]["block"], serde_json::Value::Null, "{checksum}");
+    assert!(!checksum.to_string().contains(&other), "{checksum}");
 }
 
 /// `reindex --json` on a store whose lock another process holds: the refusal is
