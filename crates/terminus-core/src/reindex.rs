@@ -8,8 +8,9 @@
 //! anything.
 //!
 //! `sessions` and `session_meta` are never touched. The archive table never
-//! migrates (`DESIGN-BRIEF.md:94`), and STOR-05's older-format path rebuilds
-//! derived tables *only*.
+//! migrates (`DESIGN-BRIEF.md:94`): a derived-schema change rebuilds derived
+//! tables *only*, and a store in an older archive format is refused at open
+//! (STOR-10) and never reaches a rebuild.
 //!
 //! Turn ids come out identical because they are derived from `sessions.
 //! session_no` and `turn_seq` (D-10), and `sessions` is never dropped. Without
@@ -243,9 +244,12 @@ fn clear_derived(tx: &rusqlite::Connection, session_key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Open a store, rebuilding its derived tables first if it predates this build.
+/// Open a store, rebuilding its derived tables first if its derived schema
+/// differs from this build's.
 ///
-/// STOR-05's older-format branch. It lives here and not in [`Store::open`] on
+/// An older archive format never gets here: [`Store::open`] refuses it
+/// (STOR-10), because there is no conversion and a rebuild would fail every
+/// session. The rebuild lives here and not in [`Store::open`] on
 /// purpose: opening a store is a read, and a read that silently rewrites four
 /// tables is not one. `Store::open` reports the outcome
 /// ([`Store::rebuild_required`]) and this is the caller that acts on it, so

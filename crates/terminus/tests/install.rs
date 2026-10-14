@@ -1475,3 +1475,53 @@ fn wait_for_sessions(fixture: &Fixture, expected: i64) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
+
+/// STOR-10 and D-07: on a store in an older archive format, install still
+/// places the binary and writes both settings files, then prints the refusal
+/// with its clean-install steps instead of promising that the next hook will
+/// archive, and exits non-zero so `install.sh` fails with it.
+#[test]
+fn an_older_archive_format_store_fails_the_install_with_the_steps() {
+    use terminus_core::store::{ARCHIVE_FORMAT, DB_FILE_NAME, META_ARCHIVE_FORMAT};
+
+    let fixture = fixture();
+    fixture.seed();
+    let data_dir = fixture.root.join("data");
+    drop(terminus_core::Store::open(&data_dir).unwrap());
+    {
+        let conn = rusqlite::Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = ?2",
+            rusqlite::params![(ARCHIVE_FORMAT - 1).to_string(), META_ARCHIVE_FORMAT],
+        )
+        .unwrap();
+    }
+    let before = std::fs::read(data_dir.join(DB_FILE_NAME)).unwrap();
+
+    let output = fixture.run(&["install"]);
+    let said = text(&output);
+    assert!(!output.status.success(), "install exited 0: {said}");
+    assert!(said.contains("cannot convert an older store"), "{said}");
+    assert!(said.contains("install.sh"), "{said}");
+    assert!(
+        !said.contains("the next hook archives the same tree"),
+        "{said}"
+    );
+
+    assert_eq!(
+        std::fs::read_link(fixture.stable()).unwrap(),
+        fixture.version_file()
+    );
+    assert_eq!(
+        our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
+        4,
+        "{said}"
+    );
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_current(&added_entry(&calls[0]), &fixture.stable());
+    assert!(
+        std::fs::read(data_dir.join(DB_FILE_NAME)).unwrap() == before,
+        "install changed the refused store"
+    );
+}

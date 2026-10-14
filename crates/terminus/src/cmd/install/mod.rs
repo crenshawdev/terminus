@@ -228,8 +228,12 @@ pub fn run() -> Result<(), Failure> {
     );
 
     // Step 6, and the last thing install does.
-    start_backfill(&stable, &data_dir, &config);
+    let refused = start_backfill(&stable, &data_dir, &config);
     match registered {
+        // Silent for the same reason as the arm below: the refusal is printed
+        // with its steps. `install.sh` runs this last and returns its status,
+        // so a store no hook can archive into fails the script.
+        Ok(_) if refused => Err(Failure::Silent),
         Ok(_) => Ok(()),
         // Silent: the summary above already says what is missing and the
         // command that finishes it. An incomplete install never exits 0,
@@ -319,21 +323,32 @@ fn register(path: &Path, stable: &Path) -> Result<Registered, Incomplete> {
 /// The design brief's step 6, and deliberately the last thing install does: it
 /// gates nothing above it, and it returns nothing. Both halves of that matter.
 ///
-/// **It cannot fail an install.** By the time this runs the binary is placed and
-/// both settings files are written, so the install has succeeded whatever
-/// happens here - and the next hook that fires would archive the same tree
-/// anyway, which is why a backfill that will not start is one reported line
-/// rather than a non-zero exit. Returning `()` is how that is enforced rather
-/// than remembered: there is no error for a caller to propagate by accident.
+/// **A backfill problem never fails an install, with one exception.** By the
+/// time this runs the binary is placed and both settings files are written, and
+/// the next hook that fires would archive the same tree anyway, so a backfill
+/// that will not start is one reported line rather than a non-zero exit. The
+/// exception is a store in an archive format this build refuses (STOR-10): no
+/// hook will archive anything into it, so the refusal is printed with its
+/// clean-install steps and this returns `true`, which `run` turns into a
+/// non-zero exit. Returning a plain flag rather than an error keeps every other
+/// problem from being propagated by accident.
 ///
 /// **It does not wait.** The work runs detached, so install returns while a
 /// gigabyte is still being read. There is no log file by design, so the summary
 /// has to say where to watch it - `terminus status` reads the `runs` row the
 /// pass writes.
-fn start_backfill(stable: &Path, data_dir: &Path, config: &Config) {
+fn start_backfill(stable: &Path, data_dir: &Path, config: &Config) -> bool {
     use crate::cmd::backfill;
 
     println!();
+    // Asked of the core directly, where the error is still typed: a `Failure`
+    // carries only text. A store that is not there yet is not refused.
+    if let Err(refused @ terminus_core::Error::ArchiveFormatTooOld { .. }) =
+        terminus_core::Store::open_read_only(data_dir)
+    {
+        println!("  problem: {refused}");
+        return true;
+    }
     let estimate = match backfill::estimate(data_dir, config) {
         Ok(estimate) => estimate,
         Err(why) => {
@@ -342,7 +357,7 @@ fn start_backfill(stable: &Path, data_dir: &Path, config: &Config) {
                 reason(why)
             );
             println!("  nothing else is affected; the next hook archives the same tree.");
-            return;
+            return false;
         }
     };
     backfill::print_estimate(&estimate);
@@ -366,6 +381,7 @@ fn start_backfill(stable: &Path, data_dir: &Path, config: &Config) {
             println!("  problem: {}", reason(why));
         }
     }
+    false
 }
 
 /// A [`Failure`]'s text, for a line that reports rather than returns.

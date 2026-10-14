@@ -57,6 +57,25 @@ pub enum Error {
         binary_format: i64,
     },
 
+    /// The other side of [`Error::ArchiveFormatTooNew`]: the store was written
+    /// in an archive format this build no longer reads, and there is no
+    /// conversion (STOR-10). Refused before any writable connection opens, so
+    /// the store is left exactly as it was.
+    #[error(
+        "store at {path} has archive format {store_format}, but this build of \
+         terminus reads archive format {binary_format} and cannot convert an older store. \
+         Nothing in the store was changed. To start a new store with a clean install:\n  \
+         1. move the data folder {data_dir} aside\n  \
+         2. move the current terminus binary aside\n  \
+         3. rerun install.sh",
+        data_dir = .path.parent().unwrap_or(.path).display()
+    )]
+    ArchiveFormatTooOld {
+        path: PathBuf,
+        store_format: i64,
+        binary_format: i64,
+    },
+
     /// A file sits where the store belongs but does not carry the version
     /// integers every terminus store carries.
     #[error("{path} exists but is not a terminus store ({detail})")]

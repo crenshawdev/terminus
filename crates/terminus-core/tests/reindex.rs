@@ -304,14 +304,17 @@ fn an_ingest_brings_an_older_store_forward_first() {
 
 /// `meta` moves with the rebuild and inside its transaction: a store stamped up
 /// to date whose rebuild rolled back is the state this must not produce.
+///
+/// Only `derived_schema` is lowered: an older `archive_format` is refused by the
+/// open itself (STOR-10) and never reaches a rebuild.
 #[test]
 fn the_version_integers_move_with_the_rebuild() {
     let bench = bench();
     {
         let conn = bench.conn();
         conn.execute(
-            "UPDATE meta SET value = '0' WHERE key IN (?1, ?2)",
-            rusqlite::params![META_ARCHIVE_FORMAT, META_DERIVED_SCHEMA],
+            "UPDATE meta SET value = '0' WHERE key = ?1",
+            rusqlite::params![META_DERIVED_SCHEMA],
         )
         .unwrap();
     }

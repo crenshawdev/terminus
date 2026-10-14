@@ -122,8 +122,10 @@ const BUSY_TIMEOUT_MS: u64 = 3;
 /// and querying the old-shape index anyway (D-18); a hook has no such channel -
 /// its stderr is not shown and its stdout is a validated protocol - so a
 /// degraded brief would be an assertion about the archive that nothing could
-/// qualify. The next ingest rebuilds the derived tables and the brief comes
-/// back.
+/// qualify. For an older derived schema the next ingest rebuilds the derived
+/// tables and the brief comes back. An older archive format is refused by the
+/// open itself and stays refused: no ingest converts it, and only a clean
+/// install brings the brief back.
 pub(crate) fn open(data_dir: &Path) -> Option<Store> {
     let store = Store::open_read_only(data_dir).ok()?;
     store

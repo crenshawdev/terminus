@@ -10,7 +10,10 @@ use crate::error::{Error, Result};
 /// The archive format this build writes and understands.
 ///
 /// Bumped only when the bytes in `sessions` change meaning. The archive table
-/// never migrates (`DESIGN-BRIEF.md:94`), so a bump rebuilds derived tables.
+/// never migrates (`DESIGN-BRIEF.md:94`) and there is no conversion, so a store
+/// written in an older format is refused ([`Error::ArchiveFormatTooOld`]) rather
+/// than rebuilt: a rebuild would read the old bytes as the new format and fail
+/// every session.
 pub const ARCHIVE_FORMAT: i64 = 1;
 
 /// The derived-table schema this build writes.
@@ -54,11 +57,13 @@ pub const META_DERIVED_SCHEMA: &str = "derived_schema";
 /// so a short overlap with a reader is not an error.
 const BUSY_TIMEOUT_MS: u32 = 5_000;
 
-/// The store is older than this build and its derived tables need rebuilding.
+/// The store's derived schema differs from this build's and its derived tables
+/// need rebuilding.
 ///
 /// Returned as an inspectable outcome rather than acted on here: the rebuild
-/// lives in `reindex`, which does not exist yet (PLAN-2 task 6 wires this to
-/// it). The archive is never part of the rebuild (STOR-05).
+/// lives in `reindex`. The archive is never part of the rebuild, and an archive
+/// format other than this build's never gets this far: newer and older are both
+/// refused by the gate (STOR-10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebuildRequired {
     pub store_archive_format: i64,
@@ -680,7 +685,8 @@ fn inspect(path: &Path) -> Result<StoreState> {
 /// Read the two version integers off an existing store and decide.
 ///
 /// Runs no DDL and no DML. Returns `Ok(None)` when the store matches this
-/// build, `Ok(Some(..))` when it is older, and an error when it is newer.
+/// build, `Ok(Some(..))` when only its derived schema differs, and an error
+/// when its archive format is newer or older.
 fn gate(path: &Path) -> Result<Option<RebuildRequired>> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let mut conn = Connection::open_with_flags(path, flags).map_err(|source| Error::NotAStore {
@@ -735,7 +741,20 @@ fn read_versions(conn: &Connection, path: &Path) -> Result<Option<RebuildRequire
         });
     }
 
-    let outcome = if store_archive < ARCHIVE_FORMAT || store_derived != DERIVED_SCHEMA {
+    // Refused, never rebuilt (STOR-10). A rebuild here would create the new
+    // archive tables empty inside the old store, fail every session in
+    // `reindex` and stamp the new format over bytes only the old one reads.
+    // Both opens reach this before any writable connection, so `bring_forward`
+    // never runs on such a store.
+    if store_archive < ARCHIVE_FORMAT {
+        return Err(Error::ArchiveFormatTooOld {
+            path: path.to_path_buf(),
+            store_format: store_archive,
+            binary_format: ARCHIVE_FORMAT,
+        });
+    }
+
+    let outcome = if store_derived != DERIVED_SCHEMA {
         // A *newer* derived_schema lands here too, and deliberately: derived
         // tables are rebuildable from the blobs by definition, so rebuilding
         // them down to this build's shape is always available. Only the archive
