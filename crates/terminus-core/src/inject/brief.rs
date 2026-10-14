@@ -58,11 +58,11 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::Payload;
-use crate::blob::BlobReader;
 use crate::config::Config;
 use crate::observe::egress::Redaction;
 use crate::recall::scope::Scoped;
 use crate::recall::{excerpt, Query};
+use crate::store::archive;
 
 /// Render the resume brief for one `SessionStart`, or nothing.
 ///
@@ -516,29 +516,25 @@ fn last_exchange(
         return (None, None);
     }
 
-    let blob: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [session_key],
-            |r| r.get(0),
-        )
-        .optional()
-        .ok()
-        .flatten();
-    let Some(blob) = blob else {
-        return (None, None);
-    };
-    let Ok(reader) = BlobReader::open(&blob) else {
+    let pair = [prompt, reply];
+    let wanted: Vec<(u64, u64)> = pair
+        .iter()
+        .flatten()
+        .map(|&(_, offset, len)| (offset as u64, len as u64))
+        .collect();
+    let Some(read) = archive::ranges(conn, session_key, &wanted).ok().flatten() else {
         return (None, None);
     };
 
     let query = Query::parse("");
-    let cut = |coordinates: Option<(i64, i64, i64)>| -> Option<Quote> {
-        let (turn_id, offset, len) = coordinates?;
-        let bytes = reader.read_range(offset as u64, len as u64).ok()?;
+    let mut bytes = read.bytes.into_iter();
+    let mut cut = |coordinates: Option<(i64, i64, i64)>| -> Option<Quote> {
+        let (turn_id, _, _) = coordinates?;
+        let bytes = bytes.next()?.ok()?;
         let text = excerpt::of_record_with(&query, &bytes, redaction);
         (!text.trim().is_empty()).then_some(Quote { turn_id, text })
     };
+    let [prompt, reply] = pair;
     (cut(prompt), cut(reply))
 }
 

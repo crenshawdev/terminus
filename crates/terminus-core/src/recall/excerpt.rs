@@ -23,14 +23,14 @@
 
 use std::collections::BTreeMap;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
-use crate::blob::BlobReader;
 use crate::error::Result;
 use crate::index::text;
 use crate::observe::egress::Redaction;
 use crate::recall::search::Hit;
 use crate::recall::Query;
+use crate::store::archive;
 
 /// How many characters of context an excerpt carries.
 ///
@@ -50,7 +50,7 @@ pub const ELISION: &str = "...";
 /// How many session blobs an excerpt pass materialized.
 ///
 /// An instrument, not an answer, and in the normal build for the same reason
-/// [`BlobReader::blocks_decompressed`] is: "each session's blob is read at most
+/// [`archive::Ranges::blocks_decompressed`] is: "each session's blob is read at most
 /// once per search" is a claim about a number, so the number is measured rather
 /// than argued from the shape of the code.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -96,26 +96,20 @@ pub fn attach(
     }
 
     for (session_key, indexes) in by_session {
-        let blob: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&session_key],
-                |r| r.get(0),
-            )
-            .optional()?;
+        let located: Vec<(usize, (u64, u64))> = indexes
+            .into_iter()
+            .filter_map(|index| {
+                let (offset, len) = coordinates.get(&hits[index].turn_id)?;
+                Some((index, (*offset as u64, *len as u64)))
+            })
+            .collect();
+        let wanted: Vec<(u64, u64)> = located.iter().map(|(_, range)| *range).collect();
+        let read = archive::ranges(conn, &session_key, &wanted)?;
         reads.blobs += 1;
-        let Some(blob) = blob else { continue };
-        let Ok(reader) = BlobReader::open(&blob) else {
-            continue;
-        };
+        let Some(read) = read else { continue };
 
-        for index in indexes {
-            let Some((offset, len)) = coordinates.get(&hits[index].turn_id) else {
-                continue;
-            };
-            let Ok(bytes) = reader.read_range(*offset as u64, *len as u64) else {
-                continue;
-            };
+        for ((index, _), bytes) in located.into_iter().zip(read.bytes) {
+            let Ok(bytes) = bytes else { continue };
             hits[index].excerpt = of_record_with(query, &bytes, redaction);
         }
     }

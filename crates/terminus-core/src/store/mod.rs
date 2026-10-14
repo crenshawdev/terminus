@@ -1,5 +1,6 @@
 //! The SQLite store: one file, one connection, opened behind a version gate.
 
+pub mod archive;
 pub mod open;
 pub mod schema;
 pub mod snapshot;

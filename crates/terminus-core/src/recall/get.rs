@@ -13,7 +13,7 @@
 //! turn materializes that session's whole compressed blob - up to 10.1 MB
 //! uncompressed (phase 1 D-05). Ids are therefore grouped by `session_key` and
 //! each session's blob is selected once, which bounds the cost per request
-//! without eliminating it. The block counter at [`crate::blob::BlobReader`]
+//! without eliminating it. The block counter at [`archive::Ranges`]
 //! would report one block decompressed either way, so the number that says this
 //! worked is [`Fetched::reads`] and not that one.
 //!
@@ -28,12 +28,12 @@ use std::collections::BTreeMap;
 
 use rusqlite::Connection;
 
-use crate::blob::BlobReader;
 use crate::config::{visible, Config};
 use crate::error::Result;
 use crate::observe::egress::Redaction;
 use crate::recall::excerpt::Reads;
 use crate::recall::scope::{self, Reason, Scope};
+use crate::store::archive;
 
 /// One requested turn, as the archive holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,22 +218,17 @@ pub fn records(conn: &Connection, config: &Config, scope: &Scope, ids: &[i64]) -
     // diverge (D-04).
     let redaction = Redaction::of(config);
     for (session_key, ranges) in by_session {
-        let blob: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&session_key],
-                |r| r.get(0),
-            )
-            .ok();
+        let wanted: Vec<(u64, u64)> = ranges
+            .iter()
+            .map(|&(_, offset, len)| (offset as u64, len as u64))
+            .collect();
+        let read = archive::ranges(conn, &session_key, &wanted).ok().flatten();
         fetched.reads.blobs += 1;
-        let Some(blob) = blob else { continue };
-        let Ok(reader) = BlobReader::open(&blob) else {
-            // Damage is `terminus verify`'s to report. Here it costs this record
-            // its body and leaves every other record of the request intact.
-            continue;
-        };
-        for (index, offset, len) in ranges {
-            if let Ok(bytes) = reader.read_range(offset as u64, len as u64) {
+        let Some(read) = read else { continue };
+        // Damage is `terminus verify`'s to report. Here it costs this record
+        // its body and leaves every other record of the request intact.
+        for ((index, _, _), bytes) in ranges.into_iter().zip(read.bytes) {
+            if let Ok(bytes) = bytes {
                 // The knob-off arm is the blob's own bytes with no conversion at
                 // all, not a round trip that happens to be lossless: this is the
                 // read whose whole claim is byte-exactness, and a `String` step

@@ -17,12 +17,12 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::blob::BlobReader;
 use crate::config::Config;
 use crate::error::Result;
 use crate::observe::egress::Redaction;
 use crate::recall::scope::{self, Reason, Scope};
 use crate::recall::{excerpt, Query};
+use crate::store::archive;
 
 /// The most turns one call may ask for on either side of the anchor.
 ///
@@ -218,7 +218,7 @@ pub fn window(
 
 /// Project every turn of the window out of the one session blob.
 ///
-/// One `SELECT blob` for the whole window, which is free here in a way it is
+/// One session read for the whole window, which is free here in a way it is
 /// not for a search: a context window is one session by definition (D-06).
 ///
 /// `redaction` is the caller's, and it is applied by [`excerpt::of_record_with`]
@@ -237,15 +237,11 @@ fn fill_text(
     if rows.is_empty() {
         return Ok(());
     }
-    let blob: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [session_key],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(blob) = blob else { return Ok(()) };
-    let Ok(reader) = BlobReader::open(&blob) else {
+    let wanted: Vec<(u64, u64)> = rows
+        .iter()
+        .map(|(_, (offset, len))| (*offset as u64, *len as u64))
+        .collect();
+    let Some(read) = archive::ranges(conn, session_key, &wanted)? else {
         return Ok(());
     };
 
@@ -253,10 +249,8 @@ fn fill_text(
     // windowed around a match: a context turn is being read for what it says,
     // not for why it matched.
     let query = Query::default();
-    for (index, (_, (offset, len))) in rows.iter().enumerate() {
-        let Ok(bytes) = reader.read_range(*offset as u64, *len as u64) else {
-            continue;
-        };
+    for (index, bytes) in read.bytes.into_iter().enumerate() {
+        let Ok(bytes) = bytes else { continue };
         turns[index].text = excerpt::of_record_with(&query, &bytes, redaction);
     }
     Ok(())

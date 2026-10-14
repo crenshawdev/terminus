@@ -453,7 +453,7 @@ pub fn archive_digest(conn: &rusqlite::Connection) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// Read one turn's bytes out of its session blob, reporting how many blocks
+/// Read one turn's bytes out of its session, reporting how many blocks
 /// had to be decompressed to do it.
 ///
 /// The block count is AC1's instrument and STOR-01's whole claim: "reading a
@@ -477,20 +477,17 @@ pub fn read_turn(conn: &rusqlite::Connection, turn_id: i64) -> (Vec<u8>, usize) 
         )
         .unwrap_or_else(|e| panic!("turn {turn_id}: {e}"));
 
-    let blob: Vec<u8> = conn
-        .query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [&session_key],
-            |r| r.get(0),
-        )
-        .unwrap_or_else(|e| panic!("blob for {session_key}: {e}"));
-
-    let reader = crate::blob::BlobReader::open(&blob).expect("a stored blob parses");
-    reader.reset_block_counter();
-    let bytes = reader
-        .read_range(offset as u64, len as u64)
+    // The product's own read path, because the block count is the product's.
+    let read = crate::store::archive::ranges(conn, &session_key, &[(offset as u64, len as u64)])
+        .unwrap_or_else(|e| panic!("archive for {session_key}: {e}"))
+        .unwrap_or_else(|| panic!("{session_key} has stored bytes"));
+    let bytes = read
+        .bytes
+        .into_iter()
+        .next()
+        .expect("one range asked, one answered")
         .expect("a turn's range is inside its own session stream");
-    (bytes, reader.blocks_decompressed())
+    (bytes, read.blocks_decompressed)
 }
 
 /// SplitMix64. A test that generates its own inputs has to be reproducible
