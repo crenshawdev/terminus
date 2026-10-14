@@ -274,6 +274,172 @@ fn a_store_one_archive_format_ahead_is_refused_with_both_versions_named() {
     );
 }
 
+/// STOR-10, at every command that opens the store. A format-1 store is refused
+/// with the clean-install steps, and its database file and WAL are left
+/// byte-for-byte as they were.
+///
+/// The store is built by hand rather than from `CREATE_SQL`, because this
+/// build's schema has no `blob` column to build one from: a `sessions` table
+/// with its `blob`, no `blocks` table, and `meta` at archive format 1. It
+/// carries a hot WAL for the same reason the newer-format test does.
+///
+/// Four commands are left out. `hook` exits 0 whatever happens, and the ingest
+/// it spawns is the `ingest` case here (INJ-06, ING-10). `mcp` answers with a
+/// reason instead of exiting (RCL-10). `uninstall` and `data move` never open
+/// the store.
+#[test]
+fn every_command_refuses_a_format_one_store_and_leaves_it_untouched() {
+    let bench = bench();
+    std::fs::create_dir_all(&bench.data_dir).unwrap();
+    let db = bench.data_dir.join(DB_FILE_NAME);
+    let wal = bench.data_dir.join(format!("{DB_FILE_NAME}-wal"));
+
+    // A copy taken while the keeper still holds the WAL, so the WAL survives.
+    let source = bench.work.join("format-one");
+    std::fs::create_dir_all(&source).unwrap();
+    let source_db = source.join(DB_FILE_NAME);
+    let keeper = Connection::open(&source_db).unwrap();
+    keeper.pragma_update(None, "journal_mode", "wal").unwrap();
+    keeper
+        .execute_batch(
+            "CREATE TABLE sessions (
+                 session_key TEXT    PRIMARY KEY,
+                 session_no  INTEGER NOT NULL UNIQUE,
+                 blob        BLOB    NOT NULL
+             );
+             CREATE TABLE meta (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             ) WITHOUT ROWID;",
+        )
+        .unwrap();
+    {
+        let writer = Connection::open(&source_db).unwrap();
+        writer
+            .execute(
+                "INSERT INTO sessions VALUES ('/old/session.jsonl', 1, x'0102030405')",
+                [],
+            )
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '1'), (?2, ?3)",
+                rusqlite::params![
+                    META_ARCHIVE_FORMAT,
+                    META_DERIVED_SCHEMA,
+                    DERIVED_SCHEMA.to_string()
+                ],
+            )
+            .unwrap();
+    }
+    std::fs::copy(&source_db, &db).unwrap();
+    std::fs::copy(source.join(format!("{DB_FILE_NAME}-wal")), &wal).unwrap();
+    drop(keeper);
+    assert!(
+        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0,
+        "this test needs a non-empty WAL to mean anything"
+    );
+
+    let before_db = std::fs::read(&db).unwrap();
+    let before_wal = std::fs::read(&wal).unwrap();
+
+    // `install` runs under its own `HOME`, bin directory and a `PATH` holding a
+    // fake `claude`, as in `tests/install.rs`.
+    let root = bench.work.parent().unwrap().to_path_buf();
+    let path_dir = root.join("path");
+    std::fs::create_dir_all(&path_dir).unwrap();
+    testkit::fake_claude(&path_dir, &root.join("claude.log"), "", 0);
+
+    let fixture = testkit::fixture_path("session-basic.jsonl");
+    let fixture = fixture.to_str().unwrap().to_owned();
+    let dest = bench.work.join("export-refused");
+    let dest_arg = dest.to_str().unwrap().to_owned();
+    let commands: [&[&str]; 19] = [
+        &["ingest"],
+        &["ingest", &fixture],
+        &["backfill"],
+        &["search", "cargo"],
+        &["show", "1"],
+        &["sessions"],
+        &["verify"],
+        &["reindex"],
+        &["status"],
+        &["compact"],
+        &["usage"],
+        &["export", &dest_arg],
+        &["stats"],
+        &["observations"],
+        &["observations", "regenerate"],
+        &["replay"],
+        &["retention", "--dry-run"],
+        &["doctor"],
+        &["install"],
+    ];
+
+    for args in commands {
+        let name = args.join(" ");
+        let out = if args == ["install"] {
+            Command::new(env!("CARGO_BIN_EXE_terminus"))
+                .args(args)
+                .env("PATH", &path_dir)
+                .env_remove(testkit::NONESSENTIAL_TRAFFIC)
+                .env("HOME", &root)
+                .env("TERMINUS_BIN_DIR", root.join("bin"))
+                .env("TERMINUS_DATA_DIR", &bench.data_dir)
+                .env("TERMINUS_CONFIG_DIR", &bench.config_dir)
+                .env("CLAUDE_CONFIG_DIR", &bench.claude_dir)
+                .output()
+                .expect("spawn terminus")
+        } else {
+            bench.run(args)
+        };
+
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "`{name}` opened a format-1 store"
+        );
+        if args == ["doctor"] {
+            assert_eq!(out.status.code(), Some(1), "`{name}`");
+        }
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        for needed in ["data folder", "terminus binary", "install.sh"] {
+            assert!(
+                said.contains(needed),
+                "`{name}` does not name {needed:?}: {said}"
+            );
+        }
+        assert!(
+            std::fs::read(&db).unwrap() == before_db,
+            "`{name}` changed terminus.db"
+        );
+        assert!(
+            std::fs::read(&wal).unwrap() == before_wal,
+            "`{name}` changed the WAL"
+        );
+    }
+    assert!(!dest.exists(), "a refused export created its destination");
+
+    // Only now: a connection opened earlier could checkpoint on close.
+    let after = bench.conn();
+    let blocks: i64 = after
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'blocks'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(blocks, 0, "a block table appeared in a format-1 store");
+    let format: String = after
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [META_ARCHIVE_FORMAT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(format, "1", "a refused open restamped the archive format");
+}
+
 /// AC4, end to end through the command. Drop `turns`, `turns_fts`, `entities`
 /// and `paths`, run `terminus reindex`, and the fixed query set's JSON is
 /// byte-identical to what it was before the drop.
