@@ -473,9 +473,9 @@ fn a_deletion_removes_every_row_the_session_owns() {
     assert_eq!(applied.observations_lost, 1);
     assert!(applied.notes.is_empty(), "{:?}", applied.notes);
     assert!(
-        applied.lines().iter().any(|l| l.contains("observation")),
+        applied.notes().iter().any(|l| l.contains("observation")),
         "the loss of an observation no rebuild reproduces has to be said out loud: {:?}",
-        applied.lines()
+        applied.notes()
     );
 
     for (table, count) in bench.rows(&key) {

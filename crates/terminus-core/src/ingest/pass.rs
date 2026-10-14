@@ -321,9 +321,10 @@ fn locked(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
     // RET-03 and D-10, and both halves of the position matter. AFTER
     // `observe_new`, because that step reads one blob per newly finalized
     // session and an eviction that ran first would destroy the bytes it was
-    // about to read. BEFORE `record_pass`, because `runs.error` is the only
-    // textual channel this product has - there is no log file, by design - and
-    // a step placed after that row is written has nowhere to report.
+    // about to read. BEFORE `record_pass`, because `runs.error` and
+    // `runs.notes` are the only textual channel this product has - there is no
+    // log file, by design - and a step placed after that row is written has
+    // nowhere to report.
     //
     // Nothing here fails the pass. The archive is the work; a retention step
     // that could not run is a note, and a `?` propagated out of it is exactly
@@ -449,44 +450,47 @@ pub fn note(path: &Path, reason: &str) -> String {
 
 /// The one `runs` row a pass leaves behind (D-10).
 ///
-/// `runs.error` is the only textual channel this product has - there is no log
-/// file, by design, and `terminus status` surfaces this table - so everything
-/// worth a human's attention goes in it: the path and reason of every file that
-/// was skipped, every directory that could not be listed, every watermark
-/// recovery had to repair, and the failure that ended the pass if one did. It
-/// stays null when there is genuinely nothing to say.
+/// `runs.error` and `runs.notes` are the only textual channel this product has -
+/// there is no log file, by design, and `terminus status` surfaces this table -
+/// so everything worth a human's attention goes in one of them. `error` holds
+/// what went wrong: the path and reason of every file that was skipped, every
+/// directory that could not be listed, every watermark recovery had to repair,
+/// every step that could not run, and the failure that ended the pass if one
+/// did. `notes` holds what a healthy pass did worth saying - labels written,
+/// sessions retention evicted or deleted - so `doctor` can flag `error` alone.
+/// Each stays null when there is genuinely nothing to say.
 fn record_pass(
     conn: &rusqlite::Connection,
     summary: &Summary,
     fatal: Option<&crate::error::Error>,
 ) -> Result<()> {
-    let mut notes: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     for (path, reason) in summary.failures.iter().chain(&summary.unreadable) {
-        notes.push(note(path, reason));
+        errors.push(note(path, reason));
     }
-    notes.extend(summary.recovery.lines());
-    notes.extend(summary.feedback.lines());
-    notes.extend(summary.outcomes.lines());
-    notes.extend(summary.observations.lines());
-    notes.extend(summary.retention.lines());
+    errors.extend(summary.recovery.lines());
+    errors.extend(summary.feedback.lines());
+    errors.extend(summary.outcomes.errors());
+    errors.extend(summary.observations.lines());
+    errors.extend(summary.retention.errors());
     if let Some(e) = fatal {
-        notes.push(format!("pass failed: {e}"));
+        errors.push(format!("pass failed: {e}"));
     }
-    let error = if notes.is_empty() {
-        None
-    } else {
-        Some(notes.join("\n"))
-    };
+    let mut notes = summary.outcomes.notes();
+    notes.extend(summary.retention.notes());
+    let joined = |lines: Vec<String>| (!lines.is_empty()).then(|| lines.join("\n"));
+    let error = joined(errors);
+    let notes = joined(notes);
 
     let elapsed = summary.duration;
     conn.execute(
         "INSERT INTO runs (
             started_at, finished_at, duration_ms, files_seen, bytes_read,
-            turns_added, error, files_committed, files_failed
+            turns_added, error, files_committed, files_failed, notes
          ) VALUES (
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-            ?2, ?3, ?4, ?5, ?6, ?7, ?8
+            ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
          )",
         rusqlite::params![
             format!("-{} seconds", elapsed.as_secs_f64()),
@@ -497,6 +501,7 @@ fn record_pass(
             error,
             summary.files_committed as i64,
             summary.failures.len() as i64,
+            notes,
         ],
     )?;
     Ok(())

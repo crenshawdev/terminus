@@ -15,8 +15,8 @@ use crate::store::{archive, Store};
 /// What one retention step did, and what it could not do.
 ///
 /// The session keys are carried rather than only counted, so a caller can say
-/// which sessions it acted on; [`Applied::lines`] summarizes instead, because
-/// `runs.error` is read by a human and a hundred keys is not a report.
+/// which sessions it acted on; [`Applied::notes`] summarizes instead, because
+/// `runs.notes` is read by a human and a hundred keys is not a report.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Applied {
     /// Sessions whose block rows were deleted.
@@ -35,7 +35,7 @@ pub struct Applied {
     /// Sessions an excluded project holds, which retention passed over.
     pub excluded: usize,
     /// Whatever could not be done, said rather than raised. There is no log
-    /// file, so these travel into `runs.error` with the pass's other notes.
+    /// file, so these travel into `runs.error` with the pass's other failures.
     pub notes: Vec<String>,
 }
 
@@ -49,8 +49,14 @@ impl Applied {
             && self.notes.is_empty()
     }
 
-    /// The reported lines, in the shape `pass::record_pass` writes.
-    pub fn lines(&self) -> Vec<String> {
+    /// What could not be done, for `runs.error`.
+    pub fn errors(&self) -> Vec<String> {
+        self.notes.clone()
+    }
+
+    /// What this step did, for `runs.notes`: a healthy pass with retention
+    /// configured says it, and none of it is a failure.
+    pub fn notes(&self) -> Vec<String> {
         let mut out = Vec::new();
         if !self.evicted.is_empty() {
             out.push(format!(
@@ -84,7 +90,6 @@ impl Applied {
                 self.excluded
             ));
         }
-        out.extend(self.notes.iter().cloned());
         out
     }
 }

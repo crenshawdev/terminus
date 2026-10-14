@@ -264,7 +264,7 @@ fn transcript_is_gone(path: &str) -> bool {
 /// selection is measured from it.
 pub fn retain(store: &mut Store, config: &Config) -> Applied {
     // The state every user is in. No clock read, no query, no note - which is
-    // what leaves `runs.error` null on a pass that had no retention to do.
+    // what leaves `runs.notes` null on a pass that had no retention to do.
     if config.retention_selects_nothing() {
         return Applied::default();
     }

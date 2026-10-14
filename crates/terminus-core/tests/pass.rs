@@ -446,6 +446,16 @@ fn runs(conn: &Connection) -> Vec<(i64, i64, i64, i64, Option<String>)> {
     .collect()
 }
 
+/// The last run's `(error, notes)`.
+fn last_run_text(conn: &Connection) -> (Option<String>, Option<String>) {
+    conn.query_row(
+        "SELECT error, notes FROM runs ORDER BY id DESC LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
 /// Five transcripts in, exactly one `runs` row out (D-10).
 ///
 /// Phase 1's `record_run` inserts a literal `1` for `files_seen` from inside
@@ -701,7 +711,8 @@ fn a_pass_with_no_retention_configured_touches_nothing_and_says_nothing() {
 
     let summary = bench.pass(&[]);
     assert_eq!(summary.retention, Applied::default());
-    assert!(summary.retention.lines().is_empty());
+    assert!(summary.retention.notes().is_empty());
+    assert!(summary.retention.errors().is_empty());
 
     for (len, evicted) in blobs(&bench.conn()) {
         assert!(len > 0, "a blob was emptied with retention off");
@@ -711,14 +722,15 @@ fn a_pass_with_no_retention_configured_touches_nothing_and_says_nothing() {
         );
     }
     assert_eq!(
-        runs(&bench.conn()).last().unwrap().4,
-        None,
-        "a pass with nothing to say must leave runs.error null"
+        last_run_text(&bench.conn()),
+        (None, None),
+        "a pass with nothing to say must leave runs.error and runs.notes null"
     );
 }
 
 /// RET-02 through the pass: an evict policy over an aged corpus empties the
-/// blobs and writes what it did into the only textual channel this product has.
+/// blobs and says what it did in `runs.notes`, leaving `runs.error` null: an
+/// eviction the user configured is not a failure, and `doctor` flags `error`.
 #[test]
 fn a_pass_with_an_evict_policy_evicts_the_aged_sessions_and_says_so() {
     let bench = bench();
@@ -740,21 +752,18 @@ fn a_pass_with_an_evict_policy_evicts_the_aged_sessions_and_says_so() {
         assert_eq!(len, 0);
         assert_eq!(evicted, Some(1));
     }
-    let error = runs(&bench.conn())
-        .last()
-        .unwrap()
-        .4
-        .clone()
-        .expect("an eviction has to be reported");
+    let (error, notes) = last_run_text(&bench.conn());
+    assert_eq!(error, None, "an eviction is not a failure");
+    let notes = notes.expect("an eviction has to be reported");
     assert!(
-        error.contains("retention evicted 2 session(s)"),
-        "the note must say what it did: {error}"
+        notes.contains("retention evicted 2 session(s)"),
+        "the note must say what it did: {notes}"
     );
 
     // And nothing is offered twice: the next pass has nothing left to report.
     let again = bench.pass_with(&bench.config_file(EVICT));
-    assert!(again.retention.is_silent(), "{:?}", again.retention.lines());
-    assert_eq!(runs(&bench.conn()).last().unwrap().4, None);
+    assert!(again.retention.is_silent(), "{:?}", again.retention.notes());
+    assert_eq!(last_run_text(&bench.conn()), (None, None));
 }
 
 /// RET-03's bound, and the half of it that matters to a reader: a truncated
@@ -797,19 +806,21 @@ fn the_bounded_step_leaves_the_rest_for_the_next_pass_and_says_how_many() {
     let first = bench.pass_with(&bench.config_file(EVICT));
     assert_eq!(first.retention.evicted.len(), MAX_PER_PASS);
     assert_eq!(first.retention.over, over);
-    let error = runs(&bench.conn()).last().unwrap().4.clone().unwrap();
+    let (error, notes) = last_run_text(&bench.conn());
+    assert_eq!(error, None, "a truncated retention step is not a failure");
+    let notes = notes.unwrap();
     assert!(
-        error.contains(&format!("{over} more session(s) are waiting on retention")),
-        "a truncated pass must say what it left: {error}"
+        notes.contains(&format!("{over} more session(s) are waiting on retention")),
+        "a truncated pass must say what it left: {notes}"
     );
 
     let second = bench.pass_with(&bench.config_file(EVICT));
     assert_eq!(second.retention.evicted.len(), over);
     assert_eq!(second.retention.over, 0);
-    let error = runs(&bench.conn()).last().unwrap().4.clone().unwrap();
+    let notes = last_run_text(&bench.conn()).1.unwrap();
     assert!(
-        !error.contains("waiting on retention"),
-        "the second pass had nothing left and said otherwise: {error}"
+        !notes.contains("waiting on retention"),
+        "the second pass had nothing left and said otherwise: {notes}"
     );
 
     let evicted = blobs(&bench.conn());

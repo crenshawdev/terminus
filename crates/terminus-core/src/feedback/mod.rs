@@ -74,19 +74,22 @@ impl Labeled {
             .map_or(0, |(_, count)| *count)
     }
 
-    /// The reported lines: what could not be done, then what was labelled when
-    /// anything was.
-    pub fn lines(&self) -> Vec<String> {
-        let mut lines = self.notes.clone();
-        if !self.labels.is_empty() {
-            let counts: Vec<String> = self
-                .labels
-                .iter()
-                .map(|(label, count)| format!("{count} {label}"))
-                .collect();
-            lines.push(format!("labelled {}", counts.join(", ")));
+    /// What could not be done, for `runs.error`.
+    pub fn errors(&self) -> Vec<String> {
+        self.notes.clone()
+    }
+
+    /// What was labelled when anything was, for `runs.notes`.
+    pub fn notes(&self) -> Vec<String> {
+        if self.labels.is_empty() {
+            return Vec::new();
         }
-        lines
+        let counts: Vec<String> = self
+            .labels
+            .iter()
+            .map(|(label, count)| format!("{count} {label}"))
+            .collect();
+        vec![format!("labelled {}", counts.join(", "))]
     }
 }
 
