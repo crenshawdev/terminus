@@ -17,18 +17,31 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh
   ```
 
-  It downloads `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>` from
+  It downloads `terminus-<os>-<arch>.manifest`,
+  `terminus-<os>-<arch>.manifest.sig` and `terminus-<os>-<arch>` from
   `https://github.com/crenshawdev/terminus/releases/latest/download`, where
   `<os>` is `linux` or `macos` and `<arch>` is `x86_64` or `aarch64`. One
   `https://` source, passed by ending the line with
   `sh -s -- https://<source>` instead of `sh`, replaces that default, and the
-  same two names are fetched under it. The manifest is exactly two lines,
-  `version X.Y.Z` and `sha256 <64 lowercase hex>`. `verify_download` checks the
-  binary's SHA-256 against it before anything is placed. The script then stores
-  the binary by version, links `~/.local/bin/terminus` to it and runs
-  `~/.local/bin/terminus install`, exiting non-zero when that does.
-- `install.sh` installs unsigned development artifacts only. No release is
-  published, and the signature check comes later, inside `verify_download`.
+  same three names are fetched under it. The manifest is exactly two lines,
+  `version X.Y.Z` and `sha256 <64 lowercase hex>`. Before the script reads the
+  manifest, it verifies the signature with `ssh-keygen -Y verify` against the
+  crenshawdev release key pinned in `install.sh`, under the namespace
+  `terminus-release`, and it downloads the binary only after that.
+  `verify_download` then checks the binary's SHA-256 against the manifest
+  before anything is placed. The script stores the binary by version, links
+  `~/.local/bin/terminus` to it and runs `~/.local/bin/terminus install`,
+  exiting non-zero when that does.
+- `install.sh` refuses a missing signature, a signature made by another key or
+  under another namespace, and a manifest changed after signing, and it never
+  downloads the binary of a release it refuses. A missing signature is
+  reported as a failed download, the others as a manifest that does not verify
+  against the pinned key. It refuses a machine without `ssh-keygen` before it
+  downloads anything, naming `openssh-client` (Debian, Ubuntu),
+  `openssh-clients` (Fedora) and `openssh` (Arch). The key is never fetched,
+  and no argument, setting or environment variable changes it, so a source
+  passed as the argument can only serve releases signed with that key. No
+  release is published yet.
 - `install.sh` refuses to run when `TERMINUS_BIN_DIR` is set, and refuses a
   stable path holding a file that is not a Terminus build, leaving it as it is.
 - `install.sh`'s `curl` download is the one network use. The Terminus binary
