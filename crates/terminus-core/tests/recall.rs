@@ -353,6 +353,20 @@ fn a_query_of_no_tokens_makes_no_match_call() {
     }
 }
 
+/// And the search says so, because an empty result with no reason looks the
+/// same as an empty archive.
+#[test]
+fn a_query_of_no_tokens_is_empty_with_a_reason() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    for raw in ["*", "?!"] {
+        let response = answer(&conn, &[], Scope::Everything, raw);
+        assert!(response.hits.is_empty(), "`{raw}`");
+        assert_eq!(response.reason, Some(Reason::NothingSearchable), "`{raw}`");
+    }
+}
+
 /// Every token is a quoted fts5 string and the tokens are conjoined, so nothing
 /// the user typed can be read as an operator.
 #[test]

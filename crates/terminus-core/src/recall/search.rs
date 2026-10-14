@@ -325,7 +325,7 @@ const CANDIDATE_POOL: usize = MAX_RESULTS * 4;
 ///
 /// A query that reduced to no tokens returns no hits without asking SQLite
 /// anything: `MATCH ''` is itself an fts5 error (D-09), so the empty result is
-/// produced rather than caught.
+/// produced rather than caught, with [`Reason::NothingSearchable`] saying why.
 pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Response> {
     let scoped = scope::resolve(conn, config, &request.scope)?;
     if let Some(reason) = scoped.reason() {
@@ -337,7 +337,10 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
     }
 
     let Some(expression) = expression(request) else {
-        return Ok(Response::default());
+        return Ok(Response {
+            reason: Some(Reason::NothingSearchable),
+            ..Response::default()
+        });
     };
 
     let mut sql = String::from(HEAD);

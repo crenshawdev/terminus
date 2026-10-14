@@ -85,6 +85,10 @@ pub enum Reason {
     EverythingExcluded,
     /// A context window was asked about a turn the archive does not hold.
     NoSuchTurn { turn_id: i64 },
+    /// The query reduced to no words that can be searched (`*`, `?!`). Said
+    /// out loud because an empty result with no reason reads as an empty
+    /// archive, to a model calling `recall_search` most of all.
+    NothingSearchable,
 }
 
 impl std::fmt::Display for Reason {
@@ -101,6 +105,7 @@ impl std::fmt::Display for Reason {
                 write!(f, "the configured exclusions cover the filesystem root")
             }
             Reason::NoSuchTurn { turn_id } => write!(f, "no turn {turn_id} is archived"),
+            Reason::NothingSearchable => write!(f, "the query has no words that can be searched"),
         }
     }
 }
