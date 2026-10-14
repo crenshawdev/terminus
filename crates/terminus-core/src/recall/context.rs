@@ -26,7 +26,7 @@ use crate::store::archive;
 
 /// The most turns one call may ask for on either side of the anchor.
 ///
-/// A window is read out of one decompressed session and every turn in it is
+/// A window is read out of one session's block rows and every turn in it is
 /// projected, so an unbounded `before` returns the whole session as prose - the
 /// thing `recall_get` exists for, arrived at by accident.
 pub const MAX_CONTEXT_SIDE: usize = 25;
@@ -62,6 +62,9 @@ pub struct Window {
     pub continues_from: Option<String>,
     /// Set when the window is empty for a reason rather than by accident.
     pub reason: Option<Reason>,
+    /// Block rows fetched and blocks decompressed to fill the turns' text: only
+    /// the rows the window's turns cover (D-13, D-14).
+    pub reads: excerpt::Reads,
 }
 
 impl Window {
@@ -194,7 +197,7 @@ pub fn window(
     // D-01). A context window is model-facing - `recall_context` is one of the
     // three MCP tools - so its turns are an egress boundary in exactly the way
     // a search excerpt is, and they go through the same argument.
-    fill_text(
+    let reads = fill_text(
         conn,
         &session_key,
         &rows,
@@ -213,13 +216,15 @@ pub fn window(
         // a fact about the session rather than about this call.
         continues_from,
         reason: None,
+        reads,
     })
 }
 
-/// Project every turn of the window out of the one session blob.
+/// Project every turn of the window out of its session's block rows, fetching
+/// only the rows those turns cover, each once.
 ///
-/// One session read for the whole window, which is free here in a way it is
-/// not for a search: a context window is one session by definition (D-06).
+/// One read for the whole window, which is free here in a way it is not for a
+/// search: a context window is one session by definition (D-06).
 ///
 /// `redaction` is the caller's, and it is applied by [`excerpt::of_record_with`]
 /// to the FULL projection before the window is cut (phase 4 D-02) - the same
@@ -233,17 +238,19 @@ fn fill_text(
     rows: &[(ContextTurn, (i64, i64))],
     turns: &mut [ContextTurn],
     redaction: &Redaction,
-) -> Result<()> {
+) -> Result<excerpt::Reads> {
+    let mut reads = excerpt::Reads::default();
     if rows.is_empty() {
-        return Ok(());
+        return Ok(reads);
     }
     let wanted: Vec<(u64, u64)> = rows
         .iter()
         .map(|(_, (offset, len))| (*offset as u64, *len as u64))
         .collect();
     let Some(read) = archive::ranges(conn, session_key, &wanted)? else {
-        return Ok(());
+        return Ok(reads);
     };
+    reads.add(&read);
 
     // An empty query, so the projection is taken from its head rather than
     // windowed around a match: a context turn is being read for what it says,
@@ -253,5 +260,5 @@ fn fill_text(
         let Ok(bytes) = bytes else { continue };
         turns[index].text = excerpt::of_record_with(&query, &bytes, redaction);
     }
-    Ok(())
+    Ok(reads)
 }

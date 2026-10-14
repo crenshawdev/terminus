@@ -11,7 +11,7 @@
 //! writes tool results, `isMeta` command caveats and `<task-notification>`
 //! envelopes as `user` records as well, and 12.3% of measured sessions end on
 //! one. The discriminator is `turns.is_typed`, written at ingest by
-//! `parse::record` and rebuilt from blobs alone, and the brief spends exactly
+//! `parse::record` and rebuilt from the archive alone, and the brief spends exactly
 //! one `AND` on it - see [`last_turn`].
 //!
 //! The counts are read the way D-09 requires: the project-only projection
@@ -49,7 +49,7 @@
 //! that rendered nothing writes nothing at all.
 //!
 //! **Nothing here fails.** Every block is an `Option` and the brief is the ones
-//! that rendered: a session with no meta row, no branch, no timestamp or a blob
+//! that rendered: a session with no meta row, no branch, no timestamp or block rows
 //! that will not open drops that block and keeps the rest, because a brief that
 //! returned an error would be a `SessionStart` that emitted nothing at all.
 
@@ -90,6 +90,27 @@ pub fn session_start(data_dir: &Path, config: &Config, payload: &Payload) -> Opt
     )?;
     remember(data_dir, payload, &brief);
     Some(brief.text)
+}
+
+/// What the brief [`session_start`] would render read from the archive: the
+/// block rows fetched and blocks decompressed for the two turns it quotes
+/// (D-14). Renders the same brief, writes no state and emits nothing, so the
+/// hook's output stays exactly what it was. Test support only.
+#[cfg(feature = "testkit")]
+pub fn session_start_reads(
+    data_dir: &Path,
+    config: &Config,
+    payload: &Payload,
+) -> Option<excerpt::Reads> {
+    let store = super::open(data_dir)?;
+    let scoped = super::scoped(store.conn(), config, payload)?;
+    let brief = render(
+        store.conn(),
+        &scoped,
+        config.brief_chars(),
+        &Redaction::of(config),
+    )?;
+    Some(brief.reads)
 }
 
 /// Leave the next prompt an injection to make (INJ-05, D-08).
@@ -154,6 +175,9 @@ struct Brief {
     text: String,
     /// The turns quoted in [`Brief::text`], after the budget had its say.
     turns: Vec<i64>,
+    /// What reading the quoted turns cost. Never rendered.
+    #[cfg_attr(not(feature = "testkit"), allow(dead_code))]
+    reads: excerpt::Reads,
 }
 
 /// The brief's blocks, in order, joined by a blank line, inside `budget`.
@@ -178,7 +202,7 @@ fn render(
     redaction: &Redaction,
 ) -> Option<Brief> {
     let budget = budget.min(MAX_BRIEF_CHARS);
-    let continuity = last_session(conn, scoped, redaction);
+    let (continuity, reads) = last_session(conn, scoped, redaction);
     let pointer = index_pointer(conn, scoped);
     if continuity.is_none() && pointer.is_none() {
         return None;
@@ -189,6 +213,7 @@ fn render(
         return Some(Brief {
             turns: quoted(continuity.as_ref()),
             text: full,
+            reads,
         });
     }
 
@@ -207,6 +232,7 @@ fn render(
     Some(Brief {
         turns: quoted(cut.as_ref()),
         text: clip(&assemble(cut.as_ref(), pointer.as_deref()), budget),
+        reads,
     })
 }
 
@@ -382,9 +408,16 @@ struct LastSession {
 }
 
 /// INJ-01's continuity blocks: which session was last here, when it ended, on
-/// what branch, and the last thing said in each direction.
-fn last_session(conn: &Connection, scoped: &Scoped, redaction: &Redaction) -> Option<Continuity> {
-    let row = last_session_row(conn, scoped).ok()??;
+/// what branch, and the last thing said in each direction, with what reading
+/// those two turns cost.
+fn last_session(
+    conn: &Connection,
+    scoped: &Scoped,
+    redaction: &Redaction,
+) -> (Option<Continuity>, excerpt::Reads) {
+    let Some(row) = last_session_row(conn, scoped).ok().flatten() else {
+        return (None, excerpt::Reads::default());
+    };
     let project = project_label(scoped);
 
     let day = row.last_turn_at.as_deref().map(day);
@@ -397,12 +430,13 @@ fn last_session(conn: &Connection, scoped: &Scoped, redaction: &Redaction) -> Op
         (None, None) => format!("The last session in {project} is archived."),
     };
 
-    let (prompt, reply) = last_exchange(conn, &row.session_key, redaction);
-    Some(Continuity {
+    let (prompt, reply, reads) = last_exchange(conn, &row.session_key, redaction);
+    let continuity = Continuity {
         head,
         prompt,
         reply,
-    })
+    };
+    (Some(continuity), reads)
 }
 
 /// The greatest `last_turn_at` among the scoped project's own sessions.
@@ -487,11 +521,10 @@ fn day(ts: &str) -> &str {
 /// typed `user` record at all renders no "It last asked" line, because the
 /// lookup returns nothing and [`Continuity::text`] omits what it has not got.
 ///
-/// **One blob read for the pair.** Both turns are in the same session and
-/// rusqlite's incremental blob I/O is behind a feature this workspace does not
-/// enable, so selecting the blob twice would decompress the same session twice -
-/// up to 10.1 MB uncompressed (phase 1 D-05) on the path with the tightest
-/// budget in the product.
+/// **One read for the pair, of only the rows it covers (D-13).** Both turns are
+/// in the same session, so one read fetches and decompresses each block row the
+/// two turns cover once - usually the session's last row - on the path with the
+/// tightest budget in the product. What it cost comes back beside the quotes.
 ///
 /// `turn_seq` order and never `ts` order: 31 of 62 sampled real transcripts
 /// carry a record whose timestamp runs backwards (phase 3 D-22), so the last
@@ -509,11 +542,12 @@ fn last_exchange(
     conn: &Connection,
     session_key: &str,
     redaction: &Redaction,
-) -> (Option<Quote>, Option<Quote>) {
+) -> (Option<Quote>, Option<Quote>, excerpt::Reads) {
+    let mut reads = excerpt::Reads::default();
     let prompt = last_turn(conn, session_key, "user");
     let reply = last_turn(conn, session_key, "assistant");
     if prompt.is_none() && reply.is_none() {
-        return (None, None);
+        return (None, None, reads);
     }
 
     let pair = [prompt, reply];
@@ -523,8 +557,9 @@ fn last_exchange(
         .map(|&(_, offset, len)| (offset as u64, len as u64))
         .collect();
     let Some(read) = archive::ranges(conn, session_key, &wanted).ok().flatten() else {
-        return (None, None);
+        return (None, None, reads);
     };
+    reads.add(&read);
 
     let query = Query::parse("");
     let mut bytes = read.bytes.into_iter();
@@ -535,13 +570,13 @@ fn last_exchange(
         (!text.trim().is_empty()).then_some(Quote { turn_id, text })
     };
     let [prompt, reply] = pair;
-    (cut(prompt), cut(reply))
+    (cut(prompt), cut(reply), reads)
 }
 
 /// `(id, stream_offset, byte_len)` of one session's last turn of a record type,
 /// skipping the `user` records nobody typed (INJ-07).
 ///
-/// D-04: both offsets address the UNCOMPRESSED session stream, never the blob.
+/// D-04: both offsets address the UNCOMPRESSED session stream, never a block.
 /// `UNIQUE (session_key, turn_seq)` covers the lookup. The id comes back too
 /// because INJ-04 suppresses a turn the brief quoted and cannot recognize one
 /// from its text.
@@ -552,8 +587,8 @@ fn last_exchange(
 /// construction (`parse::record` classifies `user` records and nothing else),
 /// and a preserved evicted session's rows keep null because `reindex` skips
 /// them (v0.1.1 phase 1 D-04). For an evicted session the choice is
-/// unobservable anyway - `retention::apply` empties the blob, so
-/// [`last_exchange`] finds no reader and renders no quote either way.
+/// unobservable anyway - `retention::apply` deletes its block rows, so
+/// [`last_exchange`] reads no bytes and renders no quote either way.
 ///
 /// One `AND` and no new index. Measured against the live 1.16 GB store
 /// (450,834 turns), the lookup costs 0.002 ms and a variant forced to scan a

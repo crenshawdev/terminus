@@ -194,6 +194,124 @@ impl Bench {
     }
 }
 
+impl Bench {
+    /// What the brief a `SessionStart` in one project would carry read from
+    /// the archive, at the default config.
+    fn brief_reads(&self, project: &str) -> terminus_core::recall::Reads {
+        let cwd = self.project(project);
+        let payload = Payload {
+            session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
+            transcript_path: Some("/home/user/.claude/projects/-p/s.jsonl"),
+            cwd: cwd.to_str(),
+            prompt: None,
+            source: Some("startup"),
+        };
+        brief::session_start_reads(&self.data_dir, &Config::default(), &payload)
+            .expect("a brief renders")
+    }
+
+    /// The store's turn ids for one session file, in `turn_seq` order, and how
+    /// many block rows that session has.
+    fn turns_and_rows(&self, file: &str) -> (Vec<i64>, usize) {
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
+                .unwrap();
+        let key = self
+            .work
+            .join(file)
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let ids = conn
+            .prepare("SELECT id FROM turns WHERE session_key = ?1 ORDER BY turn_seq")
+            .unwrap()
+            .query_map([&key], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        (ids, terminus_core::testkit::block_count(&conn, &key))
+    }
+
+    fn covered(&self, ids: &[i64]) -> usize {
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
+                .unwrap();
+        terminus_core::testkit::covered_blocks(&conn, ids)
+    }
+}
+
+/// A session for the AC2 tests, in `project-blocks`.
+const BLOCKS: Session<'static> = Session {
+    file: "blocks.jsonl",
+    id: "55555555-5555-4555-8555-555555555555",
+    project: "project-blocks",
+    branch: None,
+    day: "2026-08-14",
+    prompt: "the last prompt",
+    reply: "the last reply",
+};
+
+/// AC2 for the brief: when the two quoted turns sit in one block of a session
+/// of three or more, the brief fetches that one row and decompresses it once.
+#[test]
+fn the_brief_reads_only_the_row_its_two_quotes_sit_in() {
+    let bench = bench();
+    let filler = "filler ".repeat(30_000);
+    bench.archive_records(
+        &BLOCKS,
+        &[
+            text_record("assistant", &filler),
+            text_record("user", BLOCKS.prompt),
+            text_record("assistant", BLOCKS.reply),
+        ],
+    );
+    let (ids, rows) = bench.turns_and_rows(BLOCKS.file);
+    assert!(
+        rows >= 3,
+        "the session must be three or more blocks: {rows}"
+    );
+    assert_eq!(bench.covered(&ids[1..]), 1, "the quotes share a block");
+
+    let text = bench.brief(BLOCKS.project).expect("a brief renders");
+    assert!(
+        text.contains(BLOCKS.prompt) && text.contains(BLOCKS.reply),
+        "{text}"
+    );
+    let reads = bench.brief_reads(BLOCKS.project);
+    assert_eq!(reads.block_rows, 1, "{reads:?}");
+    assert_eq!(reads.blocks_decompressed, 1, "{reads:?}");
+}
+
+/// AC2 for the brief: a quoted reply spanning k blocks costs the union of the
+/// rows the two quotes cover, each fetched and decompressed once.
+#[test]
+fn the_brief_reads_the_union_of_the_rows_its_quotes_cover() {
+    let bench = bench();
+    let reply = format!("{} {}", BLOCKS.reply, "filler ".repeat(30_000));
+    bench.archive_records(
+        &BLOCKS,
+        &[
+            text_record("user", BLOCKS.prompt),
+            text_record("assistant", &reply),
+        ],
+    );
+    let (ids, rows) = bench.turns_and_rows(BLOCKS.file);
+    assert!(
+        rows >= 3,
+        "the session must be three or more blocks: {rows}"
+    );
+    let union = bench.covered(&ids);
+    assert!(
+        union >= 3,
+        "the reply must span three or more blocks: {union}"
+    );
+
+    let reads = bench.brief_reads(BLOCKS.project);
+    assert_eq!(reads.block_rows, union, "{reads:?}");
+    assert_eq!(reads.blocks_decompressed, union, "{reads:?}");
+}
+
 /// The two sessions of `project-alpha`, one clearly later than the other.
 const EARLY: Session<'static> = Session {
     file: "early.jsonl",

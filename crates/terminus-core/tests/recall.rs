@@ -1360,6 +1360,40 @@ fn turn_at(conn: &Connection, fixture: &str, seq: i64) -> i64 {
     .unwrap_or_else(|e| panic!("{fixture} turn {seq}: {e}"))
 }
 
+/// AC2 for context windows: a window of one turn inside one block of a
+/// session of three or more fetches that one row and decompresses that block.
+#[test]
+fn a_context_window_of_a_turn_inside_one_block_reads_one_row() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let anchor = turn_at(&conn, SPANNING, 1);
+    assert_eq!(testkit::covered_blocks(&conn, &[anchor]), 1);
+    let window = around(&conn, &[], anchor, 0, 0);
+    assert_eq!(window.turns.len(), 1, "{window:?}");
+    assert!(window.turns[0].text.contains(INSIDE_WORD), "{window:?}");
+    assert_eq!(window.reads.block_rows, 1, "{:?}", window.reads);
+    assert_eq!(window.reads.blocks_decompressed, 1);
+}
+
+/// AC2 for context windows: a window whose turns span k blocks fetches k rows
+/// and decompresses k blocks, each once though two turns share one.
+#[test]
+fn a_context_window_spanning_k_blocks_reads_k_rows() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let ids = [turn_at(&conn, SPANNING, 0), turn_at(&conn, SPANNING, 1)];
+    let k = testkit::covered_blocks(&conn, &ids);
+    assert!(k >= 3, "the window must span three or more blocks: {k}");
+    let window = around(&conn, &[], ids[1], 1, 0);
+    assert_eq!(window.turns.len(), 2, "{window:?}");
+    assert_eq!(window.reads.block_rows, k, "{:?}", window.reads);
+    assert_eq!(window.reads.blocks_decompressed, k);
+}
+
 fn around(
     conn: &Connection,
     exclusions: &[&str],
