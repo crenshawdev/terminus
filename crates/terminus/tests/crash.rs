@@ -39,7 +39,7 @@ use rusqlite::Connection;
 use terminus_core::ingest::fault;
 use terminus_core::store::{Store, DB_FILE_NAME};
 use terminus_core::testkit::{self, Rng};
-use terminus_core::{blob, verify};
+use terminus_core::verify;
 
 /// Aimed kills against one transcript: every point, this many times.
 const ROUNDS: usize = 3;
@@ -304,11 +304,15 @@ impl Snapshot {
         let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
         let snapshot = Snapshot {
             blobs: conn
-                .prepare("SELECT session_key, blob FROM sessions ORDER BY session_key")
+                .prepare("SELECT session_key FROM sessions ORDER BY session_key")
                 .unwrap()
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
                 .map(Result::unwrap)
+                .map(|key| {
+                    let stored = testkit::stored(&conn, &key);
+                    (key, stored)
+                })
                 .collect(),
             turns: conn
                 .prepare(
@@ -420,18 +424,18 @@ fn check_invariants(data_dir: &Path) -> Result<(), String> {
     }
 
     // What each session's committed blob actually holds.
-    let sessions: Vec<(String, Vec<u8>)> = conn
-        .prepare("SELECT session_key, blob FROM sessions")
+    let sessions: Vec<String> = conn
+        .prepare("SELECT session_key FROM sessions")
         .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map([], |r| r.get(0))
         .unwrap()
         .map(Result::unwrap)
         .collect();
 
-    for (session_key, bytes) in &sessions {
-        let reader = blob::BlobReader::open(bytes)
-            .map_err(|e| format!("{session_key}: blob will not parse: {e}"))?;
-        let committed = reader.uncompressed_len() as i64;
+    for session_key in &sessions {
+        let stream = testkit::stream(conn, session_key)
+            .map_err(|e| format!("{session_key}: blob will not decompress: {e}"))?;
+        let committed = stream.len() as i64;
 
         // (3) Containment, for turn rows.
         let past: i64 = conn
@@ -466,9 +470,7 @@ fn check_invariants(data_dir: &Path) -> Result<(), String> {
             // vacuously: nothing has been consumed, so there is no byte before
             // it to be a newline.
             Some(at) if at > 0 => {
-                let before = reader
-                    .read_range((at - 1) as u64, 1)
-                    .map_err(|e| format!("{session_key}: reading byte {} failed: {e}", at - 1))?;
+                let before = &stream[(at - 1) as usize..at as usize];
                 if before != b"\n" {
                     return Err(format!(
                         "{session_key}: watermark at {at} is not a record boundary - the byte \

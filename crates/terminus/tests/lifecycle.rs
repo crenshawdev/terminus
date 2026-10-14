@@ -341,16 +341,10 @@ fn compact_against_no_store_is_an_answer_and_creates_nothing() {
 /// Every session's archived bytes as SQLite reports them, over the whole store.
 ///
 /// The reconciliation target `usage` documents, computed the one way that is
-/// not a second implementation of the report: one `sum()` over one column.
+/// not a second implementation of the report: one sum over what is stored, in
+/// testkit and never through `usage`'s own code path.
 fn archived_bytes(bench: &Bench) -> i64 {
-    bench
-        .conn()
-        .query_row(
-            "SELECT coalesce(sum(length(blob)), 0) FROM sessions",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
+    testkit::stored_total(&bench.conn())
 }
 
 /// The bytes in one of the two archive tables, added up by the reader.
@@ -576,8 +570,8 @@ fn exported_files(dir: &Path) -> Vec<String> {
 /// PRIV-04: the exported files ARE the archived streams, byte for byte, and the
 /// manifest accounts for every one of them and says in words what they are.
 ///
-/// The comparison is against `blob::read_all` over the stored blob rather than
-/// against the transcript on disk: what export claims to write is what the
+/// The comparison is against the stream testkit reads out of the store, not
+/// the transcript on disk: what export claims to write is what the
 /// archive holds, and those are the same bytes only for a session captured in
 /// full. Comparing to the source file would be testing ingest.
 #[test]
@@ -600,14 +594,7 @@ fn an_export_is_the_archived_streams_byte_for_byte_with_a_manifest_over_them() {
     // Every session's file holds exactly what the archive holds.
     let conn = bench.conn();
     for key in &keys {
-        let blob: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [key.to_string_lossy()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let expected = terminus_core::blob::read_all(&blob).unwrap();
+        let expected = testkit::stream(&conn, &key.to_string_lossy()).unwrap();
         let named = manifest(&dest)["files"]
             .as_array()
             .unwrap()

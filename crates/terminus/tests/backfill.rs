@@ -357,11 +357,15 @@ impl Snapshot {
         // a tail expression drops the locals first.
         let snapshot = Snapshot {
             blobs: conn
-                .prepare("SELECT session_key, blob FROM sessions ORDER BY session_key")
+                .prepare("SELECT session_key FROM sessions ORDER BY session_key")
                 .unwrap()
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
                 .map(Result::unwrap)
+                .map(|key| {
+                    let stored = testkit::stored(&conn, &key);
+                    (key, stored)
+                })
                 .collect(),
             turns: conn
                 .prepare(

@@ -1018,7 +1018,14 @@ fn the_terminal_search_refuses_the_retired_observation_kind() {
     let bench = bench();
     bench.ingest_fixtures();
 
-    let out = bench.run(&["search", "brillig", "--project", "*", "--kind", "observation"]);
+    let out = bench.run(&[
+        "search",
+        "brillig",
+        "--project",
+        "*",
+        "--kind",
+        "observation",
+    ]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert_eq!(stdout(&out), "", "misuse must print nothing to stdout");
     let message = stderr(&out);
@@ -1291,12 +1298,16 @@ fn the_knob_filters_the_search_excerpt_and_raw_reaches_past_it() {
 fn blobs(bench: &Bench) -> Vec<(String, Vec<u8>)> {
     let conn = bench.conn();
     let mut statement = conn
-        .prepare("SELECT session_key, blob FROM sessions ORDER BY session_key")
+        .prepare("SELECT session_key FROM sessions ORDER BY session_key")
         .unwrap();
     let rows: Vec<(String, Vec<u8>)> = statement
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map([], |r| r.get::<_, String>(0))
         .unwrap()
         .map(Result::unwrap)
+        .map(|key| {
+            let stored = testkit::stored(&conn, &key);
+            (key, stored)
+        })
         .collect();
     rows
 }

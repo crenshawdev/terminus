@@ -516,6 +516,17 @@ pub fn stored_len(conn: &rusqlite::Connection, session_key: &str) -> i64 {
     .unwrap_or_else(|e| panic!("stored length of {session_key}: {e}"))
 }
 
+/// Every session's stored archive bytes, summed over the whole store in one
+/// statement.
+pub fn stored_total(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row(
+        "SELECT coalesce(sum(length(blob)), 0) FROM sessions",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|e| panic!("sum the stored archive: {e}"))
+}
+
 /// One session's whole uncompressed stream, or the error its stored bytes give.
 pub fn stream(conn: &rusqlite::Connection, session_key: &str) -> crate::Result<Vec<u8>> {
     crate::blob::read_all(&stored(conn, session_key))

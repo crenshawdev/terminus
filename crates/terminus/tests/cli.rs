@@ -138,23 +138,7 @@ fn verify_names_the_corrupt_session_and_no_other() {
     let parent = bench.ingest("session-basic.jsonl");
     let sidecar = bench.ingest("subagents/agent-alpha.jsonl");
 
-    {
-        let conn = bench.conn();
-        let mut bytes: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&sidecar],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let at = bytes.len() / 2;
-        bytes[at] ^= 0xff;
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![bytes, &sidecar],
-        )
-        .unwrap();
-    }
+    testkit::damage(&bench.conn(), &sidecar);
 
     let out = bench.run(&["verify"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
@@ -543,23 +527,7 @@ fn verify_json_names_the_corrupt_session_and_still_exits_one() {
     let parent = bench.ingest("session-basic.jsonl");
     let sidecar = bench.ingest("subagents/agent-alpha.jsonl");
 
-    {
-        let conn = bench.conn();
-        let mut bytes: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&sidecar],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let at = bytes.len() / 2;
-        bytes[at] ^= 0xff;
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![bytes, &sidecar],
-        )
-        .unwrap();
-    }
+    testkit::damage(&bench.conn(), &sidecar);
 
     let out = bench.run(&["verify", "--json"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
@@ -1121,23 +1089,7 @@ fn an_operational_failure_exits_one_with_ok_false() {
     bench.ingest("session-basic.jsonl");
     let sidecar = bench.ingest("subagents/agent-alpha.jsonl");
 
-    {
-        let conn = bench.conn();
-        let mut bytes: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&sidecar],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let at = bytes.len() / 2;
-        bytes[at] ^= 0xff;
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![bytes, &sidecar],
-        )
-        .unwrap();
-    }
+    testkit::damage(&bench.conn(), &sidecar);
 
     let out = bench.run(&["verify", "--json"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
