@@ -303,7 +303,7 @@ fn the_divergence_says_the_archive_was_not_touched() {
     bench.flag_divergence(&bench.keys[0].clone());
 
     let text = report_text(&bench);
-    assert!(text.contains("shorter"), "{text}");
+    assert!(text.contains("shortened or rewritten"), "{text}");
     assert!(text.contains("archive was left untouched"), "{text}");
     // Not a checksum complaint. The rows verified.
     assert!(!text.contains("checksum"), "{text}");

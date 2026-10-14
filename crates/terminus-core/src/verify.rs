@@ -107,8 +107,12 @@ pub fn verify(store: &Store) -> Result<Report> {
 /// failure that is neither necessary nor sufficient: the pass already refused
 /// to re-read the file from offset 0, on purpose, because doing so would
 /// overwrite archived bytes.
-const DIVERGED: &str = "the transcript on disk is shorter than the bytes the archive holds \
-                        for it; the archive was left untouched";
+///
+/// It names both causes because one flag carries both: a file found shorter
+/// than its watermark sets it, and a file that grew back with a different start
+/// keeps it set, so a flagged file can be longer than the archive.
+const DIVERGED: &str = "the transcript on disk was shortened or rewritten since it was \
+                        archived; the archive was left untouched";
 
 /// What `session_meta` says about one session.
 struct Meta {
