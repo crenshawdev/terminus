@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use rusqlite::Connection;
 use terminus_core::store::DB_FILE_NAME;
-use terminus_core::{blob, ingest, testkit, verify, Store};
+use terminus_core::{ingest, testkit, verify, Store};
 
 /// The three fixtures every test here ingests, the first two colliding on the
 /// session id they report.
@@ -67,24 +67,9 @@ impl Bench {
         Connection::open(self.data_dir.join(DB_FILE_NAME)).unwrap()
     }
 
-    /// Flip one byte inside a session's blob column, with a direct UPDATE.
-    fn flip_a_byte(&self, key: &str) {
-        let conn = self.conn();
-        let mut bytes: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [key],
-                |r| r.get(0),
-            )
-            .unwrap();
-        // Inside the compressed payload, past the header and block table.
-        let at = bytes.len() / 2;
-        bytes[at] ^= 0xff;
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![bytes, key],
-        )
-        .unwrap();
+    /// Damage a session's stored bytes so they no longer decompress.
+    fn damage(&self, key: &str) {
+        testkit::damage(&self.conn(), key);
     }
 
     /// Raise D-13's flag on one session, the way a pass over a shortened
@@ -106,45 +91,21 @@ impl Bench {
     /// does to reach this state is asserted in `tests/retention.rs`, and the
     /// question here is only what `verify` reports off the two columns.
     fn evict(&self, key: &str) {
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE sessions SET blob = x'' WHERE session_key = ?1",
-            [key],
-        )
-        .unwrap();
-        let changed = conn
-            .execute(
-                "UPDATE session_meta SET is_evicted = 1 WHERE session_key = ?1",
-                [key],
-            )
-            .unwrap();
-        assert_eq!(changed, 1, "no session_meta row for {key}");
+        testkit::evict(&self.conn(), key);
     }
 
     /// Replace a session's stream with different bytes, validly compressed.
     ///
-    /// The other half of the corruption space: `flip_a_byte` usually makes zstd
-    /// refuse the block, which would let a `verify` that never hashed anything
+    /// The other half of the corruption space: `damage` makes zstd refuse the
+    /// block, which would let a `verify` that never hashed anything
     /// still pass AC3. This one decompresses perfectly and hashes differently,
     /// so only the BLAKE3 comparison can catch it (D-06).
     fn rewrite_the_stream(&self, key: &str) {
         let conn = self.conn();
-        let bytes: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [key],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let mut stream = blob::read_all(&bytes).unwrap();
+        let mut stream = testkit::stream(&conn, key).unwrap();
         let at = stream.len() / 2;
         stream[at] = if stream[at] == b'x' { b'y' } else { b'x' };
-        let rewritten = blob::write(&stream).unwrap();
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![rewritten.bytes, key],
-        )
-        .unwrap();
+        testkit::rewrite_stream(&conn, key, &stream);
     }
 }
 
@@ -165,12 +126,12 @@ fn a_clean_store_verifies() {
     assert_eq!(report.render(), "");
 }
 
-/// AC3. One flipped byte names one session and no other.
+/// AC3. One damaged session is named and no other.
 #[test]
 fn one_corrupt_session_is_named_and_no_other() {
     let bench = bench();
     let corrupt = bench.keys[0].clone();
-    bench.flip_a_byte(&corrupt);
+    bench.damage(&corrupt);
 
     let report = verify::verify(&bench.store()).unwrap();
     assert_eq!(report.checked, 3, "the walk visited every session");
@@ -219,7 +180,7 @@ fn two_corrupt_sessions_are_both_reported() {
     let bench = bench();
     let first = bench.keys[0].clone();
     let second = bench.keys[2].clone();
-    bench.flip_a_byte(&first);
+    bench.damage(&first);
     bench.rewrite_the_stream(&second);
 
     let report = verify::verify(&bench.store()).unwrap();
@@ -248,15 +209,7 @@ fn a_valid_blob_holding_the_wrong_bytes_is_still_a_failure() {
     bench.rewrite_the_stream(&corrupt);
 
     // The premise: the replacement blob is perfectly readable.
-    let bytes: Vec<u8> = bench
-        .conn()
-        .query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [&corrupt],
-            |r| r.get(0),
-        )
-        .unwrap();
-    blob::read_all(&bytes).expect("the rewritten blob must decompress cleanly");
+    testkit::stream(&bench.conn(), &corrupt).expect("the rewritten blob must decompress cleanly");
 
     let report = verify::verify(&bench.store()).unwrap();
     assert_eq!(report.failures.len(), 1);
@@ -273,7 +226,7 @@ fn a_valid_blob_holding_the_wrong_bytes_is_still_a_failure() {
 #[test]
 fn the_report_never_mentions_integrity_check() {
     let bench = bench();
-    bench.flip_a_byte(&bench.keys[0].clone());
+    bench.damage(&bench.keys[0].clone());
     let report = verify::verify(&bench.store()).unwrap();
     assert!(!report.render().contains("integrity_check"));
 }
@@ -346,9 +299,9 @@ fn a_diverged_session_with_a_damaged_blob_reports_both() {
     let bench = bench();
     let broken = bench.keys[0].clone();
     bench.flag_divergence(&broken);
-    // `rewrite_the_stream` and not `flip_a_byte`: this fixture is small enough
-    // that a flipped byte often still decompresses, so which of the two blob
-    // verdicts fires would be incidental. This one always reaches the hash.
+    // `rewrite_the_stream` and not `damage`: the blob verdict wanted here is
+    // the checksum mismatch, and only a stream that decompresses reaches the
+    // hash.
     bench.rewrite_the_stream(&broken);
 
     let report = verify::verify(&bench.store()).unwrap();
@@ -404,16 +357,8 @@ fn an_evicted_session_is_counted_and_never_named_while_a_corrupt_one_still_is() 
 
     // The premise: the emptied blob really is unreadable, so the arm is what
     // keeps it out of the report rather than the bytes happening to survive.
-    let bytes: Vec<u8> = bench
-        .conn()
-        .query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [&evicted],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(bytes.is_empty());
-    assert!(blob::read_all(&bytes).is_err());
+    assert_eq!(testkit::stored_len(&bench.conn(), &evicted), 0);
+    assert!(testkit::stream(&bench.conn(), &evicted).is_err());
 
     let report = verify::verify(&bench.store()).unwrap();
     assert_eq!(
@@ -424,7 +369,10 @@ fn an_evicted_session_is_counted_and_never_named_while_a_corrupt_one_still_is() 
     assert_eq!(report.failures[0].session_key, corrupt);
 
     let text = report.render();
-    assert!(!text.contains(&evicted), "named the evicted session: {text}");
+    assert!(
+        !text.contains(&evicted),
+        "named the evicted session: {text}"
+    );
     for other in others(&bench.keys, &[&corrupt]) {
         assert!(!text.contains(other.as_str()), "named {other}: {text}");
     }

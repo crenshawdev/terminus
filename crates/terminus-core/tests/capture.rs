@@ -358,7 +358,13 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use terminus_core::store::DB_FILE_NAME;
-use terminus_core::{blob, ingest, recall, reindex, verify, Config, Store};
+use terminus_core::{ingest, recall, reindex, verify, Config, Store};
+
+/// The key of the one session a single-transcript store holds.
+fn only_session(conn: &Connection) -> String {
+    conn.query_row("SELECT session_key FROM sessions", [], |r| r.get(0))
+        .unwrap()
+}
 
 /// One temp store fed one transcript under one mode.
 struct Bench {
@@ -416,22 +422,23 @@ impl Bench {
 
     /// `(compressed blob bytes, uncompressed stream bytes)`.
     fn sizes(&self) -> (i64, i64) {
-        self.conn()
+        let conn = self.conn();
+        let (key, stream_len): (String, i64) = conn
             .query_row(
-                "SELECT length(s.blob), m.uncompressed_len
-                 FROM sessions s JOIN session_meta m USING (session_key)",
+                "SELECT session_key, uncompressed_len FROM session_meta",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .unwrap()
+            .unwrap();
+        (testkit::stored_len(&conn, &key), stream_len)
     }
 
     fn stream(&self) -> Vec<u8> {
-        let bytes: Vec<u8> = self
-            .conn()
-            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
-            .unwrap();
-        blob::read_all(&bytes).unwrap()
+        testkit::stream(&self.conn(), &only_session(&self.conn())).unwrap()
+    }
+
+    fn stored(&self) -> Vec<u8> {
+        testkit::stored(&self.conn(), &only_session(&self.conn()))
     }
 
     fn mode(&self) -> Option<String> {
@@ -480,7 +487,7 @@ fn the_three_modes_store_strictly_decreasing_blobs() {
 
     assert!(
         compressed[0] > compressed[1] && compressed[1] > compressed[2],
-        "length(sessions.blob) must strictly decrease: {compressed:?}"
+        "the stored archive bytes must strictly decrease: {compressed:?}"
     );
     assert!(
         uncompressed[0] > uncompressed[1] && uncompressed[1] > uncompressed[2],
@@ -732,10 +739,7 @@ fn two_runs_over_an_unchanged_lean_transcript_repair_nothing() {
         let (blob_len, stream_len) = bench.sizes();
         let watermark = bench.watermark();
         let turns = bench.turns();
-        let blob: Vec<u8> = bench
-            .conn()
-            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
-            .unwrap();
+        let blob = bench.stored();
 
         let (_store, recovered) = terminus_core::recover::recover(&bench.data_dir).unwrap();
         assert!(
@@ -757,10 +761,7 @@ fn two_runs_over_an_unchanged_lean_transcript_repair_nothing() {
             "{mode:?}: the watermark moved"
         );
         assert_eq!(bench.turns(), turns, "{mode:?}: the turn rows moved");
-        let blob_after: Vec<u8> = bench
-            .conn()
-            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
-            .unwrap();
+        let blob_after = bench.stored();
         assert!(blob_after == blob, "{mode:?}: the blob was rewritten");
     }
 }
@@ -877,11 +878,7 @@ impl Tree {
     }
 
     fn stream(&self) -> Vec<u8> {
-        let bytes: Vec<u8> = self
-            .conn()
-            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
-            .unwrap();
-        blob::read_all(&bytes).unwrap()
+        testkit::stream(&self.conn(), &only_session(&self.conn())).unwrap()
     }
 
     fn verify(&self) -> verify::Report {

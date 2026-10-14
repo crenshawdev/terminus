@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use terminus_core::derive::{self, TurnRow};
 use terminus_core::ingest::{self, Outcome};
 use terminus_core::store::{schema, Store, DB_FILE_NAME};
-use terminus_core::{blob, parse, testkit};
+use terminus_core::{parse, testkit};
 
 struct Bench {
     _dir: tempfile::TempDir,
@@ -137,14 +137,7 @@ fn state_records_contribute_no_fts_row() {
 /// Re-derive every turn of the bench session from its blob, exactly as a
 /// rebuild would: same seam, same ids, nothing read but the archive.
 fn re_derive_every_turn(bench: &Bench, conn: &Connection) {
-    let raw: Vec<u8> = conn
-        .query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [&bench.session_key],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let stream = blob::read_all(&raw).unwrap();
+    let stream = testkit::stream(conn, &bench.session_key).unwrap();
     let scan = parse::scan(&stream);
     let tx = conn.unchecked_transaction().unwrap();
     for (record, turn) in scan.turns() {
@@ -282,11 +275,7 @@ fn the_seam_writes_inside_the_callers_transaction() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let conn = store.conn();
-    conn.execute(
-        "INSERT INTO sessions (session_key, session_no, blob) VALUES ('k', 0, x'00')",
-        [],
-    )
-    .unwrap();
+    testkit::plant_session(conn, "k", 0, &[0]);
 
     // A real record shape rather than a bare `"message": "quixotic"`: the body
     // is a projection of `message.content` and the three other subtrees D-01

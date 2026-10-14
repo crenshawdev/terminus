@@ -64,14 +64,7 @@ fn counts(conn: &Connection) -> Vec<(String, i64)> {
 }
 
 fn stream(conn: &Connection, session_key: &str) -> Vec<u8> {
-    let bytes: Vec<u8> = conn
-        .query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [session_key],
-            |r| r.get(0),
-        )
-        .unwrap();
-    blob::read_all(&bytes).unwrap()
+    testkit::stream(conn, session_key).unwrap()
 }
 
 fn watermark(conn: &Connection, key: &str) -> i64 {
@@ -276,14 +269,7 @@ fn resuming_from_a_mid_line_watermark_converges_on_a_single_pass() {
 
     // Byte-identical blobs, not merely equal streams: an append that
     // recompressed the whole session would still decompress correctly.
-    let blob_of = |key: &str| -> Vec<u8> {
-        conn.query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [key],
-            |r| r.get(0),
-        )
-        .unwrap()
-    };
+    let blob_of = |key: &str| testkit::stored(&conn, key);
     assert_eq!(
         blob_of(&second.session_key),
         blob_of(&reference.session_key),
@@ -528,14 +514,14 @@ fn a_session_that_lost_its_metadata_row_is_refused_rather_than_re_ingested() {
     let (blob_before, watermark_before, session_no_before) = {
         let conn = Connection::open(&db).unwrap();
         conn.execute("DELETE FROM session_meta", []).unwrap();
-        let blob: Vec<u8> = conn
-            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+        let (key, session_no): (String, i64) = conn
+            .query_row("SELECT session_key, session_no FROM sessions", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
+        let blob = testkit::stored(&conn, &key);
         let watermark: i64 = conn
             .query_row("SELECT byte_offset FROM watermarks", [], |r| r.get(0))
-            .unwrap();
-        let session_no: i64 = conn
-            .query_row("SELECT session_no FROM sessions", [], |r| r.get(0))
             .unwrap();
         (blob, watermark, session_no)
     };
@@ -552,9 +538,10 @@ fn a_session_that_lost_its_metadata_row_is_refused_rather_than_re_ingested() {
 
     // The archive is exactly as it was.
     let conn = Connection::open(&db).unwrap();
-    let blob_after: Vec<u8> = conn
-        .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+    let key: String = conn
+        .query_row("SELECT session_key FROM sessions", [], |r| r.get(0))
         .unwrap();
+    let blob_after = testkit::stored(&conn, &key);
     assert!(
         blob_after == blob_before,
         "the refused pass rewrote the blob"

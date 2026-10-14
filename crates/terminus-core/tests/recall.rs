@@ -1258,11 +1258,7 @@ fn a_damaged_blob_leaves_an_empty_excerpt_and_a_whole_hit() {
         .expect("the errors fixture answers this query")
         .session_key
         .clone();
-    conn.execute(
-        "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-        rusqlite::params![vec![0u8; 64], &damaged],
-    )
-    .unwrap();
+    testkit::damage(&conn, &damaged);
 
     let after = ranked(&conn, "cargo", MAX_RESULTS);
     assert_eq!(after.len(), before.len(), "the search still answered");
@@ -1463,11 +1459,7 @@ fn a_directory_that_is_also_another_rows_pre_worktree_key_scopes_to_itself() {
     let conn = store.conn();
 
     let insert = |key: &str, no: i64, project: &str, pre: Option<&str>| {
-        conn.execute(
-            "INSERT INTO sessions (session_key, session_no, blob) VALUES (?1, ?2, x'00')",
-            rusqlite::params![key, no],
-        )
-        .unwrap();
+        testkit::plant_session(conn, key, no, &[0]);
         conn.execute(
             "INSERT INTO session_meta
                  (session_key, transcript_path, checksum, uncompressed_len,

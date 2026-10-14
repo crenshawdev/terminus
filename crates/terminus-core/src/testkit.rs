@@ -490,6 +490,98 @@ pub fn read_turn(conn: &rusqlite::Connection, turn_id: i64) -> (Vec<u8>, usize) 
     (bytes, read.blocks_decompressed)
 }
 
+// The archive as the tests read it. Every helper below uses its own SQL and
+// the blob format directly, and never `store::archive`: a test that checks a
+// product number against what is stored would otherwise be checking the
+// product's read path against itself.
+
+/// One session's stored archive bytes, for comparing two reads or two stores
+/// with `==`.
+pub fn stored(conn: &rusqlite::Connection, session_key: &str) -> Vec<u8> {
+    conn.query_row(
+        "SELECT blob FROM sessions WHERE session_key = ?1",
+        [session_key],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|e| panic!("stored bytes of {session_key}: {e}"))
+}
+
+/// How many archive bytes one session has stored.
+pub fn stored_len(conn: &rusqlite::Connection, session_key: &str) -> i64 {
+    conn.query_row(
+        "SELECT length(blob) FROM sessions WHERE session_key = ?1",
+        [session_key],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|e| panic!("stored length of {session_key}: {e}"))
+}
+
+/// One session's whole uncompressed stream, or the error its stored bytes give.
+pub fn stream(conn: &rusqlite::Connection, session_key: &str) -> crate::Result<Vec<u8>> {
+    crate::blob::read_all(&stored(conn, session_key))
+}
+
+/// Damage one session's stored bytes so they no longer decode.
+///
+/// Every compressed byte is zeroed and the header is left alone, so the
+/// failure lands where bit-rot would, in the decompressor.
+pub fn damage(conn: &rusqlite::Connection, session_key: &str) {
+    let mut bytes = stored(conn, session_key);
+    let header = crate::blob::BlobHeader::parse(&bytes)
+        .unwrap_or_else(|e| panic!("{session_key} has no header to damage behind: {e}"));
+    let payload = header
+        .blocks
+        .first()
+        .unwrap_or_else(|| panic!("{session_key} has no block to damage"))
+        .compressed_offset as usize;
+    bytes[payload..].fill(0);
+    put_stored(conn, session_key, &bytes);
+}
+
+/// Replace one session's stream with `stream`, validly encoded, and leave its
+/// metadata alone.
+pub fn rewrite_stream(conn: &rusqlite::Connection, session_key: &str, stream: &[u8]) {
+    let written = crate::blob::write(stream).expect("encode the replacement stream");
+    put_stored(conn, session_key, &written.bytes);
+}
+
+/// Empty one session and mark it evicted, the way retention evicts one.
+pub fn evict(conn: &rusqlite::Connection, session_key: &str) {
+    put_stored(conn, session_key, &[]);
+    let changed = conn
+        .execute(
+            "UPDATE session_meta SET is_evicted = 1 WHERE session_key = ?1",
+            [session_key],
+        )
+        .unwrap_or_else(|e| panic!("mark {session_key} evicted: {e}"));
+    assert_eq!(changed, 1, "no session_meta row for {session_key}");
+}
+
+/// Insert a `sessions` row holding `bytes` as its stored archive, with no
+/// metadata. For tests that plant sessions rather than ingest them.
+pub fn plant_session(
+    conn: &rusqlite::Connection,
+    session_key: &str,
+    session_no: i64,
+    bytes: &[u8],
+) {
+    conn.execute(
+        "INSERT INTO sessions (session_key, session_no, blob) VALUES (?1, ?2, ?3)",
+        rusqlite::params![session_key, session_no, bytes],
+    )
+    .unwrap_or_else(|e| panic!("plant {session_key}: {e}"));
+}
+
+fn put_stored(conn: &rusqlite::Connection, session_key: &str, bytes: &[u8]) {
+    let changed = conn
+        .execute(
+            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
+            rusqlite::params![bytes, session_key],
+        )
+        .unwrap_or_else(|e| panic!("store bytes for {session_key}: {e}"));
+    assert_eq!(changed, 1, "no sessions row for {session_key}");
+}
+
 /// SplitMix64. A test that generates its own inputs has to be reproducible
 /// from the seed it prints, and pulling a crate in for four lines is not worth
 /// it.

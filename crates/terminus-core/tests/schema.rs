@@ -202,11 +202,10 @@ fn aged_store() -> Aged {
     }
 
     let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
-    let (session_key, blob): (String, Vec<u8>) = conn
-        .query_row("SELECT session_key, blob FROM sessions", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
+    let session_key: String = conn
+        .query_row("SELECT session_key FROM sessions", [], |r| r.get(0))
         .unwrap();
+    let blob = terminus_core::testkit::stored(&conn, &session_key);
     let checksum: Vec<u8> = conn
         .query_row("SELECT checksum FROM session_meta", [], |r| r.get(0))
         .unwrap();
@@ -254,11 +253,10 @@ impl Aged {
             }
         }
 
-        let (key, blob): (String, Vec<u8>) = conn
-            .query_row("SELECT session_key, blob FROM sessions", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+        let key: String = conn
+            .query_row("SELECT session_key FROM sessions", [], |r| r.get(0))
             .unwrap();
+        let blob = terminus_core::testkit::stored(conn, &key);
         let checksum: Vec<u8> = conn
             .query_row("SELECT checksum FROM session_meta", [], |r| r.get(0))
             .unwrap();
@@ -548,9 +546,10 @@ fn the_capture_mode_column_reaches_an_older_store_without_a_rebuild() {
     let turns_before: i64 = conn
         .query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
         .unwrap();
-    let blob_before: Vec<u8> = conn
-        .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+    let key: String = conn
+        .query_row("SELECT session_key FROM sessions", [], |r| r.get(0))
         .unwrap();
+    let blob_before = terminus_core::testkit::stored(&conn, &key);
     conn.execute_batch("ALTER TABLE session_meta DROP COLUMN capture_mode")
         .unwrap();
     assert!(
@@ -578,10 +577,7 @@ fn the_capture_mode_column_reaches_an_older_store_without_a_rebuild() {
         .conn()
         .query_row("SELECT count(*) FROM turns", [], |r| r.get(0))
         .unwrap();
-    let blob_after: Vec<u8> = store
-        .conn()
-        .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
-        .unwrap();
+    let blob_after = terminus_core::testkit::stored(store.conn(), &key);
     assert_eq!(turns_after, turns_before, "the derived tables were rebuilt");
     assert!(
         blob_after == blob_before,

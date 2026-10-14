@@ -94,13 +94,7 @@ impl Bench {
         )
         .unwrap();
 
-        let blob: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [self.key()],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let blob = testkit::stored(&conn, &self.key());
         let checksum: Vec<u8> = conn
             .query_row(
                 "SELECT checksum FROM session_meta WHERE session_key = ?1",
@@ -130,13 +124,7 @@ impl Bench {
         );
 
         let conn = self.conn();
-        let blob_after: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [self.key()],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let blob_after = testkit::stored(&conn, &self.key());
         let checksum_after: Vec<u8> = conn
             .query_row(
                 "SELECT checksum FROM session_meta WHERE session_key = ?1",

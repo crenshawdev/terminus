@@ -357,23 +357,8 @@ fn a_corrupt_blob_is_skipped_and_named_rather_than_stopping_the_rebuild() {
             .unwrap();
         assert!(others > 0, "this test needs more than one ingested session");
 
-        let mut blob: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&key],
-                |r| r.get(0),
-            )
-            .unwrap();
-        // Inside the payload, so the header still parses and the failure lands
-        // where a real bit-rot would: in the decompressor.
-        for byte in blob.iter_mut().skip(60).take(150) {
-            *byte = 0;
-        }
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![blob, &key],
-        )
-        .unwrap();
+        // The failure lands where a real bit-rot would: in the decompressor.
+        testkit::damage(&conn, &key);
         (key, others)
     };
 
@@ -545,19 +530,7 @@ impl Bench {
 
     /// Empty a session's blob and mark it, exactly as `retention::apply` does.
     fn evict(&self, key: &str) {
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE sessions SET blob = x'' WHERE session_key = ?1",
-            [key],
-        )
-        .unwrap();
-        let changed = conn
-            .execute(
-                "UPDATE session_meta SET is_evicted = 1 WHERE session_key = ?1",
-                [key],
-            )
-            .unwrap();
-        assert_eq!(changed, 1, "no session_meta row for {key}");
+        testkit::evict(&self.conn(), key);
     }
 }
 
@@ -668,21 +641,7 @@ fn the_preserving_path_still_names_a_corrupt_blob_and_does_not_confuse_the_two()
     bench.evict(&evicted);
     {
         let conn = bench.conn();
-        let mut blob: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&corrupt],
-                |r| r.get(0),
-            )
-            .unwrap();
-        for byte in blob.iter_mut().skip(60).take(150) {
-            *byte = 0;
-        }
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![blob, &corrupt],
-        )
-        .unwrap();
+        testkit::damage(&conn, &corrupt);
     }
 
     let mut store = bench.store();

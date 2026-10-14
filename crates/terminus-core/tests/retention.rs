@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use terminus_core::config::{Config, CONFIG_FILE_NAME};
+use terminus_core::ingest::pass;
 use terminus_core::retention::{self, Applied, Selection, MAX_PER_PASS};
 use terminus_core::store::{Store, DB_FILE_NAME};
-use terminus_core::ingest::pass;
 use terminus_core::{ingest, testkit};
 
 /// The instant every evaluation below measures from.
@@ -76,11 +76,7 @@ impl Bench {
         self.next.set(no + 1);
 
         let conn = self.conn();
-        conn.execute(
-            "INSERT INTO sessions (session_key, session_no, blob) VALUES (?1, ?2, ?3)",
-            rusqlite::params![key, no, vec![0u8; 8]],
-        )
-        .unwrap();
+        testkit::plant_session(&conn, &key, no, &[0u8; 8]);
         conn.execute(
             "INSERT INTO session_meta
                 (session_key, transcript_path, checksum, uncompressed_len,
@@ -421,14 +417,14 @@ fn an_eviction_empties_the_blob_and_leaves_everything_else_standing() {
     assert!(applied.notes.is_empty(), "{:?}", applied.notes);
 
     let conn = bench.conn();
-    let (len, evicted): (i64, Option<i64>) = conn
+    let evicted: Option<i64> = conn
         .query_row(
-            "SELECT length(s.blob), m.is_evicted FROM sessions s
-             JOIN session_meta m USING (session_key) WHERE s.session_key = ?1",
+            "SELECT is_evicted FROM session_meta WHERE session_key = ?1",
             [&key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .unwrap();
+    let len = testkit::stored_len(&conn, &key);
     assert_eq!(
         len, 0,
         "the blob must be emptied, never null and never dropped"
@@ -606,7 +602,7 @@ impl Bench {
     }
 
     fn blob_len(&self, key: &str) -> i64 {
-        self.count("SELECT length(blob) FROM sessions WHERE session_key = ?1", key)
+        testkit::stored_len(&self.conn(), key)
     }
 
     fn is_evicted(&self, key: &str) -> Option<i64> {
@@ -661,7 +657,11 @@ fn re_ingesting_an_evicted_transcript_that_grew_is_up_to_date_and_writes_nothing
     assert_eq!(outcome, ingest::Outcome::UpToDate);
 
     assert_eq!(bench.blob_len(&key), 0, "the emptied blob was written back");
-    assert_eq!(bench.is_evicted(&key), Some(1), "the session was un-evicted");
+    assert_eq!(
+        bench.is_evicted(&key),
+        Some(1),
+        "the session was un-evicted"
+    );
     assert_eq!(
         bench.watermark(&key),
         Some(watermark),
@@ -781,15 +781,15 @@ fn a_pass_records_no_failure_for_an_evicted_session_whose_transcript_grew() {
     );
     assert!(second.turns_added > 0, "the sibling's tail added no turn");
 
-    let (len, flag): (i64, Option<i64>) = tree
+    let flag: Option<i64> = tree
         .conn()
         .query_row(
-            "SELECT length(s.blob), m.is_evicted FROM sessions s
-             JOIN session_meta m USING (session_key) WHERE s.session_key = ?1",
+            "SELECT is_evicted FROM session_meta WHERE session_key = ?1",
             [&evicted],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .unwrap();
+    let len = testkit::stored_len(&tree.conn(), &evicted);
     assert_eq!(len, 0, "the pass wrote bytes into an emptied blob");
     assert_eq!(flag, Some(1), "the pass un-evicted the session");
     assert_eq!(

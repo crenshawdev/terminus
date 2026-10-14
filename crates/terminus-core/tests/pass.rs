@@ -101,13 +101,14 @@ impl Bench {
 /// Every session's blob length and eviction flag, in ingest order.
 fn blobs(conn: &Connection) -> Vec<(i64, Option<i64>)> {
     conn.prepare(
-        "SELECT length(s.blob), m.is_evicted FROM sessions s
+        "SELECT s.session_key, m.is_evicted FROM sessions s
          JOIN session_meta m USING (session_key) ORDER BY s.session_no",
     )
     .unwrap()
-    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))
     .unwrap()
     .map(Result::unwrap)
+    .map(|(key, evicted)| (testkit::stored_len(conn, &key), evicted))
     .collect()
 }
 
@@ -412,7 +413,11 @@ fn the_data_directory_and_the_lock_are_owner_only_from_the_first_acquire() {
         other => panic!("the lock should have been free: {other:?}"),
     };
 
-    assert_eq!(mode(&data_dir), 0o700, "the data directory is not owner-only");
+    assert_eq!(
+        mode(&data_dir),
+        0o700,
+        "the data directory is not owner-only"
+    );
     assert_eq!(
         mode(&parent),
         0o755,
@@ -769,11 +774,7 @@ fn the_bounded_step_leaves_the_rest_for_the_next_pass_and_says_how_many() {
         let conn = store.conn();
         for n in 0..total {
             let key = format!("/planted/{n}.jsonl");
-            conn.execute(
-                "INSERT INTO sessions (session_key, session_no, blob) VALUES (?1, ?2, ?3)",
-                rusqlite::params![key, n as i64 + 1, vec![0u8; 16]],
-            )
-            .unwrap();
+            testkit::plant_session(conn, &key, n as i64 + 1, &[0u8; 16]);
             conn.execute(
                 "INSERT INTO session_meta
                     (session_key, transcript_path, checksum, uncompressed_len,
