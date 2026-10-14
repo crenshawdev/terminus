@@ -1333,7 +1333,10 @@ fn a_closed_stdout_changes_no_exit_code() {
         vec!["status"],
     ] {
         let read = bench.run(&args);
-        assert!(!read.stdout.is_empty(), "{args:?} wrote nothing to close on");
+        assert!(
+            !read.stdout.is_empty(),
+            "{args:?} wrote nothing to close on"
+        );
 
         let mut child = bench
             .command(&args)
