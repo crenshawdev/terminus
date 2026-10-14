@@ -22,9 +22,8 @@ use crate::recall::Query;
 ///
 /// A caller may lower it and may not raise it. The MCP server needs a
 /// server-side budget it does not have to trust a client to respect (RCL-10),
-/// and every hit costs an excerpt read out of a session blob, which is a whole
-/// decompressed session per session touched while rusqlite's incremental blob
-/// I/O stays out of scope (D-20).
+/// and every hit costs an excerpt read out of its session's block rows: the
+/// blocks its turn covers, fetched and decompressed.
 pub const MAX_RESULTS: usize = 50;
 
 /// What a caller gets when it does not say.
@@ -92,7 +91,7 @@ pub struct Request {
     /// [`Hit::entity_count`], so a candidate that matched only as free text
     /// costs a row here and injects nothing (INJ-03).
     pub candidates: Vec<Query>,
-    /// Whether every returned hit gets an excerpt cut from its session blob.
+    /// Whether every returned hit gets an excerpt cut from its session's block rows.
     ///
     /// On for both front ends, because a hit with no text under it is not a
     /// search result. Off for injection until its threshold has fired: an
@@ -251,7 +250,7 @@ pub struct Hit {
     /// Higher is a better match: the negated bm25 (see [`HEAD`]) plus
     /// [`Hit::entity_score`].
     pub relevance: f64,
-    /// The matched text, cut from the session blob (D-05). Empty only when the
+    /// The matched text, cut from the session's block rows (D-05). Empty only when the
     /// archive would not give it up - see [`crate::recall::excerpt`].
     pub excerpt: String,
 }

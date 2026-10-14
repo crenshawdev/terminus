@@ -1,4 +1,4 @@
-//! `terminus reindex`: rebuild every derived table from the blobs (STOR-04).
+//! `terminus reindex`: rebuild every derived table from the archive (STOR-04).
 
 use serde_json::json;
 use terminus_core::ingest::{lock, Attempt};

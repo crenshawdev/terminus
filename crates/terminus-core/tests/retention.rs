@@ -581,10 +581,10 @@ fn a_failure_on_one_session_does_not_stop_the_next() {
     }
 }
 
-// D-03 on the ingest side. An evicted session's blob was emptied on purpose, so
-// `blob::append` has no header to parse out of it: left to the ordinary path
+// D-03 on the ingest side. An evicted session's block rows were deleted on
+// purpose, so an append has no tail block to build on: left to the ordinary path
 // the transcript becomes a per-file failure on every pass forever, and writing
-// its tail as a FRESH blob instead would resurrect a session retention
+// its tail as FRESH block rows instead would resurrect a session retention
 // deliberately emptied while leaving every stored `turns.stream_offset`
 // pointing into bytes that are no longer there. The only safe answer is to do
 // nothing at all, which is what these two cases assert - one through the

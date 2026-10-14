@@ -399,8 +399,8 @@ fn a_corrupt_blob_is_skipped_and_named_rather_than_stopping_the_rebuild() {
 /// D-02, as the failure it prevents: a `reindex` must leave every observation
 /// row exactly where it was.
 ///
-/// The facts in these rows come off the session blob, and retention eviction
-/// empties that blob, so a `reindex` that dropped the table would silently lose
+/// The facts in these rows come off the session's block rows, and retention
+/// eviction deletes those rows, so a `reindex` that dropped the table would silently lose
 /// every evicted session's observation - and `open_up_to_date` runs on the
 /// ingest path, so it would happen unattended on the first pass after an
 /// upgrade.

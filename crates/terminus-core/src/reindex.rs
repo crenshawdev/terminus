@@ -1,6 +1,6 @@
-//! Rebuilding every derived table from the blobs alone (STOR-04).
+//! Rebuilding every derived table from the block rows alone (STOR-04).
 //!
-//! The input is the blobs and nothing else. Every table in
+//! The input is the block rows and nothing else. Every table in
 //! `schema::DERIVED_TABLES` - `turns`, `compaction_boundaries`, `turns_fts`,
 //! `entities` and `paths` - is dropped before a single row is read, so a
 //! rebuild cannot quietly carry forward a value only the old rows knew, which
@@ -85,7 +85,7 @@ pub struct Rebuilt {
     pub preserved: usize,
 }
 
-/// Drop every derived table and rebuild it from the session blobs.
+/// Drop every derived table and rebuild it from the sessions' block rows.
 ///
 /// One transaction: a rebuild that committed half way would leave the store
 /// with derived tables that describe some sessions and not others, and no
@@ -122,7 +122,7 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
 
     if preserved == 0 {
         // Every store until a user writes a `[retention]` table, and the
-        // stronger guarantee: nothing survives that the blobs did not produce.
+        // stronger guarantee: nothing survives that the block rows did not produce.
         //
         // Children first, and that is not tidiness. The bundled SQLite is
         // compiled with `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`

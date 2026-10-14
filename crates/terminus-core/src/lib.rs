@@ -1,10 +1,10 @@
 //! Terminus archive core.
 //!
-//! The session blob is truth; everything else is derived and rebuildable from
-//! it (`.planning/PROJECT.md`, D-13). This crate owns the store, the zstd
-//! block rows the archive is kept in and the ingest path. It links no async
-//! runtime and no thread-pool crate: the hook path must not pay for a runtime
-//! it does not use (`DESIGN-BRIEF.md:39`).
+//! The archived session, kept as block rows, is truth; everything else is
+//! derived and rebuildable from it (`.planning/PROJECT.md`, D-13). This crate
+//! owns the store, the zstd block rows the archive is kept in and the ingest
+//! path. It links no async runtime and no thread-pool crate: the hook path must
+//! not pay for a runtime it does not use (`DESIGN-BRIEF.md:39`).
 //!
 //! It does start threads, in exactly one place, and the exception is worth
 //! naming precisely rather than leaving the sentence above to quietly become

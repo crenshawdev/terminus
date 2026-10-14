@@ -7,9 +7,9 @@
 //!
 //! **Archival, never derived (D-02).** `observations` is deliberately absent
 //! from [`crate::store::schema::DERIVED_TABLES`]: the facts come off the
-//! session blob, and retention eviction empties that blob, so a `reindex` that
-//! dropped the table could not recompute an evicted session's row. `terminus
-//! observations regenerate` (OBS-07) is the only rebuild path.
+//! session's block rows, and retention eviction deletes those rows, so a
+//! `reindex` that dropped the table could not recompute an evicted session's
+//! row. `terminus observations regenerate` (OBS-07) is the only rebuild path.
 //!
 //! **Written by the pass, at the far end of it.** [`observe_new`] runs after
 //! `feedback::outcomes` - which is what sets `session_meta.is_final` - and
