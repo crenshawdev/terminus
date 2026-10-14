@@ -8,8 +8,6 @@
       `#![cfg(feature = "testkit")]`, and a bare `cargo test --workspace` skips
       `crates/terminus/tests/mcp.rs`, `recall_cli.rs` (49 tests) and
       `datamove.rs`, gated the same way on the `terminus` package.
-- [ ] (phase 8) `crates/verbatim-core/src/parse/mod.rs:3-5` still says the ingest hands the blob bytes identical to the source without qualification; phase 8's D-05 narrows that to `full` capture mode. One sentence, one file, no behaviour.
-- [ ] (phase 8) The `verbatimElided` figure is the canonical reserialized size of the dropped subtree, not the source bytes it occupied on the line, and the doc comment does not say so. Nothing in production reads it today. From the phase-8 plan-5 risk_surface fire, downgraded from medium.
 - [ ] (phase 8) Change the license to MIT before release.
 - [ ] (phase 8) The PR that merges cadence/v0.0.1 says "Fixes #13" in its description, so the issue closes on merge; 65ef2d1 fixed it.
 
