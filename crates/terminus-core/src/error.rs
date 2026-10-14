@@ -119,7 +119,8 @@ pub enum Error {
     )]
     InvalidTimeFilter { field: &'static str, value: String },
 
-    /// The bytes in `sessions.blob` are not a blob this build can read.
+    /// A block row's bytes, or a session's recorded block size, are not
+    /// something this build can read.
     #[error("malformed session blob: {detail}")]
     BlobFormat { detail: String },
 
@@ -136,13 +137,15 @@ pub enum Error {
         uncompressed_len: u64,
     },
 
-    /// A blob's stored stream does not hash to the checksum recorded for it.
+    /// The two checks an append makes before it writes: a session's stored
+    /// block hashes do not reproduce its recorded checksum, or its partial tail
+    /// block does not decode to its stored hash.
     ///
     /// Raised before an append, never after: an append that trusted the bytes
-    /// it copied would mint a fresh checksum over the corruption and destroy
-    /// the only evidence that anything was ever wrong (D-06's checksum is the
-    /// evidence). A live session is re-ingested repeatedly as it grows, so the
-    /// very next append is what would certify the damage permanently.
+    /// it built on would mint a fresh checksum over the corruption and destroy
+    /// the only evidence that anything was ever wrong. A live session is
+    /// re-ingested repeatedly as it grows, so the very next append is what would
+    /// certify the damage permanently.
     #[error("session blob failed its recorded checksum: expected {expected}, found {actual}")]
     BlobChecksumMismatch { expected: String, actual: String },
 

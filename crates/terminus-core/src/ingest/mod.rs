@@ -348,7 +348,7 @@ pub(crate) fn prepare(
                 .map_err(|detail| Error::BlobFormat {
                     detail: detail.clone(),
                 })?;
-            let appended = blob::block::append(
+            let appended = blob::append(
                 block_size,
                 existing.uncompressed_len,
                 hashes,
@@ -360,7 +360,7 @@ pub(crate) fn prepare(
         }
         None => {
             let block_size = BLOCK_SIZE as u32;
-            (blob::block::write(&stored, block_size)?, block_size)
+            (blob::write(&stored, block_size)?, block_size)
         }
     };
 

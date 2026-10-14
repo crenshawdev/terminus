@@ -1,6 +1,6 @@
 [package]
 name = "terminus-core"
-description = "Terminus archive core: store, block-framed blobs, ingest."
+description = "Terminus archive core: store, block rows, ingest."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

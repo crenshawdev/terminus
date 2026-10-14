@@ -1791,9 +1791,9 @@ fn scoped_fetch(
 
 /// D-20: ids spanning three sessions cost three blob reads, not one per id.
 ///
-/// The counter is the assertion, and it has to be: `BlobReader`'s block counter
-/// reports one block decompressed for a single-turn read whether the blob was
-/// materialized once or six times, so phase 1's AC1 stays green either way. Two
+/// The counter is the assertion, and it has to be: the block counter reports
+/// one block decompressed for a single-turn read whether the session was read
+/// once or six times, so phase 1's AC1 stays green either way. Two
 /// ids are taken from one session precisely so "one read per session" and "one
 /// read per id" give different numbers.
 #[test]
