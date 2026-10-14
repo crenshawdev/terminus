@@ -584,8 +584,8 @@ impl Fixture {
     /// the served file named by the URL's last part to its `-o` path. For the
     /// file named `failing` it writes nothing and exits 22, curl's status for
     /// an HTTP error under `-f`. It never reaches the network and never reads
-    /// its stdin.
-    fn curl_tools(&self, failing: &str) -> PathBuf {
+    /// its stdin. The folder leaves out the tools in `without`.
+    fn curl_tools(&self, failing: &str, without: &[&str]) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let fake = self.root.join("curl");
@@ -606,7 +606,11 @@ exec '@CP@' '@SERVED@'/"${url##*/}" "$out"
         .replace("@FAILING@", failing);
         std::fs::write(&fake, script).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        self.tools_folder("tools-curl", &[], &[("curl", &fake)])
+        let name = std::iter::once("tools-curl")
+            .chain(without.iter().copied())
+            .collect::<Vec<_>>()
+            .join("-");
+        self.tools_folder(&name, without, &[("curl", &fake)])
     }
 
     fn curl_log(&self) -> PathBuf {
@@ -788,7 +792,7 @@ fn default_urls() -> Vec<String> {
 fn no_source_downloads_from_the_github_releases(shell: Shell) {
     let fx = fixture(shell);
     let bytes = fx.serve("1.0.0", "");
-    let tools = fx.curl_tools("");
+    let tools = fx.curl_tools("", &[]);
     let output = fx.command_with(&[], &tools).output().unwrap();
     assert_eq!(fx.curl_urls(), default_urls(), "{}", text(&output));
     assert!(output.status.success(), "{}", text(&output));
@@ -799,7 +803,7 @@ fn no_source_downloads_from_the_github_releases(shell: Shell) {
 fn a_piped_script_with_no_source_downloads_from_the_github_releases(shell: Shell) {
     let fx = fixture(shell);
     let bytes = fx.serve("1.0.0", "");
-    let tools = fx.curl_tools("");
+    let tools = fx.curl_tools("", &[]);
     let output = fx.piped(&[], &tools);
     assert_eq!(fx.curl_urls(), default_urls(), "{}", text(&output));
     assert!(output.status.success(), "{}", text(&output));
@@ -821,7 +825,7 @@ fn a_piped_script_installs_from_its_source(shell: Shell) {
 /// was called on the last line.
 fn a_cut_off_script_runs_nothing(shell: Shell) {
     let fx = fixture(shell);
-    let tools = fx.curl_tools("");
+    let tools = fx.curl_tools("", &[]);
     let script = std::fs::read(script()).unwrap();
     assert!(
         script.ends_with(b"\n}\n"),
@@ -879,7 +883,7 @@ fn assert_download_refused(shell: Shell, failing: &str, message: &str) {
     let fx = fixture(shell);
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
-    let tools = fx.curl_tools(failing);
+    let tools = fx.curl_tools(failing, &[]);
     let output = fx.assert_refused(fx.command_with(&[], &tools));
     assert!(
         String::from_utf8_lossy(&output.stderr).contains(message),
@@ -955,6 +959,28 @@ fn an_unsupported_architecture_is_refused(shell: Shell) {
     fx.serve("2.0.0", "b");
     let tools = fx.uname_tools("Linux", "riscv64");
     fx.assert_refused(fx.command_with(&[fx.server.url()], &tools));
+}
+
+/// Without `ssh-keygen` nothing is downloaded, and the reason names the
+/// package that holds it on each distribution.
+fn no_ssh_keygen_is_refused_before_any_download(shell: Shell) {
+    let fx = fixture(shell);
+    fx.serve("1.0.0", "");
+    let tools = fx.curl_tools("", &["ssh-keygen"]);
+    let output = fx.assert_refused(fx.command_with(&[], &tools));
+    assert!(fx.curl_urls().is_empty(), "{:?}", fx.curl_urls());
+    assert!(
+        std::fs::read_dir(&fx.home).unwrap().next().is_none(),
+        "HOME changed: {}",
+        text(&output)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let words: Vec<&str> = stderr
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .collect();
+    for package in ["openssh-client", "openssh-clients", "openssh"] {
+        assert!(words.contains(&package), "{package}: {stderr}");
+    }
 }
 
 fn an_http_source_is_refused(shell: Shell) {
@@ -1118,6 +1144,7 @@ both_shells!(
     a_digest_that_does_not_match_is_refused,
     an_unsupported_system_is_refused,
     an_unsupported_architecture_is_refused,
+    no_ssh_keygen_is_refused_before_any_download,
     an_http_source_is_refused,
     two_sources_are_refused,
     terminus_bin_dir_set_is_refused,

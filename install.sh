@@ -173,6 +173,8 @@ stage() {
         aarch64 | arm64) arch=aarch64 ;;
         *) fail 'unsupported architecture; x86_64 or aarch64 is required' ;;
     esac
+    command -v ssh-keygen >/dev/null 2>&1 ||
+        fail 'ssh-keygen is needed to verify the release signature; install openssh-client (Debian, Ubuntu), openssh-clients (Fedora) or openssh (Arch)'
 
     scratch=$(mktemp -d)
     staging_temporary=
