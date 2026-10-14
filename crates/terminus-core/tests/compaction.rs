@@ -671,7 +671,7 @@ fn a_transcript_shorter_than_its_watermark_is_skipped_and_flagged() {
     assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
     assert_eq!(report.failures[0].session_key, tree.key(&tree.subject));
     let text = report.render();
-    assert!(text.contains("shorter"), "{text}");
+    assert!(text.contains("shortened or rewritten"), "{text}");
     assert!(
         !text.contains(tree.bystander.to_str().unwrap()),
         "named the bystander: {text}"
