@@ -57,19 +57,19 @@ One mechanism: **SQLite** via `rusqlite` with the `bundled` feature (vendored C 
 | `sessions` | session_key → session_no |
 | `blocks` | (session_no, block_no) → zstd-compressed bytes + BLAKE3 hash of the uncompressed bytes |
 | `session_meta` | project, cwd, branch, times, source, final?, evicted?, parent, continues-from |
-| `turns` | turn_seq, kind, tool, ts, offset/len into the blob |
+| `turns` | turn_seq, kind, tool, ts, offset/len into the session's uncompressed stream |
 | `turns_fts` | FTS5 over expanded turn text. Contentless (`content=''`, `contentless_delete=1`). Derived, droppable |
 | `entities` | (turn_id, kind, value_norm) — exact match for paths, symbols, commands, errors, tools |
 | `paths` | turn → files touched |
 | `watermarks` | transcript path → byte offset |
-| `observations` | per finalized session: mechanical facts off the blob, kept rather than rebuilt |
+| `observations` | per finalized session: mechanical facts off its block rows, kept rather than rebuilt |
 | `decisions`, `labels` | injection decision log + replay outcomes |
 | `runs` | last N ingest runs: timestamp, duration, counts, error (what went wrong), notes (what a healthy pass did, such as labels written and sessions retention evicted) |
 | `meta` | store format version, compression flag |
 
-Blob write, turn rows, FTS rows, entities and watermark **all commit in one transaction**. Nothing can be out of sync.
+Block rows, turn rows, FTS rows, entities and watermark **all commit in one transaction**. Nothing can be out of sync.
 
-### Blob format
+### Archive format
 
 Each session's stream is cut into blocks of the size its `session_meta` row records, 64 KB today. Each block is compressed with zstd on its own and stored as one row in `blocks` with its hash. Reading one turn fetches and decompresses only the blocks its range covers, and an append rewrites at most the last block.
 
@@ -90,7 +90,7 @@ No stored preview column — search results decompress the hit's block on demand
 
 ### Truth and derived data
 
-`sessions` is truth. Turns, FTS, entities and paths are derived and rebuildable by replaying blobs. `decisions` and `labels` are kept, not rebuilt: what an injector decided at prompt time is in no blob. `observations` is kept too: its facts come off the session blob, and retention eviction empties that blob, so an evicted session's observation cannot be recomputed.
+`sessions` and `blocks` are truth. Turns, FTS, entities and paths are derived and rebuildable by replaying the archived sessions. `decisions` and `labels` are kept, not rebuilt: what an injector decided at prompt time is in no archived session. `observations` is kept too: its facts come off the session's block rows, and retention eviction deletes those rows, so an evicted session's observation cannot be recomputed.
 
 **The archive tables never migrate.** A store in an older archive format is refused with the clean-install steps (move the data folder and the binary aside, rerun `install.sh`), a store in a newer one is refused with a message to upgrade, and nothing converts either. Only a derived schema that differs from the binary's rebuilds the derived tables. This is the property that prevents claude-mem's 49-migration situation.
 
@@ -338,7 +338,7 @@ age_days = 7
 action   = "delete"
 ```
 
-| Action | Blob | Index | Result |
+| Action | Block rows | Index | Result |
 |---|---|---|---|
 | `keep` | kept | kept | default |
 | `evict` | dropped | kept, `body_evicted` | still searchable and listed, not readable |
@@ -429,7 +429,7 @@ Hooks go in **user scope** — terminus is global, one store across all projects
 
 ### Upgrade
 
-Installing a new version, with `install.sh` or with the new binary's `terminus install`, moves the link to that version's file. **Hooks are never rewritten** — the path doesn't change, so there is no version-check hook and nothing to repair. Store format bumps rebuild derived tables only. Config is additive.
+Installing a new version, with `install.sh` or with the new binary's `terminus install`, moves the link to that version's file. **Hooks are never rewritten** — the path doesn't change, so there is no version-check hook and nothing to repair. A new derived schema rebuilds the derived tables, and a store in an older archive format is refused with the clean-install steps. Config is additive.
 
 ### Uninstall
 

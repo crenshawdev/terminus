@@ -121,7 +121,7 @@ pub enum Error {
 
     /// A block row's bytes, or a session's recorded block size, are not
     /// something this build can read.
-    #[error("malformed session blob: {detail}")]
+    #[error("malformed session archive: {detail}")]
     BlobFormat { detail: String },
 
     /// A read asked for bytes the session stream does not contain. Reading past
@@ -146,7 +146,7 @@ pub enum Error {
     /// the only evidence that anything was ever wrong. A live session is
     /// re-ingested repeatedly as it grows, so the very next append is what would
     /// certify the damage permanently.
-    #[error("session blob failed its recorded checksum: expected {expected}, found {actual}")]
+    #[error("session archive failed its recorded checksum: expected {expected}, found {actual}")]
     BlobChecksumMismatch { expected: String, actual: String },
 
     /// zstd failed to compress or decompress a block.

@@ -93,8 +93,8 @@ data on stdout, the counts and the warnings on stderr.
   is `[]` for a hit reached only through free text, and its length is the entity
   count the injection threshold reads. `value` is the normalized stored
   spelling, not the query's.
-- `excerpt` is cut from the session blob, never from FTS5, and may be empty when
-  the archive would not give the bytes up.
+- `excerpt` is cut from the session's block rows, never from FTS5, and may be
+  empty when the archive would not give the bytes up.
 - `--kind` takes `user`, `assistant`, `system` or `attachment`. `observation`
   is refused, as misuse (exit 2) from `terminus search` and as `isError` from
   `recall_search`, because Terminus stores no session summaries.
@@ -117,7 +117,7 @@ data on stdout, the counts and the warnings on stderr.
   stood; the archive itself is unchanged, and no key is added or removed in
   either setting.
 - `body_evicted` comes from `session_meta.is_evicted` and from nothing else. A
-  blob that will not decompress is archive damage, which `terminus verify`
+  block that will not decompress is archive damage, which `terminus verify`
   reports; it leaves `body` null with `body_evicted` false.
 - `context` is null unless `--before` or `--after` was asked for. When present:
 
@@ -292,9 +292,9 @@ and unchanged.
 ```
 
 - The **only** rebuild path for the observations table. `terminus reindex` never
-  touches it: the facts come off the session blob, and retention eviction
-  empties that blob, so a rebuild that dropped the table could not recompute an
-  evicted session's observation.
+  touches it: the facts come off the session's block rows, and retention
+  eviction deletes those rows, so a rebuild that dropped the table could not
+  recompute an evicted session's observation.
 - `since` is the selector echoed back, null when it was not given. "Two rows
   were rebuilt" is unreadable without the bound that chose them.
 - `--since` takes `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS.mmmZ` and selects

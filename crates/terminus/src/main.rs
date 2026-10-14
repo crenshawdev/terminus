@@ -24,8 +24,8 @@ const USAGE: &str = "usage: terminus [--version] <command>\n\
                        search <words>        find a past turn by text, path, error or identifier\n  \
                        show <id>...          print the archived record behind a turn id\n  \
                        sessions              list every archived session a read path may see\n  \
-                       verify                check every blob against its checksum\n  \
-                       reindex               rebuild the derived tables from the blobs\n  \
+                       verify                check every block against its hash\n  \
+                       reindex               rebuild the derived tables from the archive\n  \
                        status                sizes, counts, watermarks and the last ingest run\n  \
                        compact               reclaim the space retention freed, then truncate the wal\n  \
                        usage                 where the bytes went: by project, by month, by table\n  \

@@ -76,7 +76,9 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   The data directory is `~/.local/share/terminus` (macOS
   `~/Library/Application Support/terminus`) holding `terminus.db`, the config file is `terminus.toml`, every `VERBATIM_*`
   environment variable is `TERMINUS_*`, snapshots are `terminus-<time>.db`, and
-  `lean` and `minimal` capture mark an elided body `{"terminusElided": <bytes>}`.
+  `lean` and `minimal` capture mark an elided body `{"terminusElided": <bytes>}`,
+  where `<bytes>` is the dropped value's size re-encoded as compact JSON, not
+  the source bytes it covered.
 - Nothing reads the old names, so an existing install moves once by hand:
   `verbatim uninstall` with the old binary, checkpoint the WAL, rename the data
   directory, `verbatim.db` and its snapshots, then `terminus install`. A store

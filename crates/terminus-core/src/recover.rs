@@ -82,7 +82,7 @@ impl Recovered {
         let mut out = Vec::new();
         for w in &self.lowered {
             out.push(format!(
-                "{}: watermark {} was past the {} bytes the blob holds; lowered",
+                "{}: watermark {} was past the {} bytes the archive holds; lowered",
                 w.session_key, w.from, w.to
             ));
         }

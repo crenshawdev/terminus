@@ -119,7 +119,7 @@ impl Bench {
         assert_eq!(
             self.watermarks(),
             vec![(self.key(), committed)],
-            "the watermark must come back to the bytes the blob holds, and the \
+            "the watermark must come back to the bytes the archive holds, and the \
              orphan must be gone"
         );
 
