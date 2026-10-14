@@ -97,7 +97,7 @@ The archive is the product, so it is built first and everything else is built on
 4. After publishing, a workflow run on each of the four runners installs the release with the one curl line and runs `terminus --version`. This is the first time Terminus runs on macOS.
 
 ### Phase 8: README
-**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, and what it refuses to do. Last, because it describes the installer from Phases 4 to 6, the release from Phase 7 and the platform support from Phase 2.
+**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, and what it refuses to do. Last, because it describes the installer from Phases 4 to 6, the release from Phase 7 and the platform support from Phase 2. The owner's README brief is in `.planning/phases/8/BRIEF.md`, word for word, and its differences from DOC-01 are settled at context.
 **Depends on:** Phase 7
 **Requirements:** DOC-01
 **Success Criteria:**
