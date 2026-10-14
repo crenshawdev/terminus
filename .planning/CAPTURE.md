@@ -154,21 +154,11 @@
 
 ### Archive and injection fixes (second review, 2026-10-12, the cycle after the install work)
 
-Six findings from an outside review, each checked against the code on
-2026-10-12 by reading, not by rerunning the reviewer's synthetic probes. All
-six hold. Planned as the cycle after the install work, starting with the first,
-which has to land before any release: the archive table never migrates once a
-store exists outside this machine.
+Findings from an outside review, each checked against the code on 2026-10-12
+by reading, not by rerunning the reviewer's synthetic probes. All six held. The
+first, Blocks as rows, is now phase 7 of v0.0.1, because nothing ships until it
+is done. The five below are planned as the cycle after the install work.
 
-- [ ] **Blocks as rows.** `blob::append` decompresses and re-hashes the whole
-  session stream (`blob/writer.rs:99`) and the upsert writes the whole blob
-  back (`ingest/mod.rs:468`), so every append costs I/O in the session's full
-  size, and an excerpt reads the whole row (`inject/prompt.rs:45`). Store blocks
-  as rows (`session_no`, `block_no`, bytes, hash) with the session checksum a
-  hash over the block hashes, so an append touches only the tail block, a read
-  fetches only its blocks, and corruption is pinned to one block. Passes on the
-  owner's machine 2026-10-05 to 10-12: 2,016 runs, median 819 ms, p90 986 ms,
-  max 13.2 s, with walk and rewrite not separable from the `runs` row.
 - [ ] **Tighten the injection gate.** `eligible` (`inject/prompt.rs:511`) fires
   on any entity match in the top three or on two distinct matches at any rank.
   The candidates come from a prompt's paths and identifier-shaped tokens, but

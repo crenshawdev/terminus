@@ -12,8 +12,9 @@ The archive is the product, so it is built first and everything else is built on
 - [x] **Phase 4: One-Command Installer** - `install.sh` downloads, checks and stores a version behind the stable path, then runs `terminus install`
 - [x] **Phase 5: Install from GitHub Releases** - `install.sh` downloads from the GitHub releases by default, so the whole install is one curl line piped into `sh`
 - [x] **Phase 6: Signed Install** - `install.sh` verifies each release's signature against a pinned key before it reads the manifest
-- [ ] **Phase 7: Release Builds** - a tagged version builds four platforms in CI, and the owner signs and publishes the release on his own machine
-- [ ] **Phase 8: README** - a README at the repo root for someone who has never heard of Terminus
+- [ ] **Phase 7: Blocks as rows** - each session's archive is stored as numbered blocks, one row each, so an append writes only the tail block
+- [ ] **Phase 8: Release Builds** - a tagged version builds four platforms in CI, and the owner signs and publishes the release on his own machine
+- [ ] **Phase 9: README** - a README at the repo root for someone who has never heard of Terminus
 
 ## Phase Details
 
@@ -86,9 +87,19 @@ The archive is the product, so it is built first and everything else is built on
 4. A correctly signed release installs as in Phase 5, under `/bin/sh` and dash.
 5. No argument, setting or environment variable changes the pinned key.
 
-### Phase 7: Release Builds
-**Goal:** A tagged version produces a GitHub release that Phase 6's `install.sh` accepts. A GitHub Actions workflow builds `terminus-<os>-<arch>` for Linux and macOS on x86_64 and aarch64, writes each manifest, and attaches both to a draft release. CI never holds the key. A script on the owner's machine downloads the four manifests, signs each with `ssh-keygen -Y sign -n terminus-release`, uploads the `.sig` files and publishes the release.
+### Phase 7: Blocks as rows
+**Goal:** Each session's archive is stored as numbered blocks, one row per block (`session_no`, `block_no`, bytes, hash), in place of one whole-session blob, with the session checksum a hash over the block hashes. Today `blob::append` reads and re-hashes the whole session stream (`blob/writer.rs:99`) and the upsert writes the whole blob back (`ingest/mod.rs:466`), so every append costs I/O in the session's full size, and one excerpt decompresses a whole session (`inject/prompt.rs:45`). With blocks, an append touches only the tail block, a read fetches only its blocks, and corruption is pinned to one block. No release ships until this phase is done. There is no conversion tool: an existing store is not converted, and the owner's store is rebuilt by a clean install. One can come later if it is needed.
 **Depends on:** Phase 6
+**Requirements:** none yet; `/cad-context 7` writes them
+**Success Criteria:**
+1. An append writes the session's new blocks and rewrites at most its last block, whatever the session's size.
+2. An excerpt reads only the blocks that hold its turn.
+3. `terminus verify` checks every block against its hash and names the session and block number of a mismatch.
+4. A clean install on the owner's machine ingests every session still on disk, and `terminus verify` then reports no mismatch.
+
+### Phase 8: Release Builds
+**Goal:** A tagged version produces a GitHub release that Phase 6's `install.sh` accepts. A GitHub Actions workflow builds `terminus-<os>-<arch>` for Linux and macOS on x86_64 and aarch64, writes each manifest, and attaches both to a draft release. CI never holds the key. A script on the owner's machine downloads the four manifests, signs each with `ssh-keygen -Y sign -n terminus-release`, uploads the `.sig` files and publishes the release.
+**Depends on:** Phase 7
 **Requirements:** REL-01
 **Success Criteria:**
 1. Pushing a version tag builds all four platforms and leaves a draft release holding each binary and its manifest, at the workspace `Cargo.toml` version.
@@ -96,9 +107,9 @@ The archive is the product, so it is built first and everything else is built on
 3. No workflow names a key or a signing secret.
 4. After publishing, a workflow run on each of the four runners installs the release with the one curl line and runs `terminus --version`. This is the first time Terminus runs on macOS.
 
-### Phase 8: README
-**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, and what it refuses to do. Last, because it describes the installer from Phases 4 to 6, the release from Phase 7 and the platform support from Phase 2. The owner's README brief is in `.planning/phases/8/BRIEF.md`, word for word, and its differences from DOC-01 are settled at context.
-**Depends on:** Phase 7
+### Phase 9: README
+**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, and what it refuses to do. Last, because it describes the installer from Phases 4 to 6, the release from Phase 8 and the platform support from Phase 2. The owner's README brief is in `.planning/phases/9/BRIEF.md`, word for word, and its differences from DOC-01 are settled at context.
+**Depends on:** Phase 8
 **Requirements:** DOC-01
 **Success Criteria:**
 1. The README opens on the reader's problem and what Terminus does about it, before any mechanism.
