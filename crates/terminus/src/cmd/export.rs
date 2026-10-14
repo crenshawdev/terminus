@@ -191,8 +191,8 @@ fn write_export(reader: &Reader, destination: &Path) -> Result<Written, Failure>
             .map_err(|e| Failure::Operational(format!("{}: {e}", session.session_key)))?;
         let (evicted, session_id, session_first, session_last) = row;
 
-        // An evicted session's archive was emptied on purpose and there is no
-        // stream to read out of it (RET-02, D-03). Its file is written empty
+        // An evicted session has no block rows, on purpose, so there is no
+        // stream to read out of it (RET-02, phase 7 D-09). Its file is written empty
         // rather than skipped: the manifest names it either way, and a missing
         // file would read as an export that lost something.
         let stream = match evicted != 0 {
@@ -231,9 +231,9 @@ fn write_export(reader: &Reader, destination: &Path) -> Result<Written, Failure>
     }
 
     // The archive format the STORE reports, not the constant this build was
-    // compiled with. They are the same on any store this binary can open, and
-    // the manifest is read by whatever opens it later, for which the store's
-    // own answer is the honest one.
+    // compiled with. Every store this build opens answers 2, since any other
+    // format is refused at open, and the manifest is read by whatever opens it
+    // later, for which the store's own answer is the honest one.
     let archive_format = reader
         .store()
         .meta_int(META_ARCHIVE_FORMAT)

@@ -2,14 +2,14 @@
 //!
 //! **Two independent tables, and they are never mixed (D-09).**
 //!
-//! The ARCHIVE table is `length(sessions.blob)` by project and, separately, by
-//! month. Its totals reconcile to `sum(length(sessions.blob))` and to nothing
-//! else - never to the size of the file on disk, which on the live store
-//! measured 2026-08-22 is 1,103,396,864 bytes against 465,985,120 bytes of
-//! archived blob, 2.4x everything the projects account for. The rest is the
-//! derived tables, and attributing them pro-rata would make every per-project
-//! number an estimate: a user comparing two projects would be comparing a model
-//! rather than a measurement.
+//! The ARCHIVE table is each session's block byte lengths summed, by project
+//! and, separately, by month. Its totals reconcile to `sum(length(bytes))` over
+//! the `blocks` table (phase 7 D-17) and to nothing else - never to the size of
+//! the file on disk, which on the live store measured 2026-08-22 is
+//! 1,103,396,864 bytes against 465,985,120 bytes of archive, 2.4x everything
+//! the projects account for. The rest is the derived tables, and attributing
+//! them pro-rata would make every per-project number an estimate: a user
+//! comparing two projects would be comparing a model rather than a measurement.
 //!
 //! The FOOTPRINT table is where that other 57% actually is, per table, out of
 //! SQLite's own `dbstat`. It reconciles to the database file's size and to

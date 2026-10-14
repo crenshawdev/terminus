@@ -14,7 +14,7 @@ use std::process::{Command, Output};
 
 use rusqlite::Connection;
 use terminus_core::retention::{self, Selection};
-use terminus_core::store::DB_FILE_NAME;
+use terminus_core::store::{ARCHIVE_FORMAT, DB_FILE_NAME};
 use terminus_core::{testkit, Store};
 
 const PROJECT: &str = "-data-projects-cadence";
@@ -356,8 +356,8 @@ fn table_total(rows: &serde_json::Value) -> i64 {
         .sum()
 }
 
-/// AC4's second half: both archive tables reconcile to
-/// `sum(length(sessions.blob))`, the footprint reconciles to the database file,
+/// AC4's second half: both archive tables reconcile to the sum of every block
+/// row's length, the footprint reconciles to the database file,
 /// and the two nulls the live store actually has are inside those totals rather
 /// than dropped out of them (D-09, D-18).
 ///
@@ -570,10 +570,11 @@ fn exported_files(dir: &Path) -> Vec<String> {
 /// PRIV-04: the exported files ARE the archived streams, byte for byte, and the
 /// manifest accounts for every one of them and says in words what they are.
 ///
-/// The comparison is against the stream testkit reads out of the store, not
-/// the transcript on disk: what export claims to write is what the
-/// archive holds, and those are the same bytes only for a session captured in
-/// full. Comparing to the source file would be testing ingest.
+/// Two comparisons. Against the stream testkit reads out of the block rows,
+/// because that is what export claims to write. And, for a session captured
+/// under `full`, against the transcript it came from up to its watermark, the
+/// end of its last complete record (phase 7 AC5): that is the end-to-end claim
+/// the block rows have to keep.
 #[test]
 fn an_export_is_the_archived_streams_byte_for_byte_with_a_manifest_over_them() {
     let (bench, keys) = stocked();
@@ -610,6 +611,29 @@ fn an_export_is_the_archived_streams_byte_for_byte_with_a_manifest_over_them() {
             key.display()
         );
         assert_eq!(named["bytes"], expected.len() as i64, "{named}");
+
+        let (mode, watermark): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT m.capture_mode, w.byte_offset
+                   FROM session_meta m JOIN watermarks w USING (transcript_path)
+                  WHERE m.session_key = ?1",
+                [key.to_string_lossy()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            mode.as_deref().unwrap_or("full"),
+            "full",
+            "{}",
+            key.display()
+        );
+        let transcript = std::fs::read(key).unwrap();
+        assert_eq!(
+            written,
+            transcript[..watermark as usize],
+            "{} is not its transcript up to the watermark",
+            key.display()
+        );
     }
 
     // The manifest accounts for the directory and for nothing that is not in it.
@@ -626,7 +650,8 @@ fn an_export_is_the_archived_streams_byte_for_byte_with_a_manifest_over_them() {
             .is_some_and(|n| n.contains("unredacted") && n.contains("Not in this export")),
         "the manifest must state what it is and what it is not: {doc}"
     );
-    assert!(doc["archive_format"].is_i64(), "{doc}");
+    assert_eq!(doc["archive_format"], ARCHIVE_FORMAT, "{doc}");
+    assert_eq!(ARCHIVE_FORMAT, 2);
     assert!(doc["first_turn_at"].is_string(), "{doc}");
     assert!(doc["last_turn_at"].is_string(), "{doc}");
     assert!(doc["turns"].as_i64().unwrap() > 0, "{doc}");
@@ -634,8 +659,8 @@ fn an_export_is_the_archived_streams_byte_for_byte_with_a_manifest_over_them() {
 
 /// An evicted session is named and empty, never missing.
 ///
-/// Its blob is `x''`, which no reader can parse a header out of, so the choice
-/// is between a file with nothing in it and no file at all. A missing file
+/// It has no block rows, so there is no stream to write, and the choice is
+/// between a file with nothing in it and no file at all. A missing file
 /// would read as an export that dropped a session; an empty one beside a
 /// manifest line saying why is the honest account of what retention did.
 #[test]
