@@ -1538,10 +1538,7 @@ fn a_window_into_an_excluded_project_is_empty_with_a_reason() {
 
     let hidden = around(&conn, &[&alpha_key], anchor, 1, 1);
     assert!(hidden.turns.is_empty());
-    assert_eq!(
-        hidden.reason,
-        Some(Reason::NoSuchTurn { turn_id: anchor })
-    );
+    assert_eq!(hidden.reason, Some(Reason::NoSuchTurn { turn_id: anchor }));
 
     // And a turn that is not archived at all is a reason too, not a panic.
     let missing = around(&conn, &[], -1, 1, 1);

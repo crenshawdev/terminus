@@ -1564,8 +1564,14 @@ fn an_excluded_project_is_never_named_to_a_client_at_the_default_scope() {
     // And at `*`, where the scope arm stands aside and only the exclusion arm
     // can refuse the id.
     for (tool, args) in [
-        ("recall_get", serde_json::json!({ "turn_ids": ids, "project": "*" })),
-        ("recall_context", serde_json::json!({ "turn_id": ids[0], "project": "*" })),
+        (
+            "recall_get",
+            serde_json::json!({ "turn_ids": ids, "project": "*" }),
+        ),
+        (
+            "recall_context",
+            serde_json::json!({ "turn_id": ids[0], "project": "*" }),
+        ),
     ] {
         let rendered = bench.call(&alpha, tool, args).to_string();
         assert!(
