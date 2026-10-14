@@ -7,7 +7,7 @@
 //! ignores `CARGO_TARGET_DIR` and it names the wrong profile under `--release`.
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use rusqlite::Connection;
 use terminus_core::store::{
@@ -53,13 +53,18 @@ fn bench() -> Bench {
 
 impl Bench {
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_terminus"))
+        self.command(args).output().expect("spawn terminus")
+    }
+
+    /// The binary, pointed at this bench, not yet spawned.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_terminus"));
+        command
             .args(args)
             .env("TERMINUS_DATA_DIR", &self.data_dir)
             .env("TERMINUS_CONFIG_DIR", &self.config_dir)
-            .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
-            .output()
-            .expect("spawn terminus")
+            .env("CLAUDE_CONFIG_DIR", &self.claude_dir);
+        command
     }
 
     /// Ingest a fixture through the binary, returning its session key.
@@ -1303,4 +1308,52 @@ fn an_operational_failure_exits_one_with_ok_false() {
     let value = document(&out);
     assert_eq!(value["ok"], false, "{value}");
     assert!(value["reason"].is_string(), "{value}");
+}
+
+/// A reader that closes the pipe changes no exit code and prints no panic.
+///
+/// `println!` panicked with exit 101 on a closed stdout, so `terminus sessions |
+/// head` printed a Rust panic. The read end is dropped before the child can
+/// write, which is where `head` leaves a command once it has its lines.
+#[test]
+fn a_closed_stdout_changes_no_exit_code() {
+    let bench = bench();
+    bench.ingest("session-recall.jsonl");
+    let id: i64 = bench
+        .conn()
+        .query_row("SELECT min(id) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    let id = id.to_string();
+
+    for args in [
+        vec!["sessions", "--project", "*"],
+        vec!["sessions", "--project", "*", "--json"],
+        vec!["search", "the", "--project", "*"],
+        vec!["show", &id, "--project", "*"],
+        vec!["status"],
+    ] {
+        let read = bench.run(&args);
+        assert!(!read.stdout.is_empty(), "{args:?} wrote nothing to close on");
+
+        let mut child = bench
+            .command(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn terminus");
+        drop(child.stdout.take());
+        let closed = child.wait_with_output().unwrap();
+
+        assert!(
+            !stderr(&closed).contains("panicked"),
+            "{args:?}: {}",
+            stderr(&closed)
+        );
+        assert_eq!(
+            closed.status.code(),
+            read.status.code(),
+            "{args:?}: {}",
+            stderr(&closed)
+        );
+    }
 }
