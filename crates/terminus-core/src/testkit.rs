@@ -514,7 +514,7 @@ fn session_no(conn: &rusqlite::Connection, session_key: &str) -> i64 {
 }
 
 /// One session's block rows, `(block_no, bytes, hash)` in `block_no` order.
-fn block_rows(conn: &rusqlite::Connection, session_key: &str) -> Vec<(i64, Vec<u8>, Vec<u8>)> {
+pub fn block_rows(conn: &rusqlite::Connection, session_key: &str) -> Vec<(i64, Vec<u8>, Vec<u8>)> {
     let session_no = session_no(conn, session_key);
     conn.prepare("SELECT block_no, bytes, hash FROM blocks WHERE session_no = ?1 ORDER BY block_no")
         .expect("prepare the block scan")
