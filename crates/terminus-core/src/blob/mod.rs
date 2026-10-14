@@ -33,9 +33,11 @@
 
 use crate::error::{Error, Result};
 
+pub mod block;
 mod reader;
 mod writer;
 
+pub use block::{Block, BlockReader};
 pub use reader::BlobReader;
 pub use writer::{append, write, Appended, Written};
 
