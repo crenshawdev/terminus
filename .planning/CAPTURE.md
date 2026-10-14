@@ -8,7 +8,6 @@
       `#![cfg(feature = "testkit")]`, and a bare `cargo test --workspace` skips
       `crates/terminus/tests/mcp.rs`, `recall_cli.rs` (49 tests) and
       `datamove.rs`, gated the same way on the `terminus` package.
-- [ ] (phase 3) `recall/search.rs` a query that reduces to no tokens returns no reason, so an unsearchable query cannot be told from an empty archive
 - [ ] (phase 3) `cmd/json.rs` Document::emit uses println!, which panics with exit 101 on a closed stdout pipe; the human path has broken_pipe and the JSON path does not
 - [ ] (phase 3) `cmd/show.rs` a closed stdout in human mode maps to Failure::Silent (exit 1), indistinguishable from an operational failure under pipefail
 - [x] (phase 4) The npm shim does not forward signals to the child: spawnSync blocks the event loop, so a SIGTERM aimed at the shim's own PID kills node and orphans the binary. Ctrl-C and job control signal the whole process group and are unaffected. risk_surface review finding, adjudicated downgraded (medium). Closed 2026-10-13: no longer applicable, because phase 2 removed the npm package.
