@@ -877,35 +877,109 @@ fn a_home_dash_would_change_is_refused(shell: Shell) {
     fx.assert_linked("1.0.0", &bytes);
 }
 
-/// After 1.0.0 is installed, a no-argument run whose fake `curl` fails
-/// `failing` is refused, and stderr holds `message`.
-fn assert_download_refused(shell: Shell, failing: &str, message: &str) {
+/// The line every bad signature is refused with, and nothing else on stderr.
+const BAD_SIGNATURE: &str =
+    "terminus: the manifest does not verify against the pinned crenshawdev release key\n";
+
+/// Run `command` and assert it was refused once the fake `curl` had asked for
+/// the first `asked` release URLs, with nothing on stdout and only the
+/// script's own lines on stderr. Returns stderr.
+fn assert_refused_after(fx: &Fixture, command: Command, asked: usize) -> String {
+    let output = fx.assert_refused(command);
+    assert_eq!(fx.curl_urls(), default_urls()[..asked], "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.lines().all(|line| line.starts_with("terminus: ")),
+        "{stderr}"
+    );
+    stderr
+}
+
+/// After 1.0.0 is installed, a no-argument run whose fake `curl` fails the
+/// release URL at `failing` is refused there, and stderr holds `message`.
+fn assert_download_refused(shell: Shell, failing: usize, message: &str) {
     let fx = fixture(shell);
     fx.install("1.0.0", "");
     fx.serve("2.0.0", "b");
-    let tools = fx.curl_tools(failing, &[]);
-    let output = fx.assert_refused(fx.command_with(&[], &tools));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains(message),
-        "{}",
-        text(&output)
-    );
+    let urls = default_urls();
+    let name = urls[failing].rsplit('/').next().unwrap();
+    let tools = fx.curl_tools(name, &[]);
+    let stderr = assert_refused_after(&fx, fx.command_with(&[], &tools), failing + 1);
+    assert!(stderr.contains(message), "{stderr}");
 }
 
 fn a_failed_manifest_download_is_refused(shell: Shell) {
     assert_download_refused(
         shell,
-        &format!("terminus-{}.manifest", platform()),
+        0,
         &format!("manifest download failed: {}", default_urls()[0]),
+    );
+}
+
+/// No `.sig` is a download failure, not a bad signature, so a release whose
+/// signature was never uploaded does not read as tampering.
+fn a_missing_signature_is_refused(shell: Shell) {
+    assert_download_refused(
+        shell,
+        1,
+        &format!("signature download failed: {}", default_urls()[1]),
     );
 }
 
 fn a_failed_binary_download_is_refused(shell: Shell) {
     assert_download_refused(
         shell,
-        &format!("terminus-{}", platform()),
+        2,
         &format!("binary download failed: {}", default_urls()[2]),
     );
+}
+
+/// After 1.0.0 is installed and a signed 2.0.0 is served, `spoil` breaks the
+/// release and returns the script to run with no argument. The binary is
+/// never asked for, and stderr is the bad-signature line alone.
+fn assert_bad_signature_refused(shell: Shell, spoil: impl FnOnce(&Fixture) -> PathBuf) {
+    let fx = fixture(shell);
+    fx.install("1.0.0", "");
+    fx.serve("2.0.0", "b");
+    let tools = fx.curl_tools("", &[]);
+    let mut command = fx.shell(&tools);
+    command.arg(spoil(&fx));
+    assert_eq!(assert_refused_after(&fx, command, 2), BAD_SIGNATURE);
+}
+
+/// The shipped `install.sh` trusts only the pinned key, whatever the user's
+/// own allowed-signers file says.
+fn a_release_signed_by_another_key_is_refused(shell: Shell) {
+    assert_bad_signature_refused(shell, |fx| {
+        let ssh = fx.home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let public = std::fs::read_to_string(fx.key.with_extension("pub")).unwrap();
+        std::fs::write(
+            ssh.join("allowed_signers"),
+            format!("crenshawdev-release {public}"),
+        )
+        .unwrap();
+        script()
+    });
+}
+
+/// The right key under Baley's namespace.
+fn a_signature_under_another_namespace_is_refused(shell: Shell) {
+    assert_bad_signature_refused(shell, |fx| {
+        fx.sign("baley-release");
+        fx.copy.clone()
+    });
+}
+
+/// A manifest that would install, with the same digest, but not the one that
+/// was signed.
+fn a_manifest_changed_after_signing_is_refused(shell: Shell) {
+    assert_bad_signature_refused(shell, |fx| {
+        let digest = sha256(&fx.binary());
+        std::fs::write(fx.manifest(), format!("version 2.0.1\nsha256 {digest}\n")).unwrap();
+        fx.copy.clone()
+    });
 }
 
 /// Without `sha256sum`, `shasum -a 256` computes the digest: the install
@@ -1139,7 +1213,11 @@ both_shells!(
     a_cut_off_script_runs_nothing,
     a_home_dash_would_change_is_refused,
     a_failed_manifest_download_is_refused,
+    a_missing_signature_is_refused,
     a_failed_binary_download_is_refused,
+    a_release_signed_by_another_key_is_refused,
+    a_signature_under_another_namespace_is_refused,
+    a_manifest_changed_after_signing_is_refused,
     shasum_computes_the_digest_when_sha256sum_is_missing,
     a_digest_that_does_not_match_is_refused,
     an_unsupported_system_is_refused,
