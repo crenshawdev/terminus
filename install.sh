@@ -1,9 +1,10 @@
 #!/bin/sh
-# Install Terminus from unsigned development artifacts only.
+# Install Terminus. No release is published yet.
 # With no argument it downloads from the GitHub releases on crenshawdev/terminus;
 # one https:// argument names another source.
-# The signature check goes inside verify_download in a later cycle, with Baley's
-# release design (issue #14 in Baley's tracker).
+# Before it reads the manifest, it checks terminus-<os>-<arch>.manifest.sig with
+# ssh-keygen against the crenshawdev release key pinned below, under the namespace
+# terminus-release. Nothing overrides the key, and a release it does not verify is refused.
 # The script ends by running terminus install through the stable path, which writes Claude Code's wiring.
 # The body is one brace group, which the shell reads whole before running any of it,
 # so a download cut off before the closing brace runs nothing. Run flat, a copy cut after
@@ -15,6 +16,9 @@ export LC_ALL
 
 # The same text as MARKER in crates/terminus/src/cmd/install/binary.rs; a test ties the two.
 marker='terminus-stable-binary:8f3d1a6c-72b4-4e59-9c0d-5a1e7b34f082'
+
+# The public half of the crenshawdev release key, the only key a release may be signed with.
+release_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDRKdhQ8g59SckbR4oYy0JQlObLTSwfVjGa9UqwoPo4q'
 
 fail() {
     printf 'terminus: %s\n' "$*" >&2
@@ -183,6 +187,15 @@ stage() {
 
     curl -q --proto '=https' --tlsv1.2 -fsSL "$source/terminus-$os-$arch.manifest" -o "$scratch/manifest" ||
         fail "manifest download failed: $source/terminus-$os-$arch.manifest"
+    curl -q --proto '=https' --tlsv1.2 -fsSL "$source/terminus-$os-$arch.manifest.sig" -o "$scratch/manifest.sig" ||
+        fail "signature download failed: $source/terminus-$os-$arch.manifest.sig"
+
+    # ssh-keygen reads the signed text only from stdin, and its own output is dropped.
+    printf 'crenshawdev-release %s\n' "$release_key" > "$scratch/allowed_signers"
+    ssh-keygen -Y verify -f "$scratch/allowed_signers" -I crenshawdev-release -n terminus-release \
+        -s "$scratch/manifest.sig" < "$scratch/manifest" > /dev/null 2>&1 ||
+        fail 'the manifest does not verify against the pinned crenshawdev release key'
+
     curl -q --proto '=https' --tlsv1.2 -fsSL "$source/terminus-$os-$arch" -o "$scratch/terminus" ||
         fail "binary download failed: $source/terminus-$os-$arch"
 

@@ -23,8 +23,13 @@
 //! a fake `uname`.
 //!
 //! `s_server -WWW` answers a missing file with `200 ok` and an error text, so
-//! every real-server test serves both the manifest and the binary, and the
-//! download refusals run on a fake `curl` instead.
+//! every real-server test serves the manifest, its signature and the binary,
+//! and the download refusals run on a fake `curl` instead.
+//!
+//! The private half of the pinned release key exists only on the owner's
+//! machine, so each fixture makes a throwaway Ed25519 key, signs with it, and
+//! runs a copy of `install.sh` with the pinned line swapped for that key. Only
+//! the tests that need the shipped file run the real one.
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -34,7 +39,7 @@ use std::time::{Duration, Instant};
 use terminus_core::testkit::{self, FakeCall};
 
 /// Every program `install.sh` runs that is not a shell builtin.
-const TOOLS: [&str; 12] = [
+const TOOLS: [&str; 13] = [
     "od",
     "uname",
     "mktemp",
@@ -47,7 +52,12 @@ const TOOLS: [&str; 12] = [
     "ln",
     "readlink",
     "grep",
+    "ssh-keygen",
 ];
+
+/// The release key's public line, as `install.sh` pins it.
+const PINNED_KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDRKdhQ8g59SckbR4oYy0JQlObLTSwfVjGa9UqwoPo4q";
 
 /// The events install writes an entry for, as `tests/install.rs` spells them.
 const EVENTS: [&str; 4] = [
@@ -230,9 +240,14 @@ struct Fixture {
     fake_dir: PathBuf,
     /// Links to every tool in [`TOOLS`], second on `PATH`.
     tools: PathBuf,
-    /// The served folder: `terminus-<os>-<arch>` and `terminus-<os>-<arch>.manifest`.
+    /// The served folder: `terminus-<os>-<arch>`, `terminus-<os>-<arch>.manifest`
+    /// and `terminus-<os>-<arch>.manifest.sig`.
     served: PathBuf,
     server: Server,
+    /// The throwaway key's private half, which signs every served manifest.
+    key: PathBuf,
+    /// `install.sh` with the pinned line swapped for the throwaway key.
+    copy: PathBuf,
 }
 
 fn fixture(shell: Shell) -> Fixture {
@@ -249,6 +264,23 @@ fn fixture(shell: Shell) -> Fixture {
     std::fs::write(claude_dir.join("settings.json"), SETTINGS).unwrap();
     std::fs::write(claude_dir.join(".claude.json"), CLAUDE_JSON).unwrap();
     let server = Server::start(&root, &served);
+    let key = root.join("release-key");
+    let made = Command::new(which("ssh-keygen").expect("ssh-keygen is not on PATH"))
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "", "-f"])
+        .arg(&key)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "ssh-keygen: {}", text(&made));
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    let public = public
+        .split_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let copy = root.join("install.sh");
+    let shipped = std::fs::read_to_string(script()).unwrap();
+    std::fs::write(&copy, shipped.replace(PINNED_KEY, &public)).unwrap();
     let mut fixture = Fixture {
         _dir: dir,
         shell,
@@ -259,6 +291,8 @@ fn fixture(shell: Shell) -> Fixture {
         fake_dir,
         served,
         server,
+        key,
+        copy,
     };
     fixture.tools = fixture.tools_folder("tools", &[], &[]);
     testkit::fake_claude(&fixture.fake_dir, &fixture.claude_log(), "", 0);
@@ -393,12 +427,44 @@ impl Fixture {
         std::fs::read(binary).unwrap()
     }
 
-    /// Replace the served manifest with one naming `version` and `digest`.
+    /// The served manifest, `terminus-<os>-<arch>.manifest`.
+    fn manifest(&self) -> PathBuf {
+        self.served
+            .join(format!("terminus-{}.manifest", platform()))
+    }
+
+    /// Replace the served manifest with one naming `version` and `digest`,
+    /// signed with the throwaway key.
     fn serve_manifest(&self, version: &str, digest: &str) {
-        let manifest = self
+        std::fs::write(
+            self.manifest(),
+            format!("version {version}\nsha256 {digest}\n"),
+        )
+        .unwrap();
+        self.sign("terminus-release");
+    }
+
+    /// Sign the served manifest with the throwaway key under `namespace`,
+    /// replacing the served signature. The manifest goes in on stdin, because
+    /// signing the file by name stops to ask before overwriting its `.sig`.
+    fn sign(&self, namespace: &str) {
+        let signature = self
             .served
-            .join(format!("terminus-{}.manifest", platform()));
-        std::fs::write(manifest, format!("version {version}\nsha256 {digest}\n")).unwrap();
+            .join(format!("terminus-{}.manifest.sig", platform()));
+        let signed = Command::new(which("ssh-keygen").unwrap())
+            .args(["-Y", "sign", "-f"])
+            .arg(&self.key)
+            .args(["-n", namespace])
+            .env_clear()
+            .stdin(std::fs::File::open(self.manifest()).unwrap())
+            .stdout(std::fs::File::create(signature).unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            signed.status.success(),
+            "ssh-keygen -Y sign: {}",
+            text(&signed)
+        );
     }
 
     /// `install.sh <args>` under the test's shell, with the default tools
@@ -407,16 +473,17 @@ impl Fixture {
         self.command_with(args, &self.tools)
     }
 
+    /// The key-swapped copy of `install.sh` under the test's shell.
     fn command_with(&self, args: &[String], tools: &Path) -> Command {
         let mut command = self.shell(tools);
-        command.arg(script()).args(args);
+        command.arg(&self.copy).args(args);
         command
     }
 
-    /// The script's bytes written into the shell's stdin pipe, which is then
+    /// The copy's bytes written into the shell's stdin pipe, which is then
     /// closed, as `curl | sh` does. Any `args` go after `-s --`.
     fn piped(&self, args: &[String], tools: &Path) -> Output {
-        self.piped_bytes(&std::fs::read(script()).unwrap(), args, tools)
+        self.piped_bytes(&std::fs::read(&self.copy).unwrap(), args, tools)
     }
 
     /// `bytes` piped in place of the script, as a download cut off early is.
@@ -656,6 +723,11 @@ fn one_run_installs_and_wires_claude_code(shell: Shell) {
     let bytes = fx.serve("1.0.0", "");
     let output = fx.run();
     assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        !text(&output).contains("Good \"terminus-release\" signature"),
+        "{}",
+        text(&output)
+    );
     fx.assert_linked("1.0.0", &bytes);
 
     let stable = fx.stable().display().to_string();
@@ -706,12 +778,13 @@ fn default_urls() -> Vec<String> {
     let base = "https://github.com/crenshawdev/terminus/releases/latest/download";
     vec![
         format!("{base}/terminus-{}.manifest", platform()),
+        format!("{base}/terminus-{}.manifest.sig", platform()),
         format!("{base}/terminus-{}", platform()),
     ]
 }
 
-/// No argument: the two release URLs, manifest first, and the install
-/// finishes.
+/// No argument: the three release URLs, manifest, signature, then binary,
+/// and the install finishes.
 fn no_source_downloads_from_the_github_releases(shell: Shell) {
     let fx = fixture(shell);
     let bytes = fx.serve("1.0.0", "");
@@ -722,7 +795,7 @@ fn no_source_downloads_from_the_github_releases(shell: Shell) {
     fx.assert_linked("1.0.0", &bytes);
 }
 
-/// `curl | sh`: the same two release URLs, and the install finishes.
+/// `curl | sh`: the same three release URLs, and the install finishes.
 fn a_piped_script_with_no_source_downloads_from_the_github_releases(shell: Shell) {
     let fx = fixture(shell);
     let bytes = fx.serve("1.0.0", "");
@@ -827,7 +900,7 @@ fn a_failed_binary_download_is_refused(shell: Shell) {
     assert_download_refused(
         shell,
         &format!("terminus-{}", platform()),
-        &format!("binary download failed: {}", default_urls()[1]),
+        &format!("binary download failed: {}", default_urls()[2]),
     );
 }
 
