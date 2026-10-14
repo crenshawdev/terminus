@@ -378,9 +378,9 @@ Prefix match on canonicalized paths, case-insensitive on macOS. A repo-local mar
 
 ## 13. Install and packaging
 
-**There is no npm channel.** The npm package was removed. `install.sh` is the one-command installer, run as `sh install.sh https://<source>`. No release is published yet.
+**There is no npm channel.** The npm package was removed. `install.sh` is the one-command installer, run as `curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh`. It downloads from the GitHub releases on crenshawdev/terminus, and one `https://` source replaces them when the line ends in `sh -s -- https://<source>` instead of `sh`. No release is published yet.
 
-Secondary: GitHub releases, Homebrew, deb/rpm.
+Secondary: Homebrew, deb/rpm.
 
 **No Claude Code plugin in 0.x.** The plugin system installs into versioned directories, which is the root cause of claude-mem's inline path-resolution script and its version-check hook. Revisit at 1.0; if it ships, it stays a thin bootstrap.
 
@@ -392,7 +392,7 @@ The versions folder sits under HOME and outside the data directory. The data dir
 
 A version gets there one of two ways:
 
-- `install.sh` downloads the manifest and the binary for the machine, checks the binary's SHA-256 in `verify_download`, stages it in the folder for the manifest's version through a temporary file and `mv`, and moves a temporary link over the stable path with `mv -f`. It ends by running `~/.local/bin/terminus install`.
+- `install.sh` downloads `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>` for the machine, from the GitHub releases by default or from the given source, checks the binary's SHA-256 in `verify_download`, stages it in the folder for the manifest's version through a temporary file and `mv`, and moves a temporary link over the stable path with `mv -f`. It ends by running `~/.local/bin/terminus install`.
 - `terminus install` run from anywhere else stores its own binary under its own version and points the link at it. A local build is installed with `cargo build --release && target/release/terminus install`. Run from the file the link already names, as `install.sh`'s last step is, it changes neither the link nor the file.
 
 Both replace what is at the stable path only when nothing is there or it carries the Terminus marker, a fixed string every build holds, directly or through a link, so a plain-file install from before the link becomes the link. A link to nothing counts as nothing to `terminus install`, and to `install.sh` only when it points into the versions folder. Anything else is refused and left as it is.

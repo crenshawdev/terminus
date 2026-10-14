@@ -11,10 +11,18 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-- `install.sh` installs Terminus with one command, run as
-  `sh install.sh https://<source>`. On Linux or macOS, on x86_64 or aarch64, it
-  downloads `<source>/<os>-<arch>/manifest` and `<source>/<os>-<arch>/terminus`,
-  where `<os>` is `linux` or `macos`. The manifest is exactly two lines,
+- `install.sh` installs Terminus with one command:
+
+  ```sh
+  curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh
+  ```
+
+  It downloads `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>` from
+  `https://github.com/crenshawdev/terminus/releases/latest/download`, where
+  `<os>` is `linux` or `macos` and `<arch>` is `x86_64` or `aarch64`. One
+  `https://` source, passed by ending the line with
+  `sh -s -- https://<source>` instead of `sh`, replaces that default, and the
+  same two names are fetched under it. The manifest is exactly two lines,
   `version X.Y.Z` and `sha256 <64 lowercase hex>`. `verify_download` checks the
   binary's SHA-256 against it before anything is placed. The script then stores
   the binary by version, links `~/.local/bin/terminus` to it and runs
