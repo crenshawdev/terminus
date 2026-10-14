@@ -136,7 +136,7 @@ pub fn run(args: Args) -> Result<(), Failure> {
         // The id first, and unmissable: it is the argument `terminus show`
         // takes, and following a hit into the conversation around it is what
         // the next command a reader runs does.
-        println!(
+        outln!(
             "{}  {}  {}  {}{}",
             hit.turn_id,
             day(hit.ts.as_deref()),
@@ -144,7 +144,7 @@ pub fn run(args: Args) -> Result<(), Failure> {
             hit.project.as_deref().unwrap_or("(no project)"),
             if hit.sidechain { "  (subagent)" } else { "" },
         );
-        println!("    {}", hit.excerpt);
+        outln!("    {}", hit.excerpt);
     }
 
     // Commentary on stderr, so stdout stays the hits and nothing else. It is

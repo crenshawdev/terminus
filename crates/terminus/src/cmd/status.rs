@@ -99,18 +99,19 @@ pub fn run(json: bool) -> Result<(), Failure> {
         return Ok(());
     }
 
-    println!("store          {}", store.path().display());
-    println!("size           {}", size(&data_dir));
-    println!("sessions       {}", counts.sessions);
-    println!("turns          {}", counts.turns);
-    println!(
+    outln!("store          {}", store.path().display());
+    outln!("size           {}", size(&data_dir));
+    outln!("sessions       {}", counts.sessions);
+    outln!("turns          {}", counts.turns);
+    outln!(
         "watermarks     {} covering {} byte(s)",
-        counts.watermarks, counts.watermark_bytes
+        counts.watermarks,
+        counts.watermark_bytes
     );
     if !config.exclusions().is_empty() {
         // Named, because a count that dropped without explanation is a bug
         // report. The excluded sessions are still archived; they are not listed.
-        println!(
+        outln!(
             "excluded       {} project(s): {}",
             config.exclusions().len(),
             config.exclusions().join(", ")
@@ -120,24 +121,26 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let Some(run) = last else {
         // An empty store is not a failure: it is what a machine looks like
         // before the first hook has ever fired.
-        println!("last run       none");
+        outln!("last run       none");
         return Ok(());
     };
 
-    println!("last run       {}", run.started_at);
-    println!("  duration     {} ms", run.duration_ms);
-    println!(
+    outln!("last run       {}", run.started_at);
+    outln!("  duration     {} ms", run.duration_ms);
+    outln!(
         "  files        {} walked, {} committed, {} failed",
-        run.files_seen, run.files_committed, run.files_failed
+        run.files_seen,
+        run.files_committed,
+        run.files_failed
     );
-    println!("  bytes read   {}", run.bytes_read);
-    println!("  turns added  {}", run.turns_added);
+    outln!("  bytes read   {}", run.bytes_read);
+    outln!("  turns added  {}", run.turns_added);
     if let Some(error) = &run.error {
         // In full, every line of it. This is the only account of what that pass
         // skipped and why.
-        println!("  error");
+        outln!("  error");
         for line in error.lines() {
-            println!("    {line}");
+            outln!("    {line}");
         }
     }
 

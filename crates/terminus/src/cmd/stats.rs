@@ -57,20 +57,20 @@ pub fn run(json: bool) -> Result<(), Failure> {
         return Ok(());
     }
 
-    println!("decisions         {}", stats.decisions);
-    println!("injected turns    {}", stats.injected_turns);
-    println!("hits              {}", stats.hits);
-    println!("false positives   {}", stats.false_positives);
+    outln!("decisions         {}", stats.decisions);
+    outln!("injected turns    {}", stats.injected_turns);
+    outln!("hits              {}", stats.hits);
+    outln!("false positives   {}", stats.false_positives);
     // Two decimals, or the word: a precision printed as 0.00 on an archive
     // whose sessions are all still open would read as "injection never helps".
     match stats.precision {
-        Some(precision) => println!("precision         {precision:.2}"),
-        None => println!("precision         (nothing labelled yet)"),
+        Some(precision) => outln!("precision         {precision:.2}"),
+        None => outln!("precision         (nothing labelled yet)"),
     }
-    println!("misses            {}", stats.misses);
-    println!("wasted budget     {}", stats.wasted_budget);
-    println!("chars injected    {}", stats.chars_injected);
-    println!("chars referenced  {}", stats.chars_referenced);
+    outln!("misses            {}", stats.misses);
+    outln!("wasted budget     {}", stats.wasted_budget);
+    outln!("chars injected    {}", stats.chars_injected);
+    outln!("chars referenced  {}", stats.chars_referenced);
     Ok(())
 }
 

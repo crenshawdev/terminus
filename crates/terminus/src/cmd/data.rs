@@ -108,17 +108,17 @@ pub fn run(options: Options) -> Result<(), Failure> {
 
     refuse_impossible_destinations(&source, &destination)?;
 
-    println!("terminus data move");
-    println!();
-    println!("  from  {}", source.display());
-    println!("  to    {}", destination.display());
-    println!("  {} byte(s), including the archive itself", bytes(&source));
-    println!();
-    println!("{NETWORK_WARNING}");
-    println!();
+    outln!("terminus data move");
+    outln!();
+    outln!("  from  {}", source.display());
+    outln!("  to    {}", destination.display());
+    outln!("  {} byte(s), including the archive itself", bytes(&source));
+    outln!();
+    outln!("{NETWORK_WARNING}");
+    outln!();
 
     if !answered(&source, options.yes)? {
-        println!("  nothing was moved.");
+        outln!("  nothing was moved.");
         return Ok(());
     }
 
@@ -182,11 +182,9 @@ pub fn run(options: Options) -> Result<(), Failure> {
         ))
     })?;
 
-    println!("  moved. the store is at {}", destination.display());
-    println!("  recorded in {}", pointer.display());
-    println!(
-        "  nothing in settings.json changed: the hook and mcp entries never named a store path"
-    );
+    outln!("  moved. the store is at {}", destination.display());
+    outln!("  recorded in {}", pointer.display());
+    outln!("  nothing in settings.json changed: the hook and mcp entries never named a store path");
     Ok(())
 }
 
@@ -233,7 +231,7 @@ fn answered(source: &Path, yes: bool) -> Result<bool, Failure> {
     const QUESTION: &str = "  move it?";
 
     if yes {
-        println!("{QUESTION} [y/N] y (--yes)");
+        outln!("{QUESTION} [y/N] y (--yes)");
         return Ok(true);
     }
     super::install::confirm(QUESTION, false, false).map_err(|_| {

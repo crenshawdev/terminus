@@ -112,17 +112,17 @@ pub fn run(json: bool) -> Result<(), Failure> {
         return Ok(());
     }
 
-    println!(
+    outln!(
         "before         {} byte(s) ({})",
         before.total(),
         human(before.total())
     );
-    println!(
+    outln!(
         "after          {} byte(s) ({})",
         after.total(),
         human(after.total())
     );
-    println!(
+    outln!(
         "reclaimed      {} byte(s) ({})",
         reclaimed(before, after),
         human(reclaimed(before, after).max(0) as u64)

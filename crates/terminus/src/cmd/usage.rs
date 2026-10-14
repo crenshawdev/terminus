@@ -56,41 +56,41 @@ pub fn run(json: bool) -> Result<(), Failure> {
     // Two tables, printed as two, with the total each one reconciles to at its
     // foot. The totals are the point of the report and a reader who takes only
     // the last line of each block has the answer.
-    println!("archive by project");
+    outln!("archive by project");
     for bucket in &usage.by_project {
-        println!(
+        outln!(
             "  {:>14}  {:>5} session(s)  {}",
             human(bucket.bytes as u64),
             bucket.sessions,
             bucket.name()
         );
     }
-    println!(
+    outln!(
         "  {:>14}  {:>5} session(s)  total archived",
         human(usage.archive_bytes as u64),
         usage.sessions
     );
-    println!();
-    println!("archive by month");
+    outln!();
+    outln!("archive by month");
     for bucket in &usage.by_month {
-        println!(
+        outln!(
             "  {:>14}  {:>5} session(s)  {}",
             human(bucket.bytes as u64),
             bucket.sessions,
             bucket.name()
         );
     }
-    println!(
+    outln!(
         "  {:>14}  {:>5} session(s)  total archived",
         human(usage.archive_bytes as u64),
         usage.sessions
     );
-    println!();
-    println!("store footprint by table");
+    outln!();
+    outln!("store footprint by table");
     for row in &usage.footprint {
-        println!("  {:>14}  {}", human(row.bytes as u64), row.name);
+        outln!("  {:>14}  {}", human(row.bytes as u64), row.name);
     }
-    println!(
+    outln!(
         "  {:>14}  the whole database file",
         human(usage.file_bytes as u64)
     );

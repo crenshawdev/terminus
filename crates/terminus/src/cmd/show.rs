@@ -8,7 +8,7 @@
 //!
 //! **The bytes are the record's, not a rendering of it - unless `[privacy]
 //! redact_recall` is on.** They go to stdout through `write_all` rather than
-//! through `println!("{}")`, because the archive is verbatim and a lossy UTF-8
+//! through `outln!("{}")`, because the archive is verbatim and a lossy UTF-8
 //! conversion here would make this - the one command whose whole job is
 //! fidelity - the one place a byte could change. The `--json` mode has no such
 //! option, since a JSON string is text by definition, and it says so where it
@@ -77,7 +77,14 @@ pub fn run(args: Args) -> Result<(), Failure> {
         return Ok(());
     }
 
-    render(&fetched, &windows)?;
+    // A closed stdout is not a failure of the archive: `terminus show <id> |
+    // head` closes the pipe on the first page, and show still ends with the
+    // code its records earned.
+    match render(&fetched, &windows) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => return Err(Failure::Operational(e.to_string())),
+    }
 
     for absent in &fetched.absent {
         eprintln!("terminus: {}", absent.reason);
@@ -86,7 +93,7 @@ pub fn run(args: Args) -> Result<(), Failure> {
 }
 
 /// The human rendering: a header a reader can scan, then the bytes themselves.
-fn render(fetched: &get::Fetched, windows: &[Option<Window>]) -> Result<(), Failure> {
+fn render(fetched: &get::Fetched, windows: &[Option<Window>]) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
     for (index, record) in fetched.records.iter().enumerate() {
         let header = format!(
@@ -101,14 +108,14 @@ fn render(fetched: &get::Fetched, windows: &[Option<Window>]) -> Result<(), Fail
                 ""
             },
         );
-        writeln!(out, "{header}").map_err(broken_pipe)?;
+        writeln!(out, "{header}")?;
 
         match &record.body {
             // Written as bytes: this is the command that answers "what exactly
             // was said", and a lossy conversion would answer something else.
             Some(bytes) => {
-                out.write_all(bytes).map_err(broken_pipe)?;
-                writeln!(out).map_err(broken_pipe)?;
+                out.write_all(bytes)?;
+                writeln!(out)?;
             }
             // Evicted is said in the header; a body that would not read at all
             // is archive damage, which `terminus verify` is the command for.
@@ -116,8 +123,7 @@ fn render(fetched: &get::Fetched, windows: &[Option<Window>]) -> Result<(), Fail
                 writeln!(
                     out,
                     "(the archive would not give this record up; run `terminus verify`)"
-                )
-                .map_err(broken_pipe)?;
+                )?;
             }
             None => {}
         }
@@ -130,13 +136,13 @@ fn render(fetched: &get::Fetched, windows: &[Option<Window>]) -> Result<(), Fail
 }
 
 /// The conversation around one turn, in `turn_seq` order with its ends marked.
-fn render_window(out: &mut impl Write, window: &Window) -> Result<(), Failure> {
+fn render_window(out: &mut impl Write, window: &Window) -> std::io::Result<()> {
     if let Some(reason) = &window.reason {
-        writeln!(out, "  (no context: {reason})").map_err(broken_pipe)?;
+        writeln!(out, "  (no context: {reason})")?;
         return Ok(());
     }
     if window.at_session_start {
-        writeln!(out, "  --- start of session ---").map_err(broken_pipe)?;
+        writeln!(out, "  --- start of session ---")?;
     }
     for turn in &window.turns {
         writeln!(
@@ -146,16 +152,15 @@ fn render_window(out: &mut impl Write, window: &Window) -> Result<(), Failure> {
             turn.turn_seq,
             label(turn),
             turn.text
-        )
-        .map_err(broken_pipe)?;
+        )?;
     }
     if window.at_session_end {
-        writeln!(out, "  --- end of session ---").map_err(broken_pipe)?;
+        writeln!(out, "  --- end of session ---")?;
     }
     // Returned and NOT followed (D-06). A caller that wants the turns before
     // this file's first one resolves this itself and runs a second `show`.
     if let Some(previous) = &window.continues_from {
-        writeln!(out, "  (this session continues from {previous})").map_err(broken_pipe)?;
+        writeln!(out, "  (this session continues from {previous})")?;
     }
     Ok(())
 }
@@ -165,19 +170,6 @@ fn label(turn: &ContextTurn) -> String {
     match &turn.tool_name {
         Some(tool) => format!("{}/{tool}", turn.record_type),
         None => turn.record_type.clone(),
-    }
-}
-
-/// A closed stdout is not a failure of the archive.
-///
-/// `terminus show <id> | head` closes the pipe on the first page, and a command
-/// that reported that as an operational failure would make the ordinary way of
-/// reading a long record look like a broken store.
-fn broken_pipe(error: std::io::Error) -> Failure {
-    if error.kind() == std::io::ErrorKind::BrokenPipe {
-        Failure::Silent
-    } else {
-        Failure::Operational(error.to_string())
     }
 }
 

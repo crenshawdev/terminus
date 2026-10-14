@@ -170,12 +170,12 @@ fn watermarks(data_dir: &Path, config: Config) -> Result<HashMap<String, u64>, F
 /// own summary. A directory that could not be listed belongs beside the count
 /// it silently reduced, not on a different stream.
 pub fn print_estimate(estimate: &Estimate) {
-    println!(
+    outln!(
         "{} transcript(s), {} not yet archived",
         estimate.transcripts,
         bytes(estimate.unread_bytes)
     );
-    println!(
+    outln!(
         "about {} across {WORKERS} workers - an estimate from a measured rate \
          ({} in {}), not a promise",
         duration(estimate.duration()),
@@ -183,7 +183,7 @@ pub fn print_estimate(estimate: &Estimate) {
         duration(std::time::Duration::from_millis(MEASURED_MS)),
     );
     for (path, reason) in &estimate.unreadable {
-        println!(
+        outln!(
             "  problem: {} could not be listed ({reason}), so nothing under it is counted \
              above and nothing under it will be archived",
             path.display()

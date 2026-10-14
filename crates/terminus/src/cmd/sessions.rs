@@ -93,7 +93,7 @@ pub fn run(args: Args) -> Result<(), Failure> {
     }
 
     for listing in &listed {
-        println!(
+        outln!(
             "{}  {}  {} turn(s)  {}  {}{}{}",
             day(listing.detail.first_turn_at.as_deref()),
             file_name(&listing.session.session_key),

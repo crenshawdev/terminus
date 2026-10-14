@@ -92,22 +92,22 @@ pub fn run(args: Args) -> Result<(), Failure> {
     // The notice first and the counts after it, so a user who reads one line
     // reads the one that matters.
     for line in NOTICE.lines() {
-        println!("{line}");
+        outln!("{line}");
     }
-    println!();
-    println!("wrote          {}", args.destination.display());
-    println!("sessions       {}", written.sessions);
-    println!(
+    outln!();
+    outln!("wrote          {}", args.destination.display());
+    outln!("sessions       {}", written.sessions);
+    outln!(
         "  evicted      {} (written as empty files, no body to write)",
         written.evicted
     );
-    println!("turns          {}", written.turns);
-    println!(
+    outln!("turns          {}", written.turns);
+    outln!(
         "bytes          {} byte(s) ({})",
         written.bytes,
         human(written.bytes)
     );
-    println!(
+    outln!(
         "manifest       {}",
         args.destination.join(MANIFEST).display()
     );

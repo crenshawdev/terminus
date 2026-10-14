@@ -255,7 +255,7 @@ impl Row {
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
             .unwrap_or(Value::Null);
 
-        println!(
+        outln!(
             "{}  {}  {} turn(s)  {}  {} compaction(s)",
             file_name(&self.session_key),
             text(&facts["branch"]).unwrap_or("(no branch)"),
@@ -273,14 +273,14 @@ impl Row {
         ] {
             let values = strings(&facts[field]);
             if !values.is_empty() {
-                println!("  {label:<15} {}", values.join(", "));
+                outln!("  {label:<15} {}", values.join(", "));
             }
         }
         // What the row itself says was cut, so a list a cap shortened is never
         // read as the whole of what the session did.
         let cut = strings(&facts["truncated"]);
         if !cut.is_empty() {
-            println!("  {:<15} {}", "truncated", cut.join(", "));
+            outln!("  {:<15} {}", "truncated", cut.join(", "));
         }
     }
 }

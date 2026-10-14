@@ -77,8 +77,8 @@ pub fn run(options: Options) -> Result<(), Failure> {
     let versions = binary::versions_dir()?;
     let data_dir = super::data_dir()?;
 
-    println!("terminus uninstall");
-    println!();
+    outln!("terminus uninstall");
+    outln!();
 
     // Each of these reports its own lines and returns whether it did what it
     // set out to do. They are ordered the way install writes them, and one
@@ -88,28 +88,28 @@ pub fn run(options: Options) -> Result<(), Failure> {
     ok &= unregister(&targets::claude_json_path()?);
     ok &= unplace(&stable, &versions);
 
-    println!("  versions        {}", versions.display());
+    outln!("  versions        {}", versions.display());
     if std::fs::symlink_metadata(&versions).is_ok() {
-        println!(
+        outln!(
             "    kept: a session that is already running may be running from one of these.\n    \
              to delete them too, remove the folder once no session is running"
         );
     } else {
-        println!("    not there: nothing to keep");
+        outln!("    not there: nothing to keep");
     }
 
-    println!("  data directory  {}", data_dir.display());
+    outln!("  data directory  {}", data_dir.display());
     if !options.purge {
-        println!(
+        outln!(
             "    kept: the archive is the product, and uninstall never deletes it.\n    \
              to delete it too: terminus uninstall --purge"
         );
-        println!();
+        outln!();
         return finish(ok);
     }
-    println!();
+    outln!();
     purge(&data_dir, options.yes)?;
-    println!();
+    outln!();
     finish(ok)
 }
 
@@ -126,18 +126,18 @@ fn finish(ok: bool) -> Result<(), Failure> {
 /// `settings.json`: take terminus's hook entries out, then decide between the
 /// edited file and install's backup.
 fn clean(path: &Path, stable: &Path) -> bool {
-    println!("  {}", path.display());
+    outln!("  {}", path.display());
     let stable = stable.display().to_string();
 
     let document = match Document::read(path) {
         Ok(document) => document,
         Err(failure) => {
-            println!("    left alone: {}", detail(failure));
+            outln!("    left alone: {}", detail(failure));
             return false;
         }
     };
     if !document.exists() {
-        println!("    not there: nothing to remove");
+        outln!("    not there: nothing to remove");
         return true;
     }
 
@@ -155,16 +155,16 @@ fn clean(path: &Path, stable: &Path) -> bool {
     let before = backup.as_ref().map(Document::value);
     let edit = |root: &mut Json| strip_hooks(root, &stable, before, &removed);
     if let Err(failure) = document.apply(&edit) {
-        println!("    left alone: {}", detail(failure));
+        outln!("    left alone: {}", detail(failure));
         return false;
     }
     let Some(count) = std::num::NonZeroUsize::new(removed.get()) else {
-        println!("    no hook entry of terminus's was there");
+        outln!("    no hook entry of terminus's was there");
         // Nothing changed, so there is no restore to decide - but a backup
         // still sitting there is a file the user did not put there, and saying
         // where it is beats leaving it to be found.
         if let (Some(path), Some(_)) = (&backup_path, &backup) {
-            println!(
+            outln!(
                 "    install's backup is still beside it at {}",
                 path.display()
             );
@@ -172,7 +172,7 @@ fn clean(path: &Path, stable: &Path) -> bool {
         return true;
     };
     let count = count.get();
-    println!(
+    outln!(
         "    removed {count} hook entr{}",
         if count == 1 { "y" } else { "ies" }
     );
@@ -189,7 +189,7 @@ fn clean(path: &Path, stable: &Path) -> bool {
 /// the restore.
 fn restore(path: &Path, backup_path: Option<&Path>, backup: Option<Document>) -> bool {
     let (Some(backup_path), Some(backup)) = (backup_path, backup) else {
-        println!("    no backup from install here, so there is nothing to put back");
+        outln!("    no backup from install here, so there is nothing to put back");
         return true;
     };
     // Fresh, because the removal above just wrote it - and because Claude Code
@@ -197,7 +197,7 @@ fn restore(path: &Path, backup_path: Option<&Path>, backup: Option<Document>) ->
     let current = match Document::read(path) {
         Ok(current) => current,
         Err(failure) => {
-            println!(
+            outln!(
                 "    backup kept at {}: {}",
                 backup_path.display(),
                 detail(failure)
@@ -206,7 +206,7 @@ fn restore(path: &Path, backup_path: Option<&Path>, backup: Option<Document>) ->
         }
     };
     if current.rendered() != backup.rendered() {
-        println!(
+        outln!(
             "    this file has changed since install, so the edit above stands.\n    \
              the pre-install copy is still at {}",
             backup_path.display()
@@ -214,7 +214,7 @@ fn restore(path: &Path, backup_path: Option<&Path>, backup: Option<Document>) ->
         return true;
     }
     if let Err(failure) = current.overwrite(backup.source()) {
-        println!(
+        outln!(
             "    backup kept at {}: {}",
             backup_path.display(),
             detail(failure)
@@ -222,13 +222,13 @@ fn restore(path: &Path, backup_path: Option<&Path>, backup: Option<Document>) ->
         return false;
     }
     if let Err(e) = std::fs::remove_file(backup_path) {
-        println!(
+        outln!(
             "    restored to its pre-install bytes; {} could not be removed: {e}",
             backup_path.display()
         );
         return false;
     }
-    println!("    restored to its pre-install bytes, and the backup is gone");
+    outln!("    restored to its pre-install bytes, and the backup is gone");
     true
 }
 
@@ -315,10 +315,10 @@ fn empty(value: &Json) -> bool {
 fn unregister(path: &Path) -> bool {
     const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", targets::MCP_SERVER_KEY];
 
-    println!("  {}", path.display());
+    outln!("  {}", path.display());
     let ok = match Document::read(path) {
         Err(failure) => {
-            println!("    left alone: {}", detail(failure));
+            outln!("    left alone: {}", detail(failure));
             false
         }
         Ok(document) => {
@@ -328,17 +328,17 @@ fn unregister(path: &Path) -> bool {
                 .and_then(|servers| servers.get(targets::MCP_SERVER_KEY))
                 .is_some();
             if !registered {
-                println!("    no mcp registration of terminus's was there");
+                outln!("    no mcp registration of terminus's was there");
                 true
             } else {
                 match claude::run(&REMOVE).cause() {
                     None => {
-                        println!("    removed the mcp registration with claude mcp remove");
+                        outln!("    removed the mcp registration with claude mcp remove");
                         true
                     }
                     Some(cause) => {
-                        println!("    the mcp registration is still there: {cause}");
-                        println!("    to remove it, run  claude {}", REMOVE.join(" "));
+                        outln!("    the mcp registration is still there: {cause}");
+                        outln!("    to remove it, run  claude {}", REMOVE.join(" "));
                         false
                     }
                 }
@@ -348,7 +348,7 @@ fn unregister(path: &Path) -> bool {
 
     if let Ok(backup) = json_file::backup_path_for(path) {
         if std::fs::symlink_metadata(&backup).is_ok() {
-            println!(
+            outln!(
                 "    an old backup from install is at {}\n    \
                  it is left in place and not restored, because it holds an older copy of \
                  Claude Code's own state",
@@ -364,25 +364,25 @@ fn unregister(path: &Path) -> bool {
 /// `remove_file` takes the link and not the file it names. A marked plain file
 /// an older install left there goes the same way.
 fn unplace(stable: &Path, versions: &Path) -> bool {
-    println!("  {}", stable.display());
+    outln!("  {}", stable.display());
     match binary::occupant(stable) {
         Ok(binary::Occupant::Vacant) => unplace_dangling(stable, versions),
         Ok(binary::Occupant::Ours) => match std::fs::remove_file(stable) {
             Ok(()) => {
-                println!("    removed");
+                outln!("    removed");
                 true
             }
             Err(e) => {
-                println!("    could not be removed: {e}");
+                outln!("    could not be removed: {e}");
                 false
             }
         },
         Ok(binary::Occupant::Foreign) => {
-            println!("    left alone: not a terminus build, so it is not terminus's to remove");
+            outln!("    left alone: not a terminus build, so it is not terminus's to remove");
             true
         }
         Err(failure) => {
-            println!("    left alone: {}", detail(failure));
+            outln!("    left alone: {}", detail(failure));
             false
         }
     }
@@ -396,11 +396,11 @@ fn unplace(stable: &Path, versions: &Path) -> bool {
 fn unplace_dangling(stable: &Path, versions: &Path) -> bool {
     match std::fs::symlink_metadata(stable) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("    not there: nothing to remove");
+            outln!("    not there: nothing to remove");
             return true;
         }
         Err(e) => {
-            println!("    left alone: {e}");
+            outln!("    left alone: {e}");
             return false;
         }
         Ok(_) => {}
@@ -408,12 +408,12 @@ fn unplace_dangling(stable: &Path, versions: &Path) -> bool {
     let target = match std::fs::read_link(stable) {
         Ok(target) => target,
         Err(e) => {
-            println!("    left alone: the link could not be read: {e}");
+            outln!("    left alone: the link could not be read: {e}");
             return false;
         }
     };
     if !binary::in_versions(&target, versions) {
-        println!(
+        outln!(
             "    left alone: a link to {}, which is not there and is outside the versions folder",
             target.display()
         );
@@ -421,14 +421,14 @@ fn unplace_dangling(stable: &Path, versions: &Path) -> bool {
     }
     match std::fs::remove_file(stable) {
         Ok(()) => {
-            println!(
+            outln!(
                 "    removed: a link to {}, which is not there",
                 target.display()
             );
             true
         }
         Err(e) => {
-            println!("    could not be removed: {e}");
+            outln!("    could not be removed: {e}");
             false
         }
     }
@@ -445,23 +445,23 @@ fn purge(data_dir: &Path, yes: bool) -> Result<(), Failure> {
         // directory. Either way there is no store to delete, and
         // `remove_dir_all` on a directory terminus cannot recognize is not a
         // mistake worth the one time it would be right.
-        println!("  no store at that path, so there is nothing to purge");
+        outln!("  no store at that path, so there is nothing to purge");
         return Ok(());
     }
     let bytes = size_bytes(data_dir);
-    println!("  --purge deletes the archive itself. this cannot be undone.");
-    println!("    {}", data_dir.display());
-    println!("    {bytes} byte(s) ({})", human(bytes));
-    println!();
+    outln!("  --purge deletes the archive itself. this cannot be undone.");
+    outln!("    {}", data_dir.display());
+    outln!("    {bytes} byte(s) ({})", human(bytes));
+    outln!();
 
     match answered(data_dir, yes) {
         Ok(true) => {}
         Ok(false) => {
-            println!("  the archive was kept.");
+            outln!("  the archive was kept.");
             return Ok(());
         }
         Err(failure) => {
-            println!("  the archive was kept.");
+            outln!("  the archive was kept.");
             return Err(failure);
         }
     }
@@ -473,7 +473,7 @@ fn purge(data_dir: &Path, yes: bool) -> Result<(), Failure> {
     let held = match lock::try_acquire(data_dir)? {
         lock::Attempt::Acquired(held) => held,
         lock::Attempt::Held => {
-            println!("  an ingest is running, so the archive was kept.");
+            outln!("  an ingest is running, so the archive was kept.");
             return Err(Failure::Operational(
                 "another terminus process holds the ingest lock; nothing was deleted".to_owned(),
             ));
@@ -483,7 +483,7 @@ fn purge(data_dir: &Path, yes: bool) -> Result<(), Failure> {
         Failure::Operational(format!("{} could not be removed: {e}", data_dir.display()))
     })?;
     drop(held);
-    println!("  deleted {bytes} byte(s) at {}", data_dir.display());
+    outln!("  deleted {bytes} byte(s) at {}", data_dir.display());
     Ok(())
 }
 
@@ -499,7 +499,7 @@ fn answered(data_dir: &Path, yes: bool) -> Result<bool, Failure> {
     const QUESTION: &str = "  delete it?";
 
     if yes {
-        println!("{QUESTION} [y/N] y (--yes)");
+        outln!("{QUESTION} [y/N] y (--yes)");
         return Ok(true);
     }
     install::confirm(QUESTION, false, false).map_err(|_| {

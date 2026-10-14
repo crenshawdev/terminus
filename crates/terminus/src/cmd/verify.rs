@@ -50,7 +50,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
         // Failing session keys are the data, so they go to stdout. The count is
         // commentary and goes to stderr, which also keeps stdout free of anything
         // AC3's "and no other session" clause would have to exempt.
-        print!("{}", report.render());
+        out!("{}", report.render());
         // Not printed in JSON mode, and that is the rule rather than an
         // omission: `--json` means the document IS the answer, so routine
         // commentary moves into it and stderr is left for warnings. Printing

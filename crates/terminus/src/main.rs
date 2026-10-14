@@ -3,8 +3,13 @@
 //! Exit codes (phase 1 subset of the CLI contract): 0 success, 1 operational
 //! failure, 2 misuse. Data goes to stdout, errors go to stderr.
 
+// Stdout goes through `outln!` and `out!`, which survive a closed pipe.
+#![cfg_attr(not(test), deny(clippy::print_stdout))]
+
 use std::process::ExitCode;
 
+#[macro_use]
+mod out;
 mod cmd;
 
 use cmd::Failure;
@@ -88,9 +93,9 @@ fn run() -> Result<(), Failure> {
     }
 
     if show_version {
-        println!("{}", env!("CARGO_PKG_VERSION"));
+        outln!("{}", env!("CARGO_PKG_VERSION"));
     } else {
-        println!("{USAGE}");
+        outln!("{USAGE}");
     }
     Ok(())
 }

@@ -148,17 +148,17 @@ pub fn run() -> Result<(), Failure> {
 
     advise(&settings)?;
 
-    println!();
+    outln!();
     match &registered {
-        Ok(_) => println!("installed"),
-        Err(_) => println!("install incomplete: the mcp server is not registered"),
+        Ok(_) => outln!("installed"),
+        Err(_) => outln!("install incomplete: the mcp server is not registered"),
     }
-    println!(
+    outln!(
         "  binary            {} (a link to {})",
         stable.display(),
         version_file.display()
     );
-    println!(
+    outln!(
         "  hook entries      {} ({})",
         settings.path().display(),
         outcome(wrote_hooks, "four entries added", "already current")
@@ -166,46 +166,44 @@ pub fn run() -> Result<(), Failure> {
     if wrote_hooks && settings.reformats() {
         // The file was not in the two-space form this renderer writes, so the
         // write re-rendered all of it (D-12).
-        println!(
+        outln!(
             "                    rewritten in full in two-space form, keys and values unchanged"
         );
         match backups.first() {
-            Some(backup) => println!(
+            Some(backup) => outln!(
                 "                    the original bytes are in {}",
                 backup.display()
             ),
-            None => println!("                    no backup was written"),
+            None => outln!("                    no backup was written"),
         }
     }
     match &registered {
-        Ok(done) => println!(
+        Ok(done) => outln!(
             "  mcp server        {} ({})",
             claude_json.display(),
             done.describe()
         ),
         Err(incomplete) => {
-            println!(
+            outln!(
                 "  mcp server        {} (not registered: {})",
                 claude_json.display(),
                 incomplete.cause
             );
-            println!("  to finish, run    {}", incomplete.command);
+            outln!("  to finish, run    {}", incomplete.command);
         }
     }
     if backups.is_empty() {
         // True whichever way it got here: a file that did not exist has nothing
         // to copy, and a file that did not change is not backed up either.
-        println!(
-            "  backups           none: a backup is written for a file that existed and changed"
-        );
+        outln!("  backups           none: a backup is written for a file that existed and changed");
     } else {
         for backup in &backups {
-            println!("  backup            {}", backup.display());
+            outln!("  backup            {}", backup.display());
         }
     }
-    println!("  data directory    {}", data_dir.display());
+    outln!("  data directory    {}", data_dir.display());
     let roots = config.roots();
-    println!(
+    outln!(
         "  transcript roots  {} ({})",
         roots.len(),
         roots
@@ -217,11 +215,11 @@ pub fn run() -> Result<(), Failure> {
     if roots.len() > 1 {
         // Hooks live in one settings file. The other roots are still ingested,
         // but nothing in them fires a hook.
-        println!("                    only the first root's settings file carries the hooks");
+        outln!("                    only the first root's settings file carries the hooks");
     }
-    println!("  undo              terminus uninstall");
-    println!();
-    println!(
+    outln!("  undo              terminus uninstall");
+    outln!();
+    outln!(
         "observed on the Claude Code versions on this machine: hook entries written into\n\
          settings.json are picked up by a session that is already running, with no restart.\n\
          That is measured behaviour rather than a documented contract."
@@ -340,23 +338,23 @@ fn register(path: &Path, stable: &Path) -> Result<Registered, Incomplete> {
 fn start_backfill(stable: &Path, data_dir: &Path, config: &Config) -> bool {
     use crate::cmd::backfill;
 
-    println!();
+    outln!();
     // Asked of the core directly, where the error is still typed: a `Failure`
     // carries only text. A store that is not there yet is not refused.
     if let Err(refused @ terminus_core::Error::ArchiveFormatTooOld { .. }) =
         terminus_core::Store::open_read_only(data_dir)
     {
-        println!("  problem: {refused}");
+        outln!("  problem: {refused}");
         return true;
     }
     let estimate = match backfill::estimate(data_dir, config) {
         Ok(estimate) => estimate,
         Err(why) => {
-            println!(
+            outln!(
                 "  problem: the backfill could not be sized ({}).",
                 reason(why)
             );
-            println!("  nothing else is affected; the next hook archives the same tree.");
+            outln!("  nothing else is affected; the next hook archives the same tree.");
             return false;
         }
     };
@@ -366,19 +364,19 @@ fn start_backfill(stable: &Path, data_dir: &Path, config: &Config) -> bool {
     // This process may be a build outside the versions folder, such as
     // `target/release/terminus`, which the next `cargo` run replaces.
     match backfill::start_from(Some(stable), data_dir, &estimate) {
-        Ok(true) => println!(
+        Ok(true) => outln!(
             "archiving that now, in a detached process - this install is done and the\n\
              archive fills in behind it. `terminus status` is where to watch it: there is\n\
              no log file by design, and the pass writes a `runs` row this reads."
         ),
         // Nothing on disk to archive, so nothing was started and no store was
         // created by installing. The hooks take it from the first session.
-        Ok(false) => println!(
+        Ok(false) => outln!(
             "nothing to archive yet - the hooks above start doing that from your next\n\
              session, and `terminus status` is where to watch it."
         ),
         Err(why) => {
-            println!("  problem: {}", reason(why));
+            outln!("  problem: {}", reason(why));
         }
     }
     false
@@ -411,18 +409,18 @@ fn advise(settings: &Document) -> Result<(), Failure> {
         ),
     };
 
-    println!();
-    println!(
+    outln!();
+    outln!(
         "  {how}.\n  \
          Claude Code deletes its own transcripts that many days after they are written,\n  \
          so its transcripts older than {effective} days are already gone. What terminus\n  \
          has archived stays. install leaves the setting as it is. To keep them longer:"
     );
-    println!(
+    outln!(
         "    set \"cleanupPeriodDays\": {KEEP_CLEANUP_DAYS} in {}",
         settings.path().display()
     );
-    println!(
+    outln!(
         "  autoCompactEnabled is left as it is, and terminus never sets it. Turning it\n  \
          off is the recommendation: compaction spends tokens summarizing context this\n  \
          store already holds losslessly, and a fresh session plus targeted recall beats\n  \
@@ -455,7 +453,7 @@ fn current_exe_display() -> String {
 pub(super) fn confirm(question: &str, default: bool, yes: bool) -> Result<bool, Failure> {
     let hint = if default { "[Y/n]" } else { "[y/N]" };
     if yes {
-        println!(
+        outln!(
             "{question} {hint} {} (--yes)",
             if default { "y" } else { "n" }
         );
@@ -464,10 +462,10 @@ pub(super) fn confirm(question: &str, default: bool, yes: bool) -> Result<bool, 
 
     let interactive = std::io::stdin().is_terminal();
     if interactive {
-        print!("{question} {hint} ");
+        out!("{question} {hint} ");
         let _ = std::io::stdout().flush();
     } else {
-        println!("{question} {hint}");
+        outln!("{question} {hint}");
     }
 
     let mut answer = String::new();
