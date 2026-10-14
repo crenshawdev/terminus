@@ -348,6 +348,11 @@ CREATE TABLE IF NOT EXISTS watermarks (
 -- files, commits most of them and skips the damaged ones (D-12), and one
 -- integer cannot carry those three numbers - so the other two get columns of
 -- their own rather than being inferred from `error` being non-null.
+--
+-- `error` holds what went wrong and `notes` what a healthy pass did worth
+-- saying (labels written, sessions retention evicted), so a reader that flags
+-- a non-null `error` flags only failures. `notes` is declared last, and
+-- appended last in `BRING_FORWARD_COLUMNS`, for the column-order rule there.
 CREATE TABLE IF NOT EXISTS runs (
     id           INTEGER PRIMARY KEY,
     started_at   TEXT    NOT NULL,
@@ -358,7 +363,8 @@ CREATE TABLE IF NOT EXISTS runs (
     turns_added  INTEGER NOT NULL DEFAULT 0,
     error        TEXT,
     files_committed INTEGER NOT NULL DEFAULT 0,
-    files_failed    INTEGER NOT NULL DEFAULT 0
+    files_failed    INTEGER NOT NULL DEFAULT 0,
+    notes           TEXT
 );
 
 -- The two version integers the gate reads before any write (D-09).
@@ -448,6 +454,7 @@ pub const BRING_FORWARD_COLUMNS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("files_committed", "INTEGER NOT NULL DEFAULT 0"),
             ("files_failed", "INTEGER NOT NULL DEFAULT 0"),
+            ("notes", "TEXT"),
         ],
     ),
     // `turns` is a DERIVED table, and it is here anyway (phase 1 D-08). The

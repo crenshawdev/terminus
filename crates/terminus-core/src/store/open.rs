@@ -490,34 +490,20 @@ fn narrow(path: &Path, mode: u32, wanted: fn(&std::fs::FileType) -> bool) {
 /// Nothing is written when nothing is missing - the common case is three read
 /// queries and no transaction at all - so a plain reopen of an up-to-date store
 /// still touches no byte of it.
+///
+/// When something is missing, the list is read again inside an IMMEDIATE
+/// transaction before anything is altered, as [`drop_summary_columns`] does.
+/// Two processes opening one older store at once would otherwise both see the
+/// same column missing, and the second `ALTER TABLE ADD COLUMN` would fail on a
+/// column the first had just added.
 fn bring_forward(conn: &Connection) -> Result<()> {
-    let present_tables = table_names(conn)?;
-    let missing_tables: Vec<&&str> = crate::store::schema::TABLES
-        .iter()
-        .filter(|t| !present_tables.iter().any(|p| p == *t))
-        .collect();
-
-    let mut missing_columns: Vec<(&str, &str, &str)> = Vec::new();
-    for (table, columns) in crate::store::schema::BRING_FORWARD_COLUMNS {
-        // A table this build is about to create arrives with every column
-        // already on it, so asking `PRAGMA table_info` about it would only
-        // schedule columns that are not missing.
-        if missing_tables.iter().any(|t| **t == *table) {
-            continue;
-        }
-        let present = column_names(conn, table)?;
-        for (name, declaration) in *columns {
-            if !present.iter().any(|c| c == name) {
-                missing_columns.push((table, name, declaration));
-            }
-        }
-    }
-
+    let (missing_tables, missing_columns) = missing(conn)?;
     if missing_tables.is_empty() && missing_columns.is_empty() {
         return Ok(());
     }
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let (missing_tables, missing_columns) = missing(&tx)?;
     if !missing_tables.is_empty() {
         // Every statement in it is `IF NOT EXISTS`, so this creates exactly the
         // tables and indexes that are absent and leaves the rest alone. One
@@ -532,6 +518,36 @@ fn bring_forward(conn: &Connection) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+/// A column this build declares: `(table, column, declaration)`.
+type Column = (&'static str, &'static str, &'static str);
+
+/// The tables and the columns this build declares and the open store lacks.
+fn missing(conn: &Connection) -> Result<(Vec<&'static str>, Vec<Column>)> {
+    let present_tables = table_names(conn)?;
+    let missing_tables: Vec<&'static str> = crate::store::schema::TABLES
+        .iter()
+        .copied()
+        .filter(|t| !present_tables.iter().any(|p| p == t))
+        .collect();
+
+    let mut missing_columns = Vec::new();
+    for (table, columns) in crate::store::schema::BRING_FORWARD_COLUMNS {
+        // A table this build is about to create arrives with every column
+        // already on it, so asking `PRAGMA table_info` about it would only
+        // schedule columns that are not missing.
+        if missing_tables.contains(table) {
+            continue;
+        }
+        let present = column_names(conn, table)?;
+        for (name, declaration) in *columns {
+            if !present.iter().any(|c| c == name) {
+                missing_columns.push((*table, *name, *declaration));
+            }
+        }
+    }
+    Ok((missing_tables, missing_columns))
 }
 
 /// Drop the session-summary columns from `observations`, and their meta key,

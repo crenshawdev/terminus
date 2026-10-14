@@ -897,3 +897,55 @@ fn a_wide_store_is_tightened_by_a_writable_open_and_by_nothing_else() {
         );
     }
 }
+
+/// Several processes opening one older store at once all succeed, and the
+/// column they were missing is added once.
+///
+/// `bring_forward` read what was missing and then altered in a deferred
+/// transaction, so two opens could both see `runs.notes` missing and the second
+/// `ALTER TABLE ADD COLUMN` failed on the column the first had just added. It
+/// now reads the list again under the write lock.
+#[test]
+fn concurrent_opens_of_an_older_store_all_bring_it_forward() {
+    use std::sync::{Arc, Barrier};
+
+    const OPENERS: usize = 8;
+
+    for round in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Store::open(dir.path()).unwrap());
+        {
+            let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+            conn.execute_batch("ALTER TABLE runs DROP COLUMN notes")
+                .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(OPENERS));
+        let openers: Vec<_> = (0..OPENERS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let path = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&path).map(drop)
+                })
+            })
+            .collect();
+        for opener in openers {
+            if let Err(e) = opener.join().unwrap() {
+                panic!("round {round}: an open of the older store failed: {e}");
+            }
+        }
+
+        let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+        let has_notes: bool = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'notes'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1;
+        assert!(has_notes, "round {round}: runs.notes was not added");
+    }
+}
