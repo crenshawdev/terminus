@@ -8,7 +8,6 @@
       `#![cfg(feature = "testkit")]`, and a bare `cargo test --workspace` skips
       `crates/terminus/tests/mcp.rs`, `recall_cli.rs` (49 tests) and
       `datamove.rs`, gated the same way on the `terminus` package.
-- [ ] (phase 6) runs.error carries a routine "labelled N hit, N false positive" line whenever an ingest pass labels anything, and verbatim status prints that channel under an error heading, so a correct pass reads as a failed one.
 - [ ] (phase 7) `observe::cost::spend` is a read-then-write against the `meta` row, so two concurrent increments store one and the day's token accumulator permanently under-reports. Distinct from the bounded one-call overshoot `cost::admits` documents and accepts; an atomic add closes it. Raised by the phase 7 plan 3 risk_surface review and adjudicated down to medium.
 - [ ] (phase 7) `observe::cost::admits` runs the minimum-turn and daily-budget gates before the reservation check, so a concurrent caller on an in-flight session reports `BudgetSpent` rather than the new `InFlight` skip. Affects the skip string only, not whether a request is made or what is charged.
 - [ ] (phase 7) `crates/verbatim/tests/hook.rs` fails nondeterministically under full-workspace parallel load - a different subset each run, all passing in isolation. Pre-existing process-spawn contention, not a regression (hook.rs is untouched by phase 7). Needs either serialization or a resource guard so the suite is trustworthy under `cargo test --workspace`.
