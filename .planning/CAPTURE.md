@@ -2,41 +2,16 @@
 
 ## Todos
 
-- [ ] (phase 8) `cargo test -p terminus-core` skips the 26 test files gated on
-      `#![cfg(feature = "testkit")]` and exits 0: only `crates/terminus`'s
-      dev-dependency turns `testkit` on, so a `-p`-scoped CI step is a green run
-      over an almost empty test set. The release CI must not run it that way.
-- [ ] (phase 3) `index/text.rs` MAX_BODY_BYTES does not bound the projected body: the newline separator is uncharged and `take` is 0 when the budget is below the next leaf's first char, so the short-circuit never fires
-- [ ] (phase 3) `index/entity.rs` path/command/symbol entity values carry no length bound; only `error` does
-- [ ] (phase 3) `index/entity.rs` splitting a command on `;&|<>()` cuts a real path containing one of them, and splitting on `|` multiplies BRE-escape debris (24.7% of unique Bash-derived path entities)
-- [ ] (phase 3) `index/entity.rs` normalize_error leaves a rejected timestamp's date or hour in the value, so one failure logged twice can normalize two ways
-- [ ] (phase 3) `index/entity.rs` program_of returns the first argv word, so a compound command records the wrapper (`cd` for 17.8% of Bash calls)
-- [ ] (phase 3) `index/entity.rs` identifier_tokens glues a regex escape's letter onto the symbol (`\\bsearch_manager` -> `bsearch_manager`)
-- [ ] (phase 3) `recall/excerpt.rs` first_token indexes the lowercased string while window slices the source, so the excerpt is displaced for any char whose lowercase changes length
-- [ ] (phase 3) `recall/excerpt.rs` excerpt cutting is unbounded in one record's size: two Vec<char> materializations per hit to produce 240 chars
-- [ ] (phase 3) `recall/search.rs` the per-value document-frequency query builds a temp b-tree (15.5-16.7 ms on a 250k-turn store) on the default search path
-- [ ] (phase 3) `recall/query.rs` a token of characters Rust calls alphanumeric but unicode61 does not index becomes a zero-term phrase and silently returns zero hits
+- [ ] (phase 8) The release CI must run `cargo test --workspace --all-features`.
+      Without it `testkit` is off and the run still exits 0: `cargo test -p
+      terminus-core` skips the 26 test files gated on
+      `#![cfg(feature = "testkit")]`, and a bare `cargo test --workspace` skips
+      `crates/terminus/tests/mcp.rs`, `recall_cli.rs` (49 tests) and
+      `datamove.rs`, gated the same way on the `terminus` package.
 - [ ] (phase 3) `recall/search.rs` a query that reduces to no tokens returns no reason, so an unsearchable query cannot be told from an empty archive
 - [ ] (phase 3) `cmd/json.rs` Document::emit uses println!, which panics with exit 101 on a closed stdout pipe; the human path has broken_pipe and the JSON path does not
-- [ ] (phase 3) `cmd/mod.rs` time_bound validates shape but not the calendar, so `--since 2026-08-32` is accepted and silently hides the month with exit 0
 - [ ] (phase 3) `cmd/show.rs` a closed stdout in human mode maps to Failure::Silent (exit 1), indistinguishable from an operational failure under pipefail
 - [ ] (phase 3) `recall/get.rs` the exclusion arm names an excluded project's absolute path in a reason, where the scope arm answers NoSuchTurn so as not to confirm the id exists
-- [ ] (phase 3) `docs/json-shapes.md` the sessions shape documents nullability nowhere, though five of its eleven fields are null in ordinary states
-- [ ] (phase 3) the MCP tool result shape is pinned in no document; docs/json-shapes.md is the CLI contract only
-- [ ] (phase 3) `recall::search::run` resolves scope before validating filters, so D-23's two-shape time rule now exists twice (cmd/mod.rs and recall::search::bound)
-- [ ] (phase 3) a JSON-RPC line is materialized whole by read_until with no size cap on one message
-- [ ] (phase 3) `cmd/mcp/tools.rs` optional_time inherits shape-only date validation, so `since: 2026-02-30` is accepted and returns reason:null with isError:false
-- [ ] (phase 3) `cmd/mcp/mod.rs` serve has no size cap on one JSON-RPC line and amplifies wire bytes to resident memory ~20x (12.9 MB line -> 278.7 MiB RSS)
-- [ ] (phase 3) `cmd/mcp/rpc.rs` an integer id outside i64/u64 is parsed as f64 so the echoed id differs from the id sent; a fractional id is accepted, which MCP forbids
-- [ ] (phase 3) `cmd/mcp/tools.rs` time_bound's message hardcodes the CLI `--since` spelling in a tool result whose inputSchema forbids that argument
-- [ ] (phase 3) `cmd/mcp/tools.rs` recall_get truncates to MAX_IDS before get::records deduplicates, so duplicate ids consume the budget
-- [ ] (phase 3) `cmd/mcp/rpc.rs` PROTOCOL_VERSIONS offers 2025-03-26, which mandates JSON-RPC batching, but a batch is answered with one -32600 and every request in it goes unanswered
-- [ ] (phase 3) `crates/verbatim/tests/mcp.rs` and `tests/recall_cli.rs` are
-      `#![cfg(feature = "testkit")]` on the `verbatim` package, whose `testkit`
-      feature is not default and is enabled by nothing in the workspace. A bare
-      `cargo test --workspace` runs 0 of their 41 tests and still reports 304
-      passed / 0 failed, so the two binaries carrying AC5/AC6/AC7's
-      process-level assertions are silently absent from the default command.
 - [x] (phase 4) The npm shim does not forward signals to the child: spawnSync blocks the event loop, so a SIGTERM aimed at the shim's own PID kills node and orphans the binary. Ctrl-C and job control signal the whole process group and are unaffected. risk_surface review finding, adjudicated downgraded (medium). Closed 2026-10-13: no longer applicable, because phase 2 removed the npm package.
 - [ ] (phase 4) Hoist pass::record_pass and pass::walk's per-file failure arm into ingest/mod.rs (or make them pub(crate)) so pass and backfill share one runs-row writer and one skip rule. Needs a plan whose lease covers crates/verbatim-core/src/ingest/pass.rs.
 - [ ] (phase 4) The four-worker backfill pipeline is only 8% faster than the sequential pass on the real corpus (49,089 ms vs 53,007 ms). The remaining cost is the single SQLite writer's: batch derived-row inserts, or move derive_turn's text expansion and entity extraction onto the workers. Measurement-led task, not a guess.
