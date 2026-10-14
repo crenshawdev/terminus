@@ -770,6 +770,36 @@ fn a_cut_off_script_runs_nothing(shell: Shell) {
     assert!(fx.calls().is_empty(), "{:?}", fx.calls());
 }
 
+/// A HOME holding `ü`. dash started without a UTF-8 locale, as every test
+/// starts it, adds a byte to `ü` each time it copies HOME, so the run is
+/// refused there; `/bin/sh`, and dash started with `LANG=C.UTF-8`, install.
+fn a_home_dash_would_change_is_refused(shell: Shell) {
+    let mut fx = fixture(shell);
+    fx.home = fx.root.join("jürgen");
+    std::fs::create_dir_all(&fx.home).unwrap();
+    let bytes = fx.serve("1.0.0", "");
+    match shell {
+        Shell::Sh => {
+            let output = fx.run();
+            assert!(output.status.success(), "{}", text(&output));
+        }
+        Shell::Dash => {
+            let output = fx.assert_refused(fx.command(&[fx.server.url()]));
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("this shell changes some bytes of HOME"),
+                "{}",
+                text(&output)
+            );
+            let mut command = fx.command(&[fx.server.url()]);
+            command.env("LANG", "C.UTF-8");
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{}", text(&output));
+        }
+    }
+    fx.assert_linked("1.0.0", &bytes);
+}
+
 /// After 1.0.0 is installed, a no-argument run whose fake `curl` fails
 /// `failing` is refused, and stderr holds `message`.
 fn assert_download_refused(shell: Shell, failing: &str, message: &str) {
@@ -1008,6 +1038,7 @@ both_shells!(
     a_piped_script_with_no_source_downloads_from_the_github_releases,
     a_piped_script_installs_from_its_source,
     a_cut_off_script_runs_nothing,
+    a_home_dash_would_change_is_refused,
     a_failed_manifest_download_is_refused,
     a_failed_binary_download_is_refused,
     shasum_computes_the_digest_when_sha256sum_is_missing,

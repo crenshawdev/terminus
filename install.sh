@@ -135,6 +135,11 @@ stage() {
         *) fail 'HOME is relative; set it to your absolute home folder' ;;
     esac
     valid_utf8 "$HOME" || fail 'HOME is not valid UTF-8; set it to a path that is'
+    # dash 0.5.13 started without a UTF-8 locale adds a byte before some UTF-8
+    # bytes each time it copies a value, and every path below is a copy of HOME.
+    home_copy=$HOME
+    [ "$home_copy" = "$HOME" ] && [ "$(printf '%s' "$HOME")" = "$HOME" ] ||
+        fail 'this shell changes some bytes of HOME when it copies them (dash without a UTF-8 locale); run the script with LANG=C.UTF-8 sh, or with bash'
 
     # Spell HOME without empty or . parts and without following folder links, so a
     # link this script made reads back as $versions/<version>/terminus.
