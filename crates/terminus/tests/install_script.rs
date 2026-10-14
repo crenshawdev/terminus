@@ -416,6 +416,11 @@ impl Fixture {
     /// The script's bytes written into the shell's stdin pipe, which is then
     /// closed, as `curl | sh` does. Any `args` go after `-s --`.
     fn piped(&self, args: &[String], tools: &Path) -> Output {
+        self.piped_bytes(&std::fs::read(script()).unwrap(), args, tools)
+    }
+
+    /// `bytes` piped in place of the script, as a download cut off early is.
+    fn piped_bytes(&self, bytes: &[u8], args: &[String], tools: &Path) -> Output {
         use std::io::Write;
 
         let mut command = self.shell(tools);
@@ -430,7 +435,7 @@ impl Fixture {
             .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         // A shell that stops early closes the pipe; its output says why.
-        let _ = stdin.write_all(&std::fs::read(script()).unwrap());
+        let _ = stdin.write_all(bytes);
         drop(stdin);
         child.wait_with_output().unwrap()
     }
@@ -737,6 +742,34 @@ fn a_piped_script_installs_from_its_source(shell: Shell) {
     fx.assert_linked("1.0.0", &bytes);
 }
 
+/// `curl | sh -s -- https://<source>` cut off at any byte before the closing
+/// brace runs nothing: no `curl`, and HOME stays empty. Every byte, because a
+/// cut mid-line can leave a complete command, as `main` did when a function
+/// was called on the last line.
+fn a_cut_off_script_runs_nothing(shell: Shell) {
+    let fx = fixture(shell);
+    let tools = fx.curl_tools("");
+    let script = std::fs::read(script()).unwrap();
+    assert!(
+        script.ends_with(b"\n}\n"),
+        "install.sh no longer ends in its brace group"
+    );
+    for length in 0..script.len() - 1 {
+        let output = fx.piped_bytes(&script[..length], &[fx.server.url()], &tools);
+        assert!(
+            fx.curl_urls().is_empty(),
+            "cut at byte {length} ran curl: {}",
+            text(&output)
+        );
+        assert!(
+            std::fs::read_dir(&fx.home).unwrap().next().is_none(),
+            "cut at byte {length} changed HOME: {}",
+            text(&output)
+        );
+    }
+    assert!(fx.calls().is_empty(), "{:?}", fx.calls());
+}
+
 /// After 1.0.0 is installed, a no-argument run whose fake `curl` fails
 /// `failing` is refused, and stderr holds `message`.
 fn assert_download_refused(shell: Shell, failing: &str, message: &str) {
@@ -974,6 +1007,7 @@ both_shells!(
     no_source_downloads_from_the_github_releases,
     a_piped_script_with_no_source_downloads_from_the_github_releases,
     a_piped_script_installs_from_its_source,
+    a_cut_off_script_runs_nothing,
     a_failed_manifest_download_is_refused,
     a_failed_binary_download_is_refused,
     shasum_computes_the_digest_when_sha256sum_is_missing,

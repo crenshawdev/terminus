@@ -5,9 +5,9 @@
 # The signature check goes inside verify_download in a later cycle, with Baley's
 # release design (issue #14 in Baley's tracker).
 # The script ends by running terminus install through the stable path, which writes Claude Code's wiring.
-# The body is one function called on the last line, so a download cut off at a
-# line break runs nothing. Run flat, a copy cut after the link moves would leave
-# the new version linked, never run terminus install, and exit 0.
+# The body is one brace group, which the shell reads whole before running any of it,
+# so a download cut off before the closing brace runs nothing. Run flat, a copy cut after
+# the link moves would leave the new version linked, never run terminus install, and exit 0.
 set -eu
 
 LC_ALL=C
@@ -118,7 +118,7 @@ stage() {
     staging_temporary=
 }
 
-main() {
+{
     case $# in
         0) source=https://github.com/crenshawdev/terminus/releases/latest/download ;;
         1) case $1 in https://*) source=$1 ;; *) fail 'the source must start with https://' ;; esac ;;
@@ -248,5 +248,3 @@ main() {
 
     "$stable" install
 }
-
-main "$@"
