@@ -11,7 +11,7 @@ The archive is the product, so it is built first and everything else is built on
 - [x] **Phase 3: Install Asks Nothing** - `terminus install` applies its defaults without a question, registers through `claude mcp`, and ends with a receipt
 - [x] **Phase 4: One-Command Installer** - `install.sh` downloads, checks and stores a version behind the stable path, then runs `terminus install`
 - [x] **Phase 5: Install from GitHub Releases** - `install.sh` downloads from the GitHub releases by default, so the whole install is one curl line piped into `sh`
-- [ ] **Phase 6: Signed Install** - `install.sh` verifies each release's signature against a pinned key before it reads the manifest
+- [x] **Phase 6: Signed Install** - `install.sh` verifies each release's signature against a pinned key before it reads the manifest
 - [ ] **Phase 7: Release Builds** - a tagged version builds four platforms in CI, and the owner signs and publishes the release on his own machine
 - [ ] **Phase 8: README** - a README at the repo root for someone who has never heard of Terminus
 
