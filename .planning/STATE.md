@@ -1,6 +1,6 @@
 # State
 
-Phase: 7 of 9 (Blocks as rows)
-Status: phase complete
-Next: /cad-context 8
+Phase: 8 of 9 (Release Builds)
+Status: context gathered
+Next: /cad-plan 8
 Updated: 2026-10-14
