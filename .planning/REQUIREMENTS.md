@@ -29,7 +29,7 @@ under `## Shipped` as written, because they record what shipped then.
 ### Storage (STOR)
 
 - **STOR-08**: A session's archive is stored as numbered block rows, one per block of the uncompressed stream, each holding its compressed bytes and a BLAKE3 hash of its uncompressed bytes. The block size is recorded per session, and the session checksum is a hash over the block hashes in order. An append writes the new blocks and rewrites at most the last one, and reading one turn fetches and decompresses only the blocks it covers.
-- **STOR-09**: `terminus verify` checks each non-evicted session's block numbering, each block's hash and the session checksum, and names the session key and block number of every failure.
+- **STOR-09**: `terminus verify` checks each non-evicted session's block numbering, each block's hash and the session checksum, and names the session key of every failure and the block number of every failure in a single block.
 - **STOR-10**: The binary refuses a store whose archive format is older or newer than it knows, before it opens the store for writing, and the refusal names the clean-install steps. When only the derived schema is older, it rebuilds derived tables and never the archive table.
 
 ### Release (REL)
@@ -165,6 +165,9 @@ Explicit exclusions. The reason prevents scope creep later.
 | INST-12 | Phase 4 | Complete |
 | INST-13 | Phase 5 | Complete |
 | INST-14 | Phase 6 | Complete |
+| STOR-08 | Phase 7 | Pending |
+| STOR-10 | Phase 7 | Pending |
+| STOR-09 | Phase 7 | Pending |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 
