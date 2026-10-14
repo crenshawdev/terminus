@@ -37,9 +37,8 @@
 
 use rusqlite::Connection;
 
-use crate::blob;
 use crate::error::Result;
-use crate::store::Store;
+use crate::store::{archive, Store};
 
 /// One session that did not verify.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,34 +98,37 @@ const DIVERGED: &str = "the transcript on disk is shorter than the bytes the arc
                         for it; the archive was left untouched";
 
 fn walk(conn: &Connection) -> Result<Report> {
-    let mut statement = conn.prepare(
-        "SELECT s.session_key, s.blob, m.checksum, m.transcript_diverged, m.is_evicted
-         FROM sessions s LEFT JOIN session_meta m USING (session_key)
-         ORDER BY s.session_key",
-    )?;
-    let rows = statement.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, Vec<u8>>(1)?,
-            r.get::<_, Option<Vec<u8>>>(2)?,
-            r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
-            r.get::<_, Option<i64>>(4)?.unwrap_or(0) != 0,
-        ))
-    })?;
+    // Keys and metadata first, streams one at a time, for the memory bound
+    // `reindex` documents: selecting every stream in one statement holds as
+    // much of the archive as the cursor has reached.
+    let sessions: Vec<(String, Option<Vec<u8>>, bool, bool)> = conn
+        .prepare(
+            "SELECT s.session_key, m.checksum, m.transcript_diverged, m.is_evicted
+             FROM sessions s LEFT JOIN session_meta m USING (session_key)
+             ORDER BY s.session_key",
+        )?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<Vec<u8>>>(1)?,
+                r.get::<_, Option<i64>>(2)?.unwrap_or(0) != 0,
+                r.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
+            ))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
 
     let mut report = Report::default();
-    for row in rows {
-        let (session_key, bytes, expected, diverged, evicted) = row?;
+    for (session_key, expected, diverged, evicted) in sessions {
         report.checked += 1;
         // Counted, and never a failure. An evicted session's blob was emptied
-        // on purpose (RET-02, phase 8 D-03), so `blob::read_all` has no header
-        // to find and would report every one of them as "does not decompress" -
+        // on purpose (RET-02, phase 8 D-03), so it has no header to find and
+        // would report every one of them as "does not decompress" -
         // which is the confusion the divergence arm above exists to prevent,
         // arriving from the other side. The count still moves because the walk
         // did visit the session and can say what it is; the check is what has
         // nothing left to check.
         if !evicted {
-            if let Err(detail) = check(&bytes, expected.as_deref()) {
+            if let Err(detail) = check(conn, &session_key, expected.as_deref())? {
                 report.failures.push(Failure {
                     session_key: session_key.clone(),
                     detail,
@@ -146,25 +148,35 @@ fn walk(conn: &Connection) -> Result<Report> {
     Ok(report)
 }
 
-/// One session's verdict. The error is the message the report prints, so it
-/// says what is wrong rather than what failed.
-fn check(bytes: &[u8], expected: Option<&[u8]>) -> std::result::Result<(), String> {
+/// One session's verdict. The inner error is the message the report prints, so
+/// it says what is wrong rather than what failed; the outer one is the
+/// database's and ends the walk.
+fn check(
+    conn: &Connection,
+    session_key: &str,
+    expected: Option<&[u8]>,
+) -> Result<std::result::Result<(), String>> {
     let Some(expected) = expected else {
         // The archive is two tables written in one transaction (STOR-02), so a
         // blob with no metadata row is not a state ingest can produce.
-        return Err("no session_meta row, so there is no checksum to check it against".into());
+        return Ok(Err(
+            "no session_meta row, so there is no checksum to check it against".into(),
+        ));
     };
 
-    let stream = blob::read_all(bytes).map_err(|e| format!("blob does not decompress: {e}"))?;
+    let stream = match archive::stream(conn, session_key)? {
+        Ok(stream) => stream,
+        Err(e) => return Ok(Err(format!("blob does not decompress: {e}"))),
+    };
     let actual = blake3::hash(&stream);
     if actual.as_bytes().as_slice() != expected {
-        return Err(format!(
+        return Ok(Err(format!(
             "checksum mismatch: expected {}, found {}",
             hex(expected),
             actual.to_hex()
-        ));
+        )));
     }
-    Ok(())
+    Ok(Ok(()))
 }
 
 fn hex(bytes: &[u8]) -> String {

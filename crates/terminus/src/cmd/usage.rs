@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 use terminus_core::config::visible;
+use terminus_core::store::archive;
 
 use super::json::Document;
 use super::read::{self, Opened, Reader};
@@ -147,17 +148,18 @@ fn measure(reader: &Reader) -> terminus_core::Result<Usage> {
     // exists to prevent.
     let visible = visible::sessions(conn, config)?;
 
-    // The bytes and the month for every session in the store, in one pass.
-    // Keyed on `session_key` so the visible set decides which of them count.
-    let mut rows: BTreeMap<String, (Option<String>, i64)> = BTreeMap::new();
+    // The month and the stored bytes for every session in the store, keyed on
+    // `session_key` so the visible set decides which of them count.
+    let mut months: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut statement = conn.prepare(
-        "SELECT s.session_key, substr(m.first_turn_at, 1, 7), length(s.blob)
+        "SELECT s.session_key, substr(m.first_turn_at, 1, 7)
            FROM sessions s LEFT JOIN session_meta m USING (session_key)",
     )?;
     let mut cursor = statement.query([])?;
     while let Some(row) = cursor.next()? {
-        rows.insert(row.get(0)?, (row.get(1)?, row.get(2)?));
+        months.insert(row.get(0)?, row.get(1)?);
     }
+    let stored = archive::stored_bytes(conn)?;
 
     let mut usage = Usage::default();
     let mut by_project: BTreeMap<Option<String>, Bucket> = BTreeMap::new();
@@ -167,7 +169,8 @@ fn measure(reader: &Reader) -> terminus_core::Result<Usage> {
         // covers only the impossible case of a key that vanished between the
         // two statements, and counts it as a session with no bytes rather than
         // dropping it out of the session count.
-        let (month, bytes) = rows.get(&session.session_key).cloned().unwrap_or((None, 0));
+        let month = months.get(&session.session_key).cloned().flatten();
+        let bytes = stored.get(&session.session_key).copied().unwrap_or(0);
         usage.sessions += 1;
         usage.archive_bytes += bytes;
         for (buckets, key) in [

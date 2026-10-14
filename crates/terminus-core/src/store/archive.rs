@@ -5,6 +5,8 @@
 //! session stream (v0.1.0 phase 1 D-04), and nothing here checks a hash
 //! (phase 7 D-15): `verify` and append are the checkers.
 
+use std::collections::BTreeMap;
+
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::blob::BlobReader;
@@ -66,4 +68,25 @@ pub fn ranges(
         bytes,
         blocks_decompressed: reader.blocks_decompressed(),
     }))
+}
+
+/// One session's whole uncompressed stream.
+///
+/// The outer error is the database's, and a session with no row is one of
+/// them. The inner one is the stored bytes failing to read, which callers
+/// report against that session and keep going.
+pub fn stream(conn: &Connection, session_key: &str) -> Result<Result<Vec<u8>>> {
+    let blob: Vec<u8> = conn.query_row(
+        "SELECT blob FROM sessions WHERE session_key = ?1",
+        [session_key],
+        |r| r.get(0),
+    )?;
+    Ok(crate::blob::read_all(&blob))
+}
+
+/// Every session's stored archive bytes, by `session_key`.
+pub fn stored_bytes(conn: &Connection) -> Result<BTreeMap<String, i64>> {
+    let mut statement = conn.prepare("SELECT session_key, length(blob) FROM sessions")?;
+    let rows = statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }

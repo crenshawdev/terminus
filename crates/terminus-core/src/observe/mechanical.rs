@@ -264,12 +264,7 @@ fn entity_values(conn: &Connection, session_key: &str, kind: &str) -> Result<Vec
 /// of a `Bash` `tool_use` block, which is a record of what ran rather than a
 /// sentence about it.
 fn from_blob(conn: &Connection, session_key: &str) -> Result<(Vec<String>, Vec<String>)> {
-    let bytes: Vec<u8> = conn.query_row(
-        "SELECT blob FROM sessions WHERE session_key = ?1",
-        [session_key],
-        |r| r.get(0),
-    )?;
-    let stream = crate::blob::read_all(&bytes)?;
+    let stream = crate::store::archive::stream(conn, session_key)??;
     let scan = crate::parse::scan(&stream);
 
     let mut commands: Vec<String> = Vec::new();

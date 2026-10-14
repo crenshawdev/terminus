@@ -48,12 +48,12 @@
 
 use std::path::Path;
 
-use crate::blob;
 use crate::derive::{self, TurnRow};
 use crate::error::Result;
 use crate::parse;
 use crate::store::{
-    schema, Store, ARCHIVE_FORMAT, DERIVED_SCHEMA, META_ARCHIVE_FORMAT, META_DERIVED_SCHEMA,
+    archive, schema, Store, ARCHIVE_FORMAT, DERIVED_SCHEMA, META_ARCHIVE_FORMAT,
+    META_DERIVED_SCHEMA,
 };
 
 /// What a rebuild produced.
@@ -92,7 +92,7 @@ pub struct Rebuilt {
 pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
     let tx = store.conn_mut().transaction()?;
 
-    // Keys first, blobs one at a time. Selecting `blob` here too would hold the
+    // Keys first, streams one at a time. Reading them here too would hold the
     // whole archive in memory at once - 895 MB of it today and growing with
     // every session ever archived - and this runs inside the ingest lock on the
     // first hook-spawned pass after an upgrade, where an allocation failure
@@ -162,12 +162,7 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
             clear_derived(&tx, &session_key)?;
         }
         rebuilt.sessions += 1;
-        let bytes: Vec<u8> = tx.query_row(
-            "SELECT blob FROM sessions WHERE session_no = ?1",
-            [session_no],
-            |r| r.get(0),
-        )?;
-        let stream = match blob::read_all(&bytes) {
+        let stream = match archive::stream(&tx, &session_key)? {
             Ok(stream) => stream,
             Err(e) => {
                 // Named and skipped. `verify` is the command that reports this
