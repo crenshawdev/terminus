@@ -45,11 +45,6 @@ is done. The five below are planned as the cycle after the install work.
   reasons at module level, short and plain, and move the history into one
   decisions file with globally unique ids.
 
-### Security disclosure
-
-- [ ] **SECURITY.md and a private disclosure channel.** Still undecided, and no
-  phase owns it.
-
 ## Notes
 
 ## Debt markers
