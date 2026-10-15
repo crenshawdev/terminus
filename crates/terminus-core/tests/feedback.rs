@@ -434,8 +434,9 @@ fn insert_decision(conn: &Connection) {
     conn.execute(
         "INSERT INTO decisions (
             session_id, ts, cwd, prompt, watermark_session_no, chars_injected,
-            spellings, candidates, injected, suppressed, thresholds
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            spellings, candidates, injected, suppressed, thresholds,
+            compacted, dropped
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             "0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55",
             "2026-08-20T09:14:21.000Z",
@@ -448,6 +449,8 @@ fn insert_decision(conn: &Connection) {
             r#"[{"turn_id":117440514,"chars":412}]"#,
             r#"[{"turn_id":117440515,"reason":"already_injected"}]"#,
             r#"{"ranked":10,"entity_rank":3,"co_occurring":2,"max_turns":3}"#,
+            1_i64,
+            "[117440510,117440511]",
         ],
     )
     .unwrap();
@@ -596,6 +599,103 @@ fn a_file_that_is_not_a_record_is_removed_and_named() {
     assert!(
         error.contains(&garbage.display().to_string()),
         "the note does not name the file: {error}"
+    );
+}
+
+/// The `compacted` flag and the dropped turns of each record, read off its
+/// row by prompt.
+fn compaction_of(conn: &Connection, prompt: &str) -> (Option<i64>, Option<String>) {
+    conn.query_row(
+        "SELECT compacted, dropped FROM decisions WHERE prompt = ?1",
+        [prompt],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap_or_else(|e| panic!("no decisions row for {prompt:?}: {e}"))
+}
+
+/// #40: a decision made under the compacted pool keeps that fact and its
+/// dropped turns through the drain, and an ordinary one is stored as ordinary
+/// rather than as unknown.
+#[test]
+fn a_drained_decision_keeps_its_compaction() {
+    let bench = bench();
+    let cwd = bench.project();
+
+    let mut compacted = Decision::opened(Some(SESSION), Some(&cwd), "after the compaction");
+    compacted.compacted = true;
+    compacted.dropped = vec![41, 42];
+    assert!(compacted.save(&bench.data_dir), "the record did not land");
+    let ordinary = Decision::opened(Some(SESSION), Some(&cwd), "before any compaction");
+    assert!(ordinary.save(&bench.data_dir), "the record did not land");
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 2, "{summary:?}");
+
+    let conn = bench.conn();
+    assert_eq!(
+        compaction_of(&conn, "after the compaction"),
+        (Some(1), Some("[41,42]".to_owned()))
+    );
+    assert_eq!(
+        compaction_of(&conn, "before any compaction"),
+        (Some(0), Some("[]".to_owned()))
+    );
+}
+
+/// The columns of one table, in declaration order, with their types.
+fn table_info(conn: &Connection, table: &str) -> Vec<(String, String)> {
+    conn.prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// #40, D-11: a store made before the columns existed gains them on its first
+/// writable open, in a fresh store's order, and the rows it already held read
+/// null in both - their values are unknown, not ordinary.
+#[test]
+fn a_store_without_the_compaction_columns_gains_them_and_its_rows_read_unknown() {
+    let bench = bench();
+    {
+        let conn = bench.conn();
+        insert_decision(&conn);
+        conn.execute_batch(
+            "ALTER TABLE decisions DROP COLUMN dropped;
+             ALTER TABLE decisions DROP COLUMN compacted;",
+        )
+        .unwrap();
+        let names: Vec<String> = table_info(&conn, "decisions")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "compacted" || n == "dropped"),
+            "the premise: an aged table: {names:?}"
+        );
+    }
+
+    bench.pass();
+
+    let conn = bench.conn();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM decisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+    let (compacted, dropped): (Option<i64>, Option<String>) = conn
+        .query_row("SELECT compacted, dropped FROM decisions", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((compacted, dropped), (None, None));
+
+    let fresh = tempfile::tempdir().unwrap();
+    let store = Store::open(fresh.path()).unwrap();
+    assert_eq!(
+        table_info(&conn, "decisions"),
+        table_info(store.conn(), "decisions"),
+        "an upgraded store and a fresh one disagree on the column order"
     );
 }
 

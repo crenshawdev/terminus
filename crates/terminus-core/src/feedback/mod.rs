@@ -179,14 +179,19 @@ pub fn drain(conn: &mut Connection, data_dir: &Path) -> Result<Drained> {
 /// crate grows no second date implementation (see
 /// [`crate::inject::decision`]). The list-shaped fields are JSON documents: they
 /// are read back whole by replay and stats and joined on by nothing.
+///
+/// `compacted` is always written as 1 or 0 and `dropped` always as a document,
+/// an empty array for an ordinary decision. Null in either column is kept for
+/// the rows drained before the columns existed, whose values are unknown.
 fn insert(conn: &Connection, decision: &Decision, watermark: Option<i64>) -> Result<()> {
     conn.execute(
         "INSERT INTO decisions (
             session_id, ts, cwd, prompt, watermark_session_no, chars_injected,
-            spellings, candidates, injected, suppressed, thresholds
+            spellings, candidates, injected, suppressed, thresholds,
+            compacted, dropped
          ) VALUES (
             ?1, strftime('%Y-%m-%dT%H:%M:%fZ', ?2 / 1000.0, 'unixepoch'), ?3, ?4,
-            ?5, ?6, ?7, ?8, ?9, ?10, ?11
+            ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
          )",
         rusqlite::params![
             decision.session_id,
@@ -202,6 +207,8 @@ fn insert(conn: &Connection, decision: &Decision, watermark: Option<i64>) -> Res
             document(&decision.injected),
             document(&decision.suppressed),
             document(&decision.thresholds),
+            i64::from(decision.compacted),
+            document(&decision.dropped),
         ],
     )?;
     Ok(())

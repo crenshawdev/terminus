@@ -205,7 +205,20 @@ CREATE TABLE IF NOT EXISTS decisions (
     suppressed   TEXT,
     -- The threshold values in force, logged per decision because they are
     -- compile-time constants a later build may change (D-08).
-    thresholds   TEXT
+    thresholds   TEXT,
+    -- 1 when the prompt ran under the compacted pool (INJ-05), 0 when it did
+    -- not. Null means the decision was drained before this column existed, so
+    -- its value is unknown. Nullable rather than `NOT NULL DEFAULT 0`, which
+    -- would record every earlier decision as ordinary for good.
+    compacted    INTEGER,
+    -- The turn ids the compaction dropped, one JSON document like the other
+    -- list-shaped columns. Null for the same earlier decisions.
+    --
+    -- Both declared last, and appended last in `BRING_FORWARD_COLUMNS`, which
+    -- is that constant's own rule: `ALTER TABLE ADD COLUMN` appends, so a
+    -- column placed mid-table would give a fresh store and an upgraded store
+    -- different column orders.
+    dropped      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id);
@@ -465,6 +478,10 @@ pub const BRING_FORWARD_COLUMNS: &[(&str, &[(&str, &str)])] = &[
     // fail with `no such column` on every future pass, permanently, because
     // `reindex::open_up_to_date` runs at the top of each one.
     ("turns", &[("is_typed", "INTEGER")]),
+    (
+        "decisions",
+        &[("compacted", "INTEGER"), ("dropped", "TEXT")],
+    ),
 ];
 
 /// The session-summary columns `observations` carried while Terminus called a
