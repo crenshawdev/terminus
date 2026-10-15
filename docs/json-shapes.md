@@ -1,8 +1,10 @@
 # `--json` shapes and the exit-code contract
 
-Every data command accepts `--json`. This file is the contract, and
-`crates/terminus/tests/cli.rs` holds it to it: one test per property across all
-commands, so a seventh command added later is one line rather than a new file.
+Every data command accepts `--json`. This file is the contract.
+`crates/terminus/tests/cli.rs` holds every command but `doctor` to it, one test
+per property across all of them, so a command added later is one line in that
+test's command list rather than a new file. `crates/terminus/tests/doctor.rs`
+holds `doctor`'s shape.
 
 ## The envelope
 
@@ -223,7 +225,7 @@ and unchanged.
 ### `replay`
 
 ```json
-{"thresholds": {"ranked": 10, "compacted_ranked": 50, "entity_rank": 5, "co_occurring": 2,
+{"thresholds": {"ranked": 10, "compacted_ranked": 50, "entity_rank": 3, "co_occurring": 2,
                 "max_turns": 3, "max_candidates": 8},
  "decisions": 12,
  "labels": [{"label": "hit", "old": 3, "new": 5},
@@ -242,8 +244,11 @@ and unchanged.
 - `decisions` counts the rows that were scored: the decisions of sessions the
   idle rule has closed, which is exactly the set the labeller was allowed to
   judge. A decision of a live session has no stored label to diff against.
-- `labels` is one entry per label, always all four and always in that order.
-  `old` is what the store holds, `new` is what the replayed rules produce.
+- `labels` is one entry per label, all four in that order, whenever replay ran
+  against the decision log, even one with no decision to score. With no store,
+  or a store with no decision log, `labels` is `[]`, and it is `[]` in the
+  failure document for a damaged log too. `old` is what the store holds, `new`
+  is what the replayed rules produce.
 - `changed` names the decision ids whose label set moved, in id order, so a diff
   can be followed back into the prompts behind it.
 - `replay` never writes: the store is opened read-only, `terminus.db` is byte
@@ -388,9 +393,10 @@ gives the pages back to the filesystem afterwards.
   compaction that reclaimed nothing and left the store fractionally larger
   reports a negative number rather than a floor of zero.
 - **Exit 1 when the ingest lock is held**, with the document still written and
-  `ok` false. This is the one place the "0 including an empty result" rule does
-  not apply, and deliberately: a contended `ingest` exits 0 because the next
-  hook spawn catches what it skipped, but a compaction was asked for explicitly
+  `ok` false, as `reindex` and `observations regenerate` also answer a held
+  lock. The "0 including an empty result" rule does not apply here, and
+  deliberately: a contended `ingest` exits 0 because the next hook spawn
+  catches what it skipped, but a compaction was asked for explicitly
   and one that did not happen is an operational failure. `before` and `after`
   are the same unchanged measurement in that document, because nothing moved.
 - A machine with no store is an ordinary empty answer: exit 0, a `reason`, all
@@ -482,9 +488,10 @@ snapshot, not an export.
 - The manifest carries `notice`, `archive_format` as the store itself reports
   it, the session / turn / evicted counts, the total bytes, the distinct
   projects, the `first_turn_at`..`last_turn_at` range, and a `files` array with
-  one entry per session naming its file, session key, session id, project, turn
-  count, bytes and evicted flag. It is pretty-printed, unlike the one-line
-  `--json` envelope: an envelope is piped, a manifest is opened and read.
+  one entry per session: `file`, `session_key`, `session_id`, `project`,
+  `turns`, `bytes`, `evicted`, `first_turn_at` and `last_turn_at`. It is
+  pretty-printed, unlike the one-line `--json` envelope: an envelope is piped,
+  a manifest is opened and read.
 
 ### `doctor`
 
@@ -499,14 +506,17 @@ snapshot, not an export.
                          "fix": "set \"cleanupPeriodDays\": 3650 in /home/you/.claude/settings.json"}}
 ```
 
-`data`'s keys are the check names, and there is no list: `data` is the checks,
-one object per check.
+`data` holds one object per check, keyed by the check's name. Every run carries
+the same 14 keys: `binary`, `settings_file`, `hook_SessionStart`,
+`hook_UserPromptSubmit`, `hook_SessionEnd`, `hook_PostCompact`, `mcp_server`,
+`claude_code`, `config_roots`, `data_directory`, `store`, `last_run`,
+`cleanup_period_days` and `auto_compact`.
 
 | Field | Type | Meaning |
 |---|---|---|
 | `state` | string | One of `ok`, `note`, `unknown`, `problem`. Never null. |
 | `finding` | string | One line, always present, never empty. Names the file or path it is about, so a check reads on its own. |
-| `fix` | string or null | What to run, or the settings edit to make. Null whenever there is nothing to do - which is every `ok`, and also a `problem` whose repair is a hand edit (a duplicated hook entry is the one that is). |
+| `fix` | string or null | What to run, or the settings edit to make. Null wherever doctor has no one command or edit to give, as listed below. |
 
 - `note` is true, worth saying, and not a failure: a machine before its first
   ingest, or a setting terminus would choose differently and never changes
@@ -519,6 +529,17 @@ one object per check.
 - The key set does not depend on what doctor found. A check it could not run
   reports `unknown` rather than going missing, so a caller reads a state instead
   of testing for a key.
+- `fix` is set only where doctor can name one command to run or one settings
+  edit to make. It is null for every `ok` and every `unknown`. It is null for a
+  `note` with nothing to run: a settings file, data directory or store not
+  there yet, no ingest run yet, more than one config root, or a hook event
+  another install's entry also runs. It is null for a `problem` doctor has no
+  one command for: a `settings.json` or `.claude.json` that cannot be read or
+  is not JSON, a duplicated hook entry, a config that does not load or resolves
+  no root, a data directory that cannot be resolved or read or is not a
+  directory, a store that cannot be opened or counted, a `runs` table that
+  cannot be read, a `cleanupPeriodDays` that is not a number, and an
+  `autoCompactEnabled` that is neither true nor false.
 - `fix` is a shell command wherever one exists. Where the repair is a value in
   the user's own settings file, it is that edit written out literally, because
   terminus never changes either of the two Claude Code settings it reports
