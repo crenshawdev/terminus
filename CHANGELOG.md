@@ -3,11 +3,32 @@
 All notable changes to Terminus are recorded here. Terminus was named Verbatim
 until 2026-10-05. The two Verbatim versions at the bottom were local test
 builds, tagged `verbatim-v0.1.0` and `verbatim-v0.1.1` and never released.
-Terminus numbers its unreleased work 0.0.x, and its first release will be
-0.1.0. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+Before its first release, 0.1.0, Terminus numbered its unreleased work 0.0.x.
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.1.1] - 2026-10-15
+
+### Fixed
+
+- 0.1.0's Linux and macOS aarch64 binaries could not install themselves. They
+  did not carry the marker `terminus install` looks for at
+  `~/.local/bin/terminus`, so after `install.sh` placed the link,
+  `terminus install` refused it as not a terminus build and exited 1, leaving
+  no hook entries and no MCP entry. Every build now carries the marker, and the
+  release workflow fails a build whose binary does not.
+- `install.sh` replaces a link to
+  `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus` without
+  checking that file for the marker, so running the one-line command again on
+  an aarch64 machine 0.1.0 left half installed installs 0.1.1.
+- On macOS, the command `terminus install` prints when it refuses the file at
+  `~/.local/bin/terminus` named the path it was started by, which is the link,
+  so it deleted the link and then ran it. It now names the version file behind
+  the link.
+
+## [0.1.0] - 2026-10-15
 
 ### Added
 
@@ -40,8 +61,7 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   downloads anything, naming `openssh-client` (Debian, Ubuntu),
   `openssh-clients` (Fedora) and `openssh` (Arch). The key is never fetched,
   and no argument, setting or environment variable changes it, so a source
-  passed as the argument can only serve releases signed with that key. No
-  release is published yet.
+  passed as the argument can only serve releases signed with that key.
 - `install.sh` refuses to run when `TERMINUS_BIN_DIR` is set, and refuses a
   stable path holding a file that is not a Terminus build, leaving it as it is.
 - `install.sh`'s `curl` download is the one network use. The Terminus binary
@@ -54,6 +74,8 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- The Linux binaries are static musl builds with mimalloc as the allocator,
+  and the macOS binaries link only the system libraries every Mac has.
 - `~/.local/bin/terminus` is now a symbolic link to
   `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus`. The hooks and
   the MCP registration name the link, so they are not rewritten when the
@@ -250,6 +272,8 @@ granularity, and gives the model recall over its own history through three MCP
 tools and hook-driven context injection. Local only, no daemon, no port, no
 telemetry.
 
-[Unreleased]: https://github.com/crenshawdev/terminus/compare/verbatim-v0.1.1...HEAD
+[Unreleased]: https://github.com/crenshawdev/terminus/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/crenshawdev/terminus/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/crenshawdev/terminus/compare/verbatim-v0.1.1...v0.1.0
 [Verbatim 0.1.1]: https://github.com/crenshawdev/terminus/compare/verbatim-v0.1.0...verbatim-v0.1.1
 [Verbatim 0.1.0]: https://github.com/crenshawdev/terminus/tree/verbatim-v0.1.0

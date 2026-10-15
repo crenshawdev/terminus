@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install Terminus. No release is published yet.
+# Install Terminus.
 # With no argument it downloads from the GitHub releases on crenshawdev/terminus;
 # one https:// argument names another source.
 # Before it reads the manifest, it checks terminus-<os>-<arch>.manifest.sig with
