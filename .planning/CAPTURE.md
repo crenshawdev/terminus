@@ -2,14 +2,6 @@
 
 ## Todos
 
-- [ ] (phase 8) The release CI must run `cargo test --workspace --all-features`.
-      Without it `testkit` is off and the run still exits 0: `cargo test -p
-      terminus-core` skips the 26 test files gated on
-      `#![cfg(feature = "testkit")]`, and a bare `cargo test --workspace` skips
-      `crates/terminus/tests/mcp.rs`, `recall_cli.rs` (49 tests) and
-      `datamove.rs`, gated the same way on the `terminus` package.
-- [ ] (phase 8) Change the license to MIT before release.
-- [ ] (phase 8) The PR that merges cadence/v0.0.1 says "Fixes #13" in its description, so the issue closes on merge; 65ef2d1 fixed it.
 
 
 ## Seeds

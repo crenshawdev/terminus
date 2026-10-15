@@ -120,7 +120,8 @@ The archive is the product, so it is built first and everything else is built on
 4. Every command is listed with one line on what it does, and every `terminus.toml` setting with its key and default; the user docs cover each in full.
 5. It states what Terminus refuses to do: no daemon, no telemetry, no model calls, no API keys and no network use at all.
 6. The trust page shows how to check a downloaded release by hand with `ssh-keygen -Y verify` against the pinned key.
-7. `/cad-docs-verify` reports no stale claim: every command, path and key the README and the user docs name matches the code.
+7. The license is MIT: `LICENSE`, the `license` field in `Cargo.toml` and the README all say so, before Phase 10 publishes anything.
+8. `/cad-docs-verify` reports no stale claim: every command, path and key the README and the user docs name matches the code.
 
 ### Phase 10: Publish 0.1.0
 **Goal:** Terminus 0.1.0 is published. Phases 1 to 9 land on `main`, `v0.1.0` is tagged there, the release workflow from Phase 8 makes the draft, and the owner signs and publishes it with the signing script. The check installs it on all four runners, the owner removes his local install entirely and installs the release from nothing, and then the docs stop saying no release is published. A published release cannot be taken back, so every step before publishing stays reversible. Moved out of Phase 8 so the README is in place before anyone can install.
