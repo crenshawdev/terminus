@@ -313,10 +313,11 @@ fn write_atomically(path: &Path, state: &State) -> Option<()> {
 /// The name can never collide with a session's own file: it starts with a dot
 /// and ends in `.tmp`, and [`file_name`] admits neither.
 ///
-/// Owner-only from the moment it exists. The temporary holds the same quoted
-/// prompt text the target does, and it is on disk under its own name for the
-/// length of the write, so a mode applied after the fact would cover the target
-/// and miss the bytes.
+/// Owner-only from the moment it exists. The temporary holds the same document
+/// the target does: the turn ids injected and briefed, the suppressions and the
+/// compaction flag, a record of what this person's sessions were given. It is
+/// on disk under its own name for the length of the write, so a mode applied
+/// after the fact would cover the target and miss the bytes.
 fn create_temporary(dir: &Path) -> Option<(PathBuf, std::fs::File)> {
     /// Enough to step over a stale name or two. Past that, something is wrong
     /// with the directory rather than with the name.

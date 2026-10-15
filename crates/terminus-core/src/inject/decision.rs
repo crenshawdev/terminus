@@ -246,10 +246,9 @@ pub fn read_all(data_dir: &Path) -> Vec<Found> {
             continue;
         }
         let path = entry.path();
-        // A `.tmp` left by a write that was cut off at the hook's deadline is
-        // not a record and never will be: skipping it here and deleting it in
-        // the drain are two different answers, and this is the one that cannot
-        // race a write still in flight.
+        // A `.tmp` is a write's temporary and never a record, so it is skipped
+        // here. One left by a write cut off at the hook's deadline is deleted
+        // by the drain's sweep once it is older than the age limit.
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
@@ -303,7 +302,8 @@ fn now_ms() -> i64 {
 /// The same tmp+rename shape [`super::state`] uses and for the same reason: this
 /// runs on a thread the binary never joins, so process exit takes it wherever it
 /// got to, and a rename within a directory is atomic - the drain sees a whole
-/// document or no file at all, never a prefix.
+/// document, the empty reservation made below, or no file at all, never a
+/// prefix.
 ///
 /// No `fsync`. The rename buys the atomicity a reader cares about; durability
 /// across a power cut would cost a disk flush on the path where the user is

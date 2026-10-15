@@ -232,9 +232,14 @@ pub(crate) fn arm(event: &str) -> Option<Arm> {
 /// **The work runs on a thread this command starts and never joins**, the same
 /// shape and the same reason as [`drain`]: a blocking SQLite call cannot be
 /// cancelled with `std` alone, so the only way to stop waiting is to stop
-/// waiting and let process exit take the thread with it. Abandoning it is safe
-/// because nothing on that thread writes, creates a directory or takes the
-/// ingest lock (INJ-06). This is the second of D-03's two mechanisms: the busy
+/// waiting and let process exit take the thread with it. The thread does write
+/// files: both arms save the session's state file (`State::save`), and the
+/// prompt arm saves a decision file (`Decision::save`), each creating its
+/// directory if it has to. Abandoning it is still safe because both writes go
+/// through a temp file and a rename, so a write cut off here leaves at most a
+/// `.tmp`, which the ingest's drain deletes once it is old. The thread never
+/// writes SQLite and never takes the ingest lock (INJ-06). This is the second
+/// of D-03's two mechanisms: the busy
 /// timeout `terminus_core::inject` sets turns lock contention into an immediate
 /// `SQLITE_BUSY`, and this catches what a busy timeout cannot see - a slow
 /// query, a large blob, a `terminus.toml` on a filesystem that has stopped
