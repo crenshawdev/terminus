@@ -15,3 +15,21 @@ Reports about Terminus on the `main` branch and about any published release are 
 - Terminus reading a project listed under `exclude` in `terminus.toml`, or returning its sessions;
 - with `[privacy] redact_recall` on, a secret of a shape the redaction filter is built to replace reaching Claude Code through a hook or an MCP tool;
 - an archived session whose stored blocks no longer match their recorded hashes, which `terminus verify` still passes.
+
+## How Terminus is checked
+
+Terminus is audited with [sentinel](https://github.com/crenshawdev/sentinel), which this repo carries as a git submodule at `.sentinel`. The audit works from [THREAT-MODEL.md](THREAT-MODEL.md), which lists what Terminus reads, writes and runs, and where untrusted data enters.
+
+- **Every pull request** runs sentinel's mechanical checks through `.github/workflows/fast.yml`: `cargo audit`, `cargo deny` against this repo's `deny.toml`, `cargo clippy` and `semgrep`. If any of them fails, the pull request fails. The workflow holds no secrets.
+- **The full audit** runs by hand, not in CI. Each of sentinel's review prompts covers one concern and runs several times through more than one model. The results are merged, and each finding is then adjudicated. A finding counts as confirmed only once a failing test demonstrates it. The steps are in sentinel's README.
+- **Fuzzing.** `fuzz/` holds a cargo-fuzz target for every parser that reads input from outside Terminus: transcripts, `terminus.toml`, the command line, hook input, MCP messages and Claude Code's settings files. `cargo +nightly fuzz build` builds them all, and `cargo +nightly fuzz run <target>` runs one.
+- **Miri.** Terminus has one `unsafe` block, the volatile read of the install marker in `crates/terminus/src/cmd/install/binary.rs`. The two tests that exercise it without touching the filesystem run under Miri:
+
+  ```sh
+  rustup +nightly component add miri
+  cargo +nightly miri test -p terminus --lib -- a_marker_split_across_two_reads_is_still_found a_file_without_the_marker_is_foreign
+  ```
+
+## Confirmed findings
+
+Every confirmed finding becomes a regression test. The test goes into the test suite of the crate the finding is in, it fails before the fix and passes after, and it stays there so the same bug cannot come back unnoticed.
