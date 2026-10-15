@@ -111,13 +111,20 @@ data on stdout, the counts and the warnings on stderr.
  "absent": [{"turn_id": 99, "reason": "no turn 99 is archived"}]}
 ```
 
+- `tool_name` is null for a turn whose record has no `tool_use` block. When it
+  has one, `tool_name` is the first block's name.
+- `ts` is null for a turn row with no timestamp. Ingest makes a turn only of a
+  record that carries a `timestamp`, so a turn it wrote always has one.
+- `project` is null when the turn's session has no `session_meta` row, or when no
+  record in the session carried a `cwd`.
 - `body` is the record's own archived line. It is the only lossy rendering
   terminus performs: a JSON string is text by definition, so a byte that is not
   UTF-8 is replaced here. The human mode writes the bytes themselves. With
   `[privacy] redact_recall = true` in `terminus.toml` the line is put through the
   egress filter first, so `body` carries `[redacted]` markers where a credential
   stood; the archive itself is unchanged, and no key is added or removed in
-  either setting.
+  either setting. `body` is null when the line was not read: retention evicted
+  the session, or its blocks would not give the bytes up.
 - `body_evicted` comes from `session_meta.is_evicted` and from nothing else. A
   block that will not decompress is archive damage, which `terminus verify`
   reports; it leaves `body` null with `body_evicted` false.
@@ -132,7 +139,12 @@ data on stdout, the counts and the warnings on stderr.
 
   `at_session_start` / `at_session_end` say which end the window stopped at. The
   window never crosses a session boundary, and `continues_from` is handed back
-  unfollowed so a caller can decide to make a second call.
+  unfollowed so a caller can decide to make a second call. `turns[].tool_name`
+  and `turns[].ts` are null on the same terms as the record's own `tool_name`
+  and `ts`. `continues_from` is null when the session names no session it
+  continues from, or has no `session_meta` row. `reason` is null unless the
+  window came back empty for a reason, and then it says why in the words
+  `absent` uses.
 - `absent` carries every requested id that named no record this caller may see:
   an unknown id, a turn of an excluded project, or a turn outside the scope.
 
@@ -145,6 +157,21 @@ data on stdout, the counts and the warnings on stderr.
    "watermark": 12034, "sidecar": false, "evicted": false}]}
 ```
 
+- `project` is null when no record in the session carried a `cwd`, so there was
+  no directory to resolve a project from.
+- `project_pre_worktree` is null unless the session's `cwd` was in a git
+  worktree and its project was folded onto the parent repository. It is also
+  null on a store too old to have the column.
+- `branch` is null when no record in the session carried a `gitBranch`.
+- `first_turn_at` and `last_turn_at` are null until a pass has archived a turn
+  of the session. A transcript holding only state records, with no turn among
+  them, has neither.
+- `project`, `project_pre_worktree`, `branch`, `first_turn_at` and
+  `last_turn_at` are all null for a session with no `session_meta` row. Ingest
+  never leaves one that way, and `terminus verify` reports it as damage.
+- `watermark` is null when the store holds no watermark row for the session.
+  Ingest writes that row in the same transaction as the session's blocks, and
+  eviction keeps it.
 - `sidecar` is true when the session has a `parent_session_key`: it is a
   subagent transcript.
 - An excluded project's sessions are absent, including sessions archived before
