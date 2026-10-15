@@ -143,3 +143,21 @@ Terminus runs on its defaults with no file. To change one, write `terminus.toml`
 | [`[privacy] redact_recall`](docs/configuration.md#privacy) | `false` | Filters text shaped like a secret out of what Claude Code is handed. |
 
 Each key's full effect, and the environment variables Terminus reads, are in [docs/configuration.md](docs/configuration.md).
+
+## How it is designed and built
+
+- **How it is designed:** the design decisions are in [DESIGN-BRIEF.md](DESIGN-BRIEF.md) and in [.planning/](.planning/).
+- **How it is built:** `main` is protected, and every change reaches it through a pull request. No status check is required and no workflow runs the tests ([#47](https://github.com/crenshawdev/terminus/issues/47)), so the tests run locally with `cargo test --workspace --all-features`.
+- **The issues:** bugs and known gaps are tracked at [github.com/crenshawdev/terminus/issues](https://github.com/crenshawdev/terminus/issues).
+
+## Issues and contributions
+
+Issues are welcome: bugs, questions, and reports of anything in the docs that is wrong. Pull requests are by invitation only; open an issue first. Security problems go through [SECURITY.md](SECURITY.md), not a public issue.
+
+## Sponsoring
+
+Terminus is open source, built by one person, and sold to no one. If it is useful to you, [GitHub Sponsors](https://github.com/sponsors/crenshawdev) is the way to support it.
+
+## License
+
+[MIT](LICENSE)
