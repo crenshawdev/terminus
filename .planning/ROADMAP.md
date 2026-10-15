@@ -19,6 +19,7 @@ The archive is the product, so it is built first and everything else is built on
 - [ ] **Phase 11: How Terminus Works** - design docs with diagrams of the system as it stands, in the shape of Baley's `docs/design/`
 - [ ] **Phase 12: Quick Issue Fixes** - thirteen small open issues are fixed and closed before the release is announced
 - [ ] **Phase 13: CI and Data Integrity** - the test suite runs in CI, and the archive and decision fixes land under it
+- [ ] **Phase 14: MCP 2** - the MCP server speaks protocol 2026-07-28, so Claude Code no longer has to fall back to the older handshake
 
 ## Phase Details
 
@@ -170,3 +171,14 @@ The archive is the product, so it is built first and everything else is built on
 5. The drain deletes `.tmp` decision and state files older than the hook's deadline, and the comments that say the abandoned thread writes nothing and that state files hold prompt text are corrected.
 6. A decision record renamed into place while a drain runs is inserted on that pass or the next, never deleted unread.
 7. Issues #47, #44, #15, #40 and #38 are closed by the changes that fix them, and the suite passes in CI.
+
+### Phase 14: MCP 2
+**Goal:** The MCP server does not implement MCP 2 (protocol 2026-07-28). `server/discover` answers -32601 method not found, `tools/list` carries no `ttlMs` or `cacheScope`, the shape Claude Code rejected in Baley's 2026-10-02 probe, and no result carries `resultType`. The server stopped offering 2026-07-28 from `initialize` until this lands, and stays connected only because Claude Code falls back to the older handshake (#45). It lands before the release is announced, ahead of Baley's conformance work, where #45 was first scheduled.
+**Depends on:** Phase 13
+**Requirements:** None. Tracked as GitHub issue #45.
+**Success Criteria:**
+1. `server/discover` returns `resultType`, `supportedVersions`, `capabilities`, `serverInfo` under `_meta`, `ttlMs` and `cacheScope`, as the 2026-07-28 spec defines them.
+2. Under 2026-07-28, `tools/list` carries `ttlMs` and `cacheScope`, and every result the server sends carries `resultType`.
+3. `initialize` offers `2026-07-28` again, and a client that asks for an older revision still gets it.
+4. Claude Code connects to the server on 2026-07-28 without falling back, and all three tools work.
+5. #45 is closed by the change that fixes it, and the suite passes in CI.
