@@ -55,7 +55,7 @@ The MCP step reads `~/.claude.json` first and decides from what is under `mcpSer
 
 `claude` is found on `PATH`, run by its full path with no shell, and given 30 seconds. When the file cannot be read, `claude` is not on `PATH` or cannot be started, takes longer than 30 seconds, or exits non-zero, the registration is incomplete. Install still does everything else, the receipt opens with `install incomplete: the mcp server is not registered`, prints the reason and the exact command that finishes it, and install exits 1.
 
-Install also exits 1 when the store in the data directory is in an archive format this build cannot read. It prints the refusal with the steps for a clean install, and nothing in the store is changed.
+Install also exits 1 when the store in the data directory is in an older archive format than this build reads. It prints the refusal with the steps for a clean install, and nothing in the store is changed. A store in a newer archive format, which installing an older release leaves behind, prints `problem: the backfill could not be sized (...)` with the reason inside the brackets, and does not by itself make install exit 1.
 
 Run it again at any time. It writes nothing to a file that is already current.
 
@@ -101,4 +101,4 @@ After `terminus uninstall --purge`, these are still on disk:
 - `settings.json.terminus-backup`, when you edited `settings.json` after install.
 - `.claude.json.terminus-backup`, when an older install left one. Uninstall prints its path and does not restore it, because it holds an older copy of Claude Code's own state.
 
-To remove everything, delete the config directory and `~/.local/lib/crenshawdev/terminus` once no session is running. Leave `~/.local/lib/crenshawdev` itself, because Baley uses it too.
+To remove the rest of Terminus, delete the config directory and `~/.local/lib/crenshawdev/terminus` once no session is running. Either backup file above stays where it is until you delete it. Leave `~/.local/lib/crenshawdev` itself, because Baley uses it too.

@@ -57,7 +57,7 @@ The owner runs [`scripts/sign-release.sh`](../scripts/sign-release.sh) on his ow
 
 Only then does it store the binary as `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus`, check `~/.local/bin/terminus` again, move that link to the new binary and run `terminus install`. Storing is refused when a link, something other than a regular file, or a copy of the same binary without execute permission is already at that path.
 
-The whole script is one brace group, which the shell reads in full before running any of it, so a download cut off partway runs nothing.
+The script's body is one brace group, which the shell reads in full before running any of it. The lines before it only set options and variables and define functions, so a download cut off partway runs nothing.
 
 ## The pinned key
 

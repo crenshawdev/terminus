@@ -15,7 +15,7 @@ The order is the same on Linux and macOS. An environment variable set to the emp
 - A missing file means every default below.
 - Terminus never writes the file. Every setting is changed by editing it by hand.
 - Unknown keys are ignored, so a file written for a newer version still loads.
-- A key set to `""` means the same as a key left out.
+- A text key set to `""` means the same as the key left out. The text keys are `[retention] action`, `[retention.project."<path>"] action` and `[capture] mode`. Any other key set to `""`, whether it takes a number, true or false, or a list, fails the load with the `is not valid TOML` error below.
 - A file that is not valid TOML fails the load with `<path> is not valid TOML: <detail>`. When the parser's message names `api_key`, the excerpt of the line is left out and only the line and column are printed.
 - A `[provider]` table fails the load with `<path> still has a [provider] table. Model calls were removed from Terminus, so nothing reads that table any more. Delete it from the file to continue.` Nothing in the table is read.
 
