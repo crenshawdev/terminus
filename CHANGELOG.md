@@ -78,6 +78,12 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   two opens could put one file's tail after another file's prefix in the
   archive. Both reads now go through one open file (#15). A file rewritten in
   place while it is being read is still not caught.
+- A compaction boundary record with no `uuid` or no `timestamp` got no boundary
+  row, so the prompt after that compaction searched as if nothing had been
+  compacted and could not offer back the turns that fell out of context. Such a
+  boundary now gets a row at its own place in the session, and the prompt after
+  it offers back what fell out (#17). The first ingest after upgrading rebuilds
+  the derived tables once, which moves the boundary rows into their new table.
 
 ## [0.1.1] - 2026-10-15
 

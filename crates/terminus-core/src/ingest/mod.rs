@@ -533,6 +533,12 @@ pub(crate) fn apply(
             },
         )?;
     }
+    // A boundary with no `uuid` or `timestamp` is not a turn, so the loop above
+    // never sees it. Its row goes in this same transaction (STOR-02), at its
+    // offset in the stored stream, which is the coordinate `derive_turn` got.
+    for record in &scan.records {
+        derive::derive_boundary(&tx, &session_key, record)?;
+    }
     fault::stall(fault::IN_TX_AFTER_TURNS);
     write_watermark(&tx, &session_key, pass.watermark)?;
     if run_row == RunRow::PerFile {

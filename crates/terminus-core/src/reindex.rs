@@ -211,6 +211,11 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
             )?;
             rebuilt.turns += 1;
         }
+        // The boundaries that are not turns, at their offset in the blob's
+        // scan, through the same seam ingest used (D-19, D-20).
+        for record in &scan.records {
+            derive::derive_boundary(&tx, &session_key, record)?;
+        }
     }
 
     // The version integers move with the rebuild, inside the same transaction:

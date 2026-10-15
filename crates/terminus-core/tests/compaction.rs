@@ -1013,3 +1013,146 @@ fn another_per_file_failure_flags_no_session() {
         tree.flagged()
     );
 }
+
+// ---------------------------------------------------------------------------
+// #17's second case (D-19, D-20): a boundary with no `uuid` or no `timestamp`
+// is not a turn, and still gets a row at its own byte offset.
+// ---------------------------------------------------------------------------
+
+/// The boundary line with one field taken out, so it no longer classifies as
+/// a turn.
+fn boundary_without(field: &str) -> Vec<u8> {
+    let mut record: serde_json::Value = serde_json::from_slice(&testkit::boundary_line()).unwrap();
+    record
+        .as_object_mut()
+        .unwrap()
+        .remove(field)
+        .unwrap_or_else(|| panic!("the boundary line carries {field}"));
+    serde_json::to_vec(&record).unwrap()
+}
+
+/// Ordinary turns to put after the boundary, as whole lines.
+fn later_turns() -> Vec<u8> {
+    testkit::fixture_bytes("session-basic.jsonl")
+}
+
+/// Every turn's `(id, uuid)`, which is what "the turns after it keep their
+/// ids" compares. Offsets are left out: the boundary line moves them.
+fn turn_ids(conn: &Connection) -> Vec<(i64, Option<String>)> {
+    turn_rows(conn)
+        .into_iter()
+        .map(|row| (row.0, row.3))
+        .collect()
+}
+
+fn committed(outcome: ingest::Outcome) {
+    match outcome {
+        ingest::Outcome::Committed(_) => {}
+        other => panic!("the appended records must commit: {other:?}"),
+    }
+}
+
+/// The whole claim for one stripped field: the row at the line's offset with
+/// its metadata, no turn for the line, the later turns' ids unchanged, and the
+/// same row after a rebuild on either path.
+fn a_boundary_that_is_not_a_turn_gets_a_row(field: &str) {
+    let line = boundary_without(field);
+    let subject = bench(BIG_FIXTURE);
+    let conn = subject.conn();
+    let turns_before = turn_rows(&conn);
+    let offset = std::fs::metadata(&subject.transcript).unwrap().len() as i64;
+
+    // The line is the transcript's last, so this pass archives no turn at all.
+    subject.append_line(&line);
+    committed(subject.ingest());
+    assert_eq!(
+        turn_rows(&conn),
+        turns_before,
+        "the boundary line became a turn"
+    );
+    let rows = boundaries(&conn);
+    assert_eq!(rows.len(), 1, "one boundary, one row: {rows:?}");
+    assert_eq!(
+        rows[0].0, offset,
+        "the row is not at the line's byte offset"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rows[0].1).unwrap(),
+        expected_metadata(&line)
+    );
+
+    // More turns after it, and they number as if the line were not there.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&subject.transcript)
+        .unwrap();
+    file.write_all(&later_turns()).unwrap();
+    drop(file);
+    committed(subject.ingest());
+
+    let control = bench(BIG_FIXTURE);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&control.transcript)
+        .unwrap();
+    file.write_all(&later_turns()).unwrap();
+    drop(file);
+    committed(control.ingest());
+    assert!(turn_rows(&conn).len() > turns_before.len());
+    assert_eq!(
+        turn_ids(&conn),
+        turn_ids(&control.conn()),
+        "the turns after the boundary moved"
+    );
+    let after = boundaries(&conn);
+    assert_eq!(after, rows, "a later pass touched the boundary row");
+
+    // A rebuild with no evicted session drops and recreates every table.
+    let rebuilt = reindex::reindex(&mut Store::open(&subject.data_dir).unwrap()).unwrap();
+    assert_eq!(rebuilt.preserved, 0);
+    assert_eq!(boundaries(&conn), after, "the drop path lost the row");
+
+    // With a different session evicted, the rebuild takes the preserving path.
+    let other_dir = subject.data_dir.parent().unwrap().join("other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let other = testkit::copy_fixture_into("session-basic.jsonl", &other_dir);
+    let other_key = match ingest::run(&subject.data_dir, &other).unwrap() {
+        ingest::Outcome::Committed(pass) => pass.session_key,
+        other => panic!("{other:?}"),
+    };
+    testkit::evict(&conn, &other_key);
+    let rebuilt = reindex::reindex(&mut Store::open(&subject.data_dir).unwrap()).unwrap();
+    assert_eq!(
+        rebuilt.preserved, 1,
+        "the rebuild did not take the preserving path"
+    );
+    assert_eq!(boundaries(&conn), after, "the preserving path lost the row");
+}
+
+#[test]
+fn a_boundary_with_no_uuid_gets_a_row_at_its_offset() {
+    a_boundary_that_is_not_a_turn_gets_a_row("uuid");
+}
+
+#[test]
+fn a_boundary_with_no_timestamp_gets_a_row_at_its_offset() {
+    a_boundary_that_is_not_a_turn_gets_a_row("timestamp");
+}
+
+/// The type rule holds for a record that is not a turn too: a `user` record
+/// with the subtype and no `uuid` gets no row.
+#[test]
+fn a_user_record_with_the_subtype_and_no_uuid_gets_no_row() {
+    let bench = bench(BIG_FIXTURE);
+    let mut record: serde_json::Value = serde_json::from_slice(&boundary_without("uuid")).unwrap();
+    record["type"] = "user".into();
+    bench.append_line(&serde_json::to_vec(&record).unwrap());
+    committed(bench.ingest());
+    assert!(boundaries(&bench.conn()).is_empty());
+
+    reindex::reindex(&mut Store::open(&bench.data_dir).unwrap()).unwrap();
+    assert!(
+        boundaries(&bench.conn()).is_empty(),
+        "the rebuild wrote one"
+    );
+}
