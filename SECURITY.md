@@ -22,7 +22,7 @@ Terminus is audited with [sentinel](https://github.com/crenshawdev/sentinel), wh
 
 - **Every pull request** runs sentinel's mechanical checks through `.github/workflows/fast.yml`: `cargo audit`, `cargo deny` against this repo's `deny.toml`, `cargo clippy` and `semgrep`. If any of them fails, the pull request fails. When they pass, a second job, on GitHub only, has Claude Code review the pull request's diff against THREAT-MODEL.md, reading only the repository's files, and posts the review as a comment on the pull request. The job fails if the review did not run. Findings don't fail it; they are posted for the author to read. It reads the `ANTHROPIC_API_KEY` secret, which GitHub does not pass to workflows run from a fork.
 - **Every push and pull request** runs the whole test suite through `.github/workflows/test.yml`: `cargo test --workspace --all-features --locked`, on Linux and macOS, on x86_64 and aarch64. If any test fails on any of the four, the run fails. It reads no secret.
-- **The full audit** runs by hand, not in CI. Each of sentinel's review prompts covers one concern and runs several times through more than one model. The results are merged, and each finding is then adjudicated. A finding counts as confirmed only once a failing test demonstrates it. The steps are in sentinel's README.
+- **The full audit** runs by hand, not in CI. The next section says what it runs.
 - **Fuzzing.** `fuzz/` holds a cargo-fuzz target for every parser that reads input from outside Terminus: transcripts, `terminus.toml`, the command line, hook input, MCP messages and Claude Code's settings files. `cargo +nightly fuzz build` builds them all, and `cargo +nightly fuzz run <target>` runs one.
 - **Miri.** Terminus has one `unsafe` block, the volatile read of the install marker in `crates/terminus/src/cmd/install/binary.rs`. The two tests that exercise it without touching the filesystem run under Miri:
 
@@ -30,6 +30,18 @@ Terminus is audited with [sentinel](https://github.com/crenshawdev/sentinel), wh
   rustup +nightly component add miri
   cargo +nightly miri test -p terminus --lib -- a_marker_split_across_two_reads_is_still_found a_file_without_the_marker_is_foreign
   ```
+
+## The full audit
+
+The full audit runs [sentinel](https://github.com/crenshawdev/sentinel)'s pipeline in seven steps. The run counts are sentinel's defaults.
+
+1. **Mechanical checks.** The same checks every pull request runs.
+2. **Context map.** Trail of Bits' `audit-context-building` skill maps the code. The map goes at the top of every review prompt in step 4.
+3. **Claude Security scan.** One scan of the whole repository.
+4. **Review prompts.** Eight prompts, which sentinel calls lenses, each limited to one concern: untrusted input, path handling, hook execution, permissions, data exposure, crypto and state, resource limits, and supply chain. Each prompt runs three times on Claude, each run in a fresh context, and once on OpenAI's Codex, 32 runs in all. Every run reads the same snapshot of the repository and cannot write to it. The step 3 findings are added as one more run of each prompt. Findings from the same prompt that cite the same file and overlapping lines are merged into one, with a count of how many runs reported it, and a finding only one run reported is tagged low-agreement. The merge removes which run and which model wrote each finding.
+5. **Adjudication.** A separate Claude agent goes through every merged finding without knowing where it came from and marks it confirmed, unproven or dropped. A finding is confirmed only when the agent has written a test that fails because of it. Unproven and dropped findings each carry the reason. The audit's own Claude Code session then reruns every confirmed test and checks that it fails for the reason the finding gives.
+6. **Variant analysis.** For each confirmed finding, Trail of Bits' `variant-analysis` skill looks for the same pattern elsewhere in the repository. New hits are adjudicated the same way.
+7. **Findings log.** For each step, how many findings were reported, confirmed, unproven and dropped.
 
 ## Confirmed findings
 
