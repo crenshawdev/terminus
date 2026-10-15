@@ -13,7 +13,7 @@ const REVIEW_WORKFLOW: &str = "fast.yml";
 
 /// CI never holds the release key. The draft is made with the job's
 /// `github.token`, and the only secret any workflow reads is the API key
-/// `fast.yml` hands to the security-review action, which signs nothing. A
+/// `fast.yml` hands to its security-review job, which signs nothing. A
 /// workflow that signs anything means the key has moved off the owner's
 /// machine. An empty folder fails too, so a moved one cannot pass by reading
 /// nothing.
