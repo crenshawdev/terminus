@@ -1,0 +1,39 @@
+{
+  "phase": "12",
+  "trigger": "risk_surface",
+  "discriminator": "plan-1",
+  "round": 1,
+  "base": "074dd4b",
+  "head": "0f9d5c7",
+  "base_id": "074dd4b410f95eba17d1deff03f112d594c34ef3",
+  "head_id": "0f9d5c7b391fae9e736ef6383c58c724bf20cadb",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus/src/cmd/mcp/rpc.rs",
+      "line": 114,
+      "severity": "medium",
+      "claim": "The `is_i64() || is_u64()` check rejects valid integer-valued JSON-RPC numeric IDs based on serde_json's storage representation rather than whether the number is fractional or out of range.",
+      "failure_scenario": "A conforming client sends `{\"jsonrpc\":\"2.0\",\"id\":1e3,\"method\":\"ping\"}` or uses `id:-0`. Both are JSON numbers representing integers within range and have no fractional value, but serde_json stores them as f64, so the server returns `-32600` with a null id instead of processing the request and echoing its id. The added test explicitly locks in this incorrect refusal.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/12/CONTEXT.md",
+        "line": 20,
+        "note": "D-03 is a locked decision that refuses every id serde_json parses as f64, naming 1e3 and -0 explicitly, because an f64 id is not echoed back as the client wrote it (1e3 would come back as 1000.0). The spec requires a string or integer id, and rpc.rs:111-113 states the reason in the code. The refusal is the decided behaviour, not a defect."
+      },
+      "base_id": "074dd4b410f95eba17d1deff03f112d594c34ef3",
+      "head_id": "0f9d5c7b391fae9e736ef6383c58c724bf20cadb"
+    }
+  ]
+}

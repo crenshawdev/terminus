@@ -1,0 +1,66 @@
+# sentinel fast check, on every pull request.
+#
+# Copied from sentinel's ci/fast.yml. It expects sentinel as a git submodule at
+# the path in SENTINEL_DIR. Valid for GitHub Actions and Forgejo Actions.
+#
+# The mechanical job runs on GitHub and Forgejo. The security-review job runs
+# on GitHub only, because it posts its review as a pull request comment
+# through the GitHub API. It reads the ANTHROPIC_API_KEY secret.
+name: sentinel-fast
+
+on:
+  pull_request:
+
+env:
+  SENTINEL_DIR: .sentinel
+
+permissions:
+  contents: read
+
+jobs:
+  mechanical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # Builds run the pull request's code; keep the token out of .git/config.
+          persist-credentials: false
+      - name: Install gating tools
+        run: '"$SENTINEL_DIR/ci/install-tools.sh"'
+      - name: Mechanical checks
+        run: '"$SENTINEL_DIR/mechanical/check.sh" .'
+
+  security-review:
+    if: github.server_url == 'https://github.com'
+    needs: mechanical
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          submodules: recursive
+          # The reviewer can read files; keep the token out of .git/config.
+          persist-credentials: false
+      # Claude Code needs Node 22 or newer; older Node gets an old CLI that
+      # cannot run current models.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.300
+      - name: Review the diff
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BASE_REF: ${{ github.base_ref }}
+        run: '"$SENTINEL_DIR/ci/security-review.sh" "origin/$BASE_REF"'
+      - name: Post the review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr comment "$PR" --body-file security-review.md

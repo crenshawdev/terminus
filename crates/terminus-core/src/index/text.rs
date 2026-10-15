@@ -73,6 +73,9 @@ pub fn project(record: &Value) -> String {
 struct Projector {
     text: String,
     remaining: usize,
+    /// Set once a piece is cut short or nothing more can fit. Later pieces add
+    /// nothing, so the body ends on the cut and never on a gap.
+    full: bool,
 }
 
 impl Default for Projector {
@@ -80,6 +83,7 @@ impl Default for Projector {
         Projector {
             text: String::new(),
             remaining: MAX_BODY_BYTES,
+            full: false,
         }
     }
 }
@@ -90,16 +94,28 @@ impl Projector {
     /// The separator matters: `unicode61` splits on it, so two leaves that
     /// happened to be `"cargo"` and `"build"` cannot run together into a token
     /// neither one is.
+    ///
+    /// The separator is charged to the budget, and written only when at least
+    /// one character of the piece fits after it. Left uncharged, a full body
+    /// ran past the cap by a byte per piece, and once `remaining` fell below
+    /// the next piece's first character every later piece still added a bare
+    /// newline. After the first cut nothing more is appended.
     fn push(&mut self, value: &str) {
-        if value.is_empty() || self.remaining == 0 {
+        if value.is_empty() || self.full {
             return;
         }
-        if !self.text.is_empty() {
+        let separator = usize::from(!self.text.is_empty());
+        let take = floor_char_boundary(value, self.remaining.saturating_sub(separator));
+        if take == 0 {
+            self.full = true;
+            return;
+        }
+        if separator == 1 {
             self.text.push('\n');
         }
-        let take = floor_char_boundary(value, self.remaining.min(value.len()));
         self.text.push_str(&value[..take]);
-        self.remaining -= take;
+        self.remaining -= separator + take;
+        self.full = take < value.len() || self.remaining == 0;
     }
 
     /// `message.content`, per D-01's block rules.
@@ -159,7 +175,7 @@ impl Projector {
 
     /// Every string leaf of an arbitrary value, keys excluded.
     fn leaves(&mut self, value: &Value, depth: usize) {
-        if depth >= MAX_DEPTH || self.remaining == 0 {
+        if depth >= MAX_DEPTH || self.full {
             return;
         }
         match value {
@@ -193,4 +209,53 @@ pub(super) fn floor_char_boundary(text: &str, at: usize) -> usize {
         at -= 1;
     }
     at
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn budget(remaining: usize) -> Projector {
+        Projector {
+            remaining,
+            ..Projector::default()
+        }
+    }
+
+    #[test]
+    fn the_separator_is_charged_to_the_budget() {
+        let mut out = budget(10);
+        for piece in ["aaaa", "bbbb", "cccc"] {
+            out.push(piece);
+        }
+        assert!(out.text.len() <= 10, "{:?}", out.text);
+        assert!(!out.text.ends_with('\n'), "{:?}", out.text);
+    }
+
+    #[test]
+    fn a_piece_that_cannot_fit_stops_every_later_piece() {
+        let mut out = budget(6);
+        out.push("aaaa");
+        out.push("\u{1F600}");
+        out.push("x");
+        assert_eq!(out.text, "aaaa");
+    }
+
+    #[test]
+    fn a_record_that_fills_the_cap_only_with_separators_stays_under_it() {
+        let half = "a".repeat(MAX_BODY_BYTES / 2);
+        let record = json!({"type": "attachment", "attachment": {"items": [half, half]}});
+        let body = project(&record);
+        assert!(body.len() <= MAX_BODY_BYTES, "{}", body.len());
+        assert!(!body.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_piece_cut_partway_through_ends_the_record() {
+        let mut out = budget(7);
+        out.push("a\u{1F600}\u{1F600}");
+        out.push("x");
+        assert_eq!(out.text, "a\u{1F600}");
+    }
 }

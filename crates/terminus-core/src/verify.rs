@@ -26,8 +26,11 @@
 //!
 //! Phase 8 adds one *silence*, on the same terms: a session
 //! `session_meta.is_evicted` marks (RET-02, D-03) has had its block rows
-//! deleted on purpose, so there is nothing to decompress and nothing to hash. It is counted
-//! and it is never a failure. The divergence check stays independent of it,
+//! deleted on purpose, so there is nothing to decompress and nothing to hash. It
+//! is counted and never checked block by block. Eviction does promise that no
+//! block rows are left, and that is checked: an evicted session that still has
+//! rows is one failure for the whole session, saying how many remain, and one
+//! with none is never named. The divergence check stays independent of it,
 //! exactly as it is independent of the checksum verdict - "the file on disk is
 //! shorter than what was archived" is a statement about the FILE, and an
 //! evicted session's file can still be wrong about it.
@@ -150,11 +153,29 @@ fn walk(conn: &Connection) -> Result<Report> {
     let mut report = Report::default();
     for (session_key, meta, diverged, evicted) in sessions {
         report.checked += 1;
-        // Counted, and never a failure. An evicted session's block rows were
-        // deleted on purpose (RET-02, phase 8 D-03), so it would report every
-        // block as missing - the confusion the divergence arm exists to
-        // prevent, arriving from the other side.
-        if !evicted {
+        // An evicted session's block rows were deleted on purpose (RET-02,
+        // phase 8 D-03), so checking it block by block would report every block
+        // as missing - the confusion the divergence arm exists to prevent,
+        // arriving from the other side. What eviction does promise is that no
+        // rows are left, so rows still there are one failure for the session.
+        if evicted {
+            let remaining: i64 = conn.query_row(
+                "SELECT count(*) FROM blocks JOIN sessions USING (session_no)
+                 WHERE session_key = ?1",
+                [&session_key],
+                |r| r.get(0),
+            )?;
+            if remaining > 0 {
+                report.failures.push(Failure {
+                    session_key: session_key.clone(),
+                    block: None,
+                    detail: format!(
+                        "evicted, but {remaining} block row(s) remain; an evicted session \
+                         should have none"
+                    ),
+                });
+            }
+        } else {
             for (block, detail) in check(conn, &session_key, &meta)? {
                 report.failures.push(Failure {
                     session_key: session_key.clone(),

@@ -157,7 +157,7 @@ pub struct Payload {
 
 impl Payload {
     /// The same five fields as the borrowed shape the library takes.
-    fn borrowed(&self) -> inject::Payload<'_> {
+    pub(crate) fn borrowed(&self) -> inject::Payload<'_> {
         inject::Payload {
             session_id: self.session_id.as_deref(),
             transcript_path: self.transcript_path.as_deref(),
@@ -175,7 +175,7 @@ impl Payload {
     /// malformed payload is upstream's, and a hook that reported it would be
     /// spending the user's prompt on a diagnostic about a field nothing here
     /// requires.
-    fn parse(line: &[u8]) -> Payload {
+    pub(crate) fn parse(line: &[u8]) -> Payload {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
             return Payload::default();
         };
@@ -210,7 +210,17 @@ pub fn run(event: &str) -> Result<(), Failure> {
 }
 
 /// One event's injection arm, as the library declares it.
-type Arm = fn(&std::path::Path, &terminus_core::Config, &inject::Payload) -> Option<String>;
+pub(crate) type Arm = fn(&std::path::Path, &terminus_core::Config, &inject::Payload) -> Option<String>;
+
+/// The injection arm for `event`, or `None` for the two events that inject
+/// nothing.
+pub(crate) fn arm(event: &str) -> Option<Arm> {
+    match event {
+        "SessionStart" => Some(inject::brief::session_start),
+        "UserPromptSubmit" => Some(inject::prompt::user_prompt_submit),
+        _ => None,
+    }
+}
 
 /// The text this event injects, or nothing, and never later than
 /// [`INJECT_DEADLINE`].
@@ -240,11 +250,7 @@ type Arm = fn(&std::path::Path, &terminus_core::Config, &inject::Payload) -> Opt
 /// `terminus.toml` that does not parse is a reported error on `terminus search`
 /// and one uninjected event here.
 fn inject(event: &str, payload: Payload) -> Option<String> {
-    let arm: Arm = match event {
-        "SessionStart" => inject::brief::session_start,
-        "UserPromptSubmit" => inject::prompt::user_prompt_submit,
-        _ => return None,
-    };
+    let arm = arm(event)?;
 
     let (done, injected) = mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()

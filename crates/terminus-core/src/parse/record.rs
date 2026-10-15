@@ -105,11 +105,12 @@ impl Record {
     ///
     /// Not a new record class and not a classification rule: `system` is already
     /// in [`TURN_TYPES`] and the real boundary record carries both `uuid` and
-    /// `timestamp`, so D-03 has already made it a turn. This only names the
-    /// subtype, so the one caller that writes a derived boundary row does not
-    /// spell the literal itself.
+    /// `timestamp`, so D-03 has already made it a turn. The type is checked as
+    /// well as the subtype, because `subtype` is read off any record that
+    /// carries one. The derive seam writes boundary rows by the same rule.
     pub fn is_compact_boundary(&self) -> bool {
-        self.subtype.as_deref() == Some(COMPACT_BOUNDARY)
+        self.record_type.as_deref() == Some("system")
+            && self.subtype.as_deref() == Some(COMPACT_BOUNDARY)
     }
 
     /// Classify one line. `offset` is where it starts in the stream and

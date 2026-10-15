@@ -25,7 +25,7 @@ From [`.github/workflows/release.yml`](../.github/workflows/release.yml):
 
 4. The draft job runs only when all four builds pass. It checks that it holds exactly the four binaries and four manifests, and creates the release as a draft, never as a prerelease and never published.
 
-The workflow's permissions are `contents: read`. The draft job alone has `contents: write`, and it uses only the workflow's own token. No workflow names a key or a signing secret, so CI can build a draft but cannot sign one.
+The workflow's permissions are `contents: read`. The draft job alone has `contents: write`, and it uses only the workflow's own token. No workflow names a signing key, so CI can build a draft but cannot sign one.
 
 ## How a release is signed
 
@@ -70,7 +70,7 @@ Identity `crenshawdev-release`, namespace `terminus-release`, fingerprint `SHA25
 ## What the signature protects
 
 - Each manifest, signed by `crenshawdev-release` under `terminus-release`, and through the manifest's SHA-256 the binary it names.
-- CI holds no key. The build jobs have `contents: read` and the draft job uses only the workflow's own token, so nothing CI produces carries a signature.
+- CI holds no signing key. The build jobs have `contents: read` and the draft job uses only the workflow's own token, so nothing CI produces carries a signature.
 - Only a draft is signed, so the signatures on a published release are never replaced.
 - The signer checks each binary against its manifest before signing, so a draft whose binary and manifest disagree is never signed.
 

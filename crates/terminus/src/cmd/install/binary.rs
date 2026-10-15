@@ -167,7 +167,9 @@ pub fn occupant(path: &Path) -> Result<Occupant, Failure> {
 /// Does this file carry [`MARKER`] anywhere in it?
 fn carries_marker(mut file: impl Read) -> std::io::Result<bool> {
     // SAFETY: the pointer comes from a reference to a static of the type being
-    // read, so it is aligned and initialised.
+    // read, so it is aligned and initialised. That is also why semgrep's
+    // unsafe-usage rule is silenced on this line.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let marker: &str = unsafe { std::ptr::read_volatile(&MARKER) };
     let needle = marker.as_bytes();
     let overlap = needle.len() - 1;

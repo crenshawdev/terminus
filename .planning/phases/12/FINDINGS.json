@@ -1,0 +1,21 @@
+{
+  "auto_passed": 16,
+  "gaps": 0,
+  "added": 0,
+  "skipped": 0,
+  "rejected": 0,
+  "rejected_entries": [],
+  "skipped_entries": [
+    {
+      "list": "human_checks",
+      "reason": "already-recorded",
+      "item": 17,
+      "status": "pending",
+      "entry": {
+        "name": "The issues are closed by the merged PR",
+        "expected": "After the PR from hardin merges with a `Fixes #N` line for each, GitHub shows #10, #14, #20, #25, #28, #29, #30, #33, #35, #39, #41 and #42 closed by that PR, and #17 still open with a reference to it.",
+        "why_human": "Out-of-reach resource and an irreversible owner action: the PR is not opened or merged yet, merging it is the owner's call, and issue state can only be read on GitHub, which this verifier is barred from reaching (no network)."
+      }
+    }
+  ]
+}

@@ -55,24 +55,23 @@ use super::Failure;
 /// The server name a client shows the user.
 const SERVER_NAME: &str = "terminus";
 
-/// The protocol revisions Claude Code 2.1.229 accepts, newest first.
+/// The protocol revisions this server agrees to, newest first.
 ///
-/// Read out of that bundle rather than guessed. The client sends its own in
-/// `initialize` and the server answers with one it supports; a client that
-/// cannot use the answer disconnects, and one that can proceeds.
+/// Taken from the ones Claude Code 2.1.229 accepts, read out of that bundle
+/// rather than guessed. The client sends its own in `initialize` and the server
+/// answers with one it supports; a client that cannot use the answer
+/// disconnects, and one that can proceeds.
 ///
 /// MCP 2 (`2026-07-28`) is left out until this server implements it: it answers
 /// no `server/discover`, and its `tools/list` carries no `ttlMs` or
 /// `cacheScope`, the shape Claude Code rejected in Baley's 2026-10-02 probe.
 /// Agreeing to a revision the server does not speak is worse than answering an
 /// older one the client then falls back to.
-const PROTOCOL_VERSIONS: [&str; 5] = [
-    "2025-11-25",
-    "2025-06-18",
-    "2025-03-26",
-    "2024-11-05",
-    "2024-10-07",
-];
+///
+/// `2025-03-26` is left out for the same reason. It is the one revision that
+/// requires JSON-RPC batching, which `2024-11-05` did not have and `2025-06-18`
+/// removed, and this server answers a batch with a single `-32600`.
+const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2024-11-05", "2024-10-07"];
 
 /// What the server answers when the client asked for a revision it does not
 /// know.
@@ -256,6 +255,24 @@ mod tests {
             Value::from(SERVER_NAME)
         );
         assert!(responses[0]["result"]["capabilities"]["tools"].is_object());
+    }
+
+    /// `2025-03-26` requires batches, which this server refuses, so it is not
+    /// offered. The loop above walks the list and stops covering it once it is
+    /// gone, so this pins it by name.
+    #[test]
+    fn the_revision_that_requires_batches_is_not_offered() {
+        assert!(!PROTOCOL_VERSIONS.contains(&"2025-03-26"));
+
+        let responses = exchange(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#,
+        );
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0]["result"]["protocolVersion"],
+            Value::from(DEFAULT_PROTOCOL_VERSION),
+            "the server agreed to a revision whose batches it does not answer"
+        );
     }
 
     /// One response per request, in order, and none at all for a notification.

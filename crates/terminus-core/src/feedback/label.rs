@@ -224,6 +224,9 @@ fn miss() -> String {
 /// threshold would have produced. Neither list is a join key, which is why they
 /// can be substituted at all.
 ///
+/// Only `recall_search` calls count, because they are the only recall calls
+/// [`crate::index::entity`] extracts entities from.
+///
 /// `min` because a decision may have withheld several and a label carries one
 /// detail; arbitrary, but stable.
 fn sought_sql(spellings: &str, injected: &str) -> String {
@@ -234,8 +237,10 @@ fn sought_sql(spellings: &str, injected: &str) -> String {
             JOIN session_meta m ON m.session_key = t.session_key
            WHERE m.session_id = d.session_id
              AND t.ts > d.ts
-             AND (t.tool_name LIKE '%recall\\_search' ESCAPE '\\'
-               OR t.tool_name LIKE '%recall\\_get' ESCAPE '\\')
+             -- index::entity::is_recall_search's rule, which the two must
+             -- share: GLOB is case-sensitive and its `_` is literal.
+             AND (t.tool_name = 'recall_search'
+               OR t.tool_name GLOB '*_recall_search')
              AND EXISTS (
                  SELECT 1 FROM json_each({spellings}) s
                   WHERE s.value = sought.value_norm

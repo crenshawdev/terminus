@@ -9,6 +9,44 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- `terminus mcp` agreed to protocol revision `2025-03-26` when a client asked
+  for it. That revision requires JSON-RPC batching, and the server answers a
+  batch with a single `-32600` error, so a client that took the server at its
+  word could send a batch and get that error back instead of its answers. A
+  client that asks for `2025-03-26` is now answered `2025-06-18`.
+- `terminus mcp` accepted any JSON number as a request id, including `1.5`,
+  `1.0`, `1e3`, `-0` and integers too large for 64 bits, and did not always
+  echo back the id the client sent: `1e3` came back as `1000.0`. MCP allows a
+  string or an integer. A request whose id is a number that is not an integer
+  in the signed or unsigned 64-bit range is now refused with a `-32600` error
+  whose id is `null`.
+- `recall_get` counted repeated ids toward its cap of 25. A call that named the
+  same id more than once could be told only the first 25 ids were read, and the
+  real ids after the repeats went unread. Repeats are now removed first, keeping
+  each id's first place in the list, so 30 ids naming 20 distinct turns return
+  all 20 records with no truncation reason.
+- `terminus status` could fail with "database is locked" when it opened a data
+  directory another Terminus process was creating at the same moment. Both
+  processes read the directory as new, and the one that lost the race failed at
+  once instead of waiting for the other to finish. It now waits for the other
+  process's write lock and then opens the store that process made.
+- After `terminus ingest <path>` on one transcript, `terminus status` showed 1
+  walked and 0 committed for that run, because the `runs` row a single-file
+  ingest writes left `files_committed` at 0. It now records 1 committed and 0
+  failed. `runs` rows written before this fix keep their 0.
+- `terminus reindex` carried evicted sessions across without rebuilding them
+  and never said how many. It now prints
+  `preserved N evicted session(s) without rebuilding them` on stderr when there
+  are any, and its `--json` output carries an integer `preserved`, which is 0
+  in the document it writes when another process holds the ingest lock.
+- `terminus verify` never failed an evicted session. Eviction deletes a
+  session's block rows, and verify skipped evicted sessions, so one whose rows
+  were still there passed. Such a session is now one failure for the whole
+  session, with `block` `null` under `--json`, saying how many block rows
+  remain, and `terminus verify` exits 1.
+
 ## [0.1.1] - 2026-10-15
 
 ### Fixed

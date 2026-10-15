@@ -1,0 +1,97 @@
+{
+  "phase": "12",
+  "trigger": "plan",
+  "discriminator": "plan-review-94b3248",
+  "round": 1,
+  "base": "94b3248",
+  "head": "94b3248",
+  "base_id": "94b32484370dd5f506f63a2a0fcba7bf084bd77f",
+  "head_id": "94b32484370dd5f506f63a2a0fcba7bf084bd77f",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/12/PLAN-3.md",
+      "line": 46,
+      "severity": "high",
+      "claim": "Task 1 does not deliver AC3's required race between two opens of a fresh data directory.",
+      "failure_scenario": "The proposed regression test opens the winning store to completion, opens the losing store through the existing-store path, and then calls `initialize` directly while a third connection holds a lock. This can prove the transaction-upgrade defect in `initialize`, but it never exercises two concurrent `Store::open` calls on a fresh directory. A race elsewhere in the fresh-open path, including the flagged WAL transition, could remain broken while this test and the phase gate pass.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/12/CONTEXT.md",
+        "line": 25,
+        "note": "D-08 leaves how the regression test is made deterministic to the planner. PLAN-3.md:73 states why a barrier race of two Store::open calls reaches the window only by chance, so the reverted code would pass on most runs; the planned test drives the losing open after the winner commits and while a writer holds the lock, and fails on the deferred form. The WAL transition is a CONTEXT assumption outside #33, which PLAN-3.md:74 names."
+      },
+      "citation_missing": true,
+      "base_id": "94b32484370dd5f506f63a2a0fcba7bf084bd77f",
+      "head_id": "94b32484370dd5f506f63a2a0fcba7bf084bd77f"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/12/PLAN-2.md",
+      "line": 47,
+      "severity": "medium",
+      "claim": "The prescribed #20 tests do not cover the locked requirement that later pieces are ignored after a piece is partially truncated.",
+      "failure_scenario": "The 10-byte `aaaa`/`bbbb`/`cccc` case stops because there is not enough room for a separator plus the next piece's first character, and the explicit stall case covers the same boundary. Neither supplies a piece whose prefix is appended before it is cut, followed by another piece. An implementation could charge separators and pass all three tests but fail to mark a partially copied piece as terminal, allowing a later short leaf to be appended and violating both D-05 and the plan's must-be-true condition.",
+      "ruling": "survived",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/src/index/text.rs",
+        "line": 99,
+        "note": "Confirmed. push cuts with floor_char_boundary, which can leave remaining at 1 to 3 bytes after a multi-byte character is cut, so a later one-byte piece fits a separator plus its character. None of the three planned tests cuts a piece partway and then offers a later piece, so a fix that marks only the stall as terminal passes them all."
+      },
+      "citation_missing": true,
+      "base_id": "94b32484370dd5f506f63a2a0fcba7bf084bd77f",
+      "head_id": "94b32484370dd5f506f63a2a0fcba7bf084bd77f"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/12/PLAN-4.md",
+      "line": 94,
+      "severity": "high",
+      "claim": "No task delivers the phase's issue-closing success criterion or AC7; the only closing instructions are relegated to a note about an external PR-opening step.",
+      "failure_scenario": "All code, tests, docs, and changelog tasks can complete while the PR body omits one or more `Fixes #N` lines, incorrectly includes `Fixes #17`, or is never merged. The phase gate would still pass even though the roadmap requires twelve issues to be closed by the fixing change and #17 to remain open with a reference.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/12/PLAN-4.md",
+        "line": 76,
+        "note": "The plan assigns D-15 and AC7 to the step that opens the pull request and names every Fixes line and the #17 reference line. CONTEXT.md marks AC7 human-verify after the merge, so /cad-verify checks it on GitHub; closing an issue is not an executor task."
+      },
+      "citation_missing": true,
+      "base_id": "94b32484370dd5f506f63a2a0fcba7bf084bd77f",
+      "head_id": "94b32484370dd5f506f63a2a0fcba7bf084bd77f"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/12/PLAN-1.md",
+      "line": 15,
+      "severity": "medium",
+      "claim": "The plans restate the phase goal with the wrong issue count and target open-list count.",
+      "failure_scenario": "Plans 1-3 say thirteen issues are fixed and the list falls from 39 to 26, while ROADMAP and CONTEXT lock twelve closed issues, a reduction from 39 to 27, with only half of #17 fixed and the issue left open. An executor or phase summary following the plan goal could report or pursue closure of thirteen issues, contradicting the explicit decision that #17 stays open for phase 13.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/12/PLAN-1.md",
+        "line": 16,
+        "note": "Confirmed at low. The goal line in all four plans, not only plans 1 to 3, still says thirteen issues and 39 to 26 (PLAN-1.md:16, PLAN-2.md:19, PLAN-3.md:21, PLAN-4.md:16). No task is affected: PLAN-2.md:33 defers the second case of #17 and PLAN-4.md:76 closes twelve issues and leaves #17 open."
+      },
+      "citation_missing": true,
+      "base_id": "94b32484370dd5f506f63a2a0fcba7bf084bd77f",
+      "head_id": "94b32484370dd5f506f63a2a0fcba7bf084bd77f"
+    }
+  ]
+}

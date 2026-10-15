@@ -43,6 +43,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
                     .field("sessions", 0)
                     .field("turns", 0)
                     .field("skipped", Vec::<serde_json::Value>::new())
+                    .field("preserved", 0)
                     .emit();
                 return Err(Failure::Silent);
             }
@@ -68,7 +69,8 @@ pub fn run(json: bool) -> Result<(), Failure> {
                     .iter()
                     .map(|(session_key, reason)| json!({"session_key": session_key, "reason": reason}))
                     .collect::<Vec<_>>(),
-            );
+            )
+            .field("preserved", rebuilt.preserved as i64);
         if !rebuilt.failed.is_empty() {
             document = document.failed().because(format!(
                 "{} session(s) could not be rebuilt and were skipped",
@@ -85,6 +87,14 @@ pub fn run(json: bool) -> Result<(), Failure> {
             "rebuilt {} turn(s) across {} session(s)",
             rebuilt.turns, rebuilt.sessions
         );
+        // Only when there is one, so a store with nothing evicted prints the
+        // one line it always has.
+        if rebuilt.preserved > 0 {
+            eprintln!(
+                "preserved {} evicted session(s) without rebuilding them",
+                rebuilt.preserved
+            );
+        }
         for (session_key, reason) in &rebuilt.failed {
             eprintln!("{session_key}: {reason}");
         }

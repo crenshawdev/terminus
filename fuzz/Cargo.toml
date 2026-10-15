@@ -1,0 +1,116 @@
+# Fuzz targets for every parser that reads input from outside Terminus.
+# Build them all with `cargo +nightly fuzz build` from the repo root; run one
+# with `cargo +nightly fuzz run <target>`.
+[package]
+name = "terminus-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# A workspace of its own, so the root workspace never builds it.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tempfile = "3"
+terminus = { path = "../crates/terminus" }
+terminus-core = { path = "../crates/terminus-core" }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "jsonl_scan"
+path = "fuzz_targets/jsonl_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_record"
+path = "fuzz_targets/index_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capture_elide"
+path = "fuzz_targets/capture_elide.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "search_query"
+path = "fuzz_targets/search_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redaction"
+path = "fuzz_targets/redaction.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "excerpt"
+path = "fuzz_targets/excerpt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_rpc"
+path = "fuzz_targets/mcp_rpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_serve"
+path = "fuzz_targets/mcp_serve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hook_payload"
+path = "fuzz_targets/hook_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_args"
+path = "fuzz_targets/cli_args.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "settings_json"
+path = "fuzz_targets/settings_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "commit_subject"
+path = "fuzz_targets/commit_subject.rs"
+test = false
+doc = false
+bench = false

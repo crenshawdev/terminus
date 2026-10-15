@@ -395,6 +395,25 @@ fn the_boundary_line_carries_its_subtype_and_its_metadata_bytes() {
     }
 }
 
+/// #17: the subtype alone does not make a boundary. The same line retyped as
+/// any other turn type is not one, and the real line still is.
+#[test]
+fn only_a_system_record_is_a_compact_boundary() {
+    let line = testkit::boundary_line();
+    let scan = parse::scan(&[line.as_slice(), b"\n"].concat());
+    assert!(scan.records[0].is_compact_boundary());
+
+    for record_type in ["user", "assistant", "attachment"] {
+        let mut value: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        value["type"] = record_type.into();
+        let retyped = serde_json::to_vec(&value).unwrap();
+        let scan = parse::scan(&[retyped.as_slice(), b"\n"].concat());
+        let record = &scan.records[0];
+        assert_eq!(record.subtype.as_deref(), Some(parse::COMPACT_BOUNDARY));
+        assert!(!record.is_compact_boundary(), "{record_type}: {record:?}");
+    }
+}
+
 /// The other half of the same change: a record with neither field is unchanged.
 /// Every phase 1 assertion compares whole `Record` values, so a subtype or a
 /// metadata blob appearing where the line has none would break them all.

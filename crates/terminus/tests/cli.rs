@@ -790,8 +790,58 @@ fn reindex_json_reports_a_held_lock_as_a_document() {
             .is_some_and(|r| r.contains("LOCK")),
         "the refusal must name the lock: {document}"
     );
+    // The same keys a success carries, so a script reads one shape either way.
+    let mut keys: Vec<&str> = document["data"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["preserved", "sessions", "skipped", "turns"]);
+    assert_eq!(document["data"]["preserved"], 0);
 
     drop(guard);
+}
+
+/// `preserved` reaches the output: an evicted session's index is carried
+/// across rather than rebuilt, and the count of those is reported apart from
+/// `sessions`. With nothing evicted, plain `reindex` prints only the line it
+/// always has.
+#[test]
+fn reindex_reports_the_evicted_sessions_it_carried_across() {
+    let bench = bench();
+    let kept = bench.ingest("session-basic.jsonl");
+    let evicted = bench.ingest("subagents/agent-alpha.jsonl");
+
+    let clean = document(&bench.run(&["reindex", "--json"]));
+    assert_eq!(clean["data"]["preserved"], 0, "{clean}");
+    let out = bench.run(&["reindex"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "rebuilt {} turn(s) across {} session(s)\n",
+            clean["data"]["turns"], clean["data"]["sessions"]
+        )
+    );
+
+    testkit::evict(&bench.conn(), &evicted);
+
+    let out = bench.run(&["reindex", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let document = document(&out);
+    assert_eq!(document["data"]["preserved"], 1, "{document}");
+    assert_eq!(document["data"]["sessions"], 1, "only {kept} was rebuilt");
+
+    let out = bench.run(&["reindex"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(
+        text.lines()
+            .any(|line| line.contains("preserved 1 evicted session(s)")),
+        "{text}"
+    );
 }
 
 /// AC5: `terminus stats` reports the numbers a reader can add up by hand, in
@@ -950,7 +1000,11 @@ const DATA_COMMANDS: &[(&str, &[&str], &[&str])] = &[
         ],
     ),
     ("verify", &[], &["checked", "failures"]),
-    ("reindex", &[], &["sessions", "turns", "skipped"]),
+    (
+        "reindex",
+        &[],
+        &["sessions", "turns", "skipped", "preserved"],
+    ),
     (
         "stats",
         &[],

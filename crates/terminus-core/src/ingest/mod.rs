@@ -133,9 +133,10 @@ pub fn run_with(
 
 /// Who owns the `runs` row for this file's transaction.
 ///
-/// D-10: one row per pass, not per file. `record_run` inserts a literal `1` for
-/// `files_seen` from inside the per-file transaction, which is right for a
-/// caller that named one file and wrong for a tree walk - reused unchanged it
+/// D-10: one row per pass, not per file. `record_run` inserts the literals
+/// `files_seen` 1, `files_committed` 1 and `files_failed` 0 from inside the
+/// per-file transaction, which is right for a caller that named one file and is
+/// committing it, and wrong for a tree walk - reused unchanged it
 /// would write roughly 2,071 rows per hook-triggered pass, and ING-09's "the
 /// last ingest run" would name one file rather than the pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1258,11 +1259,12 @@ pub(crate) fn record_run(
     elapsed: std::time::Duration,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO runs (started_at, finished_at, duration_ms, files_seen, bytes_read, turns_added)
+        "INSERT INTO runs (started_at, finished_at, duration_ms, files_seen, files_committed,
+                           files_failed, bytes_read, turns_added)
          VALUES (
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-            ?2, 1, ?3, ?4
+            ?2, 1, 1, 0, ?3, ?4
          )",
         rusqlite::params![
             format!("-{} seconds", elapsed.as_secs_f64()),
