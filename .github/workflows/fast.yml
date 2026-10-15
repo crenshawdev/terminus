@@ -1,0 +1,29 @@
+# sentinel fast check, on every pull request.
+#
+# Copied from sentinel's ci/fast.yml. It expects sentinel as a git submodule at
+# the path in SENTINEL_DIR. Valid for GitHub Actions and Forgejo Actions.
+#
+# Only the mechanical job is kept. sentinel's security-review job needs an
+# ANTHROPIC_API_KEY secret, and no workflow in this repo holds a key.
+name: sentinel-fast
+
+on:
+  pull_request:
+
+env:
+  SENTINEL_DIR: .sentinel
+
+permissions:
+  contents: read
+
+jobs:
+  mechanical:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install gating tools
+        run: '"$SENTINEL_DIR/ci/install-tools.sh"'
+      - name: Mechanical checks
+        run: '"$SENTINEL_DIR/mechanical/check.sh" .'

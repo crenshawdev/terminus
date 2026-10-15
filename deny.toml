@@ -1,0 +1,40 @@
+# cargo-deny config for Terminus, copied from sentinel's mechanical/deny.toml
+# with the license list cut to what Terminus's dependencies actually need.
+
+[advisories]
+# Vulnerability advisories always fail; cargo-deny no longer allows turning
+# that off. These make the other advisory kinds fail too.
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+# Each entry is here because a dependency needs it:
+#   MIT           most crates, alone or as one choice of a dual license
+#   Apache-2.0    blake3 and constant_time_eq (no MIT option)
+#   BSD-2-Clause  arrayref, through blake3
+#   Zlib          foldhash, through hashbrown
+#   Unicode-3.0   unicode-ident, which requires it alongside MIT or Apache-2.0
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "Zlib",
+    "Unicode-3.0",
+]
+# An entry no dependency needs any more is reported, so the list stays exact.
+unused-allowed-license = "warn"
+
+[licenses.private]
+# Skip the project's own unpublished crates (publish = false).
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
