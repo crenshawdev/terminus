@@ -57,7 +57,7 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::Payload;
+use super::{chars, clip, Payload};
 use crate::config::Config;
 use crate::observe::egress::Redaction;
 use crate::recall::scope::Scoped;
@@ -363,33 +363,6 @@ fn shares(
         })
     };
     (cut(prompt, given_prompt), cut(reply, given_reply))
-}
-
-/// How many characters a string is, which is what the budget counts (D-16).
-///
-/// Characters and not bytes and not tokens: the workspace has no tokenizer and
-/// will not grow one on the cold-start path, and bytes would under-count a brief
-/// by a factor of three against the same text in another script.
-fn chars(text: &str) -> usize {
-    text.chars().count()
-}
-
-/// `text`, cut to `budget` characters with [`excerpt::ELISION`] where it was cut.
-///
-/// One spelling of three dots in the product, and cut on a character boundary:
-/// a byte-indexed slice through a multi-byte character is a panic, and a panic
-/// on this path is a `SessionStart` that emits nothing.
-fn clip(text: &str, budget: usize) -> String {
-    if chars(text) <= budget {
-        return text.to_owned();
-    }
-    let marker = chars(excerpt::ELISION);
-    if budget <= marker {
-        return text.chars().take(budget).collect();
-    }
-    let mut out: String = text.chars().take(budget - marker).collect();
-    out.push_str(excerpt::ELISION);
-    out
 }
 
 /// What the brief calls the project it is about.
