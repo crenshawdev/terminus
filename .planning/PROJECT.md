@@ -20,7 +20,7 @@ The verbatim transcript is the record: every session archived losslessly and per
 
 Nine phases. Four bring Terminus in line with Baley's ADR 0038 and 0039: no model calls and so no API keys and no network use, Linux and macOS only with the npm package removed, an install that asks nothing and registers the MCP server through `claude mcp`, and a one-command installer script. The fifth points that script at GitHub releases by default, and the sixth has it refuse a release whose signature does not verify against the crenshawdev release key pinned in the script. The seventh stores each session's archive as blocks, one row each, in place of one whole-session blob. The eighth builds each release in CI, and John signs and publishes it from his own machine. The ninth writes the README the public repository does not have yet. An update is a rerun of the install command, so it gets the same check.
 
-No release ships until phase 7's blocks as rows is done. That phase has no conversion tool: an existing store is not converted, and the owner's store is rebuilt by a clean install; one can come later if it is needed. Phase 8 then publishes the first release, signed, without waiting for Baley. Version numbers started over with the rename: Verbatim's tags were local test builds and were never released (now `verbatim-v0.1.0` and `verbatim-v0.1.1`), so unreleased cycles are 0.0.x and the first release will be 0.1.0.
+No release ships until phase 7's blocks as rows is done. That phase has no conversion tool: an existing store is not converted, and the owner's store is rebuilt by a clean install; one can come later if it is needed. Phase 8 then publishes the first release, signed, without waiting for Baley. Version numbers started over with the rename: Verbatim's tags were local test builds and were never released (now `verbatim-v0.1.0` and `verbatim-v0.1.1`), so unreleased cycles were 0.0.x and the first release was 0.1.0.
 
 **Shipped: v0.1.1, closed 2026-09-04.**
 
@@ -94,7 +94,7 @@ Merged to `main` and tagged `v0.1.0`.
 
 - Auto-tuner for injection thresholds — hypothesis, not a plan. Ship logging + replay; gate the tuner behind evidence it converges.
 - Import of `/data/verbatim-legacy` (801 MB) — deferred.
-- crates.io name `terminus` is taken — skip crates.io; how Terminus is delivered is still open.
+- crates.io name `terminus` is taken — skip crates.io; Terminus is delivered by `install.sh` from the GitHub releases.
 
 ## Constraints
 
@@ -103,7 +103,7 @@ Merged to `main` and tagged `v0.1.0`.
 - **Compatibility**: Linux and macOS only. Windows was dropped, as it is across all of the owner's products, and a build for any other system fails at compile time. Path comparison is case-folded on macOS
 - **Privacy**: no telemetry; the Terminus binary opens no network connection, and `install.sh`'s `curl` download is the one network use
 - **Licensing**: MIT, public OSS — an explicit override of the private-by-default rule, scoped to this project; all dependencies permissive
-- **Distribution**: there is no npm channel, because the npm package was removed; `install.sh` is the one-command installer, and no release is published yet. `origin` (self-hosted) is the only remote
+- **Distribution**: there is no npm channel, because the npm package was removed; `install.sh` is the one-command installer. `origin` is github.com/crenshawdev/terminus, where releases are published
 - **Testing**: real SQLite temp databases, never mocks; private real-corpus fixture reached via env var, small synthetic set in-repo for CI
 
 ## Key Decisions
