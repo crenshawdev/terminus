@@ -322,3 +322,5 @@ A same-user process that can already write `~/.claude/projects` or the data dire
   - It never touches the project path and branch in the brief, or the `session_key`, `project` and `tool_name` fields of MCP results.
 
 **Secrets Terminus itself holds:** none. It reads no API key and refuses a `[provider]` table. The release signing key, `~/.ssh/crenshawdev-release`, is mode 0600 on the maintainer's machine and is used only by `scripts/sign-release.sh`, never by the binary or by CI. Whether that key has a passphrase [VERIFY].
+
+**CI:** the `ANTHROPIC_API_KEY` Actions secret, read only by the `security-review` job in `.github/workflows/fast.yml` on GitHub pull requests. GitHub does not pass it to workflows run from a fork.

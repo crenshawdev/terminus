@@ -3,8 +3,9 @@
 # Copied from sentinel's ci/fast.yml. It expects sentinel as a git submodule at
 # the path in SENTINEL_DIR. Valid for GitHub Actions and Forgejo Actions.
 #
-# Only the mechanical job is kept. sentinel's security-review job needs an
-# ANTHROPIC_API_KEY secret, and no workflow in this repo holds a key.
+# The mechanical job runs on GitHub and Forgejo. The security-review job runs
+# on GitHub only, because the action reads the pull request and posts its
+# comments through api.github.com. It reads the ANTHROPIC_API_KEY secret.
 name: sentinel-fast
 
 on:
@@ -27,3 +28,24 @@ jobs:
         run: '"$SENTINEL_DIR/ci/install-tools.sh"'
       - name: Mechanical checks
         run: '"$SENTINEL_DIR/mechanical/check.sh" .'
+
+  security-review:
+    if: github.server_url == 'https://github.com'
+    needs: mechanical
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+      # Pinned to a commit because a branch can change under us. This was main
+      # on 2026-10-15; update it on purpose after reading the diff.
+      - uses: anthropics/claude-code-security-review@0c6a49f1fa56a1d472575da86a94dbc1edb78eda
+        with:
+          claude-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The action's own default is an older Opus.
+          claude-model: claude-opus-5-5
+          comment-pr: true
