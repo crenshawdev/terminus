@@ -1,0 +1,75 @@
+{
+  "phase": "1",
+  "trigger": "risk_surface",
+  "discriminator": "plan-3",
+  "round": 1,
+  "base": "4520c119d6c421bc067b3d961e5e318a0027fc95",
+  "head": "c5bd7603228b0c2af4b5920d763f7c9796fca879",
+  "base_id": "4520c119d6c421bc067b3d961e5e318a0027fc95",
+  "head_id": "c5bd7603228b0c2af4b5920d763f7c9796fca879",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus-core/src/store/open.rs",
+      "line": 548,
+      "severity": "high",
+      "claim": "A schema object that references any retired column permanently prevents every writable open instead of being migrated or producing a usable store.",
+      "failure_scenario": "If an existing store has an index, trigger, or view whose SQL references `observations.status` (or another retired column), SQLite rejects the corresponding `ALTER TABLE ... DROP COLUMN`. The transaction rolls back, but `Store::open` propagates the error. Because the same object and column remain, every later writable open retries the same failing migration, so ingest, hooks, and the MCP server cannot open the archive until the user manually edits its schema.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/src/store/schema.rs",
+        "line": 439,
+        "note": "No version of CREATE_SQL ever declared an index, trigger or view on observations (git log -S \"ON observations\" over schema.rs is empty, and the base schema at 4520c11 indexes only session_meta, decisions, labels, turns, entities and paths). Only an object a user added by hand could block the drop. The drop ran clean on a copy of the owner real 2026-10-12 snapshot: 14 columns to 4, 6440 rows kept, terminus verify 0 failed."
+      },
+      "base_id": "4520c119d6c421bc067b3d961e5e318a0027fc95",
+      "head_id": "c5bd7603228b0c2af4b5920d763f7c9796fca879"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus-core/src/store/open.rs",
+      "line": 541,
+      "severity": "medium",
+      "claim": "The early return leaves the retired token-budget metadata behind whenever the columns are already absent.",
+      "failure_scenario": "A partially upgraded or externally repaired store can have all ten summary columns removed while still containing `meta.key = 'observe.daily_tokens'`—for example, an earlier/manual migration dropped the columns but failed before deleting metadata. `summary_columns` is then empty, so this function returns before the DELETE and no future open repairs the stale row, violating the promised removal of the metadata key.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/src/store/open.rs",
+        "line": 548,
+        "note": "The column drops and the DELETE of observe.daily_tokens commit in one IMMEDIATE transaction, so this binary cannot leave the columns gone with the meta row present; that state needs an external edit."
+      },
+      "base_id": "4520c119d6c421bc067b3d961e5e318a0027fc95",
+      "head_id": "c5bd7603228b0c2af4b5920d763f7c9796fca879"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus-core/src/store/schema.rs",
+      "line": 439,
+      "severity": "medium",
+      "claim": "Using column absence as the only migration record makes the destructive schema change indistinguishable to older binaries, with no format gate to prevent them opening an incompatible store.",
+      "failure_scenario": "After a new binary drops the columns, an older Terminus binary can still open the same database because there is no schema-version bump or incompatibility marker. Its observation listing, judgment storage, or observation recall SQL still references `status`, `decisions`, and the other removed columns and fails with `no such column`; if that older binary is a concurrently running MCP server or hook, it remains operational enough to accept requests but those paths now error rather than being rejected at open with a clear incompatible-format result.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/src/observe/mod.rs",
+        "line": 183,
+        "note": "No Terminus binary has been released. The only older binary is the owner own 0.1.1 install, and on an upgraded store its ingest still works: its observation INSERT names only the four kept columns (8616b3b:observe/mod.rs:183) and its BRING_FORWARD_COLUMNS lists no observations column, so it neither fails nor re-adds them. Its observations listing and kind observation search fail with no such column until it is replaced."
+      },
+      "base_id": "4520c119d6c421bc067b3d961e5e318a0027fc95",
+      "head_id": "c5bd7603228b0c2af4b5920d763f7c9796fca879"
+    }
+  ]
+}

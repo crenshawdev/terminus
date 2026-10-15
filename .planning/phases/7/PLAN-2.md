@@ -28,6 +28,10 @@ files:
   - crates/terminus-core/src/recall/excerpt.rs
   - crates/terminus-core/src/recall/get.rs
   - crates/terminus-core/tests/recall.rs
+  - crates/terminus-core/tests/index.rs
+  - crates/terminus-core/tests/snapshot.rs
+  - crates/terminus-core/tests/ingest.rs
+  - crates/terminus-core/Cargo.toml
 ---
 
 # Phase 7: Blocks as rows - Plan 2
@@ -131,7 +135,7 @@ This plan makes that the storage. The store moves to archive format 2, ingest ap
 
 ### Task 3: Store each session as block rows, and append by rewriting at most the tail
 
-- **Files:** crates/terminus-core/src/store/schema.rs (anchors: `CREATE_SQL` `sessions` and `session_meta`, `TABLES`), crates/terminus-core/src/store/open.rs (anchor: `ARCHIVE_FORMAT`), crates/terminus-core/src/store/archive.rs, crates/terminus-core/src/blob/block.rs, crates/terminus-core/src/blob/mod.rs, crates/terminus-core/src/ingest/mod.rs (anchors: `Existing::read`, `ExistingSession`, `prepare`, `Work`, `apply`, `prefix_matches`, `write_session_meta`, `Pass`), crates/terminus-core/src/retention/apply.rs (anchors: `evict_one`, `delete_one`), crates/terminus-core/src/verify.rs (anchor: `check`), crates/terminus-core/src/testkit.rs (anchors: `archive_digest` and plan 1's archive helpers), crates/terminus-core/tests/compaction.rs (anchors: `completed_blocks`, `raw_blob`, `archived`, `the_completed_block_helper_excludes_only_the_partial_tail`), crates/terminus-core/tests/schema.rs (anchor: `sessions_carries_a_stable_integer_surrogate`)
+- **Files:** crates/terminus-core/src/store/schema.rs (anchors: `CREATE_SQL` `sessions` and `session_meta`, `TABLES`), crates/terminus-core/src/store/open.rs (anchor: `ARCHIVE_FORMAT`), crates/terminus-core/src/store/archive.rs, crates/terminus-core/src/blob/block.rs, crates/terminus-core/src/blob/mod.rs, crates/terminus-core/src/ingest/mod.rs (anchors: `Existing::read`, `ExistingSession`, `prepare`, `Work`, `apply`, `prefix_matches`, `write_session_meta`, `Pass`), crates/terminus-core/src/retention/apply.rs (anchors: `evict_one`, `delete_one`), crates/terminus-core/src/verify.rs (anchor: `check`), crates/terminus-core/src/testkit.rs (anchors: `archive_digest` and plan 1's archive helpers), crates/terminus-core/tests/compaction.rs (anchors: `completed_blocks`, `raw_blob`, `archived`, `the_completed_block_helper_excludes_only_the_partial_tail`), crates/terminus-core/tests/schema.rs (anchor: `sessions_carries_a_stable_integer_surrogate`), crates/terminus-core/tests/index.rs (the two `INSERT INTO sessions` statements naming `blob`), crates/terminus-core/tests/snapshot.rs (the `INSERT INTO sessions` statement naming `blob`), crates/terminus-core/tests/ingest.rs (anchors: `the_stored_checksum_is_blake3_over_the_uncompressed_stream`, `a_pass_moves_the_session_its_turns_and_its_watermark_together`)
 - **Action:**
   - **Schema (D-03, D-05).**
     - `sessions` keeps `session_key` and `session_no` and loses `blob`.
@@ -172,7 +176,7 @@ This plan makes that the storage. The store moves to archive format 2, ingest ap
 
 ### Task 4: Remove the whole-session blob format
 
-- **Files:** crates/terminus-core/src/blob/mod.rs, crates/terminus-core/src/blob/reader.rs, crates/terminus-core/src/blob/writer.rs, crates/terminus-core/src/blob/block.rs, crates/terminus-core/src/error.rs (anchors: `BlobFormat`, `BlobChecksumMismatch`), crates/terminus-core/src/lib.rs (anchor: crate doc), crates/terminus-core/tests/blob.rs, crates/terminus-core/src/recall/excerpt.rs (anchor: `Reads` doc), crates/terminus-core/src/recall/get.rs (anchor: module doc), crates/terminus-core/src/ingest/mod.rs (anchor: `Work::stream_base` doc), crates/terminus-core/tests/recall.rs (anchor: `ids_across_three_sessions_read_three_blobs` doc), crates/terminus-core/tests/compaction.rs (anchor: module doc)
+- **Files:** crates/terminus-core/src/blob/mod.rs, crates/terminus-core/src/blob/reader.rs, crates/terminus-core/src/blob/writer.rs, crates/terminus-core/src/blob/block.rs, crates/terminus-core/src/error.rs (anchors: `BlobFormat`, `BlobChecksumMismatch`), crates/terminus-core/src/lib.rs (anchor: crate doc), crates/terminus-core/tests/blob.rs, crates/terminus-core/src/recall/excerpt.rs (anchor: `Reads` doc), crates/terminus-core/src/recall/get.rs (anchor: module doc), crates/terminus-core/src/ingest/mod.rs (anchor: `Work::stream_base` doc), crates/terminus-core/tests/recall.rs (anchor: `ids_across_three_sessions_read_three_blobs` doc), crates/terminus-core/tests/compaction.rs (anchor: module doc), crates/terminus-core/Cargo.toml (anchor: package `description`)
 - **Action:**
   - Delete the blob format, which nothing calls after Task 3:
     - `BlobHeader` with its parse and serialize, `BlockEntry`, `MAGIC`, `HEADER_LEN` and `TABLE_ENTRY_LEN`;

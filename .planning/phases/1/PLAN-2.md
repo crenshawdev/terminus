@@ -130,6 +130,7 @@ Terminus never calls a model, never handles an API key and opens no network conn
     - The same environment with `doctor --json` must report `config_roots` as a problem whose finding names the file.
     - Neither run's output contains `PLANREFUSAL`.
   - AC2: `rg -n '_API_KEY|credentials\.toml' crates/*/src` prints nothing. `rg -n 'api_key' crates/*/src` prints only `withhold_secret_excerpt` and the egress unit-test inputs.
+  - Carried from plan 1 Task 4: `rg -n 'observe::(judgment|provider|net|cost)|mod (judgment|provider|net|cost)' crates --glob '*.rs'` prints nothing. Plan 1 excluded `cmd/doctor.rs`, `testkit.rs` and `config.rs`, whose doc comments on `host_of`, the HTTP stub and `ResponseFormat` named deleted modules; Tasks 1, 2 and 4 delete that code here.
   - The full suite passes and clippy with `-D warnings` is clean.
 
 ## Notes

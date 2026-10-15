@@ -1,0 +1,117 @@
+{
+  "phase": "8",
+  "trigger": "plan",
+  "discriminator": "plan-67952f5",
+  "round": 1,
+  "base": "67952f5",
+  "head": "67952f5",
+  "base_id": "67952f58066baa18b56acb5e3034dd51537f3973",
+  "head_id": "67952f58066baa18b56acb5e3034dd51537f3973",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/8/PLAN-3.md",
+      "line": 87,
+      "severity": "blocker",
+      "claim": "The signing command omits the required `-` file operand, so Task 1 cannot produce signatures as claimed.",
+      "failure_scenario": "`ssh-keygen -Y sign` requires one or more file operands; `-` denotes stdin and sends the signature to stdout. The planned invocation ends after `-n terminus-release` while also requiring no file argument. On the real draft it exits with usage/error before producing the first `.manifest.sig`, so the owner cannot publish the release and REL-01 fails.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/8/PLAN-3.md",
+        "line": 63,
+        "note": "ssh-keygen -Y sign signs standard input when no file operand is given and writes the signature to stdout. Run here on OpenSSH_10.6p1 with a throwaway ed25519 key: printf manifest | ssh-keygen -Y sign -f <key> -n terminus-release > m.sig exited 0, printed \"Signing data on standard input\", and m.sig begins -----BEGIN SSH SIGNATURE-----. The plan pipes the manifest on stdin and redirects stdout, which is this mode."
+      },
+      "citation_missing": true,
+      "base_id": "67952f58066baa18b56acb5e3034dd51537f3973",
+      "head_id": "67952f58066baa18b56acb5e3034dd51537f3973"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/8/PLAN-1.md",
+      "line": 83,
+      "severity": "high",
+      "claim": "The AC6 verification benchmarks a musl integration-test executable, not the released `terminus` binary whose allocator is configured in `main.rs`.",
+      "failure_scenario": "`#[global_allocator]` is added only to `crates/terminus/src/main.rs`, but `cargo test ... --test corpus` builds and runs the separate `corpus` test harness. That harness does not inherit the binary crate's global allocator. The corpus test can therefore report every hook event below 10 ms while the actual musl `terminus` binary with mimalloc exceeds the budget, allowing AC6's verification to pass with the released behavior wrong.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus/tests/corpus.rs",
+        "line": 450,
+        "note": "hook_budget spawns Command::new(env!(\"CARGO_BIN_EXE_terminus\")), the built terminus binary itself, so the timed hook runs with the #[global_allocator] from crates/terminus/src/main.rs. The test harness allocator is not what is measured."
+      },
+      "citation_missing": true,
+      "base_id": "67952f58066baa18b56acb5e3034dd51537f3973",
+      "head_id": "67952f58066baa18b56acb5e3034dd51537f3973"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/8/PLAN-2.md",
+      "line": 208,
+      "severity": "medium",
+      "claim": "The workflow-policy test does not cover every workflow file as AC5 and D-11 require.",
+      "failure_scenario": "The task's no-silent-pass condition and verification are explicitly based on `.yml` files. GitHub also loads `.github/workflows/*.yaml`; a later or existing `.yaml` workflow can contain `secrets.X`, `-Y sign`, or `PRIVATE KEY` while `cargo test -p terminus --test release_workflows` still passes. Thus AC5's condition that no file under `.github/workflows/` contains those strings is not delivered by the planned test.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/8/PLAN-2.md",
+        "line": 136,
+        "note": "The test reads every file in .github/workflows/, whatever its extension, so a .yaml workflow holding secrets.X fails it. Only the no-silent-pass guard at line 138 keys on .yml, and a folder of only .yaml files makes the test fail, not pass."
+      },
+      "citation_missing": true,
+      "base_id": "67952f58066baa18b56acb5e3034dd51537f3973",
+      "head_id": "67952f58066baa18b56acb5e3034dd51537f3973"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/8/PLAN-4.md",
+      "line": 54,
+      "severity": "high",
+      "claim": "The four-plan ordering contradicts D-02's requirement that phases 1 through 8 land on `main`: Task 1 lands before Task 4 creates the phase's documentation changes, and no later task lands those changes.",
+      "failure_scenario": "Task 1 lands plans 1–3 on `main`; Tasks 2 and 3 then tag and publish; only afterward Task 4 edits `install.sh`, `DESIGN-BRIEF.md`, `CHANGELOG.md`, and `.planning/PROJECT.md`. There is no subsequent PR or push to put that commit on `origin/main`. The phase can be declared done while the public `install.sh` and repository documents on `main` still say no release is published, so AC7 and D-21 are unmet. This also means the Task 4 local diff verification can pass while the required repository state is wrong.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/8/CONTEXT.md",
+        "line": 16,
+        "note": "True that nothing in phase 8 lands Task 4 commit on main after Task 1 has landed, but AC7 (CONTEXT.md:48) names what the files say, not origin/main, and D-02 has phase 9 follow on top through the normal land after /cad-verify. The public install.sh line still saying no release is published is a comment the install never reads. Low, and fixed in the plan: PLAN-4 Task 4 now says how its edits reach main."
+      },
+      "fix_commit": "1ac67f2136fa0b0c676e3372c40169dc125ec257",
+      "citation_missing": true,
+      "base_id": "67952f58066baa18b56acb5e3034dd51537f3973",
+      "head_id": "67952f58066baa18b56acb5e3034dd51537f3973"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/8/PLAN-4.md",
+      "line": 103,
+      "severity": "medium",
+      "claim": "Task 3 declares no files but performs a destructive fresh-install sequence that changes user files and data outside the plan's declared file set.",
+      "failure_scenario": "The task runs `terminus uninstall --purge`, deletes `~/.local/lib/crenshawdev/terminus/versions`, and runs the installer, which recreates versioned binaries, the stable link, Claude settings/MCP registration, and the archive. None of these state files or directories is declared under the task's `Files: none`. If purge, registration, or backfill changes an unintended user file, the plan's declared-file review cannot detect or bound it.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus/src/cmd/uninstall.rs",
+        "line": 1,
+        "note": "PLAN-4.md:39 states Tasks 1 to 3 are the owner steps, run by hand on his machine and human-verify; the Files field lists repository files an executor edits, and Task 3 edits none. What uninstall touches is bounded by uninstall.rs:1-12 (take out what install put in, and nothing else), and --purge asks once before deleting the archive (uninstall.rs:452-464)."
+      },
+      "citation_missing": true,
+      "base_id": "67952f58066baa18b56acb5e3034dd51537f3973",
+      "head_id": "67952f58066baa18b56acb5e3034dd51537f3973"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "phase": "2",
+  "trigger": "risk_surface",
+  "discriminator": "plan-4",
+  "round": 1,
+  "base": "5e3c719781486de458d67d541df7048f2df10606",
+  "head": "4adfc452456ff8479cf2d30a9b6a3cc3a8b4ae51",
+  "base_id": "5e3c719781486de458d67d541df7048f2df10606",
+  "head_id": "4adfc452456ff8479cf2d30a9b6a3cc3a8b4ae51",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/CAPTURE.md",
+      "line": 270,
+      "severity": "medium",
+      "claim": "The blanket closure marks still-applicable release work as complete, including SECURITY.md/private disclosure and archive-format compatibility decisions, even though removing npm and Windows does not resolve them.",
+      "failure_scenario": "Terminus remains public OSS with release channels and persistent user archives. Because these unresolved items are now checked off and the publish milestone is declared no longer applicable, a later release can ship without a private vulnerability-reporting channel or an explicit archive compatibility policy, with no open tracker item left to prevent it.",
+      "ruling": "survived",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/2/CONTEXT.md",
+        "line": 26,
+        "note": "Confirmed and not fixed. D-09 directs closing the whole Publish milestone, so the executor followed the locked decision, but bullets in it such as SECURITY.md and a private disclosure channel, the archive-format compatibility promise across 0.x and the absence of release CI do not depend on npm or Windows. Whether to reopen them is the owner's call."
+      },
+      "base_id": "5e3c719781486de458d67d541df7048f2df10606",
+      "head_id": "4adfc452456ff8479cf2d30a9b6a3cc3a8b4ae51"
+    }
+  ]
+}

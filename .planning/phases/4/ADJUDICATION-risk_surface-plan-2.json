@@ -1,0 +1,111 @@
+{
+  "phase": "4",
+  "trigger": "risk_surface",
+  "discriminator": "plan-2",
+  "round": 1,
+  "base": "db883c4",
+  "head": "b786f5a",
+  "base_id": "db883c4469fc393262c74d535d3051ca750088cb",
+  "head_id": "b786f5a339cbd4f487aec5ea0f02cb52116aa496",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "install.sh",
+      "line": 103,
+      "severity": "high",
+      "claim": "The staging directory is trusted without rejecting symbolic links in the versions path, so installation can overwrite a file outside the versions folder.",
+      "failure_scenario": "If `~/.local/lib/crenshawdev/terminus/versions/1.2.3` already exists as a symlink to an arbitrary directory, `mkdir -p` accepts it. `mktemp`, `mv -f \"$staging_temporary\" \"$staged\"`, and the later stable link then operate on `<arbitrary directory>/terminus`; an existing unowned file there can be replaced with the downloaded binary.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus/src/cmd/install/binary.rs",
+        "line": 300,
+        "note": "Confirmed but low. The precondition is a symbolic link the user made by hand inside Terminus's own versions folder; only the same user can make it, so no permission boundary is crossed. The Rust side behaves the same way: store() in crates/terminus/src/cmd/install/binary.rs:239-300 creates the version folder with create_dir_all, which also follows a linked folder."
+      },
+      "base_id": "db883c4469fc393262c74d535d3051ca750088cb",
+      "head_id": "b786f5a339cbd4f487aec5ea0f02cb52116aa496"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "install.sh",
+      "line": 87,
+      "severity": "high",
+      "claim": "An existing stable-path symlink to a marked regular file outside the versions folder is treated as an owned file and replaced.",
+      "failure_scenario": "For a non-dangling symlink, `[ -f \"$stable\" ]` follows the link and `grep` reads its target. Thus `~/.local/bin/terminus -> /some/other/marked-binary` passes ownership checking solely because the external target contains the marker, even though the link is not into the versions folder. Line 221 then replaces that symlink, contrary to the stated ownership rule.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/4/CONTEXT.md",
+        "line": 24,
+        "note": "CONTEXT D-07 decides ownership this way: \"A regular file or a link carrying the marker is Terminus's and is replaced by the link\", and D-05 records that terminus install reads the marker through the link the same way (binary.rs:113-131). mv -f at install.sh:219 renames over the link entry itself, so the external marked file it pointed at is not written."
+      },
+      "base_id": "db883c4469fc393262c74d535d3051ca750088cb",
+      "head_id": "b786f5a339cbd4f487aec5ea0f02cb52116aa496"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "install.sh",
+      "line": 220,
+      "severity": "high",
+      "claim": "Stable-path ownership checking and replacement are separated by a race, allowing an unowned entry to be overwritten.",
+      "failure_scenario": "After `check_stable_path` succeeds, another process can create or replace `~/.local/bin/terminus` with an unowned regular file before line 221 executes. `mv -f` then replaces that unchecked file. If the raced-in entry is a symlink to a directory, platform `mv` behavior can instead move the temporary link into that directory, potentially writing outside the named stable folder and leaving the stable path unchanged.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus/src/cmd/install/binary.rs",
+        "line": 270,
+        "note": "Confirmed but low. install.sh:218 re-runs check_stable_path immediately before the mv at :219, the same residual window the Rust side documents and accepts at crates/terminus/src/cmd/install/binary.rs:270-274 (\"closing that needs a rename that refuses to replace, which no platform offers through std\"). Winning it needs another process of the same user to plant an entry in that window; the mv-into-a-linked-folder case is reachable only through that race, since check_stable_path refuses a link to a folder at :81."
+      },
+      "base_id": "db883c4469fc393262c74d535d3051ca750088cb",
+      "head_id": "b786f5a339cbd4f487aec5ea0f02cb52116aa496"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "install.sh",
+      "line": 198,
+      "severity": "high",
+      "claim": "The verified download is not bound atomically to the version file that is later linked and executed, so concurrent installs can make an invocation run bytes it did not verify.",
+      "failure_scenario": "Run two installers for the same version but different sources and binary digests. Each verifies its own scratch binary, but their `stage` operations race to rename different files over the same `$staged` path. One invocation can finish staging A, have the other replace it with B, and then link and execute B at line 232 despite that invocation having verified only A's checksum.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "install.sh",
+        "line": 191,
+        "note": "Nothing unverified is ever staged or run. stage() at install.sh:99-106 is only reached after verify_download at :191, and it moves that run's own verified scratch file, so every file ever renamed onto $staged passed verify_download in some run. The scenario needs the user to run two installs of one version from two different sources at the same moment; the bytes either run executes were verified against the manifest the user pointed that other run at."
+      },
+      "base_id": "db883c4469fc393262c74d535d3051ca750088cb",
+      "head_id": "b786f5a339cbd4f487aec5ea0f02cb52116aa496"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "install.sh",
+      "line": 232,
+      "severity": "medium",
+      "claim": "Failure of `terminus install` has no rollback, despite the script already committing the new stable link and allowing the child to mutate Claude settings.",
+      "failure_scenario": "Line 221 replaces the stable path before invoking `terminus install`. If that command writes some hooks or MCP configuration and then fails—for example because `claude` is absent or a later settings write errors—the script exits nonzero while retaining the new stable link, staged version, and any partial Claude changes. The cleanup trap only removes scratch and temporary files.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/4/CONTEXT.md",
+        "line": 25,
+        "note": "CONTEXT D-08 decides this: when \"$stable\" install exits non-zero, install.sh exits non-zero and the receipt above it is the message. A rollback would delete the version just placed, which D-04 forbids (old versions are never deleted). The link left behind points at a complete, verified version, and re-running terminus install finishes the wiring."
+      },
+      "base_id": "db883c4469fc393262c74d535d3051ca750088cb",
+      "head_id": "b786f5a339cbd4f487aec5ea0f02cb52116aa496"
+    }
+  ]
+}

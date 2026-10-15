@@ -32,7 +32,7 @@ Terminus never calls a model, never handles an API key and opens no network conn
 - With `[privacy] redact_recall = true`, each sentinel planted in `tests/fixtures/session-secrets.jsonl` is missing from a recall context window over that session, and its rule's marker is there instead. With the knob off, every sentinel is present.
 - An ingest pass makes no model request and prints no judgment notes. Every finished session still gets its mechanical observation, and `terminus observations` lists it.
 - `terminus observations regenerate` rebuilds the `mechanical` column only. Its `--json` envelope is `since`, `selected`, `regenerated`, `notes`, and `--prompt-version` is an unknown flag (exit 2).
-- `observe/judgment.rs`, `provider.rs`, `net.rs` and `cost.rs` and their test files are gone, and nothing in either crate names them.
+- `observe/judgment.rs`, `provider.rs`, `net.rs` and `cost.rs` and their test files are gone, and nothing in either crate names them except three doc comments on code plan 2 deletes (`cmd/doctor.rs`'s `host_of`, `testkit.rs`'s HTTP stub, `config.rs`'s `ResponseFormat`). Plan 2 Task 4's Verify proves the full-crate search empty.
 - `cargo test --workspace --all-features` passes and `cargo clippy --workspace --all-targets --all-features -- -D warnings` is clean.
 
 ## Context
@@ -107,7 +107,7 @@ Terminus never calls a model, never handles an API key and opens no network conn
   - **What stays put for now.**
     - `ureq` stays declared until plan 2 Task 1. With `net.rs` gone, nothing names it.
     - Leave `egress.rs`, `config.rs` and `credentials.rs` alone. `for_destination`, `ResponseFormat` and `credentials::resolve` lose their callers but still compile, and each goes in plan 2 with the rest of its concern.
-- **Verify:** `rg -n 'observe::(judgment|provider|net|cost)|mod (judgment|provider|net|cost)' crates --glob '*.rs'` prints nothing. `ls crates/terminus-core/src/observe` lists only `egress.rs`, `mechanical.rs` and `mod.rs`. `cargo test --workspace --all-features` passes and clippy with `-D warnings` is clean.
+- **Verify:** `rg -n 'observe::(judgment|provider|net|cost)|mod (judgment|provider|net|cost)' crates --glob '*.rs' --glob '!crates/terminus/src/cmd/doctor.rs' --glob '!crates/terminus-core/src/testkit.rs' --glob '!crates/terminus-core/src/config.rs'` prints nothing. Those three files are excluded because each still carries one doc comment naming a deleted module, on code plan 2 deletes; they are outside this plan's lease, and plan 2 Task 4's Verify runs the search unexcluded. `ls crates/terminus-core/src/observe` lists only `egress.rs`, `mechanical.rs` and `mod.rs`. `cargo test --workspace --all-features` passes and clippy with `-D warnings` is clean.
 
 ## Notes
 

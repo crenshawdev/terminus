@@ -1,0 +1,39 @@
+{
+  "phase": "7",
+  "trigger": "risk_surface",
+  "discriminator": "plan-3",
+  "round": 1,
+  "base": "8f50e45",
+  "head": "b1139b2",
+  "base_id": "8f50e45c13943cd1c2cce793b802500f7d44d920",
+  "head_id": "b1139b29dc4f4b414f343ed415458bae2d263280",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus-core/src/store/archive.rs",
+      "line": 105,
+      "severity": "medium",
+      "claim": "Range arithmetic is unchecked, so a malformed negative turn offset or length can panic or address the wrong blocks instead of failing that range.",
+      "failure_scenario": "The readers cast `stream_offset` and `byte_len` from `i64` to `u64` before calling `archive::ranges`. If a damaged turn row contains `stream_offset = -1` and a positive length, `offset + len` overflows here: debug builds panic, while optimized builds wrap `end` and subsequent `end - start` arithmetic can underflow or select invalid slice bounds. Thus search, get, context, or brief can crash on malformed archive coordinates rather than leaving only that turn unread.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/src/store/archive.rs",
+        "line": 107,
+        "note": "Half true. `let end = offset + len` at archive.rs:105 is unchecked and runs before `reader.blocks(offset, len)?` at :107, so a negative stream_offset cast to u64 panics there in a debug or test build. The wrong-blocks and invalid-slice claims are false: the span pass at :71-73 drops any range blocks() rejects, and blocks() (blob/block.rs:253-258) uses checked_add and returns RangeOutOfBounds before the wrapped `end` is ever used, so a release build (no overflow-checks in [profile.release]) fails only that range. Low: a debug-only panic on a corrupt turn row."
+      },
+      "base_id": "8f50e45c13943cd1c2cce793b802500f7d44d920",
+      "head_id": "b1139b29dc4f4b414f343ed415458bae2d263280"
+    }
+  ]
+}

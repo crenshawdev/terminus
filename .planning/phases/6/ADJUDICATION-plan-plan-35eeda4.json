@@ -1,0 +1,36 @@
+{
+  "phase": "6",
+  "trigger": "plan",
+  "discriminator": "plan-35eeda4",
+  "round": 1,
+  "base": "35eeda49fd376cd75e15170cb34cae3bff7bb144",
+  "head": "35eeda49fd376cd75e15170cb34cae3bff7bb144",
+  "base_id": "35eeda49fd376cd75e15170cb34cae3bff7bb144",
+  "head_id": "35eeda49fd376cd75e15170cb34cae3bff7bb144",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/6/PLAN-1.md",
+      "line": 190,
+      "severity": "high",
+      "claim": "The plan explicitly omits “no release is published yet” from the `install.sh` header, contradicting AC6’s requirement that the CHANGELOG, design brief, and header “still say no release is published yet.”",
+      "failure_scenario": "Both plans can execute exactly as written and all listed verification commands can pass while the header lacks the required publication-status statement. Phase 6 would then be declared complete despite failing the locked AC6 documentation criterion.",
+      "ruling": "survived",
+      "convergent": false,
+      "fix_commit": "0359b6432bdcd712eb03bf8e43378cda1519f600",
+      "citation_missing": true,
+      "base_id": "35eeda49fd376cd75e15170cb34cae3bff7bb144",
+      "head_id": "35eeda49fd376cd75e15170cb34cae3bff7bb144"
+    }
+  ]
+}

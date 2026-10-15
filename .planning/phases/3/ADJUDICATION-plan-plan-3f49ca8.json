@@ -1,0 +1,41 @@
+{
+  "phase": "3",
+  "trigger": "plan",
+  "discriminator": "plan-3f49ca8",
+  "round": 1,
+  "base": "3f49ca8f9e5a00c86f84d4a3fe83a0a8a7eb93b1",
+  "head": "3f49ca8f9e5a00c86f84d4a3fe83a0a8a7eb93b1",
+  "base_id": "3f49ca8f9e5a00c86f84d4a3fe83a0a8a7eb93b1",
+  "head_id": "3f49ca8f9e5a00c86f84d4a3fe83a0a8a7eb93b1",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/3/PLAN-1.md",
+      "line": 356,
+      "severity": "medium",
+      "claim": "The AC1 test substitutes an open pipe for the required interactive run, so it does not prove that install behaves the same with a terminal attached.",
+      "failure_scenario": "Install could branch on `stdin.is_terminal()` and prompt, block, or produce different results only when connected to a TTY. Both planned automated runs—null stdin and a non-terminal pipe held open—would still pass. The separate human verification only checks that no question is displayed; it does not compare `settings.json`, the stable binary, and the Claude call log as ROADMAP success criterion 1 requires.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus/src/cmd/install/mod.rs",
+        "line": 431,
+        "note": "The only terminal check in install is inside confirm, at mod.rs:431. PLAN-1 task 4 removes install run call to confirm (mod.rs:173) and offer (mod.rs:462), and confirm stays only for uninstall --purge and data move. After the plan nothing install runs reads the terminal, so the gap is a missing proof, not a live path; low, not medium. Fixed in the plan: task 4 Verify now greps cmd/install for confirm( and is_terminal and expects only confirm own definition and its body line."
+      },
+      "fix_commit": "2d04ac041d060518d6ee07c94a48efd3b7d59511",
+      "citation_missing": true,
+      "base_id": "3f49ca8f9e5a00c86f84d4a3fe83a0a8a7eb93b1",
+      "head_id": "3f49ca8f9e5a00c86f84d4a3fe83a0a8a7eb93b1"
+    }
+  ]
+}

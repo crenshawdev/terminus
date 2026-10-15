@@ -1,0 +1,96 @@
+{
+  "phase": "1",
+  "trigger": "plan",
+  "discriminator": "plan-51a4979",
+  "round": 1,
+  "base": "51a4979299a8d0c6738986fd90f2fe209a906bf1",
+  "head": "51a4979299a8d0c6738986fd90f2fe209a906bf1",
+  "base_id": "51a4979299a8d0c6738986fd90f2fe209a906bf1",
+  "head_id": "51a4979299a8d0c6738986fd90f2fe209a906bf1",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/1/PLAN-1.md",
+      "line": 59,
+      "severity": "high",
+      "claim": "The redaction task proves the planted rule set only through `recall::context::window`, so it does not deliver AC6's requirement that every planted secret and corresponding marker be checked through `recall_search`, `recall_get`, and the SessionStart brief as well.",
+      "failure_scenario": "A later projection bypasses redaction, applies a different rule, or omits the marker while context-window redaction remains correct. Task 1 and all listed verification commands still pass, but AC6 and PRIV-05 fail for that projection.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/tests/redacted_recall.rs",
+        "line": 152,
+        "note": "The absence half of AC6 is already tested on every other projection and no plan removes those tests: search at redacted_recall.rs:152, get at tests/recall.rs:1930, the SessionStart brief at tests/inject_brief.rs:702 and tests/brief.rs:429. Each asserts the VBEGRESS fragment every planted sentinel shares is gone. All four projections redact through the same observe::egress::Redaction, so per-rule markers proven on the context window hold for the rest. The gap is that no plan names those tests as AC6 evidence."
+      },
+      "citation_missing": true,
+      "base_id": "51a4979299a8d0c6738986fd90f2fe209a906bf1",
+      "head_id": "51a4979299a8d0c6738986fd90f2fe209a906bf1"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/1/PLAN-3.md",
+      "line": 34,
+      "severity": "medium",
+      "claim": "The plan asserts that files, commands, and errors remain searchable after a newly finished session, but no task creates or updates a test that ingests such a session and exercises both `terminus search` and `recall_search` against those facts.",
+      "failure_scenario": "Removing the observation search branch or changing the schema accidentally breaks ordinary turn/entity search for one of files, commands, or errors. The listed tests can all pass because Task 1 tests only refusal of `kind: observation`, Task 2 deletes observation-search tests, Task 3 tests listing, and Task 4 tests migration.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/tests/recall.rs",
+        "line": 268,
+        "note": "Existing tests over freshly ingested fixtures cover search by path, entity and path filter (a_path_query_returns_the_turn_that_contains_it, an_entity_match_is_against_the_whole_stored_value, a_path_filter_is_structural_and_not_textual). No plan touches the turn index, and every task verify runs the full suite. The gap is that PLAN-3 does not name them as AC5 evidence."
+      },
+      "citation_missing": true,
+      "base_id": "51a4979299a8d0c6738986fd90f2fe209a906bf1",
+      "head_id": "51a4979299a8d0c6738986fd90f2fe209a906bf1"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/1/PLAN-3.md",
+      "line": 137,
+      "severity": "medium",
+      "claim": "Task 4's verification explicitly includes `crates/terminus-core/tests/store_open.rs` via the `--test store_open` target, but that file is absent from both Task 4's Files list and the plan-level `files` declaration even though the new concurrent/open migration behavior belongs on the store-open path.",
+      "failure_scenario": "Existing store-open tests encode assumptions about writable opens or migration ordering and must be changed when every writable open starts an immediate schema-drop transaction. Implementing those required changes violates the declared artifact boundary; leaving them untouched can produce a failing suite at the Task 4 commit.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/tests/store_open.rs",
+        "note": "store_open.rs is run as a regression in the verify, not edited. No test in it names the observations table, the ten judgment columns or observe.daily_tokens, so nothing there has to change when the drop lands."
+      },
+      "citation_missing": true,
+      "base_id": "51a4979299a8d0c6738986fd90f2fe209a906bf1",
+      "head_id": "51a4979299a8d0c6738986fd90f2fe209a906bf1"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/1/PLAN-2.md",
+      "line": 48,
+      "severity": "medium",
+      "claim": "The no-network enforcement is only a lexical blacklist for four Rust names, so its verification can pass while source code still opens a network connection through another API such as `socket2`, `libc::socket`, `UnixStream`, or a newly added networking dependency not among the four cargo-tree names.",
+      "failure_scenario": "Source code opens a socket using `socket2::Socket` or FFI. The source scan finds none of `std::net`, `TcpStream`, `TcpListener`, or `UdpSocket`, and the cargo-tree check still passes if the dependency is not `ureq`, `reqwest`, `hyper`, or `rustls`, despite PRIV-05's absolute prohibition on network connections.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/1/CONTEXT.md",
+        "line": 30,
+        "note": "PLAN-2 Task 1 implements AC1 and D-08 exactly as the owner locked them: a test that fails if any file under crates/*/src names std::net, TcpStream, TcpListener or UdpSocket. Widening the scan is a change to a locked acceptance criterion, not a plan defect."
+      },
+      "citation_missing": true,
+      "base_id": "51a4979299a8d0c6738986fd90f2fe209a906bf1",
+      "head_id": "51a4979299a8d0c6738986fd90f2fe209a906bf1"
+    }
+  ]
+}

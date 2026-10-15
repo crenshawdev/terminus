@@ -1,0 +1,39 @@
+{
+  "phase": "1",
+  "trigger": "risk_surface",
+  "discriminator": "verify-ce67f81",
+  "round": 1,
+  "base": "ce67f81f1c8429eaddf17c3c7469684c9cd22566",
+  "head": "840e1e3d775d9bc2f2db73a8be7c64d92d8798df",
+  "base_id": "ce67f81f1c8429eaddf17c3c7469684c9cd22566",
+  "head_id": "840e1e3d775d9bc2f2db73a8be7c64d92d8798df",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus-core/src/observe/egress.rs",
+      "line": 270,
+      "severity": "high",
+      "claim": "A valid JSON line rejected by serde_json's default recursion limit bypasses decoded-string redaction entirely.",
+      "failure_scenario": "Use a valid line with more than serde_json's default nesting depth, whose innermost value is a message string such as `typed {\\\"password\\\":\\\"x\\\"}`. `from_str::<IgnoredAny>` returns a recursion-limit error, so `redact_json_strings` returns the original line. The subsequent whole-line rule pass still sees escaped quotes and misses the password pair, allowing the secret to survive into the returned recall_get body.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/src/observe/egress.rs",
+        "line": 270,
+        "note": "serde_json 1.0.151 (the version in Cargo.lock) applies no recursion limit when deserializing IgnoredAny: a scratch crate on that version parsed lines nested 129, 1000 and 100000 arrays deep around an escaped password pair as Ok, so the gate does not fall back on deep nesting."
+      },
+      "base_id": "ce67f81f1c8429eaddf17c3c7469684c9cd22566",
+      "head_id": "840e1e3d775d9bc2f2db73a8be7c64d92d8798df"
+    }
+  ]
+}

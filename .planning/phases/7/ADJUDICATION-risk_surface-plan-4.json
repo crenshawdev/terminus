@@ -1,0 +1,57 @@
+{
+  "phase": "7",
+  "trigger": "risk_surface",
+  "discriminator": "plan-4",
+  "round": 1,
+  "base": "b1139b2",
+  "head": "ba10c91",
+  "base_id": "b1139b29dc4f4b414f343ed415458bae2d263280",
+  "head_id": "ba10c912dd2737efc231a5cfb1aadce60261f5e8",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus/tests/cli.rs",
+      "line": 329,
+      "severity": "high",
+      "claim": "The format-1 fixture is stamped with the current `DERIVED_SCHEMA`, so the test does not exercise opening a real older store whose archive and derived-schema versions are both old.",
+      "failure_scenario": "If store opening checks or rebuilds a mismatched derived schema before rejecting the archive format, an actual format-1 store can execute the CREATE TABLE/INDEX migration and then fail as half-upgraded. Every case in this test still passes because the fixture's derived schema already equals the current binary's version, bypassing the write-producing migration path.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/src/store/open.rs",
+        "line": 754,
+        "note": "The scenario needs a derived-schema check or rebuild ahead of the archive refusal, and there is none. read_versions refuses an older archive format at open.rs:754 before the derived-schema comparison at :762, and both opens call it on a SQLITE_OPEN_READ_ONLY connection (open.rs:248-268 and :696-704), which cannot run CREATE TABLE. The fixture is also what a real format-1 store carries: DERIVED_SCHEMA has been 4 since ea1b181 (2026-10-05), the binary that wrote the owner store, and this phase did not change it."
+      },
+      "base_id": "b1139b29dc4f4b414f343ed415458bae2d263280",
+      "head_id": "ba10c912dd2737efc231a5cfb1aadce60261f5e8"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus/tests/cli.rs",
+      "line": 287,
+      "severity": "medium",
+      "claim": "The asserted every-command coverage explicitly omits `mcp`, even though its different response protocol does not prevent testing refusal and byte preservation.",
+      "failure_scenario": "If MCP startup opens a format-1 store through a path that migrates or writes before returning its protocol-level error, this test remains green. The test can start MCP, send a request or initialization transcript, assert the refusal reason, terminate it, and compare the database and WAL bytes just as it does for exit-based commands.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus/src/cmd/mcp/mod.rs",
+        "line": 22,
+        "note": "MCP has no separate open path to migrate through. It opens the store per call, read-only, through cmd::read::open (mcp/mod.rs:22-25), which is Store::open_read_only (cmd/read.rs:96-97), the same read-only open the test already drives through the CLI read commands; a READ_ONLY connection cannot write before the refusal."
+      },
+      "base_id": "b1139b29dc4f4b414f343ed415458bae2d263280",
+      "head_id": "ba10c912dd2737efc231a5cfb1aadce60261f5e8"
+    }
+  ]
+}

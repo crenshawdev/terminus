@@ -1,0 +1,35 @@
+{
+  "phase": "8",
+  "trigger": "risk_surface",
+  "discriminator": "plan-3",
+  "round": 1,
+  "base": "638739d",
+  "head": "add6bc6",
+  "base_id": "638739dde80e26344e316099ec28a7617986e5c8",
+  "head_id": "add6bc60bdee376d151ff09dec9b559288305abd",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "scripts/sign-release.sh",
+      "line": 61,
+      "severity": "high",
+      "claim": "The script never verifies that the referenced release is a draft before uploading with --clobber and marking it latest.",
+      "failure_scenario": "If the owner supplies a syntactically valid tag that names an already-published release, `gh release download` succeeds, all local checks can pass, and the later upload replaces that release's signature assets before `gh release edit --draft=false --latest` promotes it as latest. Thus the script can mutate and promote a non-draft release despite being specified to operate on a draft only.",
+      "ruling": "survived",
+      "convergent": false,
+      "fix_commit": "8af6f7c",
+      "base_id": "638739dde80e26344e316099ec28a7617986e5c8",
+      "head_id": "add6bc60bdee376d151ff09dec9b559288305abd"
+    }
+  ]
+}

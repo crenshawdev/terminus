@@ -1,0 +1,20 @@
+{
+  "phase": "2",
+  "trigger": "risk_surface",
+  "discriminator": "plan-2",
+  "round": 1,
+  "base": "94a800e2a95eab8328a161442abec1a5542ed6a2",
+  "head": "ed43d9806471762ee219aea1e64c5e7addc2c425",
+  "base_id": "94a800e2a95eab8328a161442abec1a5542ed6a2",
+  "head_id": "ed43d9806471762ee219aea1e64c5e7addc2c425",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": []
+}

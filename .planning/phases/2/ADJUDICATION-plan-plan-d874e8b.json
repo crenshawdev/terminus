@@ -1,0 +1,97 @@
+{
+  "phase": "2",
+  "trigger": "plan",
+  "discriminator": "plan-d874e8b",
+  "round": 1,
+  "base": "d874e8b6b699435582bf313d6f1c3c3a80598686",
+  "head": "d874e8b6b699435582bf313d6f1c3c3a80598686",
+  "base_id": "d874e8b6b699435582bf313d6f1c3c3a80598686",
+  "head_id": "d874e8b6b699435582bf313d6f1c3c3a80598686",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/2/PLAN-4.md",
+      "line": 40,
+      "severity": "high",
+      "claim": "The plan deliberately retains and adds npm references in active documents, contradicting Phase 2 success criterion 1 in ROADMAP.md, which permits npm mentions only in CHANGELOG.md, shipped requirement rows, and archived planning files.",
+      "failure_scenario": "After Tasks 1 and 2, DESIGN-BRIEF.md, .planning/PROJECT.md, and the active v2 Distribution section of .planning/REQUIREMENTS.md all say that npm was removed or that there is no npm channel. The roadmap grep condition therefore remains false even though the plan declares the documentation complete.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/2/CONTEXT.md",
+        "line": 34,
+        "note": "AC1, locked by the owner, refines the roadmap criterion: DESIGN-BRIEF.md, PROJECT.md outside its shipped-cycle tables and REQUIREMENTS.md outside the INST-01 and INST-09 rows may name npm to say it was removed. D-09 (line 26) asks for exactly that wording and keeps ROADMAP.md as it is. PLAN-4 follows the locked criterion; tightening it is a change to AC1, not a plan defect."
+      },
+      "citation_missing": true,
+      "base_id": "d874e8b6b699435582bf313d6f1c3c3a80598686",
+      "head_id": "d874e8b6b699435582bf313d6f1c3c3a80598686"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/2/PLAN-1.md",
+      "line": 76,
+      "severity": "high",
+      "claim": "The plan adds a new refusal test and verifies a total of 750 tests, while locked AC5 requires the completed suite to list 749 tests.",
+      "failure_scenario": "The source-scan test is added as required and the suite lists 750 tests exactly as this plan expects. Phase acceptance then fails because AC5 explicitly requires 749; no task amends the acceptance criterion or offsets the added test.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/2/CONTEXT.md",
+        "line": 38,
+        "note": "The conflict is inside CONTEXT, not the plan: AC3 (line 36) and D-06 require a new test in the suite, so any plan that meets AC3 lists 750, and AC5 (line 38) still says 749. PLAN-1 is correct to expect 750 and the planner flagged the count for the owner. The flagged assumption at line 46 already says the summary accounts for each test gained or lost. The remedy is a one-number change to AC5, which is the owner's call."
+      },
+      "citation_missing": true,
+      "base_id": "d874e8b6b699435582bf313d6f1c3c3a80598686",
+      "head_id": "d874e8b6b699435582bf313d6f1c3c3a80598686"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/2/PLAN-2.md",
+      "line": 128,
+      "severity": "medium",
+      "claim": "The doctor task removes Windows branches but does not make doctor say that Linux and macOS are the supported systems, leaving ROADMAP Phase 2 success criterion 5 without a delivering task.",
+      "failure_scenario": "After implementation, doctor prints Unix-form fixes and no Windows text, but has no Linux/macOS support statement because D-12 is interpreted only as removing branches and adding no platform check. The docs satisfy their half of the criterion, while `terminus doctor` does not say Linux and macOS as the roadmap requires.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/2/CONTEXT.md",
+        "line": 29,
+        "note": "D-12, locked by the owner, says doctor prints nothing about Windows and gets no platform check, because a check would always pass on a binary that only builds on Linux and macOS and the doctor --json key set is a contract. AC6 is the doctor criterion and PLAN-2 meets it; the docs half of the roadmap criterion is delivered by PLAN-4 Tasks 1 and 2."
+      },
+      "citation_missing": true,
+      "base_id": "d874e8b6b699435582bf313d6f1c3c3a80598686",
+      "head_id": "d874e8b6b699435582bf313d6f1c3c3a80598686"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/2/PLAN-4.md",
+      "line": 149,
+      "severity": "medium",
+      "claim": "Task 3's diff verification cannot pass after performing all of Task 3: it permits changes only to seven todo lines and the Publish milestone, but the same task also requires adding a closure under the separate icacls proposal.",
+      "failure_scenario": "The implementer correctly adds the checked closure beneath “Proposed amendment to Phase 3.” `git diff -U0 -- .planning/CAPTURE.md` then necessarily includes lines outside both the seven todo lines and the Publish milestone, so the stated verification fails on a correct implementation.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/CAPTURE.md",
+        "line": 294,
+        "note": "The icacls proposal at CAPTURE.md:294 sits under the ### Publish milestone heading at line 204, with no other heading before ## Notes at line 313, so a closure added under it is inside the Publish milestone section the diff check allows. The proposal holds no column-0 bullets, so the one new checked bullet keeps the perl count at 0."
+      },
+      "citation_missing": true,
+      "base_id": "d874e8b6b699435582bf313d6f1c3c3a80598686",
+      "head_id": "d874e8b6b699435582bf313d6f1c3c3a80598686"
+    }
+  ]
+}

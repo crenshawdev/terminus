@@ -1,0 +1,57 @@
+{
+  "phase": "1",
+  "trigger": "risk_surface",
+  "discriminator": "plan-2",
+  "round": 1,
+  "base": "7cf57d5422b88375b900e65e4d09fb1bcc54f2e5",
+  "head": "4520c119d6c421bc067b3d961e5e318a0027fc95",
+  "base_id": "7cf57d5422b88375b900e65e4d09fb1bcc54f2e5",
+  "head_id": "4520c119d6c421bc067b3d961e5e318a0027fc95",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus-core/src/observe/egress.rs",
+      "line": 236,
+      "severity": "high",
+      "claim": "Removing exact-value credential replacement leaves common bare provider credentials unredacted because none of the remaining shape rules recognizes OpenAI-style `sk-...` tokens.",
+      "failure_scenario": "With `[privacy] redact_recall = true`, recall an archived turn containing `the rejected credential was sk-proj-PLANTEDSECRET` in plain prose. It is not a PEM block, URL userinfo, named header, JSON pair, assignment, flag, JWT, or GitHub token, so `redact` returns it unchanged and the credential reaches hook stdout or an MCP result. Removing provider configuration does not remove credentials already stored in transcripts.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/src/observe/egress.rs",
+        "line": 236,
+        "note": "Rule 1 only ever replaced the exact value of the configured provider key (Redaction::of passed config.provider_api_key() at 7cf57d5:egress.rs:290-299); no rule before or after this range matches a generic sk- token in prose, so the scenario input was unredacted before unless it was that one configured key. D-06 removed rule 1 because its only source, the [provider] key, no longer exists and now refuses to load. The remaining gap is that no shape rule matches a bare sk- token, which predates this change."
+      },
+      "base_id": "7cf57d5422b88375b900e65e4d09fb1bcc54f2e5",
+      "head_id": "4520c119d6c421bc067b3d961e5e318a0027fc95"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus-core/tests/no_network.rs",
+      "line": 10,
+      "severity": "medium",
+      "claim": "The source scan does not fail on any socket type as claimed; it only searches for four spellings.",
+      "failure_scenario": "Code can add `std::os::unix::net::UnixStream::connect(...)`, `UnixListener`, or a dependency-backed type such as `socket2::Socket` under a scanned `src` directory. None contains `std::net`, `TcpStream`, `TcpListener`, or `UdpSocket`, so this test passes despite socket-capable code being present.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/1/CONTEXT.md",
+        "line": 30,
+        "note": "tests/no_network.rs implements AC1 and D-08 as locked: a test that fails if any file under crates/*/src names std::net, TcpStream, TcpListener or UdpSocket. Unix-domain sockets are local IPC rather than a network connection, and socket2 is not a dependency of either crate."
+      },
+      "base_id": "7cf57d5422b88375b900e65e4d09fb1bcc54f2e5",
+      "head_id": "4520c119d6c421bc067b3d961e5e318a0027fc95"
+    }
+  ]
+}
