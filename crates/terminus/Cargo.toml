@@ -31,6 +31,10 @@ lexopt.workspace = true
 # hand-rolled writer fails, on the turns most worth reading.
 serde_json.workspace = true
 
+# The binary picks the allocator, so this lives here and not in terminus-core.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc.workspace = true
+
 [dev-dependencies]
 # The binary tests need the fixture corpus and the seeded Rng the library's
 # testkit already owns; a `tests/common` module duplicated per test binary was

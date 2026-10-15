@@ -37,6 +37,11 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 # CLI argument parsing. lexopt has zero dependencies of its own; cold start is
 # the product (DESIGN-BRIEF.md:39) and every transitive crate is startup cost.
 lexopt = "0.3"
+# Global allocator for the musl builds only. musl's own allocator is much
+# slower than glibc's under multi-threaded allocation, and backfill allocates
+# across rayon threads. It is compiled into the binary, so the static build
+# still needs nothing installed. The corpus test's hook budget measures it.
+mimalloc = "0.1.52"
 
 terminus-core = { path = "crates/terminus-core" }
 
