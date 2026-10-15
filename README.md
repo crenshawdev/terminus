@@ -51,3 +51,25 @@ It also refuses, under these conditions:
 - `[privacy] redact_recall` misses a bare OpenAI-style `sk-` token in plain prose, because none of its rules recognizes that shape, so the token reaches Claude Code unfiltered ([#5](https://github.com/crenshawdev/terminus/issues/5)).
 - With `[privacy] redact_recall` on, the body `recall_get` returns goes through a lossy UTF-8 round trip, so an archived line that is not valid UTF-8 comes back changed even when it holds no secret ([#1](https://github.com/crenshawdev/terminus/issues/1)).
 - What the `recall_search`, `recall_context` and `recall_get` tools return is not documented, and the tool table in `DESIGN-BRIEF.md` is out of date ([#26](https://github.com/crenshawdev/terminus/issues/26)).
+
+## How it works
+
+- **One Rust binary.** Claude Code runs it two ways. As a hook on `SessionStart`, `UserPromptSubmit`, `SessionEnd` and `PostCompact`, each entry naming `~/.local/bin/terminus` with no shell in between. And as an MCP server over stdio, which Claude Code starts for each session. Everything else is a command you type.
+- **The hooks.** Each hook first starts an ingest in a detached process, then reads the event from stdin. `SessionStart` may hand Claude Code the brief, and `UserPromptSubmit` the earlier turns it adds to the prompt. `SessionEnd` and `PostCompact` hand over nothing, and run so the ingest they start picks up the end of the session and the record a compaction appends.
+- **The ingest.** One pass runs at a time, under an OS file lock that is released when its process exits, so a pass that finds another running exits having done nothing and no stale lock is ever left behind. The pass reads each transcript from where the last one stopped and archives the complete records it finds. Then it closes the sessions that have gone idle, records their observations, applies `[retention]` and takes a snapshot when one is due.
+- **The MCP server.** It opens the store read-only for each call, so a session archived while it runs is found by the next call. It opens no port, takes no lock, and exits when Claude Code closes its input.
+- **Where the data is.** One SQLite database, `terminus.db`, in the data directory ([where that is](docs/configuration.md#the-data-directory)), with its snapshots beside it. Every file Terminus writes there is readable only by your user.
+- **The archive.** Each session is stored as numbered blocks of its transcript, one row each, holding the block's number, its zstd-compressed bytes and a BLAKE3 hash of its uncompressed bytes. The session's checksum is a BLAKE3 hash over its block hashes in order. An append rewrites at most the session's last block and adds blocks after it. Under `[capture] mode = "full"`, the default, the archived bytes are the transcript exactly. `terminus verify` checks every block against its hash.
+- **What is derived.** The turns, the full-text search index, and the paths, commands, errors and identifiers each turn names are built from the archive. `terminus reindex` drops and rebuilds them from the block rows alone, with the same turn ids. The log of injection decisions is kept beside the archive, because it records what happened at each prompt and the transcripts do not hold that. The observations are kept too: `terminus observations regenerate` recomputes them, and `reindex` leaves them alone.
+- **On a crash.** Each transcript's new blocks, its session record, its turns and the position the next pass reads from commit in one transaction, so a pass killed partway leaves that transcript as its last commit left it, and the next pass reads the rest. Every ingest starts by rebuilding the derived tables of a store an older build wrote, and by lowering any read position that claims more bytes than the archive holds, so the gap is read again. Recovery never deletes archived bytes.
+- **On a context loss.** A new session gets the brief. A compaction fires `SessionStart` again, and Terminus leaves a note for that session. The next prompt then looks through a wider set of matches and is offered only the turns the compaction dropped, worked out from the record Claude Code appends to the transcript. If the ingest has not archived that record yet when the prompt arrives, the note carries to the prompt after.
+
+The design decisions are in [DESIGN-BRIEF.md](DESIGN-BRIEF.md).
+
+## Hosts and platforms
+
+Claude Code only, on Linux and macOS, on x86_64 and aarch64.
+
+Installing needs `curl`, `ssh-keygen`, and `sha256sum` or `shasum`. It also needs `claude` on `PATH` whenever the `terminus` MCP entry in `~/.claude.json` is missing or not in the shape install writes, because install registers the server by running `claude mcp`. Without `claude` in that case, install does everything else, prints the command that finishes the registration, and exits 1.
+
+`git` is optional. With it, a session belongs to the repository its working directory is in. Without it, or when that directory is not a repository, a session belongs to the working directory itself, so one started in a subfolder of a repository is filed under that subfolder.
