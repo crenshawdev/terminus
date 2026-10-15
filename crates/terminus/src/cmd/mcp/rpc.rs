@@ -51,7 +51,7 @@ pub mod code {
 /// One request that has an id and therefore expects exactly one response.
 #[derive(Debug)]
 pub struct Request {
-    /// Echoed back terminus. A string and a number are different ids to a
+    /// Echoed back verbatim. A string and a number are different ids to a
     /// client that sent both, so this is the value and not a rendering of it.
     pub id: Value,
     pub method: String,
@@ -108,11 +108,14 @@ pub fn parse(line: &str) -> Incoming {
     let Some(id) = object.get("id") else {
         return Incoming::Notification;
     };
-    if !(id.is_string() || id.is_number()) {
+    // MCP requires a string or integer id. serde_json reads every number that is
+    // not an integer in the i64 or u64 range as f64 (`1.5`, `1.0`, `1e3`, `-0`,
+    // 2^64), and an f64 would not be echoed back as the id the client sent.
+    if !(id.is_string() || id.is_i64() || id.is_u64()) {
         return Incoming::Invalid {
             id: None,
             code: code::INVALID_REQUEST,
-            message: "a request id is a string or a number".to_owned(),
+            message: "a request id is a string or an integer".to_owned(),
         };
     }
     let id = id.clone();
@@ -206,6 +209,42 @@ mod tests {
         for (line, expected) in cases {
             match parse(line) {
                 Incoming::Invalid { code, .. } => assert_eq!(code, *expected, "{line}"),
+                other => panic!("{line} classified as {other:?}"),
+            }
+        }
+    }
+
+    /// An id is a string or an integer. Any number serde_json reads as f64 is
+    /// refused with a null id, and every integer from `i64::MIN` to `u64::MAX`
+    /// is still answered.
+    #[test]
+    fn a_request_id_that_is_not_an_integer_that_fits_is_refused() {
+        for id in [
+            "1.5",
+            "1.0",
+            "1e3",
+            "-0",
+            "18446744073709551616",
+            "-9223372036854775809",
+        ] {
+            let line = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+            match parse(&line) {
+                Incoming::Invalid { id: None, code, .. } => {
+                    assert_eq!(code, code::INVALID_REQUEST, "{line}");
+                }
+                other => panic!("{line} classified as {other:?}"),
+            }
+        }
+
+        let kept = [
+            ("-9223372036854775808", Value::from(i64::MIN)),
+            ("0", Value::from(0)),
+            ("18446744073709551615", Value::from(u64::MAX)),
+        ];
+        for (id, expected) in kept {
+            let line = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#);
+            match parse(&line) {
+                Incoming::Request(request) => assert_eq!(request.id, expected, "{line}"),
                 other => panic!("{line} classified as {other:?}"),
             }
         }
