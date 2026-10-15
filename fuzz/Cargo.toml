@@ -107,3 +107,10 @@ path = "fuzz_targets/settings_json.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "commit_subject"
+path = "fuzz_targets/commit_subject.rs"
+test = false
+doc = false
+bench = false
