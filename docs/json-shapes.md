@@ -186,8 +186,14 @@ Exits 1 when `failures` is non-empty, with the document still written.
 ### `reindex`
 
 ```json
-{"sessions": 11, "turns": 47, "skipped": [{"session_key": "...", "reason": "..."}]}
+{"sessions": 9, "turns": 38, "skipped": [{"session_key": "...", "reason": "..."}],
+ "preserved": 2}
 ```
+
+- `preserved` counts the evicted sessions whose derived rows were carried across
+  rather than rebuilt, since their blocks are gone and those rows are the only
+  copy left. `sessions` does not include them. It is 0 in a lock-held refusal.
+  Without `--json`, the count goes to stderr when it is above 0.
 
 Exits 1 when `skipped` is non-empty - every undamaged session was still rebuilt,
 and the exit code is what tells a script the store is not whole. A run refused

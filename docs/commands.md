@@ -113,7 +113,7 @@ Checks every session's archived blocks against the hash recorded for each. The s
 
 ### `terminus reindex`
 
-Rebuilds every table derived from the archive, the search index among them. Turn ids stay the same. It does not rebuild observations. It takes the ingest lock and exits 1 when another process holds it. A session that cannot be rebuilt is skipped and named on stderr, every other session is still rebuilt, and the command exits 1.
+Rebuilds every table derived from the archive, the search index among them. Turn ids stay the same. It does not rebuild observations. It prints how many evicted sessions it carried across without rebuilding them, on stderr when there are any. It takes the ingest lock and exits 1 when another process holds it. A session that cannot be rebuilt is skipped and named on stderr, every other session is still rebuilt, and the command exits 1.
 
 - `--json`
 
