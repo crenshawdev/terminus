@@ -243,6 +243,11 @@ esac
 }
 
 impl Fixture {
+    /// Put the shipped `install.sh` beside the script, pinning the real key.
+    fn use_shipped_install_sh(&self) {
+        std::fs::copy(repo_file("install.sh"), self.root.join("install.sh")).unwrap();
+    }
+
     /// The throwaway key's public line, as `install.sh` pins a key.
     fn public_key(&self) -> String {
         let public =
@@ -475,12 +480,37 @@ fn a_manifest_naming_another_version_is_refused(shell: Shell) {
     );
 }
 
+/// Beside the shipped `install.sh`, the throwaway key signs but its signature
+/// does not verify against the pinned key, so nothing is uploaded. The run
+/// stops at the first manifest, after one passphrase prompt.
+fn a_signature_the_pinned_key_does_not_verify_is_refused(shell: Shell) {
+    let fx = fixture(shell);
+    fx.use_shipped_install_sh();
+    let output = fx.run(TAG);
+    let gh = fx.gh_calls();
+    assert_eq!(gh.len(), 1, "{gh:?}");
+    assert_eq!(gh[0][..2], ["release", "download"]);
+    assert_eq!(std::fs::read_dir(&fx.uploaded).unwrap().count(), 0);
+    assert!(!output.status.success(), "{}", text(&output));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.ends_with(
+            "terminus: the signature on terminus-linux-x86_64.manifest does not verify against the key pinned in install.sh\n"
+        ),
+        "{stderr}"
+    );
+    let ssh = fx.ssh_calls();
+    let verbs: Vec<_> = ssh.iter().map(|call| call[2].as_str()).collect();
+    assert_eq!(verbs, ["sign", "verify"], "{ssh:?}");
+}
+
 both_shells!(
     a_good_draft_is_signed_and_published,
     a_bad_tag_is_refused,
     a_draft_missing_a_file_is_refused,
     a_binary_that_does_not_match_its_manifest_is_refused,
     a_manifest_naming_another_version_is_refused,
+    a_signature_the_pinned_key_does_not_verify_is_refused,
 );
 
 /// The script reads the pinned key from `install.sh` and keeps no copy of it.
