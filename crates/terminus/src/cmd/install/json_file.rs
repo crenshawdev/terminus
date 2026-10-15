@@ -602,7 +602,7 @@ fn duplicate_key(value: &Json, at: &str) -> Option<String> {
     }
 }
 
-fn render(value: &Json, trailing_newline: bool) -> String {
+pub(crate) fn render(value: &Json, trailing_newline: bool) -> String {
     let mut out = String::new();
     value.write_to(&mut out, 0);
     if trailing_newline {
@@ -757,7 +757,7 @@ fn link_once(temporary: &Path, path: &Path) -> Result<(), Failure> {
 // Reading
 // ---------------------------------------------------------------------------
 
-fn parse(text: &str) -> Result<Json, String> {
+pub(crate) fn parse(text: &str) -> Result<Json, String> {
     let mut reader = Reader {
         src: text,
         bytes: text.as_bytes(),
