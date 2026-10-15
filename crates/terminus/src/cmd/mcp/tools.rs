@@ -29,6 +29,8 @@
 //! reserved for a message that could not be read as a request at all, because a
 //! throw is what the client surfaces to the user as a broken server.
 
+use std::collections::HashSet;
+
 use serde_json::{json, Map, Value};
 
 use terminus_core::recall::{self, context, get, search, Filters, Query, Request, Scope};
@@ -517,12 +519,20 @@ fn run_context(args: &Map<String, Value>) -> Result<Value, Refused> {
 /// asked for too much still gets the first [`MAX_IDS`] of what it wanted and is
 /// told the rest were not read.
 ///
+/// Repeats are removed before the cap, keeping each id's first place. A list
+/// that names one id 30 times names one record, and counting it as over the cap
+/// dropped real ids that came after the repeats.
+///
 /// **An evicted body is a flag, not an error (D-08).** It is read off
 /// `session_meta.is_evicted` and never off a failed blob read: a blob that will
 /// not decompress is archive damage for `terminus verify` to report, and letting
 /// it look like an eviction would report silent data loss as retention working.
 fn run_get(args: &Map<String, Value>) -> Result<Value, Refused> {
-    let asked = required_ids(args, "turn_ids")?;
+    let mut asked = required_ids(args, "turn_ids")?;
+    // A set rather than a scan of what is kept: the list length came from the
+    // client.
+    let mut seen = HashSet::with_capacity(asked.len());
+    asked.retain(|id| seen.insert(*id));
     let project = optional_string(args, "project")?;
     // `get` and not a slice expression: the bound is provably inside the list
     // and is written totally anyway, because this is the one path where the

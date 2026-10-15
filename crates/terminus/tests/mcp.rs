@@ -1038,6 +1038,76 @@ fn a_list_longer_than_the_cap_is_truncated_and_said_so() {
     );
 }
 
+/// Repeats are removed before the cap. Thirty ids naming twenty turns is under
+/// it, and the cap and its reason count distinct ids, not list entries.
+#[test]
+fn repeated_ids_are_removed_before_the_cap() {
+    let bench = bench();
+    let project = bench.long_session("project-window", 60);
+
+    let ids: Vec<i64> = bench
+        .conn()
+        .prepare(
+            "SELECT id FROM turns WHERE session_key LIKE '%project-window.jsonl'
+              ORDER BY turn_seq LIMIT 40",
+        )
+        .unwrap()
+        .query_map([], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(ids.len(), 40, "this test needs more ids than the cap");
+    let served = |document: &Value| -> Vec<i64> {
+        records(document)
+            .iter()
+            .map(|record| record["turn_id"].as_i64().unwrap_or_default())
+            .collect()
+    };
+
+    // Twenty distinct ids, newest first so the answer's order is the asked
+    // order and not the archive's, then ten of them again.
+    let distinct: Vec<i64> = ids[..20].iter().rev().copied().collect();
+    let mut asked = distinct.clone();
+    asked.extend_from_slice(&distinct[..10]);
+    assert_eq!(asked.len(), 30);
+
+    let (document, is_error) =
+        bench.call_flagged(&project, "recall_get", json!({"turn_ids": asked}));
+    assert!(!is_error, "{document}");
+    assert_eq!(
+        served(&document),
+        distinct,
+        "every distinct id, in the order first asked: {document}"
+    );
+    assert!(
+        document["reason"].is_null(),
+        "twenty distinct ids were reported as over the cap: {document}"
+    );
+
+    // Thirty distinct ids with five repeats among them: the first 25 distinct
+    // are served, and the reason's count is the 30 distinct, not the 35 sent.
+    let mut asked: Vec<i64> = ids[..30].to_vec();
+    for (at, id) in ids[..5].iter().enumerate() {
+        asked.insert(at * 2 + 1, *id);
+    }
+    assert_eq!(asked.len(), 35);
+
+    let (document, is_error) =
+        bench.call_flagged(&project, "recall_get", json!({"turn_ids": asked}));
+    assert!(!is_error, "{document}");
+    assert_eq!(
+        served(&document),
+        ids[..25].to_vec(),
+        "the first 25 distinct ids are the ones served: {document}"
+    );
+    assert!(
+        document["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("only the first 25 of 30 ids")),
+        "the reason did not count distinct ids: {document}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Bounds and malformed requests (RCL-10, AC6)
 // ---------------------------------------------------------------------------
