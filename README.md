@@ -73,3 +73,73 @@ Claude Code only, on Linux and macOS, on x86_64 and aarch64.
 Installing needs `curl`, `ssh-keygen`, and `sha256sum` or `shasum`. It also needs `claude` on `PATH` whenever the `terminus` MCP entry in `~/.claude.json` is missing or not in the shape install writes, because install registers the server by running `claude mcp`. Without `claude` in that case, install does everything else, prints the command that finishes the registration, and exits 1.
 
 `git` is optional. With it, a session belongs to the repository its working directory is in. Without it, or when that directory is not a repository, a session belongs to the working directory itself, so one started in a subfolder of a repository is filed under that subfolder.
+
+## Installing and updating
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh
+```
+
+`install.sh` checks the release's signature against the key pinned in the script before it installs anything, places the binary behind `~/.local/bin/terminus`, and runs `terminus install`, which writes the hook entries and the MCP entry and starts archiving the transcripts already on disk. Running the same line again is how Terminus updates. It installs on Linux and macOS only.
+
+To install a local build from a checkout instead:
+
+```sh
+cargo build --release && target/release/terminus install
+```
+
+A local build is not checked against any signature. What install writes, when it exits 1, how an update leaves older versions in place, and what `terminus uninstall` removes and leaves behind are in [docs/install.md](docs/install.md).
+
+## Commands
+
+Every command is `terminus <command>`.
+
+- `ingest`: archives what is new in every transcript under `roots`.
+- `ingest <path.jsonl>`: archives one transcript file.
+- `backfill`: archives the transcripts already on disk, in a detached process, and returns.
+- `search <words>`: finds past turns by text, path, error or identifier.
+- `show <id>...`: prints the archived record behind each turn id.
+- `sessions`: lists the archived sessions.
+- `verify`: checks every archived block against its hash.
+- `reindex`: rebuilds everything derived from the archive.
+- `status`: prints the store's size and counts, how far into the transcripts it has read, and the last ingest pass.
+- `compact`: gives back the disk space retention freed.
+- `usage`: prints where the bytes went, by project, by month and by table.
+- `export <dir>`: writes the archived transcripts out, unfiltered, with a manifest.
+- `stats`: reports the hits, false positives, precision and misses of what was added to prompts.
+- `observations`: lists what happened in each closed session.
+- `observations regenerate`: recomputes those facts from the archive.
+- `replay`: re-scores the logged prompts under other thresholds, and changes nothing.
+- `retention --dry-run`: prints what the next ingest pass would evict and delete, and changes nothing.
+- `doctor`: reports what is wired into Claude Code and what is not.
+- `install`: wires Terminus into Claude Code's hooks and MCP servers, then starts a backfill.
+- `uninstall`: removes what `install` added and keeps the archive. `--purge` also deletes the data directory, after asking.
+- `data move <path>`: moves the data directory and records where it went.
+
+Claude Code runs two more, which are never typed:
+
+- `hook <event>`: runs on `SessionStart`, `UserPromptSubmit`, `SessionEnd` and `PostCompact`, starts an ingest, and may hand Claude Code the brief or earlier turns.
+- `mcp`: serves `recall_search`, `recall_context` and `recall_get` over stdio.
+
+Every command above except `ingest`, `backfill`, `install`, `uninstall` and `data move` accepts `--json`, and then writes one JSON document on stdout ([docs/json-shapes.md](docs/json-shapes.md)). Every option of every command is in [docs/commands.md](docs/commands.md).
+
+## Settings
+
+Terminus runs on its defaults with no file. To change one, write `terminus.toml` in `$TERMINUS_CONFIG_DIR`, otherwise `$XDG_CONFIG_HOME/terminus`, otherwise `~/.config/terminus`. Terminus never writes the file, ignores keys it does not know, and refuses a `[provider]` table.
+
+| Key | Default | What it sets |
+|---|---|---|
+| [`roots`](docs/configuration.md#roots) | `$CLAUDE_CONFIG_DIR`, otherwise `~/.claude` | The Claude Code config directories whose transcripts are archived. |
+| [`exclude`](docs/configuration.md#exclude) | none | Projects that are never read and never returned. |
+| [`[injection] brief_chars`](docs/configuration.md#injection) | 6000 | The most the brief at the start of a session may carry, in characters, capped at 10000. |
+| [`[injection] prompt_chars`](docs/configuration.md#injection) | 4000 | The most one prompt's injection may carry, in characters, capped at 10000. |
+| [`[retention] action`](docs/configuration.md#retention) | `keep` | `keep`, `evict` or `delete` for sessions past `age_days`. |
+| [`[retention] age_days`](docs/configuration.md#retention) | 0, which is off | How old a session's last turn must be before `action` applies. |
+| [`[retention.project."<path>"]`](docs/configuration.md#retentionprojectpath) | none | `action` and `age_days` for one project, in place of the global rule. |
+| [`[snapshot] enabled`](docs/configuration.md#snapshot) | `true` | Whether rolling copies of the archive are taken. |
+| [`[snapshot] interval_hours`](docs/configuration.md#snapshot) | 24 | How long after the last snapshot the next one is taken. |
+| [`[snapshot] keep`](docs/configuration.md#snapshot) | 3 | How many snapshots are kept. |
+| [`[capture] mode`](docs/configuration.md#capture) | `full` | `full`, `lean` or `minimal`: how much of each record is stored. Only `full` keeps the transcript exactly. |
+| [`[privacy] redact_recall`](docs/configuration.md#privacy) | `false` | Filters text shaped like a secret out of what Claude Code is handed. |
+
+Each key's full effect, and the environment variables Terminus reads, are in [docs/configuration.md](docs/configuration.md).
