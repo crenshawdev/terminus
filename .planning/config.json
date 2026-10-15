@@ -1,6 +1,5 @@
 {
   "granularity": "standard",
-  "stakes": "shipped",
   "model": {
     "escalate_on_failure": false,
     "effort": {
@@ -32,7 +31,7 @@
     "integration_branch": "milestone",
     "auto_branch": "ask",
     "base_branch": null,
-    "create_tag": true,
+    "create_tag": false,
     "on_land_cleanup": true,
     "auto_close": false,
     "forge_provider": "github",
@@ -46,33 +45,7 @@
   },
   "review": {
     "mode": "adjudicated",
-    "reviewers": [
-      "openai"
-    ],
     "key_file": null,
-    "providers": {
-      "openai": {
-        "tiers": {
-          "flagship": "gpt-5.5",
-          "balanced": "gpt-5.4-mini",
-          "cheap": "gpt-5.4-nano"
-        }
-      },
-      "gemini": {
-        "tiers": {
-          "flagship": null,
-          "balanced": null,
-          "cheap": null
-        }
-      },
-      "deepseek": {
-        "tiers": {
-          "flagship": null,
-          "balanced": null,
-          "cheap": null
-        }
-      }
-    },
     "consult": {
       "enabled": false,
       "tier": "flagship",

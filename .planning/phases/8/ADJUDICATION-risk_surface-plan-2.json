@@ -1,0 +1,39 @@
+{
+  "phase": "8",
+  "trigger": "risk_surface",
+  "discriminator": "plan-2",
+  "round": 1,
+  "base": "23251ac",
+  "head": "638739d",
+  "base_id": "23251acfc4eeb07a349c1b3cdf9014067bcfe3ed",
+  "head_id": "638739dde80e26344e316099ec28a7617986e5c8",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus/tests/release_workflows.rs",
+      "line": 8,
+      "severity": "medium",
+      "claim": "The regression test does not actually guarantee that workflows contain no secret reads or signing steps; it only rejects four exact, case-sensitive substrings.",
+      "failure_scenario": "A workflow can sign artifacts with a command such as `gpg --detach-sign artifact`, `cosign sign artifact`, or `openssl dgst -sign key.pem artifact`, and this test passes because none contains `-Y sign`. Likewise, alternate expression formatting or an action that accepts a secret-backed signing key can evade these literals. The asserted policy that CI never signs or reads release secrets can therefore regress without failing the test.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/8/CONTEXT.md",
+        "line": 28,
+        "note": "True that the test matches literals and a workflow could read secrets through toJSON(secrets) or sign with gpg or cosign without tripping it. But D-11 fixes this exact list as a regression tripwire, and the guarantee itself rests on the repository holding 0 Actions secrets and 0 environments (gh api, 2026-10-14; PLAN-2 Task 4 verify re-reads it), so a workflow has no secret to read and CI holds no key to sign with. Low, not fixed."
+      },
+      "base_id": "23251acfc4eeb07a349c1b3cdf9014067bcfe3ed",
+      "head_id": "638739dde80e26344e316099ec28a7617986e5c8"
+    }
+  ]
+}

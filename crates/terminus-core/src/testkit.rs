@@ -1,4 +1,5 @@
-//! Test support: the shared way to reach the synthetic fixture corpus.
+//! Test support: the shared way to reach the synthetic fixture corpus, and the
+//! fake `claude` the install, uninstall and doctor tests run against.
 //!
 //! Behind the `testkit` cargo feature, off by default, so none of it is
 //! compiled into the shipped binary. It lives in the library rather than in a
@@ -56,8 +57,8 @@ pub const FIXTURE_ROOT_TOKEN: &str = "{{ROOT}}";
 ///
 /// `project-delta` has exactly one member for that same reason.
 /// `session-secrets.jsonl` is the v0.1.1 phase 2 one: its turns carry the seven
-/// credential shapes the egress filter is asked to catch, so a test can drive
-/// the real judgment request against a loopback stub and read the wire. Its
+/// credential shapes the egress filter is asked to catch, so a test can run
+/// them through recall with `redact_recall` on and check each one is gone. Its
 /// vocabulary shares none of the corpus's counted tokens, so no existing
 /// assertion moves when it joins the set.
 ///
@@ -113,8 +114,8 @@ pub fn fixture_projects(root: &Path) -> Vec<PathBuf> {
 /// contains, so the key degrades to the path itself on every machine.
 ///
 /// Backslashes are doubled on the way in because the substitution lands inside
-/// a JSON string literal, where a Windows root would otherwise be an invalid
-/// escape and the whole record would stop parsing.
+/// a JSON string literal, where any backslash in the root would otherwise be an
+/// invalid escape and the whole record would stop parsing.
 pub fn copy_rooted_fixture_into(name: &str, dir: &Path, root: &Path) -> PathBuf {
     let project = fixture_project(name, root);
     std::fs::create_dir_all(&project)
@@ -426,33 +427,41 @@ pub fn query_set_json(conn: &rusqlite::Connection) -> String {
     out
 }
 
-/// A digest over every `sessions` and `session_meta` row.
+/// A digest over every `sessions`, `blocks` and `session_meta` row.
 ///
 /// The archive is what a rebuild must not touch, so it gets a comparison of its
 /// own rather than being inferred from the derived tables looking right.
 pub fn archive_digest(conn: &rusqlite::Connection) -> String {
     let mut hasher = blake3::Hasher::new();
-    let mut statement = conn
-        .prepare(
-            "SELECT s.session_key, s.session_no, s.blob, m.session_id, m.transcript_path,
-                    m.checksum, m.uncompressed_len, m.continues_from, m.first_turn_at,
-                    m.last_turn_at, m.cwd, m.branch
-             FROM sessions s LEFT JOIN session_meta m USING (session_key)
-             ORDER BY s.session_no",
-        )
-        .expect("prepare the archive scan");
-    let mut rows = statement.query([]).expect("run the archive scan");
-    while let Some(row) = rows.next().expect("read an archive row") {
-        for column in 0..12 {
-            let value: rusqlite::types::Value = row.get(column).expect("read an archive column");
-            hasher.update(format!("{value:?}\u{1f}").as_bytes());
+    let mut digest = |sql: &str, columns: usize| {
+        let mut statement = conn.prepare(sql).expect("prepare the archive scan");
+        let mut rows = statement.query([]).expect("run the archive scan");
+        while let Some(row) = rows.next().expect("read an archive row") {
+            for column in 0..columns {
+                let value: rusqlite::types::Value =
+                    row.get(column).expect("read an archive column");
+                hasher.update(format!("{value:?}\u{1f}").as_bytes());
+            }
+            hasher.update(b"\x1e");
         }
-        hasher.update(b"\x1e");
-    }
+        hasher.update(b"\x1d");
+    };
+    digest(
+        "SELECT s.session_key, s.session_no, m.session_id, m.transcript_path,
+                m.checksum, m.uncompressed_len, m.continues_from, m.first_turn_at,
+                m.last_turn_at, m.cwd, m.branch, m.block_size
+         FROM sessions s LEFT JOIN session_meta m USING (session_key)
+         ORDER BY s.session_no",
+        12,
+    );
+    digest(
+        "SELECT session_no, block_no, bytes, hash FROM blocks ORDER BY session_no, block_no",
+        4,
+    );
     hasher.finalize().to_hex().to_string()
 }
 
-/// Read one turn's bytes out of its session blob, reporting how many blocks
+/// Read one turn's bytes out of its session, reporting how many blocks
 /// had to be decompressed to do it.
 ///
 /// The block count is AC1's instrument and STOR-01's whole claim: "reading a
@@ -476,20 +485,250 @@ pub fn read_turn(conn: &rusqlite::Connection, turn_id: i64) -> (Vec<u8>, usize) 
         )
         .unwrap_or_else(|e| panic!("turn {turn_id}: {e}"));
 
-    let blob: Vec<u8> = conn
+    // The product's own read path, because the block count is the product's.
+    let read = crate::store::archive::ranges(conn, &session_key, &[(offset as u64, len as u64)])
+        .unwrap_or_else(|e| panic!("archive for {session_key}: {e}"))
+        .unwrap_or_else(|| panic!("{session_key} has stored bytes"));
+    let bytes = read
+        .bytes
+        .into_iter()
+        .next()
+        .expect("one range asked, one answered")
+        .expect("a turn's range is inside its own session stream");
+    (bytes, read.blocks_decompressed)
+}
+
+// The archive as the tests read it. Every helper below uses its own SQL and
+// the block codec directly, and never `store::archive`: a test that checks a
+// product number against what is stored would otherwise be checking the
+// product's read path against itself.
+
+/// One session's `session_no`. Panics when it has no `sessions` row.
+fn session_no(conn: &rusqlite::Connection, session_key: &str) -> i64 {
+    conn.query_row(
+        "SELECT session_no FROM sessions WHERE session_key = ?1",
+        [session_key],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|e| panic!("no sessions row for {session_key}: {e}"))
+}
+
+/// One session's block rows, `(block_no, bytes, hash)` in `block_no` order.
+pub fn block_rows(conn: &rusqlite::Connection, session_key: &str) -> Vec<(i64, Vec<u8>, Vec<u8>)> {
+    let session_no = session_no(conn, session_key);
+    conn.prepare("SELECT block_no, bytes, hash FROM blocks WHERE session_no = ?1 ORDER BY block_no")
+        .expect("prepare the block scan")
+        .query_map([session_no], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .expect("run the block scan")
+        .map(|r| r.expect("read a block row"))
+        .collect()
+}
+
+/// One session's stored archive: every block row's number, bytes and hash, in
+/// order, for comparing two reads or two stores with `==`.
+pub fn stored(conn: &rusqlite::Connection, session_key: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (block_no, bytes, hash) in block_rows(conn, session_key) {
+        out.extend_from_slice(&block_no.to_le_bytes());
+        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        out.extend_from_slice(&bytes);
+        out.extend_from_slice(&(hash.len() as u64).to_le_bytes());
+        out.extend_from_slice(&hash);
+    }
+    out
+}
+
+/// How many archive bytes one session has stored: its block rows' lengths,
+/// summed.
+pub fn stored_len(conn: &rusqlite::Connection, session_key: &str) -> i64 {
+    let session_no = session_no(conn, session_key);
+    conn.query_row(
+        "SELECT coalesce(sum(length(bytes)), 0) FROM blocks WHERE session_no = ?1",
+        [session_no],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|e| panic!("stored length of {session_key}: {e}"))
+}
+
+/// Every block row's length, summed over the whole store in one statement.
+pub fn stored_total(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row(
+        "SELECT coalesce(sum(length(bytes)), 0) FROM blocks",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or_else(|e| panic!("sum the stored archive: {e}"))
+}
+
+/// One session's block size and stream length as `session_meta` records them.
+fn layout(conn: &rusqlite::Connection, session_key: &str) -> (Option<i64>, Option<i64>) {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT block_size, uncompressed_len FROM session_meta WHERE session_key = ?1",
+        [session_key],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .unwrap_or_else(|e| panic!("layout of {session_key}: {e}"))
+    .unwrap_or((None, None))
+}
+
+/// One session's whole uncompressed stream, or the error its stored rows give.
+pub fn stream(conn: &rusqlite::Connection, session_key: &str) -> crate::Result<Vec<u8>> {
+    let rows = block_rows(conn, session_key);
+    let (block_size, len) = layout(conn, session_key);
+    let bad = |detail: &str| crate::Error::BlobFormat {
+        detail: format!("{session_key}: {detail}"),
+    };
+    let block_size = u32::try_from(block_size.ok_or_else(|| bad("no block size"))?)
+        .map_err(|_| bad("block size out of range"))?;
+    let len = u64::try_from(len.ok_or_else(|| bad("no stream length"))?)
+        .map_err(|_| bad("negative stream length"))?;
+    let reader = crate::blob::BlockReader::new(block_size, len)?;
+    reader.read_range(0, len, |block_no| {
+        rows.get(block_no as usize)
+            .filter(|(no, _, _)| *no == block_no as i64)
+            .map(|(_, bytes, _)| bytes.as_slice())
+    })
+}
+
+/// Damage one session's stored bytes so they no longer decode.
+///
+/// Every compressed byte of every row is zeroed and every stored hash is left
+/// alone, so the failure lands where bit-rot would, in the decompressor.
+pub fn damage(conn: &rusqlite::Connection, session_key: &str) {
+    let session_no = session_no(conn, session_key);
+    let changed = conn
+        .execute(
+            "UPDATE blocks SET bytes = zeroblob(length(bytes)) WHERE session_no = ?1",
+            [session_no],
+        )
+        .unwrap_or_else(|e| panic!("damage {session_key}: {e}"));
+    assert!(changed > 0, "{session_key} has no block to damage");
+}
+
+/// How many distinct block rows the turns' `stream_offset` and `byte_len`
+/// cover, at each session's recorded block size: the most a read of exactly
+/// those turns may fetch (D-13). A repeated id counts once.
+pub fn covered_blocks(conn: &rusqlite::Connection, turn_ids: &[i64]) -> usize {
+    let mut covered = std::collections::BTreeSet::new();
+    for id in turn_ids {
+        let (session_key, offset, len, block_size): (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT t.session_key, t.stream_offset, t.byte_len, m.block_size
+                   FROM turns t JOIN session_meta m USING (session_key)
+                  WHERE t.id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap_or_else(|e| panic!("turn {id}: {e}"));
+        if len > 0 {
+            for block_no in offset / block_size..=(offset + len - 1) / block_size {
+                covered.insert((session_key.clone(), block_no));
+            }
+        }
+    }
+    covered.len()
+}
+
+/// How many block rows one session has.
+pub fn block_count(conn: &rusqlite::Connection, session_key: &str) -> usize {
+    block_rows(conn, session_key).len()
+}
+
+/// Flip one byte in the middle of one block row's compressed bytes, leaving
+/// its hash and every other row alone.
+pub fn flip_block_byte(conn: &rusqlite::Connection, session_key: &str, block_no: i64) {
+    let session_no = session_no(conn, session_key);
+    let mut bytes: Vec<u8> = conn
         .query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [&session_key],
+            "SELECT bytes FROM blocks WHERE session_no = ?1 AND block_no = ?2",
+            rusqlite::params![session_no, block_no],
             |r| r.get(0),
         )
-        .unwrap_or_else(|e| panic!("blob for {session_key}: {e}"));
+        .unwrap_or_else(|e| panic!("block {block_no} of {session_key}: {e}"));
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0xff;
+    conn.execute(
+        "UPDATE blocks SET bytes = ?3 WHERE session_no = ?1 AND block_no = ?2",
+        rusqlite::params![session_no, block_no, bytes],
+    )
+    .unwrap_or_else(|e| panic!("flip a byte in block {block_no} of {session_key}: {e}"));
+}
 
-    let reader = crate::blob::BlobReader::open(&blob).expect("a stored blob parses");
-    reader.reset_block_counter();
-    let bytes = reader
-        .read_range(offset as u64, len as u64)
-        .expect("a turn's range is inside its own session stream");
-    (bytes, reader.blocks_decompressed())
+/// Delete one block row of one session.
+pub fn delete_block(conn: &rusqlite::Connection, session_key: &str, block_no: i64) {
+    let changed = conn
+        .execute(
+            "DELETE FROM blocks WHERE session_no = ?1 AND block_no = ?2",
+            rusqlite::params![session_no(conn, session_key), block_no],
+        )
+        .unwrap_or_else(|e| panic!("delete block {block_no} of {session_key}: {e}"));
+    assert_eq!(changed, 1, "{session_key} has no block {block_no}");
+}
+
+/// Replace one session's stream with `stream`, validly encoded at the session's
+/// block size, and leave its metadata alone.
+pub fn rewrite_stream(conn: &rusqlite::Connection, session_key: &str, stream: &[u8]) {
+    let session_no = session_no(conn, session_key);
+    let block_size = layout(conn, session_key)
+        .0
+        .map_or(crate::blob::BLOCK_SIZE as u32, |size| size as u32);
+    let blocks = crate::blob::block::cut(stream, block_size, 0).expect("encode the replacement");
+    clear_blocks(conn, session_no);
+    for block in blocks {
+        conn.execute(
+            "INSERT INTO blocks (session_no, block_no, bytes, hash) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                session_no,
+                block.block_no as i64,
+                block.bytes,
+                block.hash.as_slice()
+            ],
+        )
+        .unwrap_or_else(|e| panic!("rewrite {session_key}: {e}"));
+    }
+}
+
+/// Delete one session's block rows and mark it evicted, the way retention
+/// evicts one.
+pub fn evict(conn: &rusqlite::Connection, session_key: &str) {
+    clear_blocks(conn, session_no(conn, session_key));
+    let changed = conn
+        .execute(
+            "UPDATE session_meta SET is_evicted = 1 WHERE session_key = ?1",
+            [session_key],
+        )
+        .unwrap_or_else(|e| panic!("mark {session_key} evicted: {e}"));
+    assert_eq!(changed, 1, "no session_meta row for {session_key}");
+}
+
+/// Insert a `sessions` row holding `bytes` as its one block row, with no
+/// metadata, or no block row at all when `bytes` is empty. For tests that plant
+/// sessions rather than ingest them.
+pub fn plant_session(
+    conn: &rusqlite::Connection,
+    session_key: &str,
+    session_no: i64,
+    bytes: &[u8],
+) {
+    conn.execute(
+        "INSERT INTO sessions (session_key, session_no) VALUES (?1, ?2)",
+        rusqlite::params![session_key, session_no],
+    )
+    .unwrap_or_else(|e| panic!("plant {session_key}: {e}"));
+    if !bytes.is_empty() {
+        conn.execute(
+            "INSERT INTO blocks (session_no, block_no, bytes, hash) VALUES (?1, 0, ?2, ?3)",
+            rusqlite::params![session_no, bytes, blake3::hash(bytes).as_bytes().as_slice()],
+        )
+        .unwrap_or_else(|e| panic!("plant a block for {session_key}: {e}"));
+    }
+}
+
+fn clear_blocks(conn: &rusqlite::Connection, session_no: i64) {
+    conn.execute("DELETE FROM blocks WHERE session_no = ?1", [session_no])
+        .unwrap_or_else(|e| panic!("clear the blocks of session {session_no}: {e}"));
 }
 
 /// SplitMix64. A test that generates its own inputs has to be reproducible
@@ -527,6 +766,102 @@ pub fn seed(label: &str) -> u64 {
     seed
 }
 
+/// The variable every `claude` process terminus starts must carry, so the fake
+/// records it on every call.
+pub const NONESSENTIAL_TRAFFIC: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+
+/// Write a fake `claude` into `dir` and return its path.
+///
+/// A real `claude` run from a test writes its own keys into the fixture's
+/// `.claude.json`, creates `backups/` and connects to `api.anthropic.com`, so
+/// no test may start one. The fake appends one record per run to `log` (see
+/// [`fake_claude_calls`]), prints `stderr` to stderr when it is not empty, and
+/// exits with `status`. Asked for `--version` alone it prints the version line
+/// doctor reads and exits 0.
+///
+/// Builtins only: the `PATH` it runs under holds the fake and nothing else.
+/// Writing it again over the same path replaces it.
+pub fn fake_claude(dir: &Path, log: &Path, stderr: &str, status: i32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let quoted_log = quote(&log.display().to_string());
+    let complain = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("printf '%s\\n' {} >&2\n", quote(stderr))
+    };
+    let script = format!(
+        "#!/bin/sh\n\
+         {{\n\
+         printf 'call\\n'\n\
+         printf 'traffic=%s\\n' \"${{{NONESSENTIAL_TRAFFIC}-<unset>}}\"\n\
+         for arg in \"$@\"; do printf 'arg=%s\\n' \"$arg\"; done\n\
+         }} >> {quoted_log}\n\
+         if [ \"$#\" -eq 1 ] && [ \"$1\" = --version ]; then\n\
+         printf '2.1.296 (Claude Code)\\n'\n\
+         exit 0\n\
+         fi\n\
+         {complain}\
+         exit {status}\n"
+    );
+    // The log exists from here on, so a test listing its directory sees the same
+    // names whether or not anything ran.
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .unwrap_or_else(|e| panic!("create {}: {e}", log.display()));
+    let path = dir.join("claude");
+    std::fs::write(&path, script).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+    path
+}
+
+/// One run of the fake `claude`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeCall {
+    /// Every argument, in order.
+    pub args: Vec<String>,
+    /// [`NONESSENTIAL_TRAFFIC`] as the process saw it, `None` when unset.
+    pub traffic: Option<String>,
+}
+
+/// Every run the fake `claude` logged to `log`, oldest first. No log file is
+/// no runs.
+///
+/// An argument holding a newline would split across records; nothing terminus
+/// passes holds one, and the compact JSON it passes is a single line.
+pub fn fake_claude_calls(log: &Path) -> Vec<FakeCall> {
+    let Ok(text) = std::fs::read_to_string(log) else {
+        return Vec::new();
+    };
+    let mut calls: Vec<FakeCall> = Vec::new();
+    for line in text.lines() {
+        if line == "call" {
+            calls.push(FakeCall {
+                args: Vec::new(),
+                traffic: None,
+            });
+            continue;
+        }
+        let call = calls.last_mut().expect("a record starts with 'call'");
+        if let Some(value) = line.strip_prefix("traffic=") {
+            call.traffic = (value != "<unset>").then(|| value.to_owned());
+        } else if let Some(arg) = line.strip_prefix("arg=") {
+            call.args.push(arg.to_owned());
+        } else {
+            panic!("an unreadable line in {}: {line:?}", log.display());
+        }
+    }
+    calls
+}
+
+/// `text` as one single-quoted shell word.
+fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 /// Copy a fixture into `dir` (a temp dir, in every current caller) and return
 /// the path of the copy.
 ///
@@ -543,220 +878,4 @@ pub fn copy_fixture_into(name: &str, dir: &Path) -> PathBuf {
     std::fs::copy(fixture_path(name), &dest)
         .unwrap_or_else(|e| panic!("copy {name} to {}: {e}", dest.display()));
     dest
-}
-
-// ---------------------------------------------------------------------------
-// A real HTTP endpoint on a loopback port (D-20)
-//
-// The project bars mocks - "real SQLite temp databases, never mocks"
-// (DESIGN-BRIEF.md:500) - and a provider test is exactly where a mock would be
-// reached for. So this is a `std::net::TcpListener`, real sockets and real
-// bytes, speaking one canned HTTP/1.1 response per connection and handing back
-// the requests it received so a test can assert over what actually went out.
-//
-// One response per CONNECTION and not per request: `observe::net` builds a
-// fresh client for every call, so one call is one connection, and "exactly one
-// request was made" is answerable by counting what this received.
-
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
-
-/// Content that is prose where strict JSON was asked for.
-///
-/// OBS-04's arm exists for the model that answers helpfully instead of
-/// answering in the schema, and this is what that looks like.
-pub const UNPARSEABLE_CONTENT: &str =
-    "Sure! Here's a summary of the session: you fixed the ingest lock and then \
-     went to lunch.";
-
-/// A canned HTTP/1.1 response with a JSON body.
-pub fn http_response(status: u16, reason: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {body}",
-        body.len()
-    )
-}
-
-/// A canned 200 in the shape an OpenAI-compatible endpoint answers in.
-///
-/// `content` is placed at `choices[0].message.content` and is JSON-escaped on
-/// the way in, so a caller can hand it prose, quotes or a whole JSON document.
-pub fn chat_completion(content: &str, prompt_tokens: u64, completion_tokens: u64) -> String {
-    let body = serde_json::json!({
-        "id": "chatcmpl-testkit",
-        "object": "chat.completion",
-        "model": "testkit",
-        "choices": [{
-            "index": 0,
-            "finish_reason": "stop",
-            "message": { "role": "assistant", "content": content },
-        }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
-    });
-    http_response(200, "OK", &body.to_string())
-}
-
-/// A loopback HTTP endpoint serving a fixed list of canned responses.
-pub struct HttpStub {
-    base: String,
-    addr: SocketAddr,
-    stop: Arc<AtomicBool>,
-    arrived: Arc<AtomicUsize>,
-    served: Option<std::thread::JoinHandle<Vec<String>>>,
-}
-
-impl HttpStub {
-    /// Serve `responses` in order, one per connection, then stop accepting.
-    ///
-    /// A connection arriving after the list is exhausted gets a 500, so an
-    /// extra request is a visible failure rather than a hang.
-    pub fn serving(responses: &[String]) -> HttpStub {
-        HttpStub::new(responses, std::time::Duration::ZERO)
-    }
-
-    /// Accept one request, hold it for `hold`, and only then answer.
-    ///
-    /// The arm D-07 is asserted with: a provider that is slow rather than
-    /// broken. A test watches [`HttpStub::arrived`] until the request lands,
-    /// which is a window in which the caller is provably inside the HTTP call,
-    /// and then checks that the ingest lock is free anyway.
-    ///
-    /// It answers eventually rather than never, so the pass under test finishes
-    /// and its thread can be joined instead of leaking into the next test.
-    pub fn stalling(hold: std::time::Duration) -> HttpStub {
-        HttpStub::new(&[http_response(503, "Service Unavailable", "{}")], hold)
-    }
-
-    fn new(responses: &[String], hold: std::time::Duration) -> HttpStub {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
-        let addr = listener.local_addr().expect("the bound address");
-        let stop = Arc::new(AtomicBool::new(false));
-        let arrived = Arc::new(AtomicUsize::new(0));
-
-        let responses: Vec<String> = responses.to_vec();
-        let wanted = responses.len();
-        let flag = Arc::clone(&stop);
-        let counter = Arc::clone(&arrived);
-        let served = std::thread::spawn(move || {
-            let mut requests = Vec::new();
-            while requests.len() < wanted {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    break;
-                };
-                // The wake-up connection [`HttpStub::requests`] makes to
-                // unblock this accept, rather than a client with a request.
-                if flag.load(Ordering::SeqCst) {
-                    break;
-                }
-                requests.push(read_http_request(&mut stream));
-                // Counted after the request is fully read and BEFORE the hold,
-                // so a test waiting on this knows the caller is inside the
-                // exchange rather than still opening a socket.
-                counter.fetch_add(1, Ordering::SeqCst);
-                if !hold.is_zero() {
-                    std::thread::sleep(hold);
-                }
-                let response = responses
-                    .get(requests.len() - 1)
-                    .cloned()
-                    .unwrap_or_else(|| http_response(500, "Internal Server Error", "{}"));
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-                let _ = stream.shutdown(std::net::Shutdown::Write);
-            }
-            requests
-        });
-
-        HttpStub {
-            base: format!("http://{addr}/v1/"),
-            addr,
-            stop,
-            arrived,
-            served: Some(served),
-        }
-    }
-
-    /// The base URL to put in `[provider] base_url`, trailing slash included.
-    pub fn base_url(&self) -> &str {
-        &self.base
-    }
-
-    /// How many requests have been fully read so far.
-    ///
-    /// Readable while the stub is still serving, unlike [`HttpStub::requests`]
-    /// which consumes it: a test asserting something about a call IN FLIGHT has
-    /// no other way to know the call is in flight.
-    pub fn arrived(&self) -> usize {
-        self.arrived.load(Ordering::SeqCst)
-    }
-
-    /// Stop serving and hand back every request that arrived, in order.
-    ///
-    /// Each is the request head and its body, as text.
-    pub fn requests(mut self) -> Vec<String> {
-        self.wake();
-        self.served
-            .take()
-            .expect("the stub was already finished")
-            .join()
-            .expect("the stub thread")
-    }
-
-    /// Unblock an `accept` that is still waiting, so a test that made fewer
-    /// requests than the stub was ready for does not hang.
-    fn wake(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.addr);
-    }
-}
-
-impl Drop for HttpStub {
-    fn drop(&mut self) {
-        // A test that panicked mid-assertion never called `requests`, and its
-        // thread would otherwise sit in `accept` for the life of the harness.
-        if self.served.is_some() {
-            self.wake();
-        }
-    }
-}
-
-/// Read one HTTP request: the head, then exactly the declared body.
-///
-/// To the declared length rather than to EOF, because the client holds the
-/// socket open waiting for a response it has not been given yet.
-fn read_http_request(stream: &mut TcpStream) -> String {
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        match stream.read(&mut byte) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => head.push(byte[0]),
-        }
-    }
-    let head = String::from_utf8_lossy(&head).into_owned();
-    let length = head
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())?
-        })
-        .unwrap_or(0);
-    let mut body = vec![0u8; length];
-    if length > 0 && stream.read_exact(&mut body).is_err() {
-        body.clear();
-    }
-    format!("{head}{}", String::from_utf8_lossy(&body))
 }

@@ -1,6 +1,6 @@
-//! Rebuilding every derived table from the blobs alone (STOR-04).
+//! Rebuilding every derived table from the block rows alone (STOR-04).
 //!
-//! The input is the blobs and nothing else. Every table in
+//! The input is the block rows and nothing else. Every table in
 //! `schema::DERIVED_TABLES` - `turns`, `compaction_boundaries`, `turns_fts`,
 //! `entities` and `paths` - is dropped before a single row is read, so a
 //! rebuild cannot quietly carry forward a value only the old rows knew, which
@@ -8,8 +8,9 @@
 //! anything.
 //!
 //! `sessions` and `session_meta` are never touched. The archive table never
-//! migrates (`DESIGN-BRIEF.md:94`), and STOR-05's older-format path rebuilds
-//! derived tables *only*.
+//! migrates (`DESIGN-BRIEF.md:94`): a derived-schema change rebuilds derived
+//! tables *only*, and a store in an older archive format is refused at open
+//! (STOR-10) and never reaches a rebuild.
 //!
 //! Turn ids come out identical because they are derived from `sessions.
 //! session_no` and `turn_seq` (D-10), and `sessions` is never dropped. Without
@@ -48,12 +49,12 @@
 
 use std::path::Path;
 
-use crate::blob;
 use crate::derive::{self, TurnRow};
 use crate::error::Result;
 use crate::parse;
 use crate::store::{
-    schema, Store, ARCHIVE_FORMAT, DERIVED_SCHEMA, META_ARCHIVE_FORMAT, META_DERIVED_SCHEMA,
+    archive, schema, Store, ARCHIVE_FORMAT, DERIVED_SCHEMA, META_ARCHIVE_FORMAT,
+    META_DERIVED_SCHEMA,
 };
 
 /// What a rebuild produced.
@@ -84,7 +85,7 @@ pub struct Rebuilt {
     pub preserved: usize,
 }
 
-/// Drop every derived table and rebuild it from the session blobs.
+/// Drop every derived table and rebuild it from the sessions' block rows.
 ///
 /// One transaction: a rebuild that committed half way would leave the store
 /// with derived tables that describe some sessions and not others, and no
@@ -92,7 +93,7 @@ pub struct Rebuilt {
 pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
     let tx = store.conn_mut().transaction()?;
 
-    // Keys first, blobs one at a time. Selecting `blob` here too would hold the
+    // Keys first, streams one at a time. Reading them here too would hold the
     // whole archive in memory at once - 895 MB of it today and growing with
     // every session ever archived - and this runs inside the ingest lock on the
     // first hook-spawned pass after an upgrade, where an allocation failure
@@ -121,7 +122,7 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
 
     if preserved == 0 {
         // Every store until a user writes a `[retention]` table, and the
-        // stronger guarantee: nothing survives that the blobs did not produce.
+        // stronger guarantee: nothing survives that the block rows did not produce.
         //
         // Children first, and that is not tidiness. The bundled SQLite is
         // compiled with `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`
@@ -162,12 +163,7 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
             clear_derived(&tx, &session_key)?;
         }
         rebuilt.sessions += 1;
-        let bytes: Vec<u8> = tx.query_row(
-            "SELECT blob FROM sessions WHERE session_no = ?1",
-            [session_no],
-            |r| r.get(0),
-        )?;
-        let stream = match blob::read_all(&bytes) {
+        let stream = match archive::stream(&tx, &session_key)? {
             Ok(stream) => stream,
             Err(e) => {
                 // Named and skipped. `verify` is the command that reports this
@@ -248,9 +244,12 @@ fn clear_derived(tx: &rusqlite::Connection, session_key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Open a store, rebuilding its derived tables first if it predates this build.
+/// Open a store, rebuilding its derived tables first if its derived schema
+/// differs from this build's.
 ///
-/// STOR-05's older-format branch. It lives here and not in [`Store::open`] on
+/// An older archive format never gets here: [`Store::open`] refuses it
+/// (STOR-10), because there is no conversion and a rebuild would fail every
+/// session. The rebuild lives here and not in [`Store::open`] on
 /// purpose: opening a store is a read, and a read that silently rewrites four
 /// tables is not one. `Store::open` reports the outcome
 /// ([`Store::rebuild_required`]) and this is the caller that acts on it, so

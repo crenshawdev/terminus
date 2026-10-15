@@ -1,56 +1,41 @@
-//! `terminus uninstall`: take out exactly what install put in, and nothing
-//! else (INST-07, D-13).
+//! `terminus uninstall`: take out what install put in, and nothing else
+//! (INST-07).
 //!
-//! # What "only what install added" means
+//! Install adds four hook entries to `settings.json`, a version file in the
+//! versions folder, and a link to it at the stable path. Uninstall removes the
+//! entries and the link and keeps the versions: a session that is already
+//! running, and the ingest its hook started, run from those files, so it prints
+//! the folder's path and leaves it in place. The MCP registration is removed by
+//! running `claude mcp remove`, and only when `.claude.json` holds one. That
+//! file is read and never written: Claude Code is its only writer. An old
+//! `.claude.json.terminus-backup` is left where it is and its path printed,
+//! because putting it back would roll back Claude Code's own state.
 //!
-//! Every hook entry whose `command` is the stable path, wherever it sits: an
-//! entry is terminus's when its command is that path and is not read past that
-//! field otherwise, which is install's own rule for ownership read backwards.
-//! The walk is over the event keys the file *has* rather than the four this
-//! build writes, so an entry left by an older terminus under an event this one
-//! no longer uses is still terminus's and still goes. Plus the `terminus` key
-//! under `.mcpServers`, and nothing else in either file.
+//! # The hook entries
 //!
-//! A group left with no entries goes with them - a `{"matcher": "", "hooks":
-//! []}` install created is not a thing to leave behind - and an event key left
-//! with no groups goes only when install's backup proves the key was not there
-//! before. Measured 2026-08-13, a real `settings.json` carries
-//! `"SessionStart": []` written by Claude Code itself, so an empty array is not
-//! evidence of anything on its own. No backup means no proof, and no proof
-//! means the key stays.
+//! An entry is terminus's when its `command` is the stable path. The walk is
+//! over every event key the file has, so an entry an older terminus left under
+//! an event this build no longer uses still goes. A group left empty goes with
+//! it. An event key left empty goes only when install's backup proves it was
+//! not there before, because Claude Code itself writes `"SessionStart": []`.
 //!
-//! Never a whole-object replacement: `settings.json` carries 29 top-level keys
-//! including the `theme`, `model` and `statusLine` Claude Code's own UI writes,
-//! and `.claude.json` carries 240 KB of the user's project history.
-//!
-//! # The restore, and when it is refused (AC7)
-//!
-//! After the removal, the file is compared with install's backup - as values,
-//! by rendering both, so formatting alone never decides it. Equal means nothing
-//! but terminus's entries has changed since install, and the backup's *bytes*
-//! go back: the user's own formatting and key order, exactly as they were.
-//! Different means the user has edited it since - a `/config` change to `theme`
-//! is what that looks like - and then the surgically edited file stands and the
-//! backup stays where it is. Uninstall says which of the two happened, because
-//! they leave the machine in different states.
+//! Then the file is compared with install's backup, as values. Equal means
+//! nothing but terminus's entries changed, and the backup's bytes go back.
+//! Different means the user edited it since, so the edited file stands and the
+//! backup stays. Uninstall says which happened.
 //!
 //! # Partly broken is ordinary
 //!
-//! A settings file that is gone, a backup that is gone, an entry somebody
-//! already removed by hand, a stable path holding somebody else's program:
-//! each is one reported line and uninstall carries on to the rest. A user
-//! reaching for uninstall is often reaching for it *because* something is
-//! wrong, and a cleanup that aborts on the first surprise leaves them worse off
-//! than when they started.
+//! A missing file, a missing backup, an entry already removed by hand, a
+//! `claude` that is not there or fails: each is reported and uninstall carries
+//! on to the rest, then exits 1 if anything did not go as it should.
 //!
-//! # The archive is never collateral (INST-07)
+//! # The archive
 //!
-//! The data directory is left alone and its path is printed. `--purge` is the
-//! only thing in this phase that destroys anything the user cannot get back, so
-//! it shows the path and the size first, asks once through install's own
-//! confirmation - same `--yes`, same refusal when there is no answer to read -
-//! and takes the ingest lock before it deletes, so it can never pull the store
-//! out from under a pass that is mid-transaction.
+//! The data directory is left alone and its path printed. `--purge` deletes it
+//! after showing the path and the size and asking once, and takes the ingest
+//! lock first so it never pulls the store out from under a running pass. It
+//! never deletes the versions folder.
 //!
 //! Human-only, no `--json` (D-24).
 
@@ -60,8 +45,8 @@ use std::path::Path;
 use terminus_core::ingest::lock;
 use terminus_core::store::DB_FILE_NAME;
 
-use super::install::json_file::{Document, Json};
-use super::install::{self, binary, targets};
+use super::install::json_file::{self, Document, Json};
+use super::install::{self, binary, claude, targets};
 use super::Failure;
 
 pub struct Options {
@@ -89,31 +74,42 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Options, Failure> {
 
 pub fn run(options: Options) -> Result<(), Failure> {
     let stable = binary::stable_path()?;
+    let versions = binary::versions_dir()?;
     let data_dir = super::data_dir()?;
 
-    println!("terminus uninstall");
-    println!();
+    outln!("terminus uninstall");
+    outln!();
 
     // Each of these reports its own lines and returns whether it did what it
     // set out to do. They are ordered the way install writes them, and one
     // failing never stops the next: a half-wired machine is exactly the one
     // this command exists for.
-    let mut ok = clean(&targets::settings_path()?, &stable, Part::Hooks);
-    ok &= clean(&targets::claude_json_path()?, &stable, Part::McpServer);
-    ok &= unplace(&stable);
+    let mut ok = clean(&targets::settings_path()?, &stable);
+    ok &= unregister(&targets::claude_json_path()?);
+    ok &= unplace(&stable, &versions);
 
-    println!("  data directory  {}", data_dir.display());
+    outln!("  versions        {}", versions.display());
+    if std::fs::symlink_metadata(&versions).is_ok() {
+        outln!(
+            "    kept: a session that is already running may be running from one of these.\n    \
+             to delete them too, remove the folder once no session is running"
+        );
+    } else {
+        outln!("    not there: nothing to keep");
+    }
+
+    outln!("  data directory  {}", data_dir.display());
     if !options.purge {
-        println!(
+        outln!(
             "    kept: the archive is the product, and uninstall never deletes it.\n    \
              to delete it too: terminus uninstall --purge"
         );
-        println!();
+        outln!();
         return finish(ok);
     }
-    println!();
+    outln!();
     purge(&data_dir, options.yes)?;
-    println!();
+    outln!();
     finish(ok)
 }
 
@@ -127,48 +123,21 @@ fn finish(ok: bool) -> Result<(), Failure> {
     Err(Failure::Silent)
 }
 
-/// Which of install's two edits this file holds.
-///
-/// Not both against both files: install writes hook entries to `settings.json`
-/// and the server registration to `.claude.json` (D-05), and uninstall removes
-/// what install added rather than searching each file for the other's shape.
-#[derive(Clone, Copy)]
-enum Part {
-    Hooks,
-    McpServer,
-}
-
-impl Part {
-    fn what(self, count: usize) -> String {
-        match self {
-            Part::Hooks => format!("{count} hook entr{}", if count == 1 { "y" } else { "ies" }),
-            Part::McpServer => format!("the mcp registration '{}'", targets::MCP_SERVER_KEY),
-        }
-    }
-
-    fn nothing(self) -> &'static str {
-        match self {
-            Part::Hooks => "no hook entry of terminus's was there",
-            Part::McpServer => "no mcp registration of terminus's was there",
-        }
-    }
-}
-
-/// One file: take terminus's entries out, then decide between the edited file
-/// and install's backup.
-fn clean(path: &Path, stable: &Path, part: Part) -> bool {
-    println!("  {}", path.display());
+/// `settings.json`: take terminus's hook entries out, then decide between the
+/// edited file and install's backup.
+fn clean(path: &Path, stable: &Path) -> bool {
+    outln!("  {}", path.display());
     let stable = stable.display().to_string();
 
     let document = match Document::read(path) {
         Ok(document) => document,
         Err(failure) => {
-            println!("    left alone: {}", detail(failure));
+            outln!("    left alone: {}", detail(failure));
             return false;
         }
     };
     if !document.exists() {
-        println!("    not there: nothing to remove");
+        outln!("    not there: nothing to remove");
         return true;
     }
 
@@ -184,25 +153,29 @@ fn clean(path: &Path, stable: &Path, part: Part) -> bool {
 
     let removed = Cell::new(0usize);
     let before = backup.as_ref().map(Document::value);
-    let edit = |root: &mut Json| strip(root, part, &stable, before, &removed);
+    let edit = |root: &mut Json| strip_hooks(root, &stable, before, &removed);
     if let Err(failure) = document.apply(&edit) {
-        println!("    left alone: {}", detail(failure));
+        outln!("    left alone: {}", detail(failure));
         return false;
     }
     let Some(count) = std::num::NonZeroUsize::new(removed.get()) else {
-        println!("    {}", part.nothing());
+        outln!("    no hook entry of terminus's was there");
         // Nothing changed, so there is no restore to decide - but a backup
         // still sitting there is a file the user did not put there, and saying
         // where it is beats leaving it to be found.
         if let (Some(path), Some(_)) = (&backup_path, &backup) {
-            println!(
+            outln!(
                 "    install's backup is still beside it at {}",
                 path.display()
             );
         }
         return true;
     };
-    println!("    removed {}", part.what(count.get()));
+    let count = count.get();
+    outln!(
+        "    removed {count} hook entr{}",
+        if count == 1 { "y" } else { "ies" }
+    );
 
     restore(path, backup_path.as_deref(), backup)
 }
@@ -216,7 +189,7 @@ fn clean(path: &Path, stable: &Path, part: Part) -> bool {
 /// the restore.
 fn restore(path: &Path, backup_path: Option<&Path>, backup: Option<Document>) -> bool {
     let (Some(backup_path), Some(backup)) = (backup_path, backup) else {
-        println!("    no backup from install here, so there is nothing to put back");
+        outln!("    no backup from install here, so there is nothing to put back");
         return true;
     };
     // Fresh, because the removal above just wrote it - and because Claude Code
@@ -224,7 +197,7 @@ fn restore(path: &Path, backup_path: Option<&Path>, backup: Option<Document>) ->
     let current = match Document::read(path) {
         Ok(current) => current,
         Err(failure) => {
-            println!(
+            outln!(
                 "    backup kept at {}: {}",
                 backup_path.display(),
                 detail(failure)
@@ -233,7 +206,7 @@ fn restore(path: &Path, backup_path: Option<&Path>, backup: Option<Document>) ->
         }
     };
     if current.rendered() != backup.rendered() {
-        println!(
+        outln!(
             "    this file has changed since install, so the edit above stands.\n    \
              the pre-install copy is still at {}",
             backup_path.display()
@@ -241,7 +214,7 @@ fn restore(path: &Path, backup_path: Option<&Path>, backup: Option<Document>) ->
         return true;
     }
     if let Err(failure) = current.overwrite(backup.source()) {
-        println!(
+        outln!(
             "    backup kept at {}: {}",
             backup_path.display(),
             detail(failure)
@@ -249,30 +222,17 @@ fn restore(path: &Path, backup_path: Option<&Path>, backup: Option<Document>) ->
         return false;
     }
     if let Err(e) = std::fs::remove_file(backup_path) {
-        println!(
+        outln!(
             "    restored to its pre-install bytes; {} could not be removed: {e}",
             backup_path.display()
         );
         return false;
     }
-    println!("    restored to its pre-install bytes, and the backup is gone");
+    outln!("    restored to its pre-install bytes, and the backup is gone");
     true
 }
 
-/// Take terminus's entries out of one parsed document.
-fn strip(
-    root: &mut Json,
-    part: Part,
-    stable: &str,
-    before: Option<&Json>,
-    removed: &Cell<usize>,
-) -> Result<(), Failure> {
-    match part {
-        Part::Hooks => strip_hooks(root, stable, before, removed),
-        Part::McpServer => strip_server(root, before, removed),
-    }
-}
-
+/// Take terminus's hook entries out of one parsed document.
 fn strip_hooks(
     root: &mut Json,
     stable: &str,
@@ -319,23 +279,6 @@ fn strip_hooks(
     Ok(())
 }
 
-fn strip_server(
-    root: &mut Json,
-    before: Option<&Json>,
-    removed: &Cell<usize>,
-) -> Result<(), Failure> {
-    let Some(servers) = root.get_mut("mcpServers") else {
-        return Ok(());
-    };
-    if servers.remove(targets::MCP_SERVER_KEY).is_some() {
-        removed.set(removed.get() + 1);
-    }
-    if empty(servers) && install_created(before, &["mcpServers"]) {
-        root.remove("mcpServers");
-    }
-    Ok(())
-}
-
 /// Does install's backup prove this container was not in the file before?
 ///
 /// `false` when there is no backup: no proof, and an empty container the user
@@ -362,38 +305,130 @@ fn empty(value: &Json) -> bool {
     }
 }
 
-/// Remove the copy at the stable path, and only if it is terminus's (D-07).
-fn unplace(stable: &Path) -> bool {
-    println!("  {}", stable.display());
-    match binary::occupant(stable) {
-        Ok(binary::Occupant::Vacant) => {
-            println!("    not there: nothing to remove");
-            true
+/// Remove the MCP registration with `claude mcp remove`, when there is one
+/// (D-13).
+///
+/// Always `--scope user`: without it the remove fails when a local entry of the
+/// same name exists too. With no entry, no `claude` runs. An old
+/// `.claude.json.terminus-backup` is reported, even when the file does not
+/// parse, and never restored or deleted (D-15).
+fn unregister(path: &Path) -> bool {
+    const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", targets::MCP_SERVER_KEY];
+
+    outln!("  {}", path.display());
+    let ok = match Document::read(path) {
+        Err(failure) => {
+            outln!("    left alone: {}", detail(failure));
+            false
         }
+        Ok(document) => {
+            let registered = document
+                .value()
+                .get("mcpServers")
+                .and_then(|servers| servers.get(targets::MCP_SERVER_KEY))
+                .is_some();
+            if !registered {
+                outln!("    no mcp registration of terminus's was there");
+                true
+            } else {
+                match claude::run(&REMOVE).cause() {
+                    None => {
+                        outln!("    removed the mcp registration with claude mcp remove");
+                        true
+                    }
+                    Some(cause) => {
+                        outln!("    the mcp registration is still there: {cause}");
+                        outln!("    to remove it, run  claude {}", REMOVE.join(" "));
+                        false
+                    }
+                }
+            }
+        }
+    };
+
+    if let Ok(backup) = json_file::backup_path_for(path) {
+        if std::fs::symlink_metadata(&backup).is_ok() {
+            outln!(
+                "    an old backup from install is at {}\n    \
+                 it is left in place and not restored, because it holds an older copy of \
+                 Claude Code's own state",
+                backup.display()
+            );
+        }
+    }
+    ok
+}
+
+/// Remove the link at the stable path, and only if it is terminus's (D-07).
+///
+/// `remove_file` takes the link and not the file it names. A marked plain file
+/// an older install left there goes the same way.
+fn unplace(stable: &Path, versions: &Path) -> bool {
+    outln!("  {}", stable.display());
+    match binary::occupant(stable) {
+        Ok(binary::Occupant::Vacant) => unplace_dangling(stable, versions),
         Ok(binary::Occupant::Ours) => match std::fs::remove_file(stable) {
             Ok(()) => {
-                println!("    removed");
+                outln!("    removed");
                 true
             }
             Err(e) => {
-                println!("    could not be removed: {e}");
-                if std::env::current_exe().is_ok_and(|exe| exe == stable) {
-                    // Windows will not unlink a running image. Saying so beats
-                    // leaving the user with an errno.
-                    println!(
-                        "    that file is this running program; on Windows it can only be \
-                         removed after this process exits"
-                    );
-                }
+                outln!("    could not be removed: {e}");
                 false
             }
         },
         Ok(binary::Occupant::Foreign) => {
-            println!("    left alone: not a terminus build, so it is not terminus's to remove");
+            outln!("    left alone: not a terminus build, so it is not terminus's to remove");
             true
         }
         Err(failure) => {
-            println!("    left alone: {}", detail(failure));
+            outln!("    left alone: {}", detail(failure));
+            false
+        }
+    }
+}
+
+/// What `occupant` calls vacant is nothing at all or a link to nothing.
+///
+/// A link to nothing is terminus's when it points into the versions folder,
+/// which is what is left after that folder is deleted, the same rule
+/// `install.sh` uses. Any other is left where it is.
+fn unplace_dangling(stable: &Path, versions: &Path) -> bool {
+    match std::fs::symlink_metadata(stable) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            outln!("    not there: nothing to remove");
+            return true;
+        }
+        Err(e) => {
+            outln!("    left alone: {e}");
+            return false;
+        }
+        Ok(_) => {}
+    }
+    let target = match std::fs::read_link(stable) {
+        Ok(target) => target,
+        Err(e) => {
+            outln!("    left alone: the link could not be read: {e}");
+            return false;
+        }
+    };
+    if !binary::in_versions(&target, versions) {
+        outln!(
+            "    left alone: a link to {}, which is not there and is outside the versions folder",
+            target.display()
+        );
+        return true;
+    }
+    match std::fs::remove_file(stable) {
+        Ok(()) => {
+            outln!(
+                "    removed: a link to {}, which is not there",
+                target.display()
+            );
+            true
+        }
+        Err(e) => {
+            outln!("    could not be removed: {e}");
             false
         }
     }
@@ -410,23 +445,23 @@ fn purge(data_dir: &Path, yes: bool) -> Result<(), Failure> {
         // directory. Either way there is no store to delete, and
         // `remove_dir_all` on a directory terminus cannot recognize is not a
         // mistake worth the one time it would be right.
-        println!("  no store at that path, so there is nothing to purge");
+        outln!("  no store at that path, so there is nothing to purge");
         return Ok(());
     }
     let bytes = size_bytes(data_dir);
-    println!("  --purge deletes the archive itself. this cannot be undone.");
-    println!("    {}", data_dir.display());
-    println!("    {bytes} byte(s) ({})", human(bytes));
-    println!();
+    outln!("  --purge deletes the archive itself. this cannot be undone.");
+    outln!("    {}", data_dir.display());
+    outln!("    {bytes} byte(s) ({})", human(bytes));
+    outln!();
 
     match answered(data_dir, yes) {
         Ok(true) => {}
         Ok(false) => {
-            println!("  the archive was kept.");
+            outln!("  the archive was kept.");
             return Ok(());
         }
         Err(failure) => {
-            println!("  the archive was kept.");
+            outln!("  the archive was kept.");
             return Err(failure);
         }
     }
@@ -438,7 +473,7 @@ fn purge(data_dir: &Path, yes: bool) -> Result<(), Failure> {
     let held = match lock::try_acquire(data_dir)? {
         lock::Attempt::Acquired(held) => held,
         lock::Attempt::Held => {
-            println!("  an ingest is running, so the archive was kept.");
+            outln!("  an ingest is running, so the archive was kept.");
             return Err(Failure::Operational(
                 "another terminus process holds the ingest lock; nothing was deleted".to_owned(),
             ));
@@ -448,27 +483,23 @@ fn purge(data_dir: &Path, yes: bool) -> Result<(), Failure> {
         Failure::Operational(format!("{} could not be removed: {e}", data_dir.display()))
     })?;
     drop(held);
-    println!("  deleted {bytes} byte(s) at {}", data_dir.display());
+    outln!("  deleted {bytes} byte(s) at {}", data_dir.display());
     Ok(())
 }
 
-/// The one question `--purge` asks, and the one place `--yes` means something
-/// different here than it does in install.
+/// The one question `--purge` asks.
 ///
-/// Install's `--yes` takes every default; this one takes the delete. The
-/// default for a thing that cannot be undone is no, so a `--yes` that inherited
-/// it would make `uninstall --purge --yes` print the size, decline its own
-/// question and leave - which is not what anyone typing it asked for.
+/// `--yes` takes the delete. The default for something that cannot be undone
+/// is no, so a `--yes` that took the default would print the size, decline and
+/// leave, which is not what anyone typing it asked for.
 ///
-/// Everything else is [`install::confirm`] unchanged: the same reading of y/n,
-/// the same terminal test, and above all the same refusal when there is no
-/// answer to read rather than an assumed one (INST-08, D-20). That rule is why
-/// this calls into install instead of asking here.
+/// The rest is [`install::confirm`]: the same reading of y/n, and a refusal
+/// rather than an assumed answer when there is nothing to read (INST-08, D-20).
 fn answered(data_dir: &Path, yes: bool) -> Result<bool, Failure> {
     const QUESTION: &str = "  delete it?";
 
     if yes {
-        println!("{QUESTION} [y/N] y (--yes)");
+        outln!("{QUESTION} [y/N] y (--yes)");
         return Ok(true);
     }
     install::confirm(QUESTION, false, false).map_err(|_| {

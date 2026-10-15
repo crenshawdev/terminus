@@ -7,30 +7,28 @@
 //! to snippet. An excerpt built from `snippet()` would validate against the
 //! documented shape, pass every schema test, and tell the reader nothing.
 //!
-//! So the bytes come out of the session blob at the `stream_offset` and
+//! So the bytes come out of the session's block rows at the `stream_offset` and
 //! `byte_len` already on the turn row, and are projected through the same
 //! [`crate::index::text::project`] ingest indexed them with. That is what makes
 //! the excerpt prose rather than a JSON line: the projection is the rule that
 //! knows a `tool_use` block's text from its scaffolding, and writing a second
 //! one here would be a second definition of what a turn said.
 //!
-//! **One blob per session per search (D-20).** rusqlite's incremental blob I/O
-//! is behind a `blob` feature this workspace does not enable, so reading one
-//! turn materializes the whole compressed session - up to 10.1 MB uncompressed
-//! (phase 1 D-05). Hits are therefore grouped by session and each session's
-//! blob is selected once, which bounds the cost per request without eliminating
-//! it.
+//! **Only the covering block rows, once per search (D-13, D-20).** Each turn
+//! reads only the block rows its `stream_offset` and `byte_len` cover. Hits are
+//! grouped by session, so a row that several hits share is fetched and
+//! decompressed once per search, and [`Reads`] counts both.
 
 use std::collections::BTreeMap;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
-use crate::blob::BlobReader;
 use crate::error::Result;
 use crate::index::text;
 use crate::observe::egress::Redaction;
 use crate::recall::search::Hit;
 use crate::recall::Query;
+use crate::store::archive;
 
 /// How many characters of context an excerpt carries.
 ///
@@ -42,25 +40,35 @@ pub const EXCERPT_CHARS: usize = 240;
 
 /// What stands where text was cut away.
 ///
-/// ASCII, because this is printed to a terminal whose code page is not ours to
-/// choose - the Windows console is first-class (`.planning/PROJECT.md`) and a
-/// horizontal ellipsis is exactly the character that arrives there as mojibake.
+/// ASCII, because this is printed to a terminal whose encoding is not ours to
+/// choose, and under a locale that is not UTF-8 a horizontal ellipsis is
+/// exactly the character that arrives as mojibake.
 pub const ELISION: &str = "...";
 
-/// How many session blobs an excerpt pass materialized.
+/// What a read cost: block rows fetched from the database and blocks
+/// decompressed (D-14).
 ///
 /// An instrument, not an answer, and in the normal build for the same reason
-/// [`BlobReader::blocks_decompressed`] is: "each session's blob is read at most
-/// once per search" is a claim about a number, so the number is measured rather
+/// [`archive::Ranges::blocks_decompressed`] is: "a turn read fetches only the
+/// rows it covers" is a claim about a number, so the number is measured rather
 /// than argued from the shape of the code.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reads {
-    pub blobs: usize,
+    pub block_rows: usize,
+    pub blocks_decompressed: usize,
 }
 
-/// Give every hit an excerpt, reading each session's blob once.
+impl Reads {
+    /// Count one session's read.
+    pub(crate) fn add(&mut self, read: &archive::Ranges) {
+        self.block_rows += read.rows_fetched;
+        self.blocks_decompressed += read.blocks_decompressed;
+    }
+}
+
+/// Give every hit an excerpt, reading each covering block row once.
 ///
-/// A blob that will not open, a range that will not read, a record that is not
+/// A session whose rows will not read, a range that will not read, a record that is not
 /// JSON: each leaves that one hit with an empty excerpt and every other field
 /// intact. A search is not the command that reports archive damage - `terminus
 /// verify` is - and failing the whole search because one session of many is
@@ -76,7 +84,7 @@ pub fn attach(
     conn: &Connection,
     query: &Query,
     hits: &mut [Hit],
-    redaction: &Redaction<'_>,
+    redaction: &Redaction,
 ) -> Result<Reads> {
     let mut reads = Reads::default();
     if hits.is_empty() {
@@ -85,8 +93,8 @@ pub fn attach(
 
     let coordinates = coordinates(conn, hits)?;
 
-    // Grouped by session, which is the whole of D-20: the blob is selected once
-    // and every turn of that session is cut out of the one copy.
+    // Grouped by session, which is the whole of D-20: each covering row is
+    // fetched once and every turn of that session is cut out of it.
     let mut by_session: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, hit) in hits.iter().enumerate() {
         by_session
@@ -96,26 +104,21 @@ pub fn attach(
     }
 
     for (session_key, indexes) in by_session {
-        let blob: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&session_key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        reads.blobs += 1;
-        let Some(blob) = blob else { continue };
-        let Ok(reader) = BlobReader::open(&blob) else {
+        let located: Vec<(usize, (u64, u64))> = indexes
+            .into_iter()
+            .filter_map(|index| {
+                let (offset, len) = coordinates.get(&hits[index].turn_id)?;
+                Some((index, (*offset as u64, *len as u64)))
+            })
+            .collect();
+        let wanted: Vec<(u64, u64)> = located.iter().map(|(_, range)| *range).collect();
+        let Some(read) = archive::ranges(conn, &session_key, &wanted)? else {
             continue;
         };
+        reads.add(&read);
 
-        for index in indexes {
-            let Some((offset, len)) = coordinates.get(&hits[index].turn_id) else {
-                continue;
-            };
-            let Ok(bytes) = reader.read_range(*offset as u64, *len as u64) else {
-                continue;
-            };
+        for ((index, _), bytes) in located.into_iter().zip(read.bytes) {
+            let Ok(bytes) = bytes else { continue };
             hits[index].excerpt = of_record_with(query, &bytes, redaction);
         }
     }
@@ -125,7 +128,7 @@ pub fn attach(
 
 /// `(stream_offset, byte_len)` for every hit, in one statement.
 ///
-/// D-04: both address the UNCOMPRESSED session stream, never the blob.
+/// D-04: both address the UNCOMPRESSED session stream, never a block row.
 fn coordinates(conn: &Connection, hits: &[Hit]) -> Result<BTreeMap<i64, (i64, i64)>> {
     let ids: Vec<i64> = hits.iter().map(|hit| hit.turn_id).collect();
     let placeholders = std::iter::repeat_n("?", ids.len())
@@ -181,7 +184,7 @@ pub fn of_record(query: &Query, record: &[u8]) -> String {
 /// What it costs is measured rather than argued. Over the live store on
 /// 2026-09-04, scrubbing the real projection of every turn of the 60 most
 /// recent sessions (5,412 records, 12.9 MB) changed 0.18% of projections.
-pub fn of_record_with(query: &Query, record: &[u8], redaction: &Redaction<'_>) -> String {
+pub fn of_record_with(query: &Query, record: &[u8], redaction: &Redaction) -> String {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(record) else {
         // A line that is not JSON is archived verbatim all the same (D-13), and
         // it has no projection. Nothing to excerpt is an empty excerpt.

@@ -1,0 +1,179 @@
+name: release
+
+# A version tag is the only thing that builds a release. CI builds and drafts,
+# and the owner signs and publishes from his own machine, so no key is here.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  build:
+    # Each platform builds on its own runner, so every binary is run where it
+    # was built before it goes in the draft.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            asset: terminus-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: terminus-linux-aarch64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: terminus-macos-x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: terminus-macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      ASSET: ${{ matrix.asset }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the named Rust version
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
+          rustup default "$RUST_VERSION"
+          rustc --version
+
+      # zstd, SQLite and mimalloc are C and have to compile against musl.
+      - name: Install the musl C toolchain
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          musl-gcc --version
+
+      # cc guesses aarch64-linux-musl-gcc for the arm64 target, and Ubuntu's
+      # musl-tools only installs musl-gcc, so the compiler is named outright.
+      # No features: testkit's fault-injection points never ship.
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Linux ]; then
+            export "CC_${TARGET//-/_}=musl-gcc"
+          fi
+          cargo build --release --locked -p terminus --target "$TARGET"
+
+      # The tag is read from GITHUB_REF_NAME, never spliced into the script.
+      - name: Check the version matches the tag
+        run: |
+          set -euo pipefail
+          built="$("target/$TARGET/release/terminus" --version)"
+          tagged="${GITHUB_REF_NAME#v}"
+          if [ "$built" != "$tagged" ]; then
+            echo "::error::$ASSET reports version $built but the tag is $tagged"
+            exit 1
+          fi
+
+      # Nothing may need installing for Terminus to run. Linux builds are
+      # fully static, and macOS only links what every Mac has in /usr/lib/,
+      # since Apple does not support fully static binaries.
+      - name: Check the linkage
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/terminus"
+          if [ "$RUNNER_OS" = Linux ]; then
+            linkage="$(file "$bin")"
+            echo "$linkage"
+            case $linkage in
+              *"statically linked"* | *"static-pie linked"*) ;;
+              *)
+                echo "::error::$ASSET is not statically linked"
+                exit 1
+                ;;
+            esac
+          else
+            otool -L "$bin"
+            outside="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -v '^/usr/lib/' || true)"
+            if [ -n "$outside" ]; then
+              echo "::error::$ASSET links libraries outside /usr/lib/: $outside"
+              exit 1
+            fi
+          fi
+
+      # install.sh reads exactly these two lines, with only the hash on the
+      # second, not the file name sha256sum prints after it.
+      - name: Write the manifest
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp "target/$TARGET/release/terminus" "dist/$ASSET"
+          version="$("dist/$ASSET" --version)"
+          if [ "$RUNNER_OS" = Linux ]; then
+            sum="$(sha256sum "dist/$ASSET")"
+          else
+            sum="$(shasum -a 256 "dist/$ASSET")"
+          fi
+          printf 'version %s\nsha256 %s\n' "$version" "${sum%% *}" > "dist/$ASSET.manifest"
+          cat "dist/$ASSET.manifest"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/
+          if-no-files-found: error
+
+  draft:
+    # needs waits on every platform, so one failed build leaves no draft. This
+    # is the only job that can write to the repo, and it does it with the
+    # job's own token.
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: terminus-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check the draft holds exactly eight files
+        run: |
+          set -euo pipefail
+          want=()
+          for os in linux macos; do
+            for arch in x86_64 aarch64; do
+              want+=("terminus-$os-$arch" "terminus-$os-$arch.manifest")
+            done
+          done
+          missing="$(comm -23 <(printf '%s\n' "${want[@]}" | sort) <(ls -A dist | sort) | paste -sd ' ' -)"
+          extra="$(comm -13 <(printf '%s\n' "${want[@]}" | sort) <(ls -A dist | sort) | paste -sd ' ' -)"
+          if [ -n "$missing$extra" ]; then
+            echo "::error::missing: ${missing:-none}, extra: ${extra:-none}"
+            exit 1
+          fi
+
+      # A draft, never a prerelease: releases/latest skips prereleases, and
+      # that is where install.sh looks once the owner publishes.
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --draft --verify-tag \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --notes ""

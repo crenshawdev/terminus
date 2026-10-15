@@ -12,7 +12,7 @@ use rusqlite::Connection;
 use terminus_core::config::{Config, REDACTED};
 use terminus_core::recall::{
     context, get, search, EntityMatch, Filters, Hit, Query, Reason, Request, Response, Scope,
-    Window, MAX_CONTEXT_SIDE, MAX_QUERY_TOKENS, MAX_RESULTS, OBSERVATION_KIND,
+    Window, MAX_CONTEXT_SIDE, MAX_QUERY_TOKENS, MAX_RESULTS,
 };
 use terminus_core::store::DB_FILE_NAME;
 use terminus_core::{ingest, testkit};
@@ -172,6 +172,40 @@ impl Bench {
         Config::load_from(&dir).unwrap()
     }
 
+    /// A session of at least three blocks: one record whose text is
+    /// `SPANNING_WORD` and then filler past three blocks, and two short records
+    /// after it, each carrying a word of its own.
+    fn spanning(&self) -> PathBuf {
+        let texts = [
+            format!("{SPANNING_WORD} {}", "filler ".repeat(30_000)),
+            format!("{INSIDE_WORD} is a short record"),
+            "and another short record".to_owned(),
+        ];
+        let mut body = String::new();
+        for (n, text) in texts.iter().enumerate() {
+            let line = serde_json::json!({
+                "parentUuid": null,
+                "isSidechain": false,
+                "cwd": self.work.join("spanning").to_string_lossy(),
+                "sessionId": "99999999-9999-4999-8999-999999999999",
+                "type": "user",
+                "uuid": format!("ffffffff-0000-4000-8000-{n:012}"),
+                "timestamp": format!("2026-08-12T23:00:{n:02}.000Z"),
+                "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+            });
+            body.push_str(&line.to_string());
+            body.push('\n');
+        }
+        let path = self.archive(SPANNING, &body);
+        let key = path.canonicalize().unwrap().to_string_lossy().into_owned();
+        let rows = testkit::block_count(&self.conn(), &key);
+        assert!(
+            rows >= 3,
+            "{SPANNING} must be at least three blocks: {rows}"
+        );
+        path
+    }
+
     fn archive(&self, name: &str, body: &str) -> PathBuf {
         let path = self.work.join(name);
         std::fs::write(&path, body).unwrap();
@@ -182,6 +216,11 @@ impl Bench {
         path
     }
 }
+
+/// [`Bench::spanning`]'s file name and the words its first two records carry.
+const SPANNING: &str = "spanning.jsonl";
+const SPANNING_WORD: &str = "pangolinspan";
+const INSIDE_WORD: &str = "aardvarkinside";
 
 /// The turn ids one FTS5 expression returns, or the error it raised.
 ///
@@ -311,6 +350,20 @@ fn a_query_of_no_tokens_makes_no_match_call() {
         let query = Query::parse(raw);
         assert!(query.is_empty(), "`{raw}` produced {:?}", query.tokens());
         assert_eq!(query.match_expression(), None, "`{raw}`");
+    }
+}
+
+/// And the search says so, because an empty result with no reason looks the
+/// same as an empty archive.
+#[test]
+fn a_query_of_no_tokens_is_empty_with_a_reason() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    for raw in ["*", "?!"] {
+        let response = answer(&conn, &[], Scope::Everything, raw);
+        assert!(response.hits.is_empty(), "`{raw}`");
+        assert_eq!(response.reason, Some(Reason::NothingSearchable), "`{raw}`");
     }
 }
 
@@ -1193,11 +1246,8 @@ fn every_hit_carries_an_excerpt_from_the_blob() {
     }
 }
 
-/// D-20: several hits from one session read that session's blob once.
-///
-/// Whole-blob materialization is what this bounds, not decompression: the
-/// `blob` feature that would give the reader incremental I/O is deliberately
-/// not enabled, and one archived session reaches 10.1 MB uncompressed.
+/// D-20: several hits from one session fetch and decompress each block row
+/// they cover once, not once per hit.
 #[test]
 fn one_session_is_read_once_however_many_hits_it_answered() {
     let bench = bench();
@@ -1217,7 +1267,47 @@ fn one_session_is_read_once_however_many_hits_it_answered() {
         "this query needs several hits in one session to be about anything: {:?}",
         response.hits
     );
-    assert_eq!(response.reads.blobs, sessions.len());
+    let ids: Vec<i64> = response.hits.iter().map(|hit| hit.turn_id).collect();
+    let covered = testkit::covered_blocks(&conn, &ids);
+    assert!(covered < response.hits.len(), "no two hits share a row");
+    assert_eq!(response.reads.block_rows, covered, "{:?}", response.reads);
+    assert_eq!(response.reads.blocks_decompressed, covered);
+}
+
+/// AC2 for excerpts: a turn inside one block of a session of three or more
+/// fetches that one row and decompresses that one block.
+#[test]
+fn an_excerpt_of_a_turn_inside_one_block_reads_one_row() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let response = answer(&conn, &[], Scope::Everything, INSIDE_WORD);
+    assert_eq!(response.hits.len(), 1, "{:?}", response.hits);
+    assert!(!response.hits[0].excerpt.is_empty());
+    assert_eq!(
+        testkit::covered_blocks(&conn, &[response.hits[0].turn_id]),
+        1
+    );
+    assert_eq!(response.reads.block_rows, 1, "{:?}", response.reads);
+    assert_eq!(response.reads.blocks_decompressed, 1);
+}
+
+/// AC2 for excerpts: a turn spanning k blocks fetches k rows and decompresses
+/// k blocks, and no other row of its session.
+#[test]
+fn an_excerpt_of_a_turn_spanning_k_blocks_reads_k_rows() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let response = answer(&conn, &[], Scope::Everything, SPANNING_WORD);
+    assert_eq!(response.hits.len(), 1, "{:?}", response.hits);
+    assert!(response.hits[0].excerpt.contains(SPANNING_WORD));
+    let k = testkit::covered_blocks(&conn, &[response.hits[0].turn_id]);
+    assert!(k >= 3, "the turn must span three or more blocks: {k}");
+    assert_eq!(response.reads.block_rows, k, "{:?}", response.reads);
+    assert_eq!(response.reads.blocks_decompressed, k);
 }
 
 /// A long turn is cut down, with the cut marked and the match inside the
@@ -1258,11 +1348,7 @@ fn a_damaged_blob_leaves_an_empty_excerpt_and_a_whole_hit() {
         .expect("the errors fixture answers this query")
         .session_key
         .clone();
-    conn.execute(
-        "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-        rusqlite::params![vec![0u8; 64], &damaged],
-    )
-    .unwrap();
+    testkit::damage(&conn, &damaged);
 
     let after = ranked(&conn, "cargo", MAX_RESULTS);
     assert_eq!(after.len(), before.len(), "the search still answered");
@@ -1286,6 +1372,40 @@ fn turn_at(conn: &Connection, fixture: &str, seq: i64) -> i64 {
         |r| r.get(0),
     )
     .unwrap_or_else(|e| panic!("{fixture} turn {seq}: {e}"))
+}
+
+/// AC2 for context windows: a window of one turn inside one block of a
+/// session of three or more fetches that one row and decompresses that block.
+#[test]
+fn a_context_window_of_a_turn_inside_one_block_reads_one_row() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let anchor = turn_at(&conn, SPANNING, 1);
+    assert_eq!(testkit::covered_blocks(&conn, &[anchor]), 1);
+    let window = around(&conn, &[], anchor, 0, 0);
+    assert_eq!(window.turns.len(), 1, "{window:?}");
+    assert!(window.turns[0].text.contains(INSIDE_WORD), "{window:?}");
+    assert_eq!(window.reads.block_rows, 1, "{:?}", window.reads);
+    assert_eq!(window.reads.blocks_decompressed, 1);
+}
+
+/// AC2 for context windows: a window whose turns span k blocks fetches k rows
+/// and decompresses k blocks, each once though two turns share one.
+#[test]
+fn a_context_window_spanning_k_blocks_reads_k_rows() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let ids = [turn_at(&conn, SPANNING, 0), turn_at(&conn, SPANNING, 1)];
+    let k = testkit::covered_blocks(&conn, &ids);
+    assert!(k >= 3, "the window must span three or more blocks: {k}");
+    let window = around(&conn, &[], ids[1], 1, 0);
+    assert_eq!(window.turns.len(), 2, "{window:?}");
+    assert_eq!(window.reads.block_rows, k, "{:?}", window.reads);
+    assert_eq!(window.reads.blocks_decompressed, k);
 }
 
 fn around(
@@ -1416,7 +1536,9 @@ fn a_window_stops_at_the_session_boundary() {
     }
 }
 
-/// A turn of an excluded project has no window, and says why.
+/// A turn of an excluded project has no window, and at `*` its reason is the
+/// one an unarchived turn gets: naming the project would confirm the turn
+/// exists and say what the excluded project is called.
 #[test]
 fn a_window_into_an_excluded_project_is_empty_with_a_reason() {
     let bench = bench();
@@ -1430,12 +1552,7 @@ fn a_window_into_an_excluded_project_is_empty_with_a_reason() {
 
     let hidden = around(&conn, &[&alpha_key], anchor, 1, 1);
     assert!(hidden.turns.is_empty());
-    assert_eq!(
-        hidden.reason,
-        Some(Reason::ProjectExcluded {
-            project: alpha_key.clone()
-        })
-    );
+    assert_eq!(hidden.reason, Some(Reason::NoSuchTurn { turn_id: anchor }));
 
     // And a turn that is not archived at all is a reason too, not a panic.
     let missing = around(&conn, &[], -1, 1, 1);
@@ -1463,11 +1580,7 @@ fn a_directory_that_is_also_another_rows_pre_worktree_key_scopes_to_itself() {
     let conn = store.conn();
 
     let insert = |key: &str, no: i64, project: &str, pre: Option<&str>| {
-        conn.execute(
-            "INSERT INTO sessions (session_key, session_no, blob) VALUES (?1, ?2, x'00')",
-            rusqlite::params![key, no],
-        )
-        .unwrap();
+        testkit::plant_session(conn, key, no, &[0]);
         conn.execute(
             "INSERT INTO session_meta
                  (session_key, transcript_path, checksum, uncompressed_len,
@@ -1797,15 +1910,11 @@ fn scoped_fetch(
     get::records(conn, &config(exclusions), scope, ids).unwrap()
 }
 
-/// D-20: ids spanning three sessions cost three blob reads, not one per id.
-///
-/// The counter is the assertion, and it has to be: `BlobReader`'s block counter
-/// reports one block decompressed for a single-turn read whether the blob was
-/// materialized once or six times, so phase 1's AC1 stays green either way. Two
-/// ids are taken from one session precisely so "one read per session" and "one
-/// read per id" give different numbers.
+/// D-20: ids across three sessions fetch each covering row once, not once per
+/// id. Two ids are taken from one session and one block precisely so "one
+/// fetch per row" and "one fetch per id" give different numbers.
 #[test]
-fn ids_across_three_sessions_read_three_blobs() {
+fn ids_across_three_sessions_fetch_each_covering_row_once() {
     let bench = bench();
     let conn = bench.conn();
 
@@ -1819,10 +1928,13 @@ fn ids_across_three_sessions_read_three_blobs() {
 
     assert_eq!(fetched.records.len(), 4, "{fetched:?}");
     assert!(fetched.absent.is_empty(), "{fetched:?}");
+    let covered = testkit::covered_blocks(&conn, &ids);
+    assert_eq!(covered, 3, "the two session-recall ids must share a row");
     assert_eq!(
-        fetched.reads.blobs, 3,
-        "four ids across three sessions must cost three blob reads: {fetched:?}"
+        fetched.reads.block_rows, covered,
+        "four ids over three rows must fetch three rows: {fetched:?}"
     );
+    assert_eq!(fetched.reads.blocks_decompressed, covered);
 
     // Answered in the order they were asked for, which is what makes the output
     // of `terminus show a b c` readable.
@@ -1969,7 +2081,7 @@ fn the_knob_filters_the_body_and_leaves_the_archived_line_alone() {
 /// failed read allowed to look like an eviction would report silent data loss as
 /// retention working correctly.
 #[test]
-fn an_evicted_session_returns_the_record_flagged_and_reads_no_blob() {
+fn an_evicted_session_returns_the_record_flagged_and_reads_none_of_its_rows() {
     let bench = bench();
     let conn = bench.conn();
 
@@ -1998,10 +2110,12 @@ fn an_evicted_session_returns_the_record_flagged_and_reads_no_blob() {
     assert!(!kept.body_evicted, "{kept:?}");
     assert!(kept.body.is_some());
 
-    // One blob read, for the one session that still has a body to read.
+    // Only the intact record's rows, for the one session that still has a
+    // body to read.
     assert_eq!(
-        fetched.reads.blobs, 1,
-        "the evicted session's blob was read anyway: {fetched:?}"
+        fetched.reads.block_rows,
+        testkit::covered_blocks(&conn, &[intact]),
+        "the evicted session's rows were read anyway: {fetched:?}"
     );
 }
 
@@ -2030,8 +2144,11 @@ fn an_unknown_id_is_a_reason_and_not_an_error() {
         }],
         "{fetched:?}"
     );
-    // No blob was read for it either.
-    assert_eq!(fetched.reads.blobs, 1);
+    // No row was read for it either.
+    assert_eq!(
+        fetched.reads.block_rows,
+        testkit::covered_blocks(&conn, &[known])
+    );
 }
 
 /// The same id twice is answered once.
@@ -2043,7 +2160,43 @@ fn a_repeated_id_is_answered_once() {
 
     let fetched = fetch(&conn, &[], &[id, id, id]);
     assert_eq!(fetched.records.len(), 1, "{fetched:?}");
-    assert_eq!(fetched.reads.blobs, 1);
+    assert_eq!(
+        fetched.reads.block_rows,
+        testkit::covered_blocks(&conn, &[id])
+    );
+}
+
+/// AC2 for `recall_get`: a record inside one block of a session of three or
+/// more fetches that one row and decompresses that one block.
+#[test]
+fn a_get_of_a_turn_inside_one_block_reads_one_row() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let id = turn_at(&conn, SPANNING, 1);
+    assert_eq!(testkit::covered_blocks(&conn, &[id]), 1);
+    let fetched = fetch(&conn, &[], &[id]);
+    assert!(fetched.records[0].body.is_some(), "{fetched:?}");
+    assert_eq!(fetched.reads.block_rows, 1, "{:?}", fetched.reads);
+    assert_eq!(fetched.reads.blocks_decompressed, 1);
+}
+
+/// AC2 for `recall_get`: a record spanning k blocks fetches k rows and
+/// decompresses k blocks.
+#[test]
+fn a_get_of_a_turn_spanning_k_blocks_reads_k_rows() {
+    let bench = bench();
+    bench.spanning();
+    let conn = bench.conn();
+
+    let id = turn_at(&conn, SPANNING, 0);
+    let k = testkit::covered_blocks(&conn, &[id]);
+    assert!(k >= 3, "the turn must span three or more blocks: {k}");
+    let fetched = fetch(&conn, &[], &[id]);
+    assert!(fetched.records[0].body.is_some(), "{fetched:?}");
+    assert_eq!(fetched.reads.block_rows, k, "{:?}", fetched.reads);
+    assert_eq!(fetched.reads.blocks_decompressed, k);
 }
 
 /// RCL-10 auto-scopes all three tools, and ids are densely enumerable, so a get
@@ -2087,10 +2240,16 @@ fn a_get_is_scoped_like_a_search_is() {
             reason: Reason::NoSuchTurn { turn_id: id },
         }]
     );
-    assert_eq!(across.reads.blobs, 0, "an out-of-scope id read a blob");
+    assert_eq!(
+        across.reads,
+        Default::default(),
+        "an out-of-scope id read a row"
+    );
 }
 
-/// A turn of an excluded project is absent with the exclusion as its reason.
+/// A turn of an excluded project is absent, and at `*` its reason is the one an
+/// unarchived id gets, so the answer neither confirms the id nor names the
+/// project.
 ///
 /// The read half of ING-08 through this door too: exclusion applies on every
 /// read path, and `recall_get` is the one that would hand back the whole record
@@ -2107,206 +2266,14 @@ fn a_get_of_an_excluded_projects_turn_is_absent_with_a_reason() {
     let fetched = scoped_fetch(&conn, &[&excluded], &Scope::Everything, &[id]);
     assert!(fetched.records.is_empty(), "{fetched:?}");
     assert_eq!(fetched.absent.len(), 1, "{fetched:?}");
-    assert!(
-        matches!(
-            fetched.absent[0].reason,
-            Reason::ProjectExcluded { ref project } if project == &excluded
-        ),
+    assert_eq!(
+        fetched.absent[0].reason,
+        Reason::NoSuchTurn { turn_id: id },
         "{fetched:?}"
     );
-    assert_eq!(fetched.reads.blobs, 0, "an excluded turn read a blob");
-}
-
-// ---------------------------------------------------------------------------
-// OBS-08: observations reached through the search the model already has
-//
-// One new value on `kind`, a second query branch, and no fourth MCP tool
-// (D-17, `DESIGN-BRIEF.md:184`). The rows are written straight into the table
-// here rather than bought from a model: what is under test is the query, and
-// how a judgment gets stored is `tests/judgment.rs`'s subject.
-
-/// A word that is really in the corpus exactly once as a turn, so a query for
-/// it has turn hits AND an observation claim to tell apart.
-const SHARED: &str = "brillig";
-
-/// One session's key, found by the fixture file its transcript came from.
-fn key_of(conn: &Connection, fixture: &str) -> String {
-    conn.query_row(
-        "SELECT session_key FROM session_meta WHERE session_key LIKE '%' || ?1",
-        [fixture],
-        |r| r.get(0),
-    )
-    .unwrap_or_else(|e| panic!("no session for {fixture}: {e}"))
-}
-
-/// Store one observation carrying one claim, anchored at a real turn of that
-/// session, and answer with the session key and the anchor.
-fn observe(conn: &Connection, fixture: &str, generated_at: &str, text: &str) -> (String, i64) {
-    let key = key_of(conn, fixture);
-    let anchor: i64 = conn
-        .query_row(
-            "SELECT min(id) FROM turns WHERE session_key = ?1",
-            [&key],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let claims = serde_json::json!([{"turn_id": anchor, "text": text}]).to_string();
-    conn.execute(
-        "INSERT INTO observations (
-            session_key, generated_at, status, model, prompt_version, topic, outcome,
-            decisions, learned, unresolved, tokens
-         ) VALUES (?1, ?2, 'ok', 'stub', 'obs-judgment-1', 'a topic', 'completed',
-                   ?3, '[]', '[]', 1)",
-        rusqlite::params![key, generated_at, claims],
-    )
-    .unwrap();
-    (key, anchor)
-}
-
-/// One search under the observation kind.
-fn claims(conn: &Connection, exclusions: &[&str], scope: Scope, raw: &str) -> Response {
-    search::run(
-        conn,
-        &config(exclusions),
-        &Request::new(Query::parse(raw), scope)
-            .limit(MAX_RESULTS)
-            .filters(Filters {
-                kind: Some(OBSERVATION_KIND.to_owned()),
-                ..Filters::default()
-            }),
-    )
-    .unwrap()
-}
-
-/// OBS-08: the same tool, one new `kind`, and every hit still carries a
-/// `turn_id` that selects a real turn.
-#[test]
-fn the_observation_kind_returns_claims_anchored_to_real_turns() {
-    let bench = bench();
-    let conn = bench.conn();
-    let claim = format!("the {SHARED} helper was replaced by the steady one");
-    let (key, anchor) = observe(
-        &conn,
-        "session-recall.jsonl",
-        "2026-08-21T10:00:00.000Z",
-        &claim,
+    assert_eq!(
+        fetched.reads,
+        Default::default(),
+        "an excluded turn read a row"
     );
-
-    let response = claims(&conn, &[], Scope::Everything, SHARED);
-    assert_eq!(response.reason, None, "{response:?}");
-    assert_eq!(response.hits.len(), 1, "{:?}", response.hits);
-
-    let hit = &response.hits[0];
-    assert_eq!(hit.record_type, OBSERVATION_KIND);
-    assert_eq!(hit.session_key, key);
-    assert_eq!(hit.turn_id, anchor);
-    assert_eq!(hit.excerpt, claim, "the claim text is the excerpt");
-    // The whole of OBS-03 at the read end: the anchor is asked of the database
-    // rather than trusted from the row.
-    let of_session: String = conn
-        .query_row(
-            "SELECT session_key FROM turns WHERE id = ?1",
-            [hit.turn_id],
-            |r| r.get(0),
-        )
-        .unwrap_or_else(|e| panic!("turn {} is not archived: {e}", hit.turn_id));
-    assert_eq!(of_session, key);
-    // Nothing was decompressed to produce it: the text was already in hand.
-    assert_eq!(response.reads.blobs, 0, "{:?}", response.reads);
-
-    // The control: the SAME query without the kind is a turn search, and no
-    // observation is in it.
-    let turns = answer(&conn, &[], Scope::Everything, SHARED);
-    assert!(!turns.hits.is_empty(), "the corpus must carry {SHARED}");
-    assert!(
-        turns
-            .hits
-            .iter()
-            .all(|hit| hit.record_type != OBSERVATION_KIND),
-        "an observation came back from a turn search: {:?}",
-        turns.hits
-    );
-}
-
-/// A query no claim matches is zero hits and no reason - the ordinary empty
-/// answer, not an error and not a silence that means something else.
-#[test]
-fn a_query_matching_no_claim_is_an_empty_result() {
-    let bench = bench();
-    let conn = bench.conn();
-    observe(
-        &conn,
-        "session-recall.jsonl",
-        "2026-08-21T10:00:00.000Z",
-        "a claim about something else entirely",
-    );
-
-    let response = claims(&conn, &[], Scope::Everything, "zzzznotinanyclaim");
-    assert!(response.hits.is_empty(), "{:?}", response.hits);
-    assert_eq!(response.reason, None);
-}
-
-/// Exclusion reaches this branch too. A branch that queried `observations`
-/// directly is exactly how a project excluded after its sessions were archived
-/// becomes visible again (ING-08).
-#[test]
-fn an_excluded_projects_observation_is_hidden_and_a_siblings_is_not() {
-    let bench = bench();
-    let conn = bench.conn();
-    let text = format!("a claim naming {SHARED}");
-    let (alpha_key, _) = observe(
-        &conn,
-        "session-recall.jsonl",
-        "2026-08-21T10:00:00.000Z",
-        &text,
-    );
-    let (beta_key, _) = observe(
-        &conn,
-        "session-errors-a.jsonl",
-        "2026-08-21T09:00:00.000Z",
-        &text,
-    );
-
-    // The falsifier: both are reachable when nothing is excluded, so the
-    // absence below is the exclusion and not a query that only ever finds one.
-    let both = claims(&conn, &[], Scope::Everything, SHARED);
-    let keys: Vec<&str> = both.hits.iter().map(|h| h.session_key.as_str()).collect();
-    assert!(keys.contains(&alpha_key.as_str()), "{keys:?}");
-    assert!(keys.contains(&beta_key.as_str()), "{keys:?}");
-
-    let alpha_project = testkit::fixture_project("session-recall.jsonl", &bench.root)
-        .to_string_lossy()
-        .into_owned();
-    let response = claims(&conn, &[&alpha_project], Scope::Everything, SHARED);
-    let keys: Vec<&str> = response
-        .hits
-        .iter()
-        .map(|h| h.session_key.as_str())
-        .collect();
-    assert!(
-        !keys.contains(&alpha_key.as_str()),
-        "an excluded project's observation came back: {keys:?}"
-    );
-    assert!(
-        keys.contains(&beta_key.as_str()),
-        "the sibling project's observation went missing too: {keys:?}"
-    );
-}
-
-/// D-17's worst failure mode, ruled out: a store with no table says so rather
-/// than answering zero hits, which reads as "nothing was found".
-#[test]
-fn a_store_with_no_observations_table_says_so_rather_than_nothing() {
-    let bench = bench();
-    let conn = bench.conn();
-    conn.execute("DROP TABLE observations", []).unwrap();
-
-    let response = claims(&conn, &[], Scope::Everything, SHARED);
-    assert!(response.hits.is_empty());
-    assert_eq!(response.reason, Some(Reason::NoObservations));
-    assert!(response
-        .reason
-        .unwrap()
-        .to_string()
-        .contains("observations"));
 }

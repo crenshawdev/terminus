@@ -243,6 +243,42 @@ fn status_prints_the_damaged_files_path_and_error_from_the_last_run() {
     assert_eq!(sessions, 2);
 }
 
+/// What a healthy pass did is printed under `notes`, never under `error`.
+///
+/// Labels written and sessions retention evicted used to share `runs.error`
+/// with real failures, so `status` printed routine work as an error. The pass
+/// writing the column is proven in the core crate's `pass` and `label` tests;
+/// here the row is planted, because what is under test is the rendering.
+#[test]
+fn status_prints_a_passs_routine_notes_apart_from_its_errors() {
+    let bench = bench();
+    bench.place(&format!("{}.jsonl", uuid(1)), "session-basic.jsonl");
+    assert_eq!(bench.run(&["ingest"]).status.code(), Some(0));
+    bench
+        .conn()
+        .execute(
+            "UPDATE runs SET error = NULL, notes = 'labelled 1 hit'
+             WHERE id = (SELECT max(id) FROM runs)",
+            [],
+        )
+        .unwrap();
+
+    let out = bench.run(&["status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("  notes\n    labelled 1 hit"), "{text}");
+    assert!(
+        !text.contains("  error"),
+        "a routine note read as an error: {text}"
+    );
+
+    let out = bench.run(&["status", "--json"]);
+    let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let run = &document["data"]["last_run"];
+    assert_eq!(run["notes"], "labelled 1 hit", "{document}");
+    assert_eq!(run["error"], serde_json::Value::Null, "{document}");
+}
+
 /// D-24: `status --json` emits the same numbers the human output prints, as one
 /// document, and any OTHER argument is still misuse.
 ///
@@ -411,4 +447,40 @@ fn status_stops_counting_a_project_excluded_after_it_was_archived() {
         )
         .unwrap();
     assert_eq!(rows, 1, "exclusion hides a session, it does not delete it");
+}
+
+/// A leftover `[provider]` table stops the command, says why and where, and
+/// prints nothing that was written in it.
+#[test]
+fn status_refuses_a_config_with_a_provider_table_and_echoes_none_of_it() {
+    const SENTINEL: &str = "sk-TERMINUSSTATUS-3c9e0d-do-not-log";
+    for body in [
+        "[provider]\n".to_owned(),
+        format!("[provider]\napi_key = \"{SENTINEL}\"\n"),
+    ] {
+        let bench = bench();
+        let file = bench
+            .config_dir
+            .join(terminus_core::config::CONFIG_FILE_NAME);
+        std::fs::write(&file, &body).unwrap();
+
+        let out = bench.run(&["status"]);
+        let (out_text, err_text) = (stdout(&out), stderr(&out));
+
+        assert_ne!(out.status.code(), Some(0), "{body:?} loaded: {err_text}");
+        assert!(
+            err_text.contains(&file.display().to_string()),
+            "stderr does not name the file: {err_text}"
+        );
+        assert!(
+            err_text.contains("Model calls were removed"),
+            "stderr does not say why: {err_text}"
+        );
+        for fragment in [SENTINEL, "TERMINUSSTATUS", "3c9e0d"] {
+            assert!(
+                !out_text.contains(fragment) && !err_text.contains(fragment),
+                "the table's key reached a stream: {out_text}{err_text}"
+            );
+        }
+    }
 }

@@ -294,7 +294,7 @@ fn emit(event: &str, text: &str) {
             "additionalContext": text,
         }
     });
-    println!("{document}");
+    outln!("{document}");
 }
 
 /// Read the one line the harness owes us (D-14), but never let the harness

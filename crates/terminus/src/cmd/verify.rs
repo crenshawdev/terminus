@@ -1,4 +1,5 @@
-//! `terminus verify`: walk every blob against its recorded checksum (STOR-03).
+//! `terminus verify`: check every session's block rows and its recorded checksum
+//! (STOR-03).
 
 use serde_json::json;
 use terminus_core::{verify, Store};
@@ -10,6 +11,13 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let data_dir = super::data_dir()?;
     let store = Store::open(&data_dir)?;
     let report = verify::verify(&store)?;
+    // Sessions, not failures: one session can fail several checks.
+    let failed = report
+        .failures
+        .iter()
+        .map(|f| f.session_key.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
 
     if json {
         // The ids and the count in one document. Split across two streams they
@@ -23,14 +31,17 @@ pub fn run(json: bool) -> Result<(), Failure> {
                     .failures
                     .iter()
                     .map(|failure| {
-                        json!({"session_key": failure.session_key, "detail": failure.detail})
+                        json!({
+                            "session_key": failure.session_key,
+                            "block": failure.block,
+                            "detail": failure.detail,
+                        })
                     })
                     .collect::<Vec<_>>(),
             );
         if !report.is_ok() {
             document = document.failed().because(format!(
-                "{} of {} session(s) failed their checksum",
-                report.failures.len(),
+                "{failed} of {} session(s) failed verification",
                 report.checked
             ));
         }
@@ -39,16 +50,12 @@ pub fn run(json: bool) -> Result<(), Failure> {
         // Failing session keys are the data, so they go to stdout. The count is
         // commentary and goes to stderr, which also keeps stdout free of anything
         // AC3's "and no other session" clause would have to exempt.
-        print!("{}", report.render());
+        out!("{}", report.render());
         // Not printed in JSON mode, and that is the rule rather than an
         // omission: `--json` means the document IS the answer, so routine
         // commentary moves into it and stderr is left for warnings. Printing
         // both would give a caller two accounts of one walk that can disagree.
-        eprintln!(
-            "{} session(s) checked, {} failed",
-            report.checked,
-            report.failures.len()
-        );
+        eprintln!("{} session(s) checked, {failed} failed", report.checked);
     }
 
     if report.is_ok() {

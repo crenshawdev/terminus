@@ -1,17 +1,10 @@
 //! Terminus archive core.
 //!
-//! The session blob is truth; everything else is derived and rebuildable from
-//! it (`.planning/PROJECT.md`, D-13). This crate owns the store, the
-//! block-framed zstd blob format and the ingest path. It links no async
-//! runtime and no thread-pool crate: the hook path must not pay for a runtime
-//! it does not use (`DESIGN-BRIEF.md:39`).
-//!
-//! It does link an HTTP client, as of phase 7, and the exception is worth
-//! naming precisely rather than leaving the sentence above to quietly become
-//! false. [`observe::net`] is the one module that names it and the one
-//! constructor that opens a connection (PRIV-03, D-06): a blocking pure-Rust
-//! client with no runtime behind it, reached only by the opt-in provider call
-//! and by nothing on the hook path. The root `Cargo.toml` records what it cost.
+//! The archived session, kept as block rows, is truth; everything else is
+//! derived and rebuildable from it (`.planning/PROJECT.md`, D-13). This crate
+//! owns the store, the zstd block rows the archive is kept in and the ingest
+//! path. It links no async runtime and no thread-pool crate: the hook path must
+//! not pay for a runtime it does not use (`DESIGN-BRIEF.md:39`).
 //!
 //! It does start threads, in exactly one place, and the exception is worth
 //! naming precisely rather than leaving the sentence above to quietly become
@@ -22,10 +15,16 @@
 //! `terminus backfill`. There is still no pool, global or otherwise - no
 //! `rayon`, nothing that outlives the call that created it.
 
+// The refusal sits in core because the binary compiles core first and core
+// uses `std::os::unix` unguarded, so one in `main.rs` would never be reached.
+// It names Linux and macOS rather than `not(unix)` so FreeBSD and the other
+// Unix systems are refused too.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("Terminus supports Linux and macOS only.");
+
 pub mod blob;
 pub mod capture;
 pub mod config;
-pub mod credentials;
 pub mod derive;
 pub mod discover;
 pub mod error;

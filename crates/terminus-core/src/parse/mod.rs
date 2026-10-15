@@ -1,11 +1,13 @@
 //! Scanning a transcript byte range into records and a resume offset.
 //!
 //! Two rules carry this module. Lines are split on `\n` and never trimmed, so
-//! what the ingest hands to the blob stays byte-identical to the source
-//! (D-13/AC7). And the resume offset is the byte just past the **last** `\n`,
-//! never end-of-file (D-14): all 1,221 top-level and 812 sidecar transcripts
-//! measured end with a newline, so a trailing partial line is a record still
-//! being written and must not be archived or indexed until it is complete.
+//! what the ingest hands to the archive stays byte-identical to the source in
+//! capture mode `full` (D-13/AC7); `lean` and `minimal` replace named subtrees
+//! with an elision mark (`crate::capture`). And the resume offset is the byte
+//! just past the **last** `\n`, never end-of-file (D-14): all 1,221 top-level
+//! and 812 sidecar transcripts measured end with a newline, so a trailing
+//! partial line is a record still being written and must not be archived or
+//! indexed until it is complete.
 
 pub mod record;
 

@@ -5,7 +5,8 @@
 //! `TERMINUS_DATA_DIR`, `TERMINUS_CONFIG_DIR` and `HOME` at temporary
 //! directories, for the reason `tests/install.rs` states: without them a test
 //! would delete the `~/.local/bin/terminus` and edit the settings files this
-//! machine is actually running on.
+//! machine is actually running on. `PATH` is a fixture directory holding a
+//! fake `claude` and nothing else, so no test can start the real one.
 //!
 //! AC7's "restores it to its pre-install bytes" is asserted as a byte
 //! comparison against the seed and never as a `jq` or `serde_json` comparison.
@@ -16,6 +17,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+use terminus_core::testkit::{self, FakeCall, NONESSENTIAL_TRAFFIC};
 
 /// A `settings.json` shaped like the real one, and the same seed
 /// `tests/install.rs` and `tests/doctor.rs` use: top-level keys in an order no
@@ -75,6 +78,8 @@ struct Fixture {
     root: PathBuf,
     bin_dir: PathBuf,
     claude_dir: PathBuf,
+    /// The whole of every spawned terminus's `PATH`.
+    path_dir: PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -86,21 +91,21 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
     std::fs::write(claude_dir.join("settings.json"), SETTINGS).unwrap();
     std::fs::write(claude_dir.join(".claude.json"), CLAUDE_JSON).unwrap();
+    let path_dir = root.join("path");
+    std::fs::create_dir_all(&path_dir).unwrap();
+    testkit::fake_claude(&path_dir, &root.join("claude.log"), "", 0);
     Fixture {
         _dir: dir,
         root,
         bin_dir,
         claude_dir,
+        path_dir,
     }
 }
 
 impl Fixture {
     fn stable(&self) -> PathBuf {
-        self.bin_dir.join(if cfg!(windows) {
-            "terminus.exe"
-        } else {
-            "terminus"
-        })
+        self.bin_dir.join("terminus")
     }
 
     fn settings(&self) -> PathBuf {
@@ -115,17 +120,21 @@ impl Fixture {
         self.root.join("data")
     }
 
+    /// `PATH` holds the fake `claude` and nothing else, and the traffic
+    /// variable is taken out so a logged value can only have come from
+    /// terminus.
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_terminus"));
         command
             .args(args)
             .current_dir(&self.root)
+            .env("PATH", &self.path_dir)
+            .env_remove(NONESSENTIAL_TRAFFIC)
             .env("TERMINUS_BIN_DIR", &self.bin_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("TERMINUS_DATA_DIR", self.data_dir())
             .env("TERMINUS_CONFIG_DIR", self.root.join("config"))
-            .env("HOME", &self.root)
-            .env("USERPROFILE", &self.root);
+            .env("HOME", &self.root);
         command
     }
 
@@ -138,7 +147,7 @@ impl Fixture {
     }
 
     fn install(&self) -> &Self {
-        let out = self.run(&["install", "--yes"]);
+        let out = self.run(&["install"]);
         assert!(out.status.success(), "install failed: {}", text(&out));
         self
     }
@@ -199,6 +208,33 @@ impl Fixture {
             .sum()
     }
 
+    /// Every `claude` call terminus made, oldest first.
+    fn calls(&self) -> Vec<FakeCall> {
+        testkit::fake_claude_calls(&self.root.join("claude.log"))
+    }
+
+    /// Put a fake `claude` on `PATH` that exits with `status`.
+    fn fake_claude(&self, status: i32) {
+        testkit::fake_claude(&self.path_dir, &self.root.join("claude.log"), "", status);
+    }
+
+    /// A user-level `terminus` entry in its current shape, as `claude mcp
+    /// add-json` would leave it. Install then finds it current and runs nothing.
+    fn seed_entry(&self) -> &Self {
+        let mut seeded = json(&self.claude_json());
+        seeded["mcpServers"]["terminus"] = serde_json::json!({
+            "type": "stdio",
+            "command": self.stable().display().to_string(),
+            "args": ["mcp"],
+        });
+        std::fs::write(
+            self.claude_json(),
+            serde_json::to_string_pretty(&seeded).unwrap(),
+        )
+        .unwrap();
+        self
+    }
+
     fn backups(&self) -> Vec<String> {
         let mut found: Vec<String> = std::fs::read_dir(&self.claude_dir)
             .unwrap()
@@ -209,6 +245,12 @@ impl Fixture {
         found
     }
 }
+
+/// The arguments of `claude mcp remove --scope user terminus`.
+const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", "terminus"];
+
+/// The remove as uninstall prints it for the user to run.
+const REMOVE_COMMAND: &str = "claude mcp remove --scope user terminus";
 
 fn text(output: &Output) -> String {
     format!(
@@ -247,12 +289,14 @@ fn our_entries(settings: &serde_json::Value, stable: &Path) -> Vec<serde_json::V
 }
 
 /// AC7's first half: a settings file untouched since install comes back byte
-/// for byte, and `.claude.json` with it.
+/// for byte. `.claude.json` is never written by terminus, so with a `claude`
+/// that writes nothing it is byte-identical after install, a rerun and
+/// uninstall (AC2).
 ///
 /// Byte for byte is the assertion because it is the only one that can fail for
-/// the right reason. Both files went through terminus's renderer on the way in,
-/// so a `serde_json` comparison would pass even if the 29 keys came back in a
-/// different order.
+/// the right reason. The settings file went through terminus's renderer on the
+/// way in, so a `serde_json` comparison would pass even if the 29 keys came
+/// back in a different order.
 #[test]
 fn install_then_uninstall_leaves_both_files_exactly_as_they_were() {
     let fixture = fixture();
@@ -262,6 +306,9 @@ fn install_then_uninstall_leaves_both_files_exactly_as_they_were() {
         SETTINGS,
         "install wrote nothing, so this test proves nothing"
     );
+    assert_eq!(bytes(&fixture.claude_json()), CLAUDE_JSON);
+    fixture.install();
+    assert_eq!(bytes(&fixture.claude_json()), CLAUDE_JSON);
 
     let out = fixture.uninstall();
     assert!(out.status.success(), "uninstall failed: {}", text(&out));
@@ -274,54 +321,144 @@ fn install_then_uninstall_leaves_both_files_exactly_as_they_were() {
     assert_eq!(
         bytes(&fixture.claude_json()),
         CLAUDE_JSON,
-        ".claude.json did not come back to its pre-install bytes"
+        ".claude.json changed, and terminus never writes it"
     );
     assert_eq!(
         fixture.backups(),
         Vec::<String>::new(),
         "a restored file left its backup behind"
     );
+    // Not `exists()`: it follows the link and reports false for a dangling one.
+    assert_eq!(
+        std::fs::symlink_metadata(fixture.stable())
+            .map(|_| ())
+            .map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::NotFound),
+        "the link at the stable path was left there"
+    );
+    let versions = fixture
+        .root
+        .join(".local/lib/crenshawdev/terminus/versions");
+    assert_eq!(
+        std::fs::read(versions.join(env!("CARGO_PKG_VERSION")).join("terminus")).unwrap(),
+        std::fs::read(env!("CARGO_BIN_EXE_terminus")).unwrap(),
+        "uninstall took the version file"
+    );
+    let said = text(&out);
     assert!(
-        !fixture.stable().exists(),
-        "the copy at the stable path was left there"
+        said.contains(&versions.display().to_string()),
+        "uninstall did not print the versions folder: {said}"
     );
 }
 
-/// The `terminus` key goes and every neighbour stays (AC7).
+/// D-13: with a user-level entry there, uninstall asks `claude` to remove it,
+/// with `--scope user` and the traffic variable, and writes nothing itself.
 ///
-/// Named separately from the byte comparison above because it is the assertion
-/// that still means something on a `.claude.json` the user has edited since:
-/// the removal is keyed, not positional.
+/// The fake writes nothing, so `.claude.json` keeps the entry. That is the
+/// proof terminus did not edit the file on the way out.
 #[test]
 fn only_the_terminus_key_leaves_mcp_servers() {
     let fixture = fixture();
+    fixture.seed_entry();
+    let seeded = bytes(&fixture.claude_json());
+
     fixture.install();
-    let installed = json(&fixture.claude_json());
-    assert_eq!(
-        installed["mcpServers"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["context7", "terminus"]
+    assert!(
+        fixture.calls().is_empty(),
+        "install ran claude for an entry that was already current: {:?}",
+        fixture.calls()
     );
 
-    let out = fixture.uninstall();
-    assert!(out.status.success(), "uninstall failed: {}", text(&out));
-
-    let after = json(&fixture.claude_json());
-    assert_eq!(
-        after["mcpServers"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["context7"]
+    let output = fixture.uninstall();
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        text(&output)
     );
-    assert_eq!(after["projects"], installed["projects"]);
-    assert_eq!(after["oauthAccount"], installed["oauthAccount"]);
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].args, REMOVE, "{calls:?}");
+    assert_eq!(calls[0].traffic.as_deref(), Some("1"), "{calls:?}");
+    assert!(
+        out(&output).contains("removed the mcp registration with claude mcp remove"),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(bytes(&fixture.claude_json()), seeded);
+}
+
+/// D-13: when `claude` is not on `PATH`, or fails, the registration stays and
+/// uninstall prints the command that removes it. The hook entries and the
+/// binary still go, and the exit status says it is not done.
+#[test]
+fn a_registration_claude_cannot_remove_prints_the_command_and_the_rest_still_goes() {
+    for missing in [true, false] {
+        let fixture = fixture();
+        fixture.seed_entry().install();
+        if missing {
+            std::fs::remove_file(fixture.path_dir.join("claude")).unwrap();
+        } else {
+            fixture.fake_claude(1);
+        }
+
+        let output = fixture.uninstall();
+        let said = text(&output);
+        assert_eq!(output.status.code(), Some(1), "{said}");
+        assert!(out(&output).contains(REMOVE_COMMAND), "{said}");
+        if missing {
+            assert!(said.contains("claude is not on PATH"), "{said}");
+        } else {
+            assert_eq!(fixture.calls().last().unwrap().args, REMOVE);
+        }
+        assert!(
+            our_entries(&json(&fixture.settings()), &fixture.stable()).is_empty(),
+            "a hook entry of terminus's survived: {said}"
+        );
+        assert!(!fixture.stable().exists(), "the binary was left behind");
+    }
+}
+
+/// D-15: a `.claude.json.terminus-backup` an older install left is reported
+/// and left alone. Putting it back would roll back Claude Code's own state.
+#[test]
+fn an_old_claude_json_backup_is_reported_and_left_alone() {
+    let fixture = fixture();
+    let backup = fixture.claude_dir.join(".claude.json.terminus-backup");
+    let old = "{\n  \"numStartups\": 3\n}\n";
+    std::fs::write(&backup, old).unwrap();
+    fixture.install();
+
+    let output = fixture.uninstall();
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        out(&output).contains(&backup.display().to_string()),
+        "uninstall did not print the old backup's path:\n{}",
+        text(&output)
+    );
+    assert_eq!(bytes(&backup), old);
+    assert_eq!(bytes(&fixture.claude_json()), CLAUDE_JSON);
+}
+
+/// D-15 when `~/.claude.json` does not parse: the old backup is still
+/// reported, since a broken live file is when the user most needs to know the
+/// old copy is there, and neither file is touched.
+#[test]
+fn an_old_claude_json_backup_is_reported_when_claude_json_does_not_parse() {
+    let fixture = fixture();
+    let backup = fixture.claude_dir.join(".claude.json.terminus-backup");
+    let old = "{\n  \"numStartups\": 3\n}\n";
+    std::fs::write(&backup, old).unwrap();
+    fixture.install();
+    std::fs::write(fixture.claude_json(), "{").unwrap();
+
+    let output = fixture.uninstall();
+    assert!(
+        out(&output).contains(&backup.display().to_string()),
+        "uninstall did not print the old backup's path:\n{}",
+        text(&output)
+    );
+    assert_eq!(bytes(&backup), old);
+    assert_eq!(bytes(&fixture.claude_json()), "{");
 }
 
 /// D-13's whole point: a `/config` change made after install survives
@@ -404,12 +541,12 @@ fn the_data_directory_is_left_alone_and_its_path_printed() {
 /// A machine that is half wired is exactly the one uninstall is reached for.
 ///
 /// One reported line per thing that is not there, exit 0, and the rest of the
-/// work still done: the `.claude.json` half is cleaned up and the binary is
-/// removed even though `settings.json` went missing.
+/// work still done: the registration is removed through `claude` and the
+/// binary is removed even though `settings.json` went missing.
 #[test]
 fn a_settings_file_deleted_since_install_is_one_reported_line() {
     let fixture = fixture();
-    fixture.install();
+    fixture.seed_entry().install();
     std::fs::remove_file(fixture.settings()).unwrap();
 
     let output = fixture.uninstall();
@@ -429,13 +566,8 @@ fn a_settings_file_deleted_since_install_is_one_reported_line() {
         "uninstall recreated a settings file the user had deleted"
     );
     assert_eq!(
-        json(&fixture.claude_json())["mcpServers"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["context7"],
+        fixture.calls().last().map(|call| call.args.clone()),
+        Some(REMOVE.map(String::from).to_vec()),
         "uninstall stopped at the missing file instead of carrying on"
     );
     assert!(!fixture.stable().exists(), "the binary was left behind");
@@ -456,6 +588,11 @@ fn uninstall_on_a_machine_that_was_never_installed_changes_nothing() {
     );
     assert_eq!(bytes(&fixture.settings()), SETTINGS);
     assert_eq!(bytes(&fixture.claude_json()), CLAUDE_JSON);
+    assert!(
+        fixture.calls().is_empty(),
+        "uninstall ran claude with no registration there: {:?}",
+        fixture.calls()
+    );
 
     fixture.install();
     assert!(fixture.uninstall().status.success());
@@ -495,6 +632,68 @@ fn an_unmarked_file_at_the_stable_path_is_reported_and_kept() {
     assert!(
         out(&output).contains("not a terminus build"),
         "uninstall did not say why it kept the file:\n{}",
+        text(&output)
+    );
+}
+
+/// Deleting the versions folder leaves the link pointing at nothing, and that
+/// link is still install's to take out.
+#[test]
+fn a_link_left_dangling_by_a_deleted_versions_folder_is_removed() {
+    let fixture = fixture();
+    fixture.install();
+    std::fs::remove_dir_all(
+        fixture
+            .root
+            .join(".local/lib/crenshawdev/terminus/versions"),
+    )
+    .unwrap();
+
+    let output = fixture.uninstall();
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        text(&output)
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(fixture.stable())
+            .map(|_| ())
+            .map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::NotFound),
+        "the dangling link was left at the stable path:\n{}",
+        text(&output)
+    );
+    assert!(
+        !out(&output).contains("nothing to remove"),
+        "uninstall said nothing was there:\n{}",
+        text(&output)
+    );
+}
+
+/// A link to nothing outside the versions folder is not one install made, so
+/// uninstall reports it and keeps it.
+#[test]
+fn a_dangling_link_outside_the_versions_folder_is_reported_and_kept() {
+    let fixture = fixture();
+    fixture.install();
+    let elsewhere = fixture.root.join("elsewhere/terminus");
+    std::fs::remove_file(fixture.stable()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, fixture.stable()).unwrap();
+
+    let output = fixture.uninstall();
+    assert!(
+        output.status.success(),
+        "uninstall failed: {}",
+        text(&output)
+    );
+    assert_eq!(
+        std::fs::read_link(fixture.stable()).unwrap(),
+        elsewhere,
+        "uninstall removed or changed a link it did not make"
+    );
+    assert!(
+        out(&output).contains("outside the versions folder"),
+        "uninstall did not say why it kept the link:\n{}",
         text(&output)
     );
 }

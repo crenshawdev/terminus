@@ -182,10 +182,9 @@ pub fn git_available() -> bool {
 /// program name resolved by the OS is the Windows PATH-probing failure class
 /// the design retires (`.planning/PROJECT.md`).
 fn git_program() -> Option<PathBuf> {
-    let name = if cfg!(windows) { "git.exe" } else { "git" };
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
+        .map(|dir| dir.join("git"))
         .find(|candidate| candidate.is_file())
 }
 

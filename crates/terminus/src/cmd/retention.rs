@@ -85,12 +85,12 @@ pub fn run(args: Args) -> Result<(), Failure> {
 
     // One parseable line per session, the shape `sessions` prints in, with the
     // instant first because every line below it is relative to that one.
-    println!("cutoff  {}", selection.evaluated_at);
+    outln!("cutoff  {}", selection.evaluated_at);
     for key in &selection.evict {
-        println!("evict   {key}");
+        outln!("evict   {key}");
     }
     for key in &selection.delete {
-        println!("delete  {key}");
+        outln!("delete  {key}");
     }
 
     // Commentary on stderr, so stdout stays the list. `status` reports its own

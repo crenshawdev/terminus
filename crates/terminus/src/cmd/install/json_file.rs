@@ -1,16 +1,16 @@
 //! One Claude Code settings file: read it, change exactly one thing in it, and
 //! write it back looking like the file it was.
 //!
-//! Both of install's targets go through here, and so will `uninstall` and
-//! `doctor`. AC4's "every other key byte-identical" and AC7's "restores it to
+//! Install's write to `settings.json` and its read of `.claude.json` go
+//! through here, and so do `uninstall` and `doctor`. AC4's "every other key byte-identical" and AC7's "restores it to
 //! its pre-install bytes" are properties of this module and of nothing else.
 //!
 //! # Why not `serde_json::Value`
 //!
 //! `serde_json`'s object is a `BTreeMap`. A round trip through it re-sorts the
 //! 29 top-level keys of `settings.json` and every one of the 86 `projects`
-//! entries inside 240 KB of `.claude.json` - a diff of the whole file, offered
-//! for confirmation, for a change of two lines. `serde_json`'s `preserve_order`
+//! entries inside 240 KB of `.claude.json` - a rewrite of the whole file for a
+//! change of two lines. `serde_json`'s `preserve_order`
 //! feature would fix that and is deliberately not enabled: it is a
 //! workspace-wide feature that would silently reorder the keys of every `--json`
 //! document the six commands in `docs/json-shapes.md` promise.
@@ -33,8 +33,8 @@
 //!
 //! Read again immediately before writing (D-06). Claude Code rewrote
 //! `.claude.json` five times inside six minutes on 2026-08-13, so the copy
-//! install read a moment ago to render a diff is not the copy it may write
-//! over. The edit is re-applied to whatever is on disk at that instant, then a
+//! install read a moment ago to decide what to write is not the copy it may
+//! write over. The edit is re-applied to whatever is on disk at that instant, then a
 //! temporary file in the same directory is renamed into place.
 //!
 //! Symlinks are resolved first. `~/.claude.json` on this machine is a symlink
@@ -47,7 +47,7 @@
 //! JSON is an operational failure that writes nothing - never a file to
 //! overwrite, because whatever it is, it is not ours to lose.
 //!
-//! # What the user approves is what lands (INST-03)
+//! # A file it did not format is rewritten in full (phase 3 D-12)
 //!
 //! [`Document::apply`] writes the whole document back, re-rendered. For the two
 //! real files that is a byte-for-byte round trip, because both are what
@@ -55,18 +55,15 @@
 //! minified, four-space indented, or CRLF it is not: the write reformats
 //! everything, not only the members install added.
 //!
-//! Of the two ways to close that gap - preserve the original bytes outside the
-//! edited region, or show the rewrite honestly - this module does the second.
-//! The diff is taken against [`Document::source`], the bytes on disk, so a file
-//! whose formatting is not this renderer's shows its whole rewrite at the
-//! confirmation and the user approves exactly what lands.
+//! Install does that without asking. The write is not shown first, so what
+//! protects the file is the one-time backup [`Document::backup`] takes of its
+//! original bytes, and [`Document::reformats`] is what lets install's summary
+//! say the file was rewritten in full and where that backup is.
 //!
 //! What that does not cover: install still cannot make a small edit to a file
-//! it did not format. The user's choice is to accept a re-rendered file or to
-//! decline the install; there is no third answer, and a byte-preserving splice
-//! is the change that would offer one. It also says nothing about a file that
-//! changes between the diff and the write - `apply` re-reads and re-applies at
-//! that instant (D-06), and its own no-op check is rendered against rendered, so
+//! it did not format, and a byte-preserving splice is the change that would. A
+//! file that changes between the read and the write is re-read and re-applied
+//! at that instant (D-06), and the no-op check is rendered against rendered, so
 //! an install with nothing to add writes nothing and reformats nothing.
 
 use std::io::Write as _;
@@ -117,11 +114,6 @@ impl Json {
     /// A JSON string carrying `value`.
     pub fn string(value: &str) -> Json {
         Json::Scalar(encode(value))
-    }
-
-    /// A JSON number.
-    pub fn number(value: i64) -> Json {
-        Json::Scalar(value.to_string())
     }
 
     /// This value as text, when it is a string and its escapes decode.
@@ -270,6 +262,43 @@ impl Json {
         }
     }
 
+    /// This value on one line with no whitespace between tokens, the form
+    /// `claude mcp add-json` takes as its argument. Scalars and keys are written
+    /// as their source text, as in the two-space form.
+    pub fn compact(&self) -> String {
+        let mut out = String::new();
+        self.write_compact(&mut out);
+        out
+    }
+
+    fn write_compact(&self, out: &mut String) {
+        match self {
+            Json::Scalar(raw) => out.push_str(raw),
+            Json::Array(items) => {
+                out.push('[');
+                for (at, item) in items.iter().enumerate() {
+                    if at > 0 {
+                        out.push(',');
+                    }
+                    item.write_compact(out);
+                }
+                out.push(']');
+            }
+            Json::Object(members) => {
+                out.push('{');
+                for (at, member) in members.iter().enumerate() {
+                    if at > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&member.raw_key);
+                    out.push(':');
+                    member.value.write_compact(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
     fn write_to(&self, out: &mut String, depth: usize) {
         match self {
             Json::Scalar(raw) => out.push_str(raw),
@@ -327,8 +356,9 @@ pub struct Document {
     /// What is actually written to. May be several links away from `path`.
     resolved: PathBuf,
     existed: bool,
-    /// The bytes read, kept so the diff can be taken against the file itself
-    /// rather than against this module's idea of how it should look.
+    /// The bytes read, kept so a file this module did not format can be told
+    /// apart from one it did, and so a backup's bytes can be put back as they
+    /// were.
     source: String,
     value: Json,
     trailing_newline: bool,
@@ -378,9 +408,8 @@ impl Document {
 
     /// The file's bytes as they are on disk, empty when there is no file.
     ///
-    /// The left-hand side of every diff install shows. It is the file, not the
-    /// re-rendered copy, because the re-rendered copy is what install is asking
-    /// permission to write.
+    /// What `uninstall` writes back when it restores install's backup, which
+    /// has to be the user's bytes rather than this module's rendering of them.
     pub fn source(&self) -> &str {
         &self.source
     }
@@ -404,8 +433,8 @@ impl Document {
     /// Would writing re-render bytes install was not asked to change?
     ///
     /// True for a file this renderer did not produce - minified, four-space
-    /// indented, CRLF. The diff shows that rewrite in full; this is what lets a
-    /// caller say why it is there.
+    /// indented, CRLF. Install rewrites such a file in full when it writes it,
+    /// and this is what lets its summary say so.
     pub fn reformats(&self) -> bool {
         self.existed && self.source != self.rendered()
     }
@@ -463,9 +492,7 @@ impl Document {
     /// file, for the reason the module header gives - `~/.claude.json` is two
     /// symlinks from the file it names.
     pub fn backup_path(&self) -> Result<PathBuf, Failure> {
-        Ok(self
-            .resolved
-            .with_file_name(format!("{}{BACKUP_SUFFIX}", self.file_name()?)))
+        backup_path_for(&self.resolved)
     }
 
     fn file_name(&self) -> Result<String, Failure> {
@@ -494,13 +521,11 @@ impl Document {
     ///
     /// Returns whether anything was written. The read is deliberately not the
     /// one [`Document::read`] did: D-06's whole point is that the file may have
-    /// moved under us between the diff and the answer.
+    /// moved under us since install read it.
     ///
     /// What lands is the whole document, re-rendered - not a splice into the
-    /// original bytes. That is why the diff is taken against
-    /// [`Document::source`]: a file this renderer did not format is rewritten in
-    /// full, and the user has to have seen that before answering. See the module
-    /// header for what that choice does not cover.
+    /// original bytes, so a file this renderer did not format is rewritten in
+    /// full. See the module header for what that choice does not cover.
     pub fn apply(&self, edit: &dyn Fn(&mut Json) -> Result<(), Failure>) -> Result<bool, Failure> {
         let fresh = Document::read(&self.resolved)?;
         let before = fresh.rendered();
@@ -591,6 +616,26 @@ fn render(value: &Json, trailing_newline: bool) -> String {
 /// Falls back to resolving the parent and re-attaching the name, because
 /// `canonicalize` fails on a file that does not exist yet and install has to be
 /// able to create one.
+/// Where [`Document::backup`] puts its copy of the file at `path`, found
+/// without reading the file.
+///
+/// The name depends only on where the file is, so `uninstall` can report an old
+/// `~/.claude.json` backup even when the live file does not parse (D-15).
+/// Resolving a path that is already resolved gives it back unchanged, so
+/// [`Document::backup_path`] can hand this its own resolved path.
+pub fn backup_path_for(path: &Path) -> Result<PathBuf, Failure> {
+    let resolved = resolve(path);
+    match resolved.file_name() {
+        Some(name) => {
+            Ok(resolved.with_file_name(format!("{}{BACKUP_SUFFIX}", name.to_string_lossy())))
+        }
+        None => Err(Failure::Operational(format!(
+            "{} does not name a file",
+            resolved.display()
+        ))),
+    }
+}
+
 fn resolve(path: &Path) -> PathBuf {
     if let Ok(real) = std::fs::canonicalize(path) {
         return real;
@@ -706,114 +751,6 @@ fn link_once(temporary: &Path, path: &Path) -> Result<(), Failure> {
             path.display()
         ))
     })
-}
-
-/// The lines `edit` adds and removes, with a little context and nothing else.
-///
-/// INST-03 asks for the exact diff, and exact is the point: `.claude.json` is
-/// 240 KB and `settings.json`'s `hooks` object already holds seven event keys,
-/// so a user asked to approve a change has to be shown the change rather than
-/// the neighbourhood it happened in.
-///
-/// Common leading and trailing lines are trimmed off both sides first, which
-/// reduces both files to a handful of lines around the insertions. What is left
-/// is aligned by [`align`]. The trim is what keeps that alignment cheap: it
-/// runs on the block that differs, never on the file.
-pub fn diff(before: &str, after: &str) -> String {
-    const CONTEXT: usize = 2;
-    /// Above this many differing lines on either side, the block is printed as
-    /// removed-then-added rather than aligned. Install's own edits never come
-    /// near it; this only bounds the cost of a file that changed under us.
-    const ALIGN_LIMIT: usize = 512;
-
-    let old: Vec<&str> = before.lines().collect();
-    let new: Vec<&str> = after.lines().collect();
-
-    let mut head = 0;
-    while head < old.len() && head < new.len() && old[head] == new[head] {
-        head += 1;
-    }
-    let mut tail = 0;
-    while tail < old.len() - head
-        && tail < new.len() - head
-        && old[old.len() - 1 - tail] == new[new.len() - 1 - tail]
-    {
-        tail += 1;
-    }
-
-    let old_middle = &old[head..old.len() - tail];
-    let new_middle = &new[head..new.len() - tail];
-    if old_middle.is_empty() && new_middle.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::new();
-    for line in &old[head.saturating_sub(CONTEXT)..head] {
-        line_into(&mut out, ' ', line);
-    }
-    if old_middle.len() > ALIGN_LIMIT || new_middle.len() > ALIGN_LIMIT {
-        for line in old_middle {
-            line_into(&mut out, '-', line);
-        }
-        for line in new_middle {
-            line_into(&mut out, '+', line);
-        }
-    } else {
-        for (mark, line) in align(old_middle, new_middle) {
-            line_into(&mut out, mark, line);
-        }
-    }
-    let resume = old.len() - tail;
-    for line in &old[resume..(resume + CONTEXT).min(old.len())] {
-        line_into(&mut out, ' ', line);
-    }
-    out
-}
-
-fn line_into(out: &mut String, mark: char, line: &str) {
-    out.push_str("   ");
-    out.push(mark);
-    out.push(' ');
-    out.push_str(line);
-    out.push('\n');
-}
-
-/// Two blocks of lines as one sequence of kept, removed and added lines.
-///
-/// A longest common subsequence, which is the ordinary diff. Quadratic, and
-/// deliberately so: its caller has already cut both sides down to the block
-/// that differs, and an implementation with a name is worth more here than a
-/// heuristic that gets an insertion beside an identical line wrong.
-fn align<'a>(old: &[&'a str], new: &[&'a str]) -> Vec<(char, &'a str)> {
-    let mut common = vec![vec![0usize; new.len() + 1]; old.len() + 1];
-    for i in (0..old.len()).rev() {
-        for j in (0..new.len()).rev() {
-            common[i][j] = if old[i] == new[j] {
-                common[i + 1][j + 1] + 1
-            } else {
-                common[i + 1][j].max(common[i][j + 1])
-            };
-        }
-    }
-
-    let mut out = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    while i < old.len() && j < new.len() {
-        if old[i] == new[j] {
-            out.push((' ', old[i]));
-            i += 1;
-            j += 1;
-        } else if common[i + 1][j] >= common[i][j + 1] {
-            out.push(('-', old[i]));
-            i += 1;
-        } else {
-            out.push(('+', new[j]));
-            j += 1;
-        }
-    }
-    out.extend(old[i..].iter().map(|line| ('-', *line)));
-    out.extend(new[j..].iter().map(|line| ('+', *line)));
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1157,6 +1094,18 @@ mod tests {
         assert_eq!(document.rendered(), FIXTURE);
     }
 
+    /// The compact form drops whitespace only: every scalar and key is its
+    /// source text, and the value it parses back to is the same one.
+    #[test]
+    fn the_compact_form_is_the_same_value_on_one_line() {
+        let (_dir, path) = seeded(FIXTURE);
+        let document = Document::read(&path).unwrap();
+        let compact = document.value().compact();
+        assert!(!compact.contains('\n'), "{compact}");
+        assert!(compact.contains(r#""C:\\Users\\jo\u00e9\\code":{"lastCost":0.5,"#));
+        assert_eq!(parse(&compact).unwrap(), *document.value());
+    }
+
     /// AC4 in one test: adding a key changes that key and nothing else, and
     /// every other key keeps its value *and its position*.
     #[test]
@@ -1190,7 +1139,6 @@ mod tests {
     /// link two hops from the file it names. Renaming over the link would leave
     /// a regular file where the user's symlink was and orphan the real one.
     #[test]
-    #[cfg(unix)]
     fn writing_through_a_symlink_updates_the_target_and_keeps_the_link() {
         let (dir, real) = seeded(FIXTURE);
         let link = dir.path().join("link.json");
@@ -1244,7 +1192,6 @@ mod tests {
     /// 0600 is what `settings.json` is on this machine, and a fresh temporary
     /// file is 0644: a backup that widened them would be its own small leak.
     #[test]
-    #[cfg(unix)]
     fn the_backup_carries_the_bytes_and_the_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1377,31 +1324,6 @@ mod tests {
         ] {
             assert!(parse(bad).is_err(), "{bad:?} parsed");
         }
-    }
-
-    /// The diff is the change, not the file.
-    #[test]
-    fn the_diff_shows_only_the_changed_block() {
-        let (_dir, path) = seeded(FIXTURE);
-        let document = Document::read(&path).unwrap();
-        let after = document
-            .preview(&|root: &mut Json| {
-                root.entry("mcpServers", Json::object())?;
-                Ok(())
-            })
-            .unwrap();
-        let rendered = diff(&document.rendered(), &after);
-        assert!(rendered.contains("+"), "{rendered}");
-        assert!(rendered.contains("mcpServers"), "{rendered}");
-        assert!(
-            !rendered.contains("terse-answers"),
-            "the diff carried a line nothing changed:\n{rendered}"
-        );
-        assert!(
-            rendered.lines().count() < 10,
-            "the diff is the whole file:\n{rendered}"
-        );
-        assert!(diff(&document.rendered(), &document.rendered()).is_empty());
     }
 
     /// Escapes survive the trip in both directions.

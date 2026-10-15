@@ -1,0 +1,92 @@
+{
+  "phase": "4",
+  "trigger": "plan",
+  "discriminator": "plan-5ba87fd",
+  "round": 1,
+  "base": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1",
+  "head": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1",
+  "base_id": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1",
+  "head_id": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/4/PLAN-1.md",
+      "line": 70,
+      "severity": "high",
+      "claim": "The plan writes or replaces the version file before its second stable-path ownership check, so a refusal can occur after the first write despite the plan's stated refusal-before-write invariant.",
+      "failure_scenario": "Another process replaces a vacant or owned stable path with a foreign file after `run`'s initial `occupant` check but before the pre-rename recheck. Install has already created or replaced `versions/<version>/terminus`; it then refuses the foreign occupant, leaving the versions folder changed. This contradicts the plan's guarantee that every refusal occurs before the first write and can overwrite a same-version binary even though installation was refused.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus/src/cmd/install/binary.rs",
+        "line": 164,
+        "note": "The pre-rename recheck is a race guard the current place() already makes after its copy (binary.rs:164-168, 184-190); the refusal block in run (mod.rs:103-104) is the one that runs before any write, and PLAN-1.md:60 keeps it first. On the race-only refusal the one file written is this build in Terminus own versions folder, which D-03 already lets install replace and a running process keeps its inode. No foreign file is touched. True as stated, low as a consequence."
+      },
+      "citation_missing": true,
+      "base_id": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1",
+      "head_id": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/4/PLAN-2.md",
+      "line": 96,
+      "severity": "high",
+      "claim": "Checking ownership twice does not make the destructive `mv -f` safe because the final check and replacement are separate filesystem operations.",
+      "failure_scenario": "After the second `check_stable_path` accepts a missing or marked stable path, another process can place an unmarked file or directory there before `mv -f`. The script can overwrite the unmarked file, or move its temporary link into the directory, instead of refusing. This violates D-07/AC4 and the plan's promise that foreign occupants are unchanged; the tests exercise only static occupants and cannot expose the race.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus/src/cmd/install/binary.rs",
+        "line": 167,
+        "note": "A check-then-rename window is inherent: binary.rs:166-168 states the same residual window for the Rust side, Baley ships this shape (/code/baley/install.sh:198-199), and CONTEXT D-01 locks mv -f after a folder check. Hitting it needs a concurrent writer in the user own ~/.local/bin within the microseconds between the second check and mv. Real, but low."
+      },
+      "citation_missing": true,
+      "base_id": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1",
+      "head_id": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/4/PLAN-3.md",
+      "line": 48,
+      "severity": "medium",
+      "claim": "The plan deliberately leaves known stale installation documentation in place, so the documentation will not consistently describe the layout produced by plans 1 and 2.",
+      "failure_scenario": "DESIGN-BRIEF §12 will continue to call `~/.local/bin/terminus` the canonical binary and omit the actual version-file location, while another section says it is a link into the versions folder. A reader consulting the paths table receives a contradictory layout, so the phase goal and AC7 are not fully delivered.",
+      "ruling": "survived",
+      "convergent": false,
+      "citation_missing": true,
+      "base_id": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1",
+      "head_id": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/4/PLAN-3.md",
+      "line": 68,
+      "severity": "low",
+      "claim": "The path-consistency verification only greps for `crenshawdev` and cannot detect different versions-folder spellings between the Rust implementation and the script.",
+      "failure_scenario": "If one implementation uses `~/.local/lib/crenshawdev/terminus/versions` and the other uses a different `crenshawdev/...` path, both grep matches are printed and the verification succeeds. The task's stated requirement that both paths be spelled identically therefore has no failing check.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/4/PLAN-2.md",
+        "line": 134,
+        "note": "A spelling mismatch has a failing check. PLAN-1 task 2 (PLAN-1.md:89-91) leaves the link alone only when its target sits directly under the versions folder Rust resolves. If install.sh spelled that folder differently, the closing terminus install would store itself under versions/<CARGO_PKG_VERSION> and move the link, and PLAN-2 task 2 test asserting the link points at versions/<manifest version>/terminus (PLAN-2.md:134) fails."
+      },
+      "citation_missing": true,
+      "base_id": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1",
+      "head_id": "5ba87fd01e79f378dbd16222c47c0109d3c7f0c1"
+    }
+  ]
+}

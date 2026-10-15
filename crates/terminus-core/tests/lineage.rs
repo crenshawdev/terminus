@@ -381,15 +381,7 @@ impl Tree {
     }
 
     fn blob_of(&self, path: &Path) -> Vec<u8> {
-        let bytes: Vec<u8> = self
-            .conn()
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [path.to_str().unwrap()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        terminus_core::blob::read_all(&bytes).unwrap()
+        terminus_core::testkit::stream(&self.conn(), path.to_str().unwrap()).unwrap()
     }
 }
 

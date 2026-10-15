@@ -283,8 +283,8 @@ fn write_atomically(path: &Path, state: &State) -> Option<()> {
 
     let (temporary, mut file) = create_temporary(dir)?;
     let written = file.write_all(&bytes).and_then(|()| file.flush());
-    // Closed before the rename, not after: a Windows rename over an open handle
-    // fails, and this file is written on every prompt.
+    // Closed before the rename, not after. Nothing needs that order, and
+    // keeping it costs nothing.
     drop(file);
 
     let outcome = written.and_then(|()| std::fs::rename(&temporary, path));

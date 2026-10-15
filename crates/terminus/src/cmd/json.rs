@@ -118,20 +118,15 @@ impl Document {
     /// One line. Diagnostics go to stderr on every path, which is what lets
     /// `terminus search --json | jq` work while a warning is still printed.
     pub fn emit(&self) {
-        println!("{}", self.render());
+        outln!("{}", self.render());
     }
 
-    /// The same write, with its failure returned rather than panicked.
+    /// The same write, with its failure returned rather than handled.
     ///
-    /// [`Document::emit`] is `println!`, which panics with exit 101 when stdout
-    /// is a closed pipe - so `terminus doctor --json | head` would report a
-    /// failure that belongs to the pipe rather than to the store. A command
-    /// whose exit code has its own meaning calls this instead and decides what
-    /// a closed reader means to it.
-    ///
-    /// Additive on purpose. The six commands `docs/json-shapes.md` documents
-    /// still call `emit`; moving them is a change to six shipped contracts and
-    /// stays a logged open item rather than a thing done in passing here.
+    /// [`Document::emit`] drops the document when the reader has closed the
+    /// pipe and panics on any other write failure. A command that reports a
+    /// failed write as its own result calls this instead and decides what each
+    /// failure means to it.
     pub fn try_emit(&self) -> std::io::Result<()> {
         use std::io::Write;
 

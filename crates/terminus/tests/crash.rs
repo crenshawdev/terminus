@@ -1,12 +1,12 @@
 //! AC2 / AC6 / STOR-02: killing ingest anywhere leaves a store that converges.
 //!
-//! The harness kills the child un-catchably - `Child::kill` is `SIGKILL` on
-//! Unix and `TerminateProcess` on Windows - at more than forty points across
-//! three scenarios, spread three ways. Some are *aimed at a moment*: the child
-//! announces that it has reached a named point inside one file's pass and waits
-//! there to be killed. Some are *aimed at a file*: the walk stalls once a given
-//! number of transcripts have committed, so the kill lands in the middle of a
-//! tree. The rest are timed, at pseudorandom delays.
+//! The harness kills the child un-catchably - `Child::kill` is `SIGKILL` - at
+//! more than forty points across three scenarios, spread three ways. Some are
+//! *aimed at a moment*: the child announces that it has reached a named point
+//! inside one file's pass and waits there to be killed. Some are *aimed at a
+//! file*: the walk stalls once a given number of transcripts have committed, so
+//! the kill lands in the middle of a tree. The rest are timed, at pseudorandom
+//! delays.
 //!
 //! Aiming is not a convenience. A release ingest of a few-KB fixture finishes
 //! in single-digit milliseconds, so a harness that only randomizes on elapsed
@@ -39,7 +39,7 @@ use rusqlite::Connection;
 use terminus_core::ingest::fault;
 use terminus_core::store::{Store, DB_FILE_NAME};
 use terminus_core::testkit::{self, Rng};
-use terminus_core::{blob, verify};
+use terminus_core::verify;
 
 /// Aimed kills against one transcript: every point, this many times.
 const ROUNDS: usize = 3;
@@ -155,7 +155,7 @@ fn place(project: &Path, name: &str, fixture: &str) -> PathBuf {
 /// Append whole records to a transcript, the way a live session grows.
 ///
 /// Distinct bytes per file and per record, so an append that landed on the
-/// wrong session or was written twice shows up as a different blob rather than
+/// wrong session or was written twice shows up as different block rows rather than
 /// as a coincidence.
 fn append_records(path: &Path, count: usize) {
     let tag = path.file_stem().unwrap().to_str().unwrap().to_owned();
@@ -278,22 +278,29 @@ fn kill_after(dirs: &Dirs, data_dir: &Path, transcript: Option<&Path>, delay: Du
     kill_and_reap(&mut child);
 }
 
-/// `SIGKILL` on Unix, `TerminateProcess` on Windows: un-catchable either way,
-/// which is the point - a signal the process could handle would let it tidy up
-/// and prove nothing.
+/// `Child::kill` sends `SIGKILL`, which cannot be caught, and that is the
+/// point - a signal the process could handle would let it tidy up and prove
+/// nothing.
 fn kill_and_reap(child: &mut Child) {
     let _ = child.kill();
     child.wait().unwrap();
 }
 
+/// One block row: `(block_no, bytes, hash)`.
+type BlockRow = (i64, Vec<u8>, Vec<u8>);
+
 /// What a store holds, minus everything a pass count changes.
+///
+/// Every block row of every session, so "the same store an uninterrupted pass
+/// reaches" means the same rows, numbered the same, holding the same bytes and
+/// hashes (D-12).
 ///
 /// `runs` is excluded on purpose: an interrupted store reaches the same
 /// contents in more passes than an uninterrupted one, and one row per committed
 /// pass is exactly the record it is supposed to keep.
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
-    blobs: Vec<(String, Vec<u8>)>,
+    blocks: Vec<(String, Vec<BlockRow>)>,
     turns: Vec<(i64, String, i64, String, i64, i64)>,
     fts: Vec<i64>,
     watermarks: Vec<(String, i64)>,
@@ -303,12 +310,16 @@ impl Snapshot {
     fn of(data_dir: &Path) -> Snapshot {
         let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
         let snapshot = Snapshot {
-            blobs: conn
-                .prepare("SELECT session_key, blob FROM sessions ORDER BY session_key")
+            blocks: conn
+                .prepare("SELECT session_key FROM sessions ORDER BY session_key")
                 .unwrap()
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
                 .map(Result::unwrap)
+                .map(|key| {
+                    let rows = testkit::block_rows(&conn, &key);
+                    (key, rows)
+                })
                 .collect(),
             turns: conn
                 .prepare(
@@ -351,24 +362,27 @@ impl Snapshot {
 /// AC2's invariants, as a check that returns its complaint instead of
 /// panicking: the negative tests need to assert that it *does* complain.
 ///
-/// Five properties, and it is worth being explicit about which is which,
-/// because two of them look like one and are not:
+/// Five properties, each stated over the committed block rows (D-12), and it
+/// is worth being explicit about which is which, because two of them look like
+/// one and are not:
 ///
-/// 1. **Every blob verifies.** Decompresses, and hashes to the BLAKE3 recorded
-///    for it (D-06). A killed pass must never leave a blob its own checksum
-///    disowns.
+/// 1. **Every session that is not evicted verifies.** Its rows are numbered
+///    with no gap, each decodes to its stored hash, and the session checksum
+///    matches those hashes (D-16). A killed pass must never leave a row its own
+///    hash, or a checksum its rows, disown.
 /// 2. **No orphaned derived row.** Nothing in `turns`, `turns_fts`, `entities`
 ///    or `paths` may outlive the row it derives from - which is what "one
 ///    transaction" buys and the only thing that makes a rebuild meaningful.
 /// 3. **Containment, for turn rows.** No turn row may address bytes past the
-///    end of the committed blob. The *weaker* of the two addressing properties.
-/// 4. **Containment, for the watermark.** The watermark may not sit past the
-///    committed blob either. Also weak: it rejects a store that claims bytes
-///    nothing holds, and accepts one that resumes from the middle of a record.
+///    stream the committed blocks hold. The *weaker* of the two addressing
+///    properties.
+/// 4. **Containment, for the watermark.** The watermark may not sit past that
+///    stream either. Also weak: it rejects a store that claims bytes no block
+///    holds, and accepts one that resumes from the middle of a record.
 /// 5. **The watermark is a record boundary.** The *strong* property, and the
 ///    one that actually encodes D-14: the watermark is the byte just past a
-///    `\n`, so the byte before it in the decompressed stream is a newline. A
-///    watermark one byte short of a boundary passes 4 and fails 5, and a pass
+///    `\n`, so the byte before it, read from the committed rows, is a newline.
+///    A watermark one byte short of a boundary passes 4 and fails 5, and a pass
 ///    resuming from it would archive half a record as a whole one.
 ///
 /// Plus a store-wide one: a watermark past zero with no archived session claims
@@ -382,10 +396,10 @@ fn check_invariants(data_dir: &Path) -> Result<(), String> {
     let store = Store::open(data_dir).map_err(|e| format!("the store will not open: {e}"))?;
     let conn = store.conn();
 
-    // (1) Every blob decompresses and matches the BLAKE3 recorded for it.
+    // (1) Every session that is not evicted passes verify's checks.
     let report = verify::verify(&store).map_err(|e| format!("verify failed: {e}"))?;
     if !report.is_ok() {
-        return Err(format!("blobs failed verification: {}", report.render()));
+        return Err(format!("sessions failed verification: {}", report.render()));
     }
 
     // (2) No derived row without the row it derives from.
@@ -419,19 +433,20 @@ fn check_invariants(data_dir: &Path) -> Result<(), String> {
         }
     }
 
-    // What each session's committed blob actually holds.
-    let sessions: Vec<(String, Vec<u8>)> = conn
-        .prepare("SELECT session_key, blob FROM sessions")
+    // What each session's committed block rows actually hold, decoded in
+    // `block_no` order through testkit's own SQL.
+    let sessions: Vec<String> = conn
+        .prepare("SELECT session_key FROM sessions")
         .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_map([], |r| r.get(0))
         .unwrap()
         .map(Result::unwrap)
         .collect();
 
-    for (session_key, bytes) in &sessions {
-        let reader = blob::BlobReader::open(bytes)
-            .map_err(|e| format!("{session_key}: blob will not parse: {e}"))?;
-        let committed = reader.uncompressed_len() as i64;
+    for session_key in &sessions {
+        let stream = testkit::stream(conn, session_key)
+            .map_err(|e| format!("{session_key}: committed blocks will not decode: {e}"))?;
+        let committed = stream.len() as i64;
 
         // (3) Containment, for turn rows.
         let past: i64 = conn
@@ -443,7 +458,8 @@ fn check_invariants(data_dir: &Path) -> Result<(), String> {
             .unwrap();
         if past > committed {
             return Err(format!(
-                "{session_key}: a turn row addresses byte {past} of a {committed}-byte blob"
+                "{session_key}: a turn row addresses byte {past} of the {committed} bytes its \
+                 committed blocks hold"
             ));
         }
 
@@ -459,20 +475,18 @@ fn check_invariants(data_dir: &Path) -> Result<(), String> {
             Some(at) if at > committed => {
                 return Err(format!(
                     "{session_key}: watermark at {at} is past the {committed} bytes the \
-                     committed blob holds"
+                     committed blocks hold"
                 ))
             }
             // (5) The watermark is a record boundary. Offset 0 is one
             // vacuously: nothing has been consumed, so there is no byte before
             // it to be a newline.
             Some(at) if at > 0 => {
-                let before = reader
-                    .read_range((at - 1) as u64, 1)
-                    .map_err(|e| format!("{session_key}: reading byte {} failed: {e}", at - 1))?;
+                let before = &stream[(at - 1) as usize..at as usize];
                 if before != b"\n" {
                     return Err(format!(
                         "{session_key}: watermark at {at} is not a record boundary - the byte \
-                         before it in the committed blob is {:?}, not a newline, so a resume \
+                         before it in the committed blocks is {:?}, not a newline, so a resume \
                          would archive the tail of a record as a record",
                         before[0] as char
                     ));
@@ -577,6 +591,7 @@ fn killing_ingest_anywhere_leaves_a_store_that_converges() {
         iteration(&data_dir, &mut kills, &mut incomplete);
     }
 
+    println!("single file: {kills} kills, {incomplete} of them interrupted the pass");
     assert!(
         kills >= 20,
         "AC2 asks for 20 or more kill points, ran {kills}"
@@ -593,9 +608,13 @@ fn killing_ingest_anywhere_leaves_a_store_that_converges() {
 /// same store an uninterrupted pass reaches.
 ///
 /// The append half is the one phase 1 could not do. Every kill it ran went into
-/// an empty data directory, so `blob::append` - copying committed blocks
-/// forward, verifying the stored checksum before it writes, resuming a session
-/// at a non-zero watermark - had never been interrupted once.
+/// an empty data directory, so an append - checking the stored hashes and the
+/// tail before it writes, rewriting at most the tail row, resuming a session at
+/// a non-zero watermark - had never been interrupted once.
+///
+/// The append half also holds D-12's second check: every block that was
+/// complete after the first pass is byte-identical after the append pass, in
+/// the reference store and in every interrupted one.
 #[test]
 fn killing_a_tree_pass_converges_on_a_first_pass_and_on_an_append() {
     let dirs = dirs();
@@ -611,13 +630,13 @@ fn killing_a_tree_pass_converges_on_a_first_pass_and_on_an_append() {
     let first_time = started.elapsed();
     let first_reference = Snapshot::of(&first_reference_dir);
     assert_eq!(
-        first_reference.blobs.len(),
+        first_reference.blocks.len(),
         tree.len(),
         "the reference pass did not archive the whole tree"
     );
     println!(
         "uninterrupted tree pass: {first_time:?}, {} sessions, {} turns",
-        first_reference.blobs.len(),
+        first_reference.blocks.len(),
         first_reference.turns.len()
     );
 
@@ -636,6 +655,15 @@ fn killing_a_tree_pass_converges_on_a_first_pass_and_on_an_append() {
     );
 
     // --- Scenario two: the same spread against an append pass. ---
+    // What no append may touch: every block the first pass completed.
+    let complete = complete_blocks(&first_reference_dir);
+    assert!(
+        complete.len() >= 3,
+        "the first pass must complete blocks for the append to keep: {}",
+        complete.len()
+    );
+    println!("{} complete blocks after the first pass", complete.len());
+
     // Every transcript grows, so a kill between files always leaves work.
     for path in &tree {
         append_records(path, 3);
@@ -647,6 +675,8 @@ fn killing_a_tree_pass_converges_on_a_first_pass_and_on_an_append() {
     ingest_fully(&dirs, &append_reference_dir, None);
     let append_time = started.elapsed();
     let append_reference = Snapshot::of(&append_reference_dir);
+    kept_complete_blocks(&append_reference_dir, &complete)
+        .unwrap_or_else(|why| panic!("the uninterrupted append pass: {why}"));
     assert_ne!(
         append_reference, first_reference,
         "the appends changed nothing, so the append scenario would test the first one twice"
@@ -680,7 +710,9 @@ fn killing_a_tree_pass_converges_on_a_first_pass_and_on_an_append() {
 /// resumed to completion and compared against `reference`. Returns the count.
 ///
 /// `seed_dir` is the store every iteration starts from, copied per iteration -
-/// `None` for a first pass, which starts from nothing.
+/// `None` for a first pass, which starts from nothing. Every block complete in
+/// `seed_dir` must still be there unchanged after the kill and after converging
+/// (D-12); a first pass has none yet.
 fn kill_spread(
     dirs: &Dirs,
     label: &str,
@@ -692,18 +724,32 @@ fn kill_spread(
 ) -> usize {
     let mut kills = 0usize;
     let mut interrupted = 0usize;
+    let kept = seed_dir.map(complete_blocks).unwrap_or_default();
 
     let iteration = |data_dir: &Path, kills: &mut usize, interrupted: &mut usize| {
         *kills += 1;
         check_invariants(data_dir).unwrap_or_else(|why| {
             panic!("{label} kill {} left an inconsistent store: {why}", *kills)
         });
+        if !kept.is_empty() {
+            kept_complete_blocks(data_dir, &kept).unwrap_or_else(|why| {
+                panic!("{label} kill {} rewrote a complete block: {why}", *kills)
+            });
+        }
         if data_dir.join(DB_FILE_NAME).exists() && &Snapshot::of(data_dir) != reference {
             *interrupted += 1;
         }
         ingest_fully(dirs, data_dir, None);
         check_invariants(data_dir)
             .unwrap_or_else(|why| panic!("{label} kill {} did not converge: {why}", *kills));
+        if !kept.is_empty() {
+            kept_complete_blocks(data_dir, &kept).unwrap_or_else(|why| {
+                panic!(
+                    "{label} kill {} converged with a complete block rewritten: {why}",
+                    *kills
+                )
+            });
+        }
         assert_eq!(
             &Snapshot::of(data_dir),
             reference,
@@ -760,6 +806,49 @@ fn kill_spread(
     kills
 }
 
+/// Every block row that holds a whole block, by session: all but a partial
+/// tail, which is the one row an append may rewrite.
+fn complete_blocks(data_dir: &Path) -> Vec<(String, BlockRow)> {
+    let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+    let rows = conn
+        .prepare(
+            "SELECT s.session_key, b.block_no, b.bytes, b.hash
+               FROM blocks b
+               JOIN sessions s USING (session_no)
+               JOIN session_meta m USING (session_key)
+              WHERE b.block_no < m.uncompressed_len / m.block_size
+              ORDER BY s.session_key, b.block_no",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows
+}
+
+/// Every row in `kept` is still in `data_dir`'s store, at its number, with the
+/// same bytes and hash (D-12).
+fn kept_complete_blocks(data_dir: &Path, kept: &[(String, BlockRow)]) -> Result<(), String> {
+    let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+    let mut now = std::collections::BTreeMap::new();
+    for (session_key, _) in kept {
+        if !now.contains_key(session_key) {
+            now.insert(session_key.clone(), testkit::block_rows(&conn, session_key));
+        }
+    }
+    for (session_key, row) in kept {
+        let rows = &now[session_key];
+        if !rows.iter().any(|r| r == row) {
+            return Err(format!(
+                "{session_key}: block {} changed or went missing",
+                row.0
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// [`fault::POINTS`] in a seed-shuffled order.
 fn shuffled_points(rng: &mut Rng) -> Vec<&'static str> {
     let mut points = fault::POINTS.to_vec();
@@ -782,7 +871,7 @@ fn the_harness_catches_a_watermark_committed_outside_the_transaction() {
 
     // Half one: containment. With the watermark committed in a transaction of
     // its own before the pass - which is what "the single transaction is real"
-    // denies - a kill in between leaves the store claiming bytes no blob holds.
+    // denies - a kill in between leaves the store claiming bytes no block holds.
     let data_dir = dirs.data("split");
     kill_at(&dirs, &data_dir, transcript, Aim::SplitWatermark);
 
@@ -808,7 +897,7 @@ fn the_harness_catches_a_watermark_committed_outside_the_transaction() {
 
 /// Half two: the record boundary, which is the property containment cannot see.
 ///
-/// A watermark moved back one byte is still well inside the committed blob, so
+/// A watermark moved back one byte is still well inside the committed blocks, so
 /// check (4) accepts it and only check (5) can object - and it must, because a
 /// pass resuming from there would read the last byte of an archived record as
 /// the first byte of a new one and archive the fragment.

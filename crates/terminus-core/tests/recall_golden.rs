@@ -135,8 +135,8 @@ fn capture(bench: &Bench) -> String {
             continue;
         };
 
-        let window = context::window(&conn, &config, &scope, anchor, CONTEXT_SIDE, CONTEXT_SIDE)
-            .unwrap();
+        let window =
+            context::window(&conn, &config, &scope, anchor, CONTEXT_SIDE, CONTEXT_SIDE).unwrap();
         out.push_str(&format!("\n== context {project} anchor={anchor}\n"));
         for turn in &window.turns {
             out.push_str(&format!(
@@ -194,8 +194,8 @@ const HEADER: &str = "\
 /// [`testkit::FIXTURE_ROOT_TOKEN`].
 ///
 /// The escaped spelling first and the plain one second: a `cwd` inside an
-/// archived JSON body carries a Windows root with its separators doubled, and
-/// replacing the plain form first would leave a stray backslash behind.
+/// archived JSON body carries any backslash in the root doubled, and replacing
+/// the plain form first would leave a stray backslash behind.
 fn rooted(text: &str, dir: &Path) -> String {
     let raw = dir.to_string_lossy().into_owned();
     let escaped = raw.replace('\\', "\\\\");
@@ -259,10 +259,7 @@ fn golden_path() -> PathBuf {
 fn diff(expected: &str, actual: &str) -> String {
     for (n, (want, got)) in expected.lines().zip(actual.lines()).enumerate() {
         if want != got {
-            return format!(
-                "line {}:\n  golden: {want:?}\n  actual: {got:?}",
-                n + 1
-            );
+            return format!("line {}:\n  golden: {want:?}\n  actual: {got:?}", n + 1);
         }
     }
     format!(
@@ -287,8 +284,8 @@ fn the_four_projections_are_what_the_golden_says() {
         );
     }
 
-    let expected = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let expected =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert!(
         expected == actual,
         "the recall projections moved against {}\n{}",

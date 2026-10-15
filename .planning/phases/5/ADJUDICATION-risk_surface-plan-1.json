@@ -1,0 +1,52 @@
+{
+  "phase": "5",
+  "trigger": "risk_surface",
+  "discriminator": "plan-1",
+  "round": 1,
+  "base": "2cb563c",
+  "head": "da6bf05",
+  "base_id": "2cb563c491613c5495dcab80aac019a03a431e1b",
+  "head_id": "da6bf05ce6c68a380eabff94d2a90e576a8627dd",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "install.sh",
+      "line": 168,
+      "severity": "high",
+      "claim": "The cleanup trap recursively deletes the path printed by `mktemp` without validating that it is a newly created scratch directory.",
+      "failure_scenario": "If the environment supplies a broken or wrapped `mktemp` earlier on PATH that prints an existing directory and exits successfully (for example `/home/user`), the installer assigns that path to `scratch` and the EXIT trap executes `rm -rf \"$scratch\"`, recursively deleting the existing directory. The script should constrain and validate the cleanup target before permitting recursive deletion.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "install.sh",
+        "line": 160,
+        "note": "scratch is set by `scratch=$(mktemp -d)` under `set -eu`, so a failing mktemp exits before the trap at install.sh:168 is set. The rm -rf is not new in this range: 2cb563c:install.sh:157 holds the same line, and this range only moved it into the function. The scenario needs an attacker-controlled mktemp earlier on PATH, and whoever controls the user PATH already runs any command as that user, so no boundary is crossed."
+      },
+      "base_id": "2cb563c491613c5495dcab80aac019a03a431e1b",
+      "head_id": "da6bf05ce6c68a380eabff94d2a90e576a8627dd"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus/tests/install_script.rs",
+      "line": 676,
+      "severity": "medium",
+      "claim": "The piped-install test never truncates the script, so it does not test the stated guarantee that a pipe cut off mid-transfer runs nothing.",
+      "failure_scenario": "An implementation that leaves the entire installer body at top level would pass this test because the test writes the complete script before closing stdin. Such an implementation would begin installing when only a prefix had arrived and could leave a partial install if the transfer then stopped. The harness needs to pipe representative truncated prefixes and assert that they cause no downloads or filesystem changes.",
+      "ruling": "survived",
+      "convergent": false,
+      "base_id": "2cb563c491613c5495dcab80aac019a03a431e1b",
+      "head_id": "da6bf05ce6c68a380eabff94d2a90e576a8627dd"
+    }
+  ]
+}

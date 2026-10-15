@@ -14,25 +14,10 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 use serde_json::Value;
-use terminus_core::config::{Config, CONFIG_FILE_NAME};
-use terminus_core::ingest::lock::{self, Attempt};
-use terminus_core::ingest::pass::{self, PassOutcome};
-use terminus_core::observe::net;
 use terminus_core::store::DB_FILE_NAME;
-use terminus_core::testkit::{self, HttpStub};
-
-/// Held by every test that runs a pass IN PROCESS: `observe::net`'s attempt log
-/// is process global, so a test counting zero connections and a test making one
-/// cannot run at the same time.
-static NET: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// How long a test waits for a detached spawn or a stalled call, before it
-/// calls the thing it is waiting for broken.
-const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The session the transcript below belongs to, and the branch it ran on.
 const SESSION: &str = "11111111-1111-4111-8111-111111111111";
@@ -180,116 +165,6 @@ impl Bench {
             .join("project-alpha/crates/gizmo/lantern.rs")
             .to_string_lossy()
             .into_owned()
-    }
-
-    /// Fill one row's judgment columns with something no provider would
-    /// return, so "this row was re-judged" and "this row was left alone" are
-    /// distinguishable afterwards.
-    fn seed_judgment(&self, session: &str, topic: &str) {
-        let changed = self
-            .conn()
-            .execute(
-                "UPDATE observations
-                    SET status = 'ok', model = 'seeded', prompt_version = 'seed-1',
-                        topic = ?2, outcome = 'completed',
-                        decisions = '[]', learned = '[]', unresolved = '[]',
-                        raw = NULL, tokens = 1
-                  WHERE session_id = ?1",
-                rusqlite::params![session, topic],
-            )
-            .unwrap();
-        assert_eq!(changed, 1, "the premise: {session} has a row to seed");
-    }
-
-    /// One session's stored `topic`, which is what says whose answer wrote it.
-    fn topic(&self, session: &str) -> Option<String> {
-        self.conn()
-            .query_row(
-                "SELECT o.topic FROM observations o WHERE o.session_id = ?1",
-                [session],
-                |r| r.get(0),
-            )
-            .unwrap_or_else(|e| panic!("no observation for {session}: {e}"))
-    }
-
-    /// Every `turns.id` of one session: a model cannot anchor a claim to an id
-    /// that is not there, and neither can a stub pretending to be one.
-    fn turn_ids(&self, session: &str) -> Vec<i64> {
-        self.conn()
-            .prepare(
-                "SELECT t.id FROM turns t
-                   JOIN session_meta m ON m.session_key = t.session_key
-                  WHERE m.session_id = ?1 ORDER BY t.turn_seq",
-            )
-            .unwrap()
-            .query_map([session], |r| r.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
-    }
-
-    /// Stamp today's provider spend, the way an earlier invocation would have.
-    fn stamp_spend(&self, tokens: u64) {
-        self.conn()
-            .execute(
-                "INSERT INTO meta (key, value)
-                 VALUES ('observe.daily_tokens', strftime('%Y-%m-%d', 'now') || ' ' || ?1)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [tokens.to_string()],
-            )
-            .unwrap();
-    }
-
-    /// Write a `terminus.toml` naming the transcript root, plus whatever
-    /// provider block the caller wants.
-    ///
-    /// The root has to be spelled in the file rather than left to
-    /// `CLAUDE_CONFIG_DIR`, because the in-process tests below load this config
-    /// in a process that never set that variable.
-    fn write_config(&self, provider: &str) {
-        let root = self.claude_dir.to_string_lossy().replace('\\', "\\\\");
-        std::fs::write(
-            self.config_dir.join(CONFIG_FILE_NAME),
-            format!("roots = [\"{root}\"]\n{provider}"),
-        )
-        .unwrap();
-    }
-
-    fn config(&self) -> Config {
-        Config::load_from(&self.config_dir).unwrap()
-    }
-
-    /// How many passes this store has recorded.
-    fn runs(&self) -> i64 {
-        self.conn()
-            .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
-            .unwrap()
-    }
-
-    /// Block until a pass beyond `before` has recorded itself.
-    ///
-    /// The hook's ingest is detached by design, so there is nothing to wait on
-    /// but the row it writes - and it writes one whatever it found.
-    fn wait_for_a_pass_after(&self, before: i64) {
-        let deadline = Instant::now() + DEADLINE;
-        while self.runs() <= before {
-            assert!(
-                Instant::now() < deadline,
-                "the hook's detached ingest never recorded a pass"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    /// One session's judgment status, null until a provider has answered.
-    fn status(&self, session: &str) -> Option<String> {
-        self.conn()
-            .query_row(
-                "SELECT o.status FROM observations o WHERE o.session_id = ?1",
-                [session],
-                |r| r.get(0),
-            )
-            .unwrap_or_else(|e| panic!("no observation for {session}: {e}"))
     }
 
     /// One session carrying every OBS-01 fact: an edit, two tools, a command
@@ -451,8 +326,7 @@ fn a_finalized_session_is_listed_with_every_obs_01_fact() {
     let row = &listed[0];
     assert_eq!(row["session_id"], SESSION, "{row}");
     assert!(row["generated_at"].is_string(), "{row}");
-    // The judgment half is present and null, so a consumer reads one shape
-    // whether or not a provider has ever answered.
+    // The summary half is gone from the row, not left behind as nulls.
     for column in [
         "status",
         "model",
@@ -465,7 +339,10 @@ fn a_finalized_session_is_listed_with_every_obs_01_fact() {
         "raw",
         "tokens",
     ] {
-        assert_eq!(row[column], Value::Null, "{column} is not null yet: {row}");
+        assert!(
+            row.get(column).is_none(),
+            "{column} is still in the row: {row}"
+        );
     }
 
     let facts = &row["mechanical"];
@@ -602,7 +479,6 @@ fn regenerate_rebuilds_the_selected_rows_and_leaves_the_rest_untouched() {
     assert_eq!(value["ok"], true, "{value}");
     let data = &value["data"];
     assert_eq!(data["since"], since.as_str(), "{data}");
-    assert_eq!(data["prompt_version"], Value::Null, "{data}");
     assert_eq!(data["selected"], 1, "{data}");
     assert_eq!(data["regenerated"], 1, "{data}");
     assert_eq!(data["notes"], serde_json::json!([]), "{data}");
@@ -617,42 +493,6 @@ fn regenerate_rebuilds_the_selected_rows_and_leaves_the_rest_untouched() {
         SPOILED,
         "a row outside the selector was rewritten"
     );
-}
-
-/// The selector narrows conjunctively, and `--prompt-version` narrows to
-/// nothing while the column is null - which is the honest answer, not an empty
-/// selector that rebuilds everything.
-#[test]
-fn a_prompt_version_no_row_carries_selects_no_row() {
-    let bench = bench();
-    bench.ingest_the_finalized_session();
-    bench.spoil(SESSION);
-
-    let out = bench.run(&[
-        "observations",
-        "regenerate",
-        "--prompt-version",
-        "v1",
-        "--json",
-    ]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-
-    let data = &document(&out)["data"];
-    assert_eq!(data["prompt_version"], "v1", "{data}");
-    assert_eq!(data["selected"], 0, "{data}");
-    assert_eq!(data["regenerated"], 0, "{data}");
-    assert_eq!(
-        bench.stored(SESSION),
-        SPOILED,
-        "a selector that matched nothing still rebuilt a row"
-    );
-
-    // And with no selector at all, that same row IS rebuilt: the premise of the
-    // assertion above is that the row was reachable and simply not selected.
-    let out = bench.run(&["observations", "regenerate", "--json"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    assert_eq!(document(&out)["data"]["regenerated"], 1);
-    assert_ne!(bench.stored(SESSION), SPOILED);
 }
 
 /// D-18's misuse arm: an unknown flag and an unknown second word both exit 2
@@ -709,307 +549,4 @@ fn a_malformed_since_is_misuse_and_rebuilds_nothing() {
         SPOILED,
         "a refused bound still wrote"
     );
-}
-
-/// A `[provider]` block pointing at `stub`, on or off.
-///
-/// `local = true` throughout: the egress filter has its own tests, and what is
-/// being measured here is whether anything is reached for at all.
-fn provider(stub: &HttpStub, enabled: bool) -> String {
-    format!(
-        "[provider]\nenabled = {enabled}\nbase_url = \"{}\"\n\
-         model = \"qwen3:8b\"\nlocal = true\n",
-        stub.base_url()
-    )
-}
-
-/// AC6's ingest half: with judgment off - the default - a full tree pass and a
-/// hook run reach for nothing at all.
-///
-/// Two instruments, because one process cannot see the other's log (D-21). In
-/// process, `observe::net`'s attempt log is the count. Across the process
-/// boundary, a real endpoint is: it is named in the config, it is listening,
-/// and nothing ever knocks on it.
-#[test]
-fn with_judgment_off_a_pass_and_a_hook_run_reach_for_nothing() {
-    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
-    let bench = bench();
-    bench.place(SESSION, FIRST_TURN_SECONDS_AGO);
-
-    let stub = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
-    bench.write_config(&provider(&stub, false));
-
-    net::attempts::reset();
-    let outcome = pass::run_with(&bench.data_dir, &bench.config()).unwrap();
-    assert!(matches!(outcome, PassOutcome::Ran(_)), "{outcome:?}");
-    assert_eq!(
-        net::attempts::count(),
-        0,
-        "a pass with judgment off opened a connection: {:?}",
-        net::attempts::destinations()
-    );
-
-    // The spawned tree pass, and then the hook that spawns one of its own.
-    let out = bench.run(&["ingest"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-
-    let before = bench.runs();
-    let hook = bench.run(&["hook", "SessionStart"]);
-    assert_eq!(hook.status.code(), Some(0), "{}", stderr(&hook));
-    bench.wait_for_a_pass_after(before);
-
-    assert_eq!(
-        stub.requests(),
-        Vec::<String>::new(),
-        "something knocked on the configured endpoint with judgment off"
-    );
-}
-
-/// D-07: the provider call is outside the ingest lock, and that is asserted by
-/// taking the lock while a call is provably in flight.
-#[test]
-fn a_provider_call_in_flight_does_not_hold_the_ingest_lock() {
-    let _guard = NET.lock().unwrap_or_else(|e| e.into_inner());
-    let bench = bench();
-    bench.place(SESSION, FIRST_TURN_SECONDS_AGO);
-    // Archive and close the session first, so the pass under test has exactly
-    // one thing left to do and gets to the provider immediately.
-    bench.ingest();
-
-    let stub = HttpStub::stalling(Duration::from_secs(5));
-    bench.write_config(&provider(&stub, true));
-    let config = bench.config();
-
-    // The falsifier, before anything else: this lock really does refuse a
-    // second holder inside one process, so `Acquired` below means the pass had
-    // let go rather than that the instrument cannot see itself.
-    {
-        let held = lock::try_acquire(&bench.data_dir).unwrap();
-        assert!(matches!(held, Attempt::Acquired(_)), "{held:?}");
-        assert_eq!(
-            pass::run_with(&bench.data_dir, &config).unwrap(),
-            PassOutcome::LockHeld
-        );
-    }
-
-    let data_dir = bench.data_dir.clone();
-    let running = config.clone();
-    let passing = std::thread::spawn(move || pass::run_with(&data_dir, &running).unwrap());
-
-    // The request has been read and the stub is sitting on it, so the pass is
-    // inside the HTTP call for the length of the hold.
-    let deadline = Instant::now() + DEADLINE;
-    while stub.arrived() == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "the pass never reached the provider"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    match lock::try_acquire(&bench.data_dir).unwrap() {
-        Attempt::Acquired(_) => {}
-        Attempt::Held => panic!("a provider call is holding the ingest lock (D-07)"),
-    }
-
-    let outcome = passing.join().expect("the pass thread");
-    assert!(matches!(outcome, PassOutcome::Ran(_)), "{outcome:?}");
-}
-
-/// OBS-04's promise at the process boundary: judgment never blocks ingest. The
-/// pass completes, records itself, exits 0, and says on stderr what happened.
-#[test]
-fn a_pass_whose_answer_cannot_be_used_still_records_itself_and_exits_zero() {
-    let bench = bench();
-    bench.place(SESSION, FIRST_TURN_SECONDS_AGO);
-    bench.ingest();
-    let before = bench.runs();
-    assert_eq!(
-        bench.status(SESSION),
-        None,
-        "the premise: nothing judged yet"
-    );
-
-    // Two, because an unusable answer is asked for again exactly once.
-    let stub = HttpStub::serving(&[
-        testkit::chat_completion(testkit::UNPARSEABLE_CONTENT, 10, 5),
-        testkit::chat_completion(testkit::UNPARSEABLE_CONTENT, 10, 5),
-    ]);
-    bench.write_config(&provider(&stub, true));
-
-    let out = bench.run(&["ingest"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    assert_eq!(bench.runs(), before + 1, "the pass recorded no run");
-    assert_eq!(stub.requests().len(), 2);
-    assert_eq!(
-        bench.status(SESSION).as_deref(),
-        Some("parse_failed"),
-        "the failure was dropped instead of stored"
-    );
-
-    // Said rather than swallowed. This step runs after the `runs` row commits,
-    // so stderr is the only channel it has.
-    let said = stderr(&out);
-    assert!(
-        said.contains("could not be used"),
-        "the pass was silent about a provider answer it threw away: {said:?}"
-    );
-    assert_eq!(stdout(&out), "", "a tree pass printed to stdout");
-}
-
-/// The topic a seeded row carries: no provider would ever answer this.
-const SEEDED: &str = "seeded by hand and must survive a run that did not ask";
-
-/// The topic the stub's answer carries, so a re-judged row is unmistakable.
-const JUDGED_TOPIC: &str = "the observation step and the lock it does not hold";
-
-/// A schema-shaped answer anchored at ids that are really in the session.
-fn answer(ids: &[i64]) -> String {
-    assert!(!ids.is_empty(), "the premise: the session has turns");
-    serde_json::json!({
-        "topic": JUDGED_TOPIC,
-        "outcome": "completed",
-        "decisions": [{"turn_id": ids[0], "text": "kept the two-phase rebuild"}],
-        "learned": [],
-        "unresolved": [],
-    })
-    .to_string()
-}
-
-/// OBS-07 with a provider: `--since` re-buys judgment for exactly the rows it
-/// chose, and the rows it did not choose keep the answer they already had.
-#[test]
-fn regenerate_with_a_provider_re_judges_only_the_selected_rows() {
-    let bench = bench();
-    bench.place(SESSION, FIRST_TURN_SECONDS_AGO);
-    bench.place(OLDER_SESSION, OLDER_FIRST_TURN_SECONDS_AGO);
-    bench.ingest();
-    bench.seed_judgment(SESSION, SEEDED);
-    bench.seed_judgment(OLDER_SESSION, SEEDED);
-
-    let stub = HttpStub::serving(&[testkit::chat_completion(
-        &answer(&bench.turn_ids(SESSION)),
-        5,
-        5,
-    )]);
-    bench.write_config(&provider(&stub, true));
-
-    let since = ts(BETWEEN_SECONDS_AGO);
-    let out = bench.run(&["observations", "regenerate", "--since", &since, "--json"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-
-    let data = &document(&out)["data"];
-    assert_eq!(data["selected"], 1, "{data}");
-    assert_eq!(data["regenerated"], 1, "{data}");
-    let notes = strings(&data["notes"]);
-    assert!(
-        notes.iter().any(|note| note.contains("re-judged 1 of 1")),
-        "a run that bought a judgment said nothing about it: {notes:?}"
-    );
-
-    assert_eq!(
-        stub.requests().len(),
-        1,
-        "one selected row cost more than one call"
-    );
-    assert_eq!(
-        bench.topic(SESSION).as_deref(),
-        Some(JUDGED_TOPIC),
-        "the selected row was not re-judged"
-    );
-    assert_eq!(
-        bench.topic(OLDER_SESSION).as_deref(),
-        Some(SEEDED),
-        "a row outside the selector was re-judged"
-    );
-}
-
-/// Without a provider the same command rebuilds facts and touches no judgment
-/// column - which is what lets a user who has never configured a model use
-/// OBS-07 at all.
-#[test]
-fn regenerate_without_a_provider_leaves_every_judgment_column_alone() {
-    let bench = bench();
-    bench.place(SESSION, FIRST_TURN_SECONDS_AGO);
-    bench.place(OLDER_SESSION, OLDER_FIRST_TURN_SECONDS_AGO);
-    bench.ingest();
-    bench.seed_judgment(SESSION, SEEDED);
-    bench.seed_judgment(OLDER_SESSION, SEEDED);
-    bench.spoil(SESSION);
-    bench.spoil(OLDER_SESSION);
-
-    // Configured and listening, and simply not enabled: the endpoint exists, so
-    // "no request was made" is a fact about this run rather than about a port
-    // nothing could have reached.
-    let stub = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
-    bench.write_config(&provider(&stub, false));
-
-    let out = bench.run(&["observations", "regenerate", "--json"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-
-    let data = &document(&out)["data"];
-    assert_eq!(data["selected"], 2, "{data}");
-    assert_eq!(data["regenerated"], 2, "{data}");
-    assert_eq!(data["notes"], serde_json::json!([]), "{data}");
-
-    assert_eq!(
-        stub.requests(),
-        Vec::<String>::new(),
-        "a regenerate with no provider knocked on one anyway"
-    );
-    for session in [SESSION, OLDER_SESSION] {
-        assert_eq!(
-            bench.topic(session).as_deref(),
-            Some(SEEDED),
-            "{session}'s judgment was rewritten by a run that asked nothing"
-        );
-        assert_ne!(
-            bench.stored(session),
-            SPOILED,
-            "{session}'s facts were not rebuilt"
-        );
-    }
-}
-
-/// A spent daily budget stops the run and says how much of the set it left,
-/// rather than overspending in silence or failing the command.
-#[test]
-fn regenerate_stops_on_a_spent_budget_and_says_what_it_left_unasked() {
-    let bench = bench();
-    bench.place(SESSION, FIRST_TURN_SECONDS_AGO);
-    bench.place(OLDER_SESSION, OLDER_FIRST_TURN_SECONDS_AGO);
-    bench.ingest();
-    bench.seed_judgment(SESSION, SEEDED);
-    bench.seed_judgment(OLDER_SESSION, SEEDED);
-    bench.stamp_spend(500);
-
-    let stub = HttpStub::serving(&[testkit::chat_completion("{}", 1, 1)]);
-    bench.write_config(&format!(
-        "{}daily_token_budget = 100\n",
-        provider(&stub, true)
-    ));
-
-    let out = bench.run(&["observations", "regenerate", "--json"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-
-    let data = &document(&out)["data"];
-    // The mechanical half still ran: the budget is a cap on what a provider
-    // may charge, not a reason to stop rebuilding facts that cost nothing.
-    assert_eq!(data["regenerated"], 2, "{data}");
-    let notes = strings(&data["notes"]);
-    assert!(
-        notes
-            .iter()
-            .any(|note| note.contains("2 selected session(s) were left unasked")),
-        "the run did not say how much of the set it skipped: {notes:?}"
-    );
-
-    assert_eq!(
-        stub.requests(),
-        Vec::<String>::new(),
-        "the budget was checked after the request"
-    );
-    for session in [SESSION, OLDER_SESSION] {
-        assert_eq!(bench.topic(session).as_deref(), Some(SEEDED), "{session}");
-    }
 }

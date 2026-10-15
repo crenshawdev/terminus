@@ -22,19 +22,9 @@ use crate::recall::Query;
 ///
 /// A caller may lower it and may not raise it. The MCP server needs a
 /// server-side budget it does not have to trust a client to respect (RCL-10),
-/// and every hit costs an excerpt read out of a session blob, which is a whole
-/// decompressed session per session touched while rusqlite's incremental blob
-/// I/O stays out of scope (D-20).
+/// and every hit costs an excerpt read out of its session's block rows: the
+/// blocks its turn covers, fetched and decompressed.
 pub const MAX_RESULTS: usize = 50;
-
-/// The one [`Filters::kind`] value that is not a `turns.record_type` (OBS-08).
-///
-/// `turns_fts` is contentless with `rowid IS turns.id`, so an observation has
-/// no natural row in it and no clause added to the ranking query could ever
-/// return one. The filter therefore switches [`run`] to a second query over the
-/// `observations` table instead - which is the whole of what D-17 buys over a
-/// fourth MCP tool, and `DESIGN-BRIEF.md:184` bars a fourth outright.
-pub const OBSERVATION_KIND: &str = "observation";
 
 /// What a caller gets when it does not say.
 ///
@@ -54,9 +44,6 @@ pub struct Filters {
     /// tool filter and not a first guess at one.
     pub tool: Option<String>,
     /// `turns.record_type`: `user`, `assistant`, `system`, `attachment`.
-    ///
-    /// Or [`OBSERVATION_KIND`], which is not a record type at all: it switches
-    /// [`run`] to a second query over the `observations` table (OBS-08, D-17).
     pub kind: Option<String>,
     /// Turns carrying any of these in the `paths` table. Structural, not
     /// textual: a turn that merely names a path in prose has no `paths` row and
@@ -104,7 +91,7 @@ pub struct Request {
     /// [`Hit::entity_count`], so a candidate that matched only as free text
     /// costs a row here and injects nothing (INJ-03).
     pub candidates: Vec<Query>,
-    /// Whether every returned hit gets an excerpt cut from its session blob.
+    /// Whether every returned hit gets an excerpt cut from its session's block rows.
     ///
     /// On for both front ends, because a hit with no text under it is not a
     /// search result. Off for injection until its threshold has fired: an
@@ -263,7 +250,7 @@ pub struct Hit {
     /// Higher is a better match: the negated bm25 (see [`HEAD`]) plus
     /// [`Hit::entity_score`].
     pub relevance: f64,
-    /// The matched text, cut from the session blob (D-05). Empty only when the
+    /// The matched text, cut from the session's block rows (D-05). Empty only when the
     /// archive would not give it up - see [`crate::recall::excerpt`].
     pub excerpt: String,
 }
@@ -277,8 +264,8 @@ pub struct Hit {
 pub struct Response {
     pub hits: Vec<Hit>,
     pub reason: Option<Reason>,
-    /// How many session blobs the excerpts materialized. An instrument, not an
-    /// answer: see [`crate::recall::excerpt::Reads`].
+    /// Block rows the excerpts fetched and blocks they decompressed. An
+    /// instrument, not an answer: see [`crate::recall::excerpt::Reads`].
     pub reads: excerpt::Reads,
 }
 
@@ -337,7 +324,7 @@ const CANDIDATE_POOL: usize = MAX_RESULTS * 4;
 ///
 /// A query that reduced to no tokens returns no hits without asking SQLite
 /// anything: `MATCH ''` is itself an fts5 error (D-09), so the empty result is
-/// produced rather than caught.
+/// produced rather than caught, with [`Reason::NothingSearchable`] saying why.
 pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Response> {
     let scoped = scope::resolve(conn, config, &request.scope)?;
     if let Some(reason) = scoped.reason() {
@@ -348,15 +335,11 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
         });
     }
 
-    // OBS-08's branch, and it has to be a branch rather than a clause - see
-    // [`OBSERVATION_KIND`]. Taken after the scope resolves, so an excluded or
-    // unknown project answers with the same reason it would for a turn search.
-    if request.filters.kind.as_deref() == Some(OBSERVATION_KIND) {
-        return observations(conn, request, &scoped, &Redaction::of(config));
-    }
-
     let Some(expression) = expression(request) else {
-        return Ok(Response::default());
+        return Ok(Response {
+            reason: Some(Reason::NothingSearchable),
+            ..Response::default()
+        });
     };
 
     let mut sql = String::from(HEAD);
@@ -423,10 +406,7 @@ pub fn run(conn: &Connection, config: &Config, request: &Request) -> Result<Resp
     // And not at all when the caller said so - see [`Request::excerpts`].
     let reads = if request.excerpts {
         // The knob is read HERE, at the entry point that already holds the
-        // config, and travels down as a value (phase 4 D-01). Rule 1 is fed
-        // this run's provider credential when there is one; on the common
-        // machine there is not, and the filter rests on the shape rules alone
-        // (D-10).
+        // config, and travels down as a value (phase 4 D-01).
         excerpt::attach(conn, &request.query, &mut hits, &Redaction::of(config))?
     } else {
         excerpt::Reads::default()
@@ -460,186 +440,6 @@ fn expression(request: &Request) -> Option<String> {
         .collect();
     (!parts.is_empty()).then(|| parts.join(" OR "))
 }
-
-/// One hit per CLAIM of every stored observation whose text matches (OBS-08).
-///
-/// **Claims and not rows.** The three claim columns are walked with `json_each`
-/// the way `feedback::label` walks a decision's injected list, so a hit carries
-/// the anchoring `turn_id` of the one claim it is about. An observation-shaped
-/// hit whose `turn_id` was the whole row's would be unanchorable, which is the
-/// only thing that makes any of this auditable.
-///
-/// **Scoped and excluded like every other hit.** The join to `session_meta` and
-/// the two exclusion clauses are the turn branch's, reused: a branch that
-/// queried `observations` directly is exactly how a project excluded after its
-/// sessions were archived becomes visible again (ING-08).
-///
-/// **No excerpt read.** [`excerpt::attach`] is deliberately not called: the text
-/// IS the claim, it is already in hand, and attaching would decompress a whole
-/// session for a hit whose `turn_id` points at a different turn from the one the
-/// claim text came out of.
-///
-/// **Filtered on READ, not only on write** (PRIV-03, phase 4 D-05). Because
-/// this branch never calls `attach`, the redaction has to be applied here or
-/// not at all - and applied here it covers claim rows written BEFORE the knob
-/// was turned on, with no regeneration and no user action. That is the whole
-/// reason for doing it on the read side: the alternative is a `doctor` line
-/// telling the user to regenerate their observations, and until they did,
-/// `recall_search --kind observation` would hand the model raw claim text from
-/// every row that predates the flip. Filtering twice is free - every marker
-/// `observe::egress` leaves is one whitespace-free token and every value run
-/// stops at whitespace, so a marker is replaced by itself - which is what makes
-/// this safe to run over a row the write side already filtered.
-///
-/// **Nothing but the text moves.** `turn_id`, `session_key`, `ts`, `project`
-/// and the flat `relevance` are untouched: OBS-03's anchor is the only thing
-/// that makes a claim auditable, and a filter that could shift it would trade
-/// one leak for a claim nobody can check.
-///
-/// **No `before_turn_id`.** That bound is `terminus replay`'s alone and replay
-/// never sets a `kind`, so there is nothing here to implement it for. It also
-/// could not mean the same thing: an observation is written long after the turns
-/// it anchors to.
-fn observations(
-    conn: &Connection,
-    request: &Request,
-    scoped: &scope::Scoped,
-    redaction: &Redaction<'_>,
-) -> Result<Response> {
-    // The table, not the row count: a store written before phase 7 has no
-    // `observations` at all, and left to the query that is `no such table`
-    // inside an error rather than an answer.
-    let present: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'observations'",
-            [],
-            |_| Ok(true),
-        )
-        .unwrap_or(false);
-    if !present {
-        return Ok(Response {
-            reason: Some(Reason::NoObservations),
-            ..Response::default()
-        });
-    }
-
-    let tokens: Vec<String> = request
-        .query
-        .tokens()
-        .iter()
-        .map(|token| token.to_lowercase())
-        .collect();
-    if tokens.is_empty() {
-        return Ok(Response::default());
-    }
-
-    let mut sql = String::from(CLAIMS);
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if let Some(project) = scoped.project() {
-        sql.push_str(" AND m.project = ?\n");
-        params.push(Box::new(project.to_owned()));
-    }
-    push_exclusion(
-        &mut sql,
-        &mut params,
-        "m.project",
-        scoped.excluded_projects(),
-    );
-    push_exclusion(
-        &mut sql,
-        &mut params,
-        "m.project_pre_worktree",
-        scoped.excluded_pre_worktree(),
-    );
-    // Conjunctive, like the turn branch's tokens. `instr` over the folded text
-    // and not `LIKE`: a token carrying `%` or `_` would be a wildcard the user
-    // never typed, and a query is untrusted text.
-    for token in &tokens {
-        sql.push_str(" AND instr(lower(c.text), ?) > 0\n");
-        params.push(Box::new(token.clone()));
-    }
-    sql.push_str(CLAIMS_TAIL);
-    params.push(Box::new(request.effective_limit() as i64));
-
-    let mut statement = conn.prepare(&sql)?;
-    let hits = statement
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok(Hit {
-                turn_id: row.get(0)?,
-                session_key: row.get(1)?,
-                record_type: OBSERVATION_KIND.to_owned(),
-                // The observation's own timestamp, because a claim has no other
-                // one: `generated_at` says when this was written, and the turn
-                // the claim anchors to is reachable through `turn_id`.
-                ts: row.get(2)?,
-                project: row.get(3)?,
-                sidechain: row.get::<_, i64>(4)? != 0,
-                entity_score: 0.0,
-                entity_match: None,
-                entity_count: 0,
-                matched_on: Vec::new(),
-                // Flat, and honestly so. There is no bm25 to read here - a
-                // contentless FTS index cannot score a row that is not in it -
-                // and every hit matched every token, so nothing distinguishes
-                // them. The ORDER BY below is what makes the result stable.
-                relevance: 1.0,
-                excerpt: redaction.apply(&row.get::<_, String>(5)?).into_owned(),
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<Hit>>>()?;
-
-    Ok(Response {
-        hits,
-        reason: None,
-        reads: excerpt::Reads::default(),
-    })
-}
-
-/// Every claim of every observation, flattened, with the row it came from.
-///
-/// `coalesce(..., '[]')` because a row whose status is `parse_failed` carries
-/// null claim columns and `json_each(NULL)` is not a table this can join.
-const CLAIMS: &str = "
-    WITH claims AS (
-        SELECT o.session_key AS session_key, 0 AS list, e.key AS pos,
-               json_extract(e.value, '$.turn_id') AS turn_id,
-               json_extract(e.value, '$.text') AS text,
-               o.generated_at AS generated_at
-          FROM observations o, json_each(coalesce(o.decisions, '[]')) e
-        UNION ALL
-        SELECT o.session_key, 1, e.key,
-               json_extract(e.value, '$.turn_id'),
-               json_extract(e.value, '$.text'),
-               o.generated_at
-          FROM observations o, json_each(coalesce(o.learned, '[]')) e
-        UNION ALL
-        SELECT o.session_key, 2, e.key,
-               json_extract(e.value, '$.turn_id'),
-               json_extract(e.value, '$.text'),
-               o.generated_at
-          FROM observations o, json_each(coalesce(o.unresolved, '[]')) e
-    )
-    SELECT c.turn_id,
-           c.session_key,
-           c.generated_at,
-           m.project,
-           m.parent_session_key IS NOT NULL AS sidechain,
-           c.text
-    FROM claims c
-    LEFT JOIN session_meta m ON m.session_key = c.session_key
-    WHERE c.turn_id IS NOT NULL AND c.text IS NOT NULL
-";
-
-/// A total order, so two runs over an unchanged store agree.
-///
-/// Newest observation first, then the session key, then which of the three
-/// lists the claim came from, then its position in that list - and the last two
-/// together are unique within one observation, so there is no tie left to break
-/// nondeterministically.
-const CLAIMS_TAIL: &str = "
-    ORDER BY c.generated_at DESC, c.session_key ASC, c.list ASC, c.pos ASC
-    LIMIT ?
-";
 
 /// The same total order [`TAIL`] applies, over scores SQL could not compute.
 fn rank(a: &Hit, b: &Hit) -> std::cmp::Ordering {

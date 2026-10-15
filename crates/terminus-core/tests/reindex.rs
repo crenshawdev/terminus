@@ -304,14 +304,17 @@ fn an_ingest_brings_an_older_store_forward_first() {
 
 /// `meta` moves with the rebuild and inside its transaction: a store stamped up
 /// to date whose rebuild rolled back is the state this must not produce.
+///
+/// Only `derived_schema` is lowered: an older `archive_format` is refused by the
+/// open itself (STOR-10) and never reaches a rebuild.
 #[test]
 fn the_version_integers_move_with_the_rebuild() {
     let bench = bench();
     {
         let conn = bench.conn();
         conn.execute(
-            "UPDATE meta SET value = '0' WHERE key IN (?1, ?2)",
-            rusqlite::params![META_ARCHIVE_FORMAT, META_DERIVED_SCHEMA],
+            "UPDATE meta SET value = '0' WHERE key = ?1",
+            rusqlite::params![META_DERIVED_SCHEMA],
         )
         .unwrap();
     }
@@ -357,23 +360,8 @@ fn a_corrupt_blob_is_skipped_and_named_rather_than_stopping_the_rebuild() {
             .unwrap();
         assert!(others > 0, "this test needs more than one ingested session");
 
-        let mut blob: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&key],
-                |r| r.get(0),
-            )
-            .unwrap();
-        // Inside the payload, so the header still parses and the failure lands
-        // where a real bit-rot would: in the decompressor.
-        for byte in blob.iter_mut().skip(60).take(150) {
-            *byte = 0;
-        }
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![blob, &key],
-        )
-        .unwrap();
+        // The failure lands where a real bit-rot would: in the decompressor.
+        testkit::damage(&conn, &key);
         (key, others)
     };
 
@@ -411,10 +399,11 @@ fn a_corrupt_blob_is_skipped_and_named_rather_than_stopping_the_rebuild() {
 /// D-02, as the failure it prevents: a `reindex` must leave every observation
 /// row exactly where it was.
 ///
-/// The judgment half of one of these rows is a paid model call that nothing in
-/// a blob reproduces, so a `reindex` that dropped the table would silently
-/// delete summaries a user bought - and `open_up_to_date` runs on the ingest
-/// path, so it would happen unattended on the first pass after an upgrade.
+/// The facts in these rows come off the session's block rows, and retention
+/// eviction deletes those rows, so a `reindex` that dropped the table would silently lose
+/// every evicted session's observation - and `open_up_to_date` runs on the
+/// ingest path, so it would happen unattended on the first pass after an
+/// upgrade.
 ///
 /// The comparison is the column VALUES and not a row count: a rebuild that
 /// recreated the table empty and a rebuild that rewrote `mechanical` are both
@@ -433,13 +422,10 @@ fn a_reindex_leaves_every_observation_row_untouched() {
 
     let row = |conn: &Connection| -> Vec<Option<String>> {
         conn.query_row(
-            "SELECT o.session_key, o.session_id, o.generated_at, o.mechanical,
-                    o.status, o.model, o.prompt_version, o.topic, o.outcome,
-                    o.decisions, o.learned, o.unresolved, o.raw,
-                    CAST(o.tokens AS TEXT)
-               FROM observations o WHERE o.session_key = ?1",
+            "SELECT session_key, session_id, generated_at, mechanical
+               FROM observations WHERE session_key = ?1",
             [&key],
-            |r| (0..14).map(|i| r.get(i)).collect(),
+            |r| (0..4).map(|i| r.get(i)).collect(),
         )
         .expect("the observation row must still be there")
     };
@@ -447,13 +433,8 @@ fn a_reindex_leaves_every_observation_row_untouched() {
     bench
         .conn()
         .execute(
-            "INSERT INTO observations (
-                session_key, session_id, generated_at, mechanical, status, model,
-                prompt_version, topic, outcome, decisions, learned, unresolved,
-                raw, tokens
-             ) VALUES (?1, 'sess-1', '2026-08-21T00:00:00.000Z', '{\"turns\":3}',
-                       'ok', 'qwen3:8b', 'v1', 'the topic', 'the outcome',
-                       '[{\"turn_id\":7,\"claim\":\"a\"}]', '[]', '[]', NULL, 394)",
+            "INSERT INTO observations (session_key, session_id, generated_at, mechanical)
+             VALUES (?1, 'sess-1', '2026-08-21T00:00:00.000Z', '{\"turns\":3}')",
             [&key],
         )
         .unwrap();
@@ -552,19 +533,7 @@ impl Bench {
 
     /// Empty a session's blob and mark it, exactly as `retention::apply` does.
     fn evict(&self, key: &str) {
-        let conn = self.conn();
-        conn.execute(
-            "UPDATE sessions SET blob = x'' WHERE session_key = ?1",
-            [key],
-        )
-        .unwrap();
-        let changed = conn
-            .execute(
-                "UPDATE session_meta SET is_evicted = 1 WHERE session_key = ?1",
-                [key],
-            )
-            .unwrap();
-        assert_eq!(changed, 1, "no session_meta row for {key}");
+        testkit::evict(&self.conn(), key);
     }
 }
 
@@ -675,21 +644,7 @@ fn the_preserving_path_still_names_a_corrupt_blob_and_does_not_confuse_the_two()
     bench.evict(&evicted);
     {
         let conn = bench.conn();
-        let mut blob: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&corrupt],
-                |r| r.get(0),
-            )
-            .unwrap();
-        for byte in blob.iter_mut().skip(60).take(150) {
-            *byte = 0;
-        }
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![blob, &corrupt],
-        )
-        .unwrap();
+        testkit::damage(&conn, &corrupt);
     }
 
     let mut store = bench.store();

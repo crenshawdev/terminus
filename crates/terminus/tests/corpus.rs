@@ -46,7 +46,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
-use terminus_core::blob;
 use terminus_core::store::{DB_FILE_NAME, DERIVED_SCHEMA, META_DERIVED_SCHEMA};
 use terminus_core::testkit::{self, LineSurvey};
 
@@ -189,14 +188,13 @@ fn a_pass_over_the_real_corpus_archives_every_transcript_and_nothing_else() {
     // are decompressed and every line is handed to `serde_json`.
     let mut survey = LineSurvey::default();
     let mut statement = conn
-        .prepare("SELECT session_key, blob FROM sessions ORDER BY session_key")
+        .prepare("SELECT session_key FROM sessions ORDER BY session_key")
         .unwrap();
     let mut rows = statement.query([]).unwrap();
     let mut bytes_read = 0u64;
     while let Some(row) = rows.next().unwrap() {
         let key: String = row.get(0).unwrap();
-        let bytes: Vec<u8> = row.get(1).unwrap();
-        let stream = blob::read_all(&bytes)
+        let stream = testkit::stream(&conn, &key)
             .unwrap_or_else(|e| panic!("{key}: the archived blob will not decompress: {e}"));
         bytes_read += stream.len() as u64;
         survey.absorb(&key, &stream);
@@ -557,7 +555,6 @@ fn payload_for(fixture: &str, project: &str) -> Vec<u8> {
 /// removed when this returns, and a pass still walking it would be reading a
 /// tree that is being deleted under it. Here it also keeps a detached pass from
 /// arriving in the middle of the forced rebuild below.
-#[cfg(unix)]
 fn drain(argv: &str) {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -575,9 +572,6 @@ fn drain(argv: &str) {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
-
-#[cfg(not(unix))]
-fn drain(_argv: &str) {}
 
 /// Roll the store's derived schema back one, then time the open that repairs it.
 fn time_a_forced_rebuild(data_dir: &Path) -> Duration {

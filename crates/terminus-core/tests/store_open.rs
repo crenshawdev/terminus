@@ -299,22 +299,95 @@ fn an_older_derived_schema_opens_with_a_rebuild_outcome() {
     );
 }
 
-#[test]
-fn an_older_archive_format_also_reports_a_rebuild() {
-    let dir = tempfile::tempdir().unwrap();
-    drop(Store::open(dir.path()).unwrap());
-    {
-        let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
-        conn.execute(
-            "UPDATE meta SET value = ?1 WHERE key = ?2",
-            rusqlite::params![(ARCHIVE_FORMAT - 1).to_string(), META_ARCHIVE_FORMAT],
-        )
+/// A store aged to an archive format below this build's, with `labels` dropped
+/// so a writable open that got past the gate would visibly create it.
+fn older_archive_store(dir: &Path) {
+    drop(Store::open(dir).unwrap());
+    let conn = Connection::open(dir.join(DB_FILE_NAME)).unwrap();
+    conn.execute_batch("DROP TABLE labels").unwrap();
+    conn.execute(
+        "UPDATE meta SET value = ?1 WHERE key = ?2",
+        rusqlite::params![(ARCHIVE_FORMAT - 1).to_string(), META_ARCHIVE_FORMAT],
+    )
+    .unwrap();
+}
+
+fn table_list(db: &Path) -> Vec<String> {
+    let conn = Connection::open(db).unwrap();
+    let mut statement = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
         .unwrap();
+    let names = statement
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    names
+}
+
+/// STOR-10: an older archive format is refused by both opens, before any
+/// writable connection, with the clean-install steps. There is no conversion,
+/// and a rebuild would stamp the new format over bytes only the old one reads.
+#[test]
+fn an_older_archive_format_is_refused_by_both_opens_without_touching_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    older_archive_store(&data_dir);
+    let db = data_dir.join(DB_FILE_NAME);
+    let tables_before = table_list(&db);
+    assert!(!tables_before.iter().any(|t| t == "labels"));
+    let bytes_before = std::fs::read(&db).unwrap();
+    assert!(!data_dir.join("terminus.db-wal").exists());
+
+    for (open, err) in [
+        ("open", Store::open(&data_dir).expect_err("refused")),
+        (
+            "open_read_only",
+            Store::open_read_only(&data_dir).expect_err("refused"),
+        ),
+    ] {
+        assert!(
+            matches!(
+                err,
+                Error::ArchiveFormatTooOld {
+                    store_format,
+                    binary_format,
+                    ..
+                } if store_format == ARCHIVE_FORMAT - 1 && binary_format == ARCHIVE_FORMAT
+            ),
+            "{open}: wrong error: {err:?}"
+        );
+        let message = err.to_string();
+        for needed in [
+            data_dir.display().to_string(),
+            "data folder".into(),
+            "terminus binary".into(),
+            "install.sh".into(),
+        ] {
+            assert!(
+                message.contains(&needed),
+                "{open}: message does not name {needed:?}: {message}"
+            );
+        }
+        assert!(
+            std::fs::read(&db).unwrap() == bytes_before,
+            "{open}: terminus.db changed on a refused open"
+        );
+        // A read-only connection may leave an empty WAL; it may not commit
+        // anything through one.
+        assert!(
+            std::fs::read(data_dir.join("terminus.db-wal"))
+                .unwrap_or_default()
+                .is_empty(),
+            "{open}: a refused open wrote through the WAL"
+        );
     }
-    let store = Store::open(dir.path()).expect("an older store still opens");
-    let rebuild = store.rebuild_required().expect("rebuild outcome");
-    assert_eq!(rebuild.store_archive_format, ARCHIVE_FORMAT - 1);
-    assert_eq!(rebuild.binary_archive_format, ARCHIVE_FORMAT);
+
+    assert_eq!(
+        table_list(&db),
+        tables_before,
+        "a refused open created a table"
+    );
 }
 
 #[test]
@@ -649,7 +722,6 @@ fn a_foreign_sqlite_database_is_refused_rather_than_initialized_over() {
 /// resolves to ever stops doing that, this test fails loudly on whatever
 /// platform ran it instead of shipping 0644 files holding uncommitted session
 /// text.
-#[cfg(unix)]
 #[test]
 fn a_fresh_store_and_its_sidecars_are_owner_only() {
     use std::os::unix::fs::PermissionsExt;
@@ -697,7 +769,6 @@ fn a_fresh_store_and_its_sidecars_are_owner_only() {
 /// The symlink is the case the repair must refuse. `set_permissions` follows
 /// one, so a link left in `snapshots/` would otherwise hand a chmod to a file
 /// that is none of terminus's business.
-#[cfg(unix)]
 #[test]
 fn a_wide_store_is_tightened_by_a_writable_open_and_by_nothing_else() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -824,5 +895,57 @@ fn a_wide_store_is_tightened_by_a_writable_open_and_by_nothing_else() {
             "{} was narrowed by a read",
             file.display()
         );
+    }
+}
+
+/// Several processes opening one older store at once all succeed, and the
+/// column they were missing is added once.
+///
+/// `bring_forward` read what was missing and then altered in a deferred
+/// transaction, so two opens could both see `runs.notes` missing and the second
+/// `ALTER TABLE ADD COLUMN` failed on the column the first had just added. It
+/// now reads the list again under the write lock.
+#[test]
+fn concurrent_opens_of_an_older_store_all_bring_it_forward() {
+    use std::sync::{Arc, Barrier};
+
+    const OPENERS: usize = 8;
+
+    for round in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        drop(Store::open(dir.path()).unwrap());
+        {
+            let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+            conn.execute_batch("ALTER TABLE runs DROP COLUMN notes")
+                .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(OPENERS));
+        let openers: Vec<_> = (0..OPENERS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let path = dir.path().to_path_buf();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&path).map(drop)
+                })
+            })
+            .collect();
+        for opener in openers {
+            if let Err(e) = opener.join().unwrap() {
+                panic!("round {round}: an open of the older store failed: {e}");
+            }
+        }
+
+        let conn = Connection::open(dir.path().join(DB_FILE_NAME)).unwrap();
+        let has_notes: bool = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('runs') WHERE name = 'notes'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1;
+        assert!(has_notes, "round {round}: runs.notes was not added");
     }
 }

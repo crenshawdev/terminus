@@ -1,8 +1,10 @@
 # `--json` shapes and the exit-code contract
 
-Every data command accepts `--json`. This file is the contract, and
-`crates/terminus/tests/cli.rs` holds it to it: one test per property across all
-commands, so a seventh command added later is one line rather than a new file.
+Every data command accepts `--json`. This file is the contract.
+`crates/terminus/tests/cli.rs` holds every command but `doctor` to it, one test
+per property across all of them, so a command added later is one line in that
+test's command list rather than a new file. `crates/terminus/tests/doctor.rs`
+holds `doctor`'s shape.
 
 ## The envelope
 
@@ -34,7 +36,7 @@ and a hand-rolled writer fails on exactly the turns most worth reading.
 | Code | Meaning |
 |---|---|
 | 0 | Success, **including an empty result set**. A query that matched nothing is a successful answer to a question with no matches. |
-| 1 | Operational failure: the work was attempted and did not succeed. `verify` found a corrupt blob, `reindex` skipped a session, the store could not be read. |
+| 1 | Operational failure: the work was attempted and did not succeed. `verify` found a corrupt block, `reindex` skipped a session, the store could not be read, the store is in an archive format this build refuses. |
 | 2 | Misuse: the command line does not name work that could be attempted. An unknown flag, an unknown subcommand, a non-numeric turn id, a malformed `--since`. |
 
 A caller that parses `ok` and a caller that checks the exit code never
@@ -42,9 +44,9 @@ disagree. `verify --json` on a damaged store writes its document **and** exits
 1; the document is the evidence and the code is the verdict.
 
 **One case writes no document:** a failure raised before the command reached its
-own answer - a store from the future, an unresolvable data directory - is
-reported on stderr with exit 1 and stdout stays empty. The command never got far
-enough to know `--json` had been asked for. Empty stdout with a non-zero exit is
+own answer - a store in an archive format this build refuses, an unresolvable
+data directory - is reported on stderr with exit 1 and stdout stays empty. The
+command never got far enough to know `--json` had been asked for. Empty stdout with a non-zero exit is
 therefore part of the contract, and a caller must check the exit code before it
 parses.
 
@@ -93,18 +95,11 @@ data on stdout, the counts and the warnings on stderr.
   is `[]` for a hit reached only through free text, and its length is the entity
   count the injection threshold reads. `value` is the normalized stored
   spelling, not the query's.
-- `excerpt` is cut from the session blob, never from FTS5, and may be empty when
-  the archive would not give the bytes up.
-- `--kind observation` searches stored session summaries instead of turns, and
-  is the whole of how observations are reachable from the model - there is no
-  fourth MCP tool. Each hit is one CLAIM: `turn_id` is the turn that claim is
-  anchored to, `excerpt` is the claim's own text, `record_type` is
-  `observation`, and `ts` is when the observation was written rather than when
-  the turn happened. `relevance` is flat at 1.0, because there is no FTS index
-  over these to score against and every hit matched every token; the order is
-  newest observation first and is total. Scope and exclusion apply exactly as
-  they do to turns. On a store written before the observations table exists, the
-  answer is empty with that named in `reason` - never zero hits in silence.
+- `excerpt` is cut from the session's block rows, never from FTS5, and may be
+  empty when the archive would not give the bytes up.
+- `--kind` takes `user`, `assistant`, `system` or `attachment`. `observation`
+  is refused, as misuse (exit 2) from `terminus search` and as `isError` from
+  `recall_search`, because Terminus stores no session summaries.
 
 ### `show`
 
@@ -124,7 +119,7 @@ data on stdout, the counts and the warnings on stderr.
   stood; the archive itself is unchanged, and no key is added or removed in
   either setting.
 - `body_evicted` comes from `session_meta.is_evicted` and from nothing else. A
-  blob that will not decompress is archive damage, which `terminus verify`
+  block that will not decompress is archive damage, which `terminus verify`
   reports; it leaves `body` null with `body_evicted` false.
 - `context` is null unless `--before` or `--after` was asked for. When present:
 
@@ -162,18 +157,29 @@ data on stdout, the counts and the warnings on stderr.
  "watermarks": 11, "watermark_bytes": 34012, "excluded": ["/abs/path/private"],
  "last_run": {"started_at": "...", "duration_ms": 12, "files_seen": 11,
               "files_committed": 11, "files_failed": 0, "bytes_read": 34012,
-              "turns_added": 47, "error": null}}
+              "turns_added": 47, "error": null, "notes": null}}
 ```
 
 - The same numbers the human output prints. `size_bytes` counts the database and
   its WAL sidecars together.
 - `last_run` is null on a store no pass has ever written to.
+- `error` holds what went wrong on that pass, one line each: a file skipped, a
+  watermark repaired, a step that could not run. `notes` holds what a healthy
+  pass did worth saying, such as labels written and sessions retention evicted.
+  Each is null when there is nothing to say, and `doctor` flags only `error`.
 
 ### `verify`
 
 ```json
-{"checked": 11, "failures": [{"session_key": "...", "detail": "..."}]}
+{"checked": 11, "failures": [{"session_key": "...", "block": 3, "detail": "..."}]}
 ```
+
+- Each failure carries `block`: the number of the failing block, or `null` for a
+  failure about the whole session, such as a session checksum that no longer
+  matches the block hashes while every block matches its own hash.
+- Without `--json`, each failure is one line on stdout,
+  `<session_key>: block N: <detail>`, or `<session_key>: <detail>` when `block`
+  is `null`.
 
 Exits 1 when `failures` is non-empty, with the document still written.
 
@@ -219,7 +225,7 @@ and unchanged.
 ### `replay`
 
 ```json
-{"thresholds": {"ranked": 10, "compacted_ranked": 50, "entity_rank": 5, "co_occurring": 2,
+{"thresholds": {"ranked": 10, "compacted_ranked": 50, "entity_rank": 3, "co_occurring": 2,
                 "max_turns": 3, "max_candidates": 8},
  "decisions": 12,
  "labels": [{"label": "hit", "old": 3, "new": 5},
@@ -238,8 +244,11 @@ and unchanged.
 - `decisions` counts the rows that were scored: the decisions of sessions the
   idle rule has closed, which is exactly the set the labeller was allowed to
   judge. A decision of a live session has no stored label to diff against.
-- `labels` is one entry per label, always all four and always in that order.
-  `old` is what the store holds, `new` is what the replayed rules produce.
+- `labels` is one entry per label, all four in that order, whenever replay ran
+  against the decision log, even one with no decision to score. With no store,
+  or a store with no decision log, `labels` is `[]`, and it is `[]` in the
+  failure document for a damaged log too. `old` is what the store holds, `new`
+  is what the replayed rules produce.
 - `changed` names the decision ids whose label set moved, in id order, so a diff
   can be followed back into the prompts behind it.
 - `replay` never writes: the store is opened read-only, `terminus.db` is byte
@@ -261,10 +270,7 @@ and unchanged.
                   "errors": ["..."], "commits": ["wire the observation step up"],
                   "branch": "phase-7", "turns": 47,
                   "first_turn_at": "...", "last_turn_at": "...",
-                  "duration_seconds": 5421, "compactions": 1, "truncated": []},
-   "status": null, "model": null, "prompt_version": null, "topic": null,
-   "outcome": null, "decisions": null, "learned": null, "unresolved": null,
-   "raw": null, "tokens": null}]}
+                  "duration_seconds": 5421, "compactions": 1, "truncated": []}}]}
 ```
 
 - One entry per **finalized** session that has been observed, in ingest order.
@@ -280,22 +286,6 @@ and unchanged.
   present and not named there is the whole of what the session did.
 - `duration_seconds` is the wall clock between the first and the last turn, and
   it is null on a session carrying no timestamp to measure from.
-- The judgment columns - `status`, `model`, `prompt_version`, `topic`,
-  `outcome`, `decisions`, `learned`, `unresolved`, `raw`, `tokens` - are the
-  optional LLM half. They are **present and null** until a provider is
-  configured and answers, so a consumer reads one shape either way.
-  `observations.decisions` here is the column and not the `decisions` table.
-- `status` has three shapes and only two of them are answers. `"ok"` is a
-  validated judgment; `"parse_failed"` is the OBS-04 arm, with the raw response
-  in `raw` and the claim columns null; and `"judging <timestamp>"` is a
-  **reservation**, written before the request goes out so that two overlapping
-  runs cannot both pay for the same session - the second reads it, skips, and
-  asks nothing. A reservation is transient: the run that took it replaces it
-  with one of the two answers, or puts the column back to what it was if the
-  provider never answered. One left standing by a killed process is treated as
-  abandoned 15 minutes after its timestamp and the next ingest takes the
-  session, so a crash mid-request costs a delay and never a permanently
-  unjudgeable session.
 - A store written before this build carries no `observations` table. That is an
   empty answer with a reason naming the table and exit 0, never a SQLite
   message: the next `terminus ingest` creates it.
@@ -303,49 +293,28 @@ and unchanged.
 ### `observations regenerate`
 
 ```json
-{"since": "2026-08-14T00:00:00.000Z", "prompt_version": null,
- "selected": 2, "regenerated": 2, "notes": []}
+{"since": "2026-08-14T00:00:00.000Z", "selected": 2, "regenerated": 2, "notes": []}
 ```
 
 - The **only** rebuild path for the observations table. `terminus reindex` never
-  touches it: the judgment half is a paid model call no blob replay reproduces,
-  so a rebuild that ran on a schema bump would delete summaries a user bought.
-- `since` and `prompt_version` are the selector echoed back, each null when it
-  was not given. "Two rows were rebuilt" is unreadable without the bound that
-  chose them.
+  touches it: the facts come off the session's block rows, and retention
+  eviction deletes those rows, so a rebuild that dropped the table could not
+  recompute an evicted session's observation.
+- `since` is the selector echoed back, null when it was not given. "Two rows
+  were rebuilt" is unreadable without the bound that chose them.
 - `--since` takes `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS.mmmZ` and selects
   sessions whose `session_meta.last_turn_at` is at or after it. A session
-  carrying no `last_turn_at` is outside every bound. `--prompt-version` selects
-  rows carrying exactly that value in the `prompt_version` column. Given both,
-  they narrow conjunctively; given neither, every visible session is selected.
+  carrying no `last_turn_at` is outside every bound. Without it, every visible
+  session is selected.
 - `selected` counts the rows the selector named **and** the exclusion gate
   allows; `regenerated` counts the ones actually rewritten, and `notes` names
   the difference, one line per row that could not be recomputed.
-- The mechanical half writes the `mechanical` column and only that, on the
-  selected rows. `generated_at` dates the row as a whole - the judgment half
-  included - so a mechanical recompute leaves it alone, and every unselected row
-  stays byte for byte what it was.
-- With `[provider] enabled = true`, the same selected rows are then re-asked of
-  the model, which is what makes `--prompt-version` mean anything: the reason to
-  pay for a session twice is that the prompt changed. This is the **only** path
-  allowed to ask about a session that already carries a judgment status; every
-  other cost control still applies, so a session under the minimum turn count is
-  still not bought, and a session an ingest pass is asking about right now is
-  skipped with a note rather than asked a second time in parallel. With no provider, the stored judgment columns are left
-  exactly as they were and no request is made at all - a user without a model can
-  still rebuild facts.
-- `notes` carries the judgment half's report too: one `re-judged N of M selected
-  session(s)` line whenever a provider was asked, one line per session whose
-  answer could not be used, and - when the daily token budget runs out part way
-  through the set - one line naming how many selected sessions were left
-  unasked. A run that exhausts the budget stops asking, keeps every row it
-  already rebuilt, and still exits 0.
+- It writes the `mechanical` column and only that, on the selected rows.
+  `generated_at` dates the row as a whole, so a recompute leaves it alone, and
+  every unselected row stays byte for byte what it was.
 - This command writes, so it opens the store for writing and takes the ingest
   lock. A run refused because another process holds that lock is `ok: false`
-  with the lock named in `reason`, exit 1 - the same answer `reindex` gives. The
-  lock covers the mechanical rewrite only: provider calls are made after it is
-  released, because an HTTP call held inside the ingest lock would make every
-  hook-spawned pass in that window archive nothing.
+  with the lock named in `reason`, exit 1 - the same answer `reindex` gives.
 
 ### `retention`
 
@@ -424,9 +393,10 @@ gives the pages back to the filesystem afterwards.
   compaction that reclaimed nothing and left the store fractionally larger
   reports a negative number rather than a floor of zero.
 - **Exit 1 when the ingest lock is held**, with the document still written and
-  `ok` false. This is the one place the "0 including an empty result" rule does
-  not apply, and deliberately: a contended `ingest` exits 0 because the next
-  hook spawn catches what it skipped, but a compaction was asked for explicitly
+  `ok` false, as `reindex` and `observations regenerate` also answer a held
+  lock. The "0 including an empty result" rule does not apply here, and
+  deliberately: a contended `ingest` exits 0 because the next hook spawn
+  catches what it skipped, but a compaction was asked for explicitly
   and one that did not happen is an operational failure. `before` and `after`
   are the same unchanged measurement in that document, because nothing moved.
 - A machine with no store is an ordinary empty answer: exit 0, a `reason`, all
@@ -452,12 +422,13 @@ and to nothing else. That is the whole design, and reading one against the
 other's total is the mistake it exists to prevent.
 
 - The ARCHIVE table is `by_project` and `by_month`. The bytes in each add up to
-  `archive_bytes`, which is `sum(length(sessions.blob))` over the sessions a
-  read path may see - and **not** to `file_bytes`. On the live store measured
-  2026-08-22 the file is 1,103,396,864 bytes against 465,985,120 of archive,
-  2.4x everything the projects account for; the rest is the derived tables, and
-  attributing them to projects pro-rata would make every per-project number an
-  estimate rather than a measurement.
+  `archive_bytes`, which is the sum of each session's block byte lengths
+  (`length(bytes)` over its `blocks` rows) over the sessions a read path may
+  see - and **not** to `file_bytes`. On the live store measured 2026-08-22 the
+  file is 1,103,396,864 bytes against 465,985,120 of archive, 2.4x everything
+  the projects account for; the rest is the derived tables, and attributing them
+  to projects pro-rata would make every per-project number an estimate rather
+  than a measurement.
 - A session with no `project` and a session with no `first_turn_at` each get a
   bucket whose key is `null`. They are counted and their bytes are inside the
   totals: a null quietly dropped is a total that no longer reconciles, and the
@@ -517,9 +488,10 @@ snapshot, not an export.
 - The manifest carries `notice`, `archive_format` as the store itself reports
   it, the session / turn / evicted counts, the total bytes, the distinct
   projects, the `first_turn_at`..`last_turn_at` range, and a `files` array with
-  one entry per session naming its file, session key, session id, project, turn
-  count, bytes and evicted flag. It is pretty-printed, unlike the one-line
-  `--json` envelope: an envelope is piped, a manifest is opened and read.
+  one entry per session: `file`, `session_key`, `session_id`, `project`,
+  `turns`, `bytes`, `evicted`, `first_turn_at` and `last_turn_at`. It is
+  pretty-printed, unlike the one-line `--json` envelope: an envelope is piped,
+  a manifest is opened and read.
 
 ### `doctor`
 
@@ -534,14 +506,17 @@ snapshot, not an export.
                          "fix": "set \"cleanupPeriodDays\": 3650 in /home/you/.claude/settings.json"}}
 ```
 
-`data`'s keys are the check names, and there is no list: `data` is the checks,
-one object per check.
+`data` holds one object per check, keyed by the check's name. Every run carries
+the same 14 keys: `binary`, `settings_file`, `hook_SessionStart`,
+`hook_UserPromptSubmit`, `hook_SessionEnd`, `hook_PostCompact`, `mcp_server`,
+`claude_code`, `config_roots`, `data_directory`, `store`, `last_run`,
+`cleanup_period_days` and `auto_compact`.
 
 | Field | Type | Meaning |
 |---|---|---|
 | `state` | string | One of `ok`, `note`, `unknown`, `problem`. Never null. |
 | `finding` | string | One line, always present, never empty. Names the file or path it is about, so a check reads on its own. |
-| `fix` | string or null | What to run, or the settings edit to make. Null whenever there is nothing to do - which is every `ok`, and also a `problem` whose repair is a hand edit (a duplicated hook entry is the one that is). |
+| `fix` | string or null | What to run, or the settings edit to make. Null wherever doctor has no one command or edit to give, as listed below. |
 
 - `note` is true, worth saying, and not a failure: a machine before its first
   ingest, or a setting terminus would choose differently and never changes
@@ -554,6 +529,17 @@ one object per check.
 - The key set does not depend on what doctor found. A check it could not run
   reports `unknown` rather than going missing, so a caller reads a state instead
   of testing for a key.
+- `fix` is set only where doctor can name one command to run or one settings
+  edit to make. It is null for every `ok` and every `unknown`. It is null for a
+  `note` with nothing to run: a settings file, data directory or store not
+  there yet, no ingest run yet, more than one config root, or a hook event
+  another install's entry also runs. It is null for a `problem` doctor has no
+  one command for: a `settings.json` or `.claude.json` that cannot be read or
+  is not JSON, a duplicated hook entry, a config that does not load or resolves
+  no root, a data directory that cannot be resolved or read or is not a
+  directory, a store that cannot be opened or counted, a `runs` table that
+  cannot be read, a `cleanupPeriodDays` that is not a number, and an
+  `autoCompactEnabled` that is neither true nor false.
 - `fix` is a shell command wherever one exists. Where the repair is a value in
   the user's own settings file, it is that edit written out literally, because
   terminus never changes either of the two Claude Code settings it reports
@@ -561,6 +547,6 @@ one object per check.
 - `doctor` writes nothing anywhere: no file, no directory, on any path,
   including the data directory it reports as absent.
 
-`install` and `uninstall` deliberately have no `--json` (D-24). They show a diff
-and ask a question, and a single JSON document on stdout cannot be both of
-those things.
+`install` and `uninstall` deliberately have no `--json` (D-24). Install prints a
+receipt written for a person, and uninstall asks a question before `--purge`
+deletes the archive, which a single JSON document on stdout cannot do.

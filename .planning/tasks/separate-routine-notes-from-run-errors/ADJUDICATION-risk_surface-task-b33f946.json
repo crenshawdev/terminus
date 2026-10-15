@@ -1,0 +1,40 @@
+{
+  "phase": "0",
+  "task": "separate-routine-notes-from-run-errors",
+  "trigger": "risk_surface",
+  "discriminator": "task-b33f946",
+  "round": 1,
+  "base": "7eee274",
+  "head": "b33f946",
+  "base_id": "7eee27457d62651759a24bd6363c41a2306a26ab",
+  "head_id": "b33f9461d7031c22f6b1b9c559fb5f5d6b7cc2d2",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus/src/cmd/status.rs",
+      "line": 52,
+      "severity": "high",
+      "claim": "`status` unconditionally selects `runs.notes`, but its read-only store open does not run `bring_forward`, so it is incompatible with stores created by the previous schema.",
+      "failure_scenario": "Run `terminus status` or `terminus status --json` against an existing pre-upgrade store before any writable command has opened it. The `runs` table lacks `notes`, and because the read-only open skips migration, this query fails with `no such column: notes` instead of reporting status. The reader must either tolerate the absent column or ensure an appropriate writable upgrade occurs before querying it.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus/src/cmd/status.rs",
+        "line": 40,
+        "note": "status opens with Store::open, not open_read_only, and Store::open runs bring_forward on every open of an existing store (crates/terminus-core/src/store/open.rs:193, whose comment names status), so runs.notes exists before the SELECT. No other reader selects runs.notes."
+      },
+      "base_id": "7eee27457d62651759a24bd6363c41a2306a26ab",
+      "head_id": "b33f9461d7031c22f6b1b9c559fb5f5d6b7cc2d2"
+    }
+  ]
+}

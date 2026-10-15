@@ -1,23 +1,32 @@
-//! The copy of this build that hook entries and the MCP registration point at.
+//! The build that hook entries and the MCP registration point at.
 //!
 //! # One path, forever (D-08, INST-02)
 //!
-//! `~/.local/bin/terminus` on Linux and macOS,
-//! `%LOCALAPPDATA%\Programs\Terminus\terminus.exe` on Windows. Nothing here
-//! touches `PATH`: a settings entry names the absolute path, so the copy does
-//! not need to be reachable by name, and editing a shell profile is a change to
-//! the user's machine install has no business making.
+//! `~/.local/bin/terminus`. Nothing here touches `PATH`: a settings entry names
+//! the absolute path, so the binary does not need to be reachable by name, and
+//! editing a shell profile is a change to the user's machine install has no
+//! business making.
 //!
 //! The path never moving is what lets [`super::targets`] write the four hook
-//! entries once and never rewrite them (INST-05). An upgrade replaces the bytes
-//! at this path; the settings files do not learn about it, because there is
-//! nothing there to learn.
+//! entries once and never rewrite them (INST-05). The settings files never
+//! learn which version is behind it, because there is nothing there to learn.
 //!
-//! # The source is this process (D-09)
+//! # A link to a stored version
 //!
-//! [`std::env::current_exe`], not a search of an npm package layout. The npm
-//! shim execs the per-platform binary, so the process running `install` IS the
-//! artifact to copy, and install needs no knowledge of how npm resolved it.
+//! The stable path is a symbolic link to
+//! `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus`, the layout
+//! Baley uses and `install.sh` makes. Install stores the running binary, found
+//! through [`std::env::current_exe`], under its own version and moves the link
+//! onto it, so `target/release/terminus install` installs a local build.
+//!
+//! An upgrade moves the link and deletes nothing. A session already running
+//! keeps the file it started from, and so does the ingest its hook spawned.
+//! A rebuild at the same version is renamed over that version's file, and a
+//! process running the old one keeps its inode.
+//!
+//! The versions folder is resolved from `HOME` even when [`BIN_DIR_ENV`] is set,
+//! and it sits outside the data directory, because `uninstall --purge` deletes
+//! that and the data directory can move.
 //!
 //! # The marker, and why version cannot do its job (D-07)
 //!
@@ -37,6 +46,7 @@
 //! memory, and a sentinel straddling a chunk boundary is still found.
 
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::cmd::Failure;
@@ -70,13 +80,9 @@ pub fn stable_path() -> Result<PathBuf, Failure> {
     Ok(stable_dir()?.join(file_name()))
 }
 
-/// The file name the copy carries on this platform.
+/// The file name at the stable path and in every version folder.
 pub fn file_name() -> &'static str {
-    if cfg!(windows) {
-        "terminus.exe"
-    } else {
-        "terminus"
-    }
+    "terminus"
 }
 
 fn stable_dir() -> Result<PathBuf, Failure> {
@@ -86,19 +92,31 @@ fn stable_dir() -> Result<PathBuf, Failure> {
     platform_dir()
 }
 
-#[cfg(not(windows))]
 fn platform_dir() -> Result<PathBuf, Failure> {
     let home = non_empty_var("HOME")
         .ok_or_else(|| Failure::Operational(format!("neither {BIN_DIR_ENV} nor HOME is set")))?;
     Ok(PathBuf::from(home).join(".local").join("bin"))
 }
 
-#[cfg(windows)]
-fn platform_dir() -> Result<PathBuf, Failure> {
-    let local = non_empty_var("LOCALAPPDATA").ok_or_else(|| {
-        Failure::Operational(format!("neither {BIN_DIR_ENV} nor LOCALAPPDATA is set"))
-    })?;
-    Ok(PathBuf::from(local).join("Programs").join("Terminus"))
+/// Where every stored version lives, one folder per version.
+pub fn versions_dir() -> Result<PathBuf, Failure> {
+    let home =
+        non_empty_var("HOME").ok_or_else(|| Failure::Operational("HOME is not set".to_owned()))?;
+    let home = PathBuf::from(home);
+    // The link holds this path, and a relative one would resolve against the
+    // stable folder rather than against anything HOME meant.
+    if !home.is_absolute() {
+        return Err(Failure::Operational(format!(
+            "HOME is {}, which is not an absolute path",
+            home.display()
+        )));
+    }
+    Ok(home
+        .join(".local")
+        .join("lib")
+        .join("crenshawdev")
+        .join("terminus")
+        .join("versions"))
 }
 
 /// An environment variable set to the empty string is unset: an empty path
@@ -112,9 +130,9 @@ fn non_empty_var(name: &str) -> Option<std::ffi::OsString> {
 
 /// What install found at the stable path, before it has written anything.
 pub enum Occupant {
-    /// Nothing there. The copy is a create.
+    /// Nothing there, or a link to nothing. The link is a create.
     Vacant,
-    /// A terminus build. The copy is an upgrade and rewrites no settings entry.
+    /// A terminus build, or a link to one. Replacing it rewrites no settings entry.
     Ours,
     /// Somebody else's program, and the reason to stop.
     Foreign,
@@ -122,8 +140,8 @@ pub enum Occupant {
 
 /// Look at the stable path without touching it.
 ///
-/// Called before the confirmation and before any write, because a refusal that
-/// had already copied a binary would not be a refusal.
+/// Called before any write, because a refusal that had already stored a binary
+/// would not be a refusal.
 pub fn occupant(path: &Path) -> Result<Occupant, Failure> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -169,51 +187,162 @@ fn carries_marker(mut file: impl Read) -> std::io::Result<bool> {
     }
 }
 
-/// Copy this build to the stable path, atomically.
+/// The prefix of every temporary name install makes beside the binary.
+const TEMPORARY: &str = ".terminus-install-";
+
+/// Store this build as a version and point the stable path at it.
 ///
-/// Through a temporary file in the destination directory and a rename, on every
-/// platform. That is atomic everywhere, and on Windows it is also the only way
-/// to replace an executable that may be running - the running image holds the
-/// old inode and the name points at the new one.
-///
-/// [`occupant`] is asked again immediately before the rename, and a foreign
-/// occupant refuses here too. The check `run` made is from before the
-/// confirmation, which is as old as the user took to answer, and the rename
-/// clobbers whatever it lands on. What is left is the microseconds between this
-/// answer and the rename itself: closing that needs a rename that refuses to
-/// replace, which no platform offers through `std`.
-pub fn place(dest: &Path) -> Result<(), Failure> {
+/// Returns the version file the link now names. When install runs from the
+/// file the link already names, nothing is written.
+pub fn place(stable: &Path, versions: &Path) -> Result<PathBuf, Failure> {
     let source = std::env::current_exe().map_err(|e| {
         Failure::Operational(format!("this build's own path could not be resolved: {e}"))
     })?;
-    let dir = dest.parent().ok_or_else(|| {
-        Failure::Operational(format!("{} has no parent directory", dest.display()))
-    })?;
-    std::fs::create_dir_all(dir).map_err(|e| {
-        Failure::Operational(format!("{} could not be created: {e}", dir.display()))
-    })?;
+    if let Some(target) = linked_to(stable, versions, &source) {
+        return Ok(target);
+    }
+    let version_file = versions.join(env!("CARGO_PKG_VERSION")).join(file_name());
+    store(&source, &version_file)?;
+    link(stable, &version_file)?;
+    Ok(version_file)
+}
+
+/// The link's target, when it is a file in a folder directly under the
+/// versions folder and is the same file as `source`.
+///
+/// Same file means the same device and inode. A path comparison would miss a
+/// HOME reached through a linked folder, because `current_exe()` is resolved
+/// and the link holds whatever spelling of HOME wrote it. The folder's name is
+/// never compared with this build's version: `install.sh` names it from its
+/// manifest.
+fn linked_to(stable: &Path, versions: &Path, source: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let target = std::fs::read_link(stable).ok()?;
+    if !in_versions(&target, versions) {
+        return None;
+    }
+    let linked = std::fs::metadata(&target).ok()?;
+    let running = std::fs::metadata(source).ok()?;
+    (linked.dev() == running.dev() && linked.ino() == running.ino()).then_some(target)
+}
+
+/// Whether `target` is a file in a folder directly under the versions folder.
+pub fn in_versions(target: &Path, versions: &Path) -> bool {
+    use std::path::Component;
+
+    let Ok(rest) = target.strip_prefix(versions) else {
+        return false;
+    };
+    let mut rest = rest.components();
+    matches!(
+        (rest.next(), rest.next(), rest.next()),
+        (Some(Component::Normal(_)), Some(Component::Normal(_)), None)
+    )
+}
+
+/// Put `source`'s bytes at `dest`, unless they are already there.
+///
+/// Through a temporary file in the same folder and a rename, so a process
+/// running the old file keeps its inode. Only a regular file is compared: a
+/// link at `dest` is renamed over, never written through.
+fn store(source: &Path, dest: &Path) -> Result<(), Failure> {
+    let dir = parent(dest)?;
+    create_dir(dir)?;
+    if std::fs::symlink_metadata(dest).is_ok_and(|meta| meta.file_type().is_file())
+        && same_bytes(source, dest).map_err(|e| {
+            Failure::Operational(format!(
+                "{} could not be compared with {}: {e}",
+                dest.display(),
+                source.display()
+            ))
+        })?
+    {
+        return Ok(());
+    }
 
     // Exclusively, and not with `File::create`: a stale `.terminus-install-<pid>`
-    // symlink would otherwise be followed, truncating whatever it points at and
-    // then renaming the link itself over the stable path.
-    let (temporary, file) = super::create_temporary(dir, ".terminus-install-")?;
-    let outcome = copy_into(&source, file, &temporary)
-        .and_then(|()| match occupant(dest)? {
-            // Not the check `run` made: that one is from before the question was
-            // asked. This is the last look anything gets at the path the rename
-            // is about to take.
-            Occupant::Foreign => Err(super::occupied(dest)),
-            Occupant::Vacant | Occupant::Ours => Ok(()),
+    // symlink would otherwise be followed and whatever it points at truncated.
+    let (temporary, file) = super::create_temporary(dir, TEMPORARY)?;
+    let outcome = copy_into(source, file, &temporary).and_then(|()| {
+        std::fs::rename(&temporary, dest).map_err(|e| {
+            Failure::Operational(format!("{} could not be replaced: {e}", dest.display()))
         })
-        .and_then(|()| {
-            std::fs::rename(&temporary, dest).map_err(|e| {
-                Failure::Operational(format!("{} could not be replaced: {e}", dest.display()))
-            })
-        });
+    });
     if outcome.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     outcome
+}
+
+/// Move a link to `target` over the stable path.
+///
+/// [`occupant`] is asked again immediately before the rename, and a foreign
+/// occupant refuses here too. The check `run` made is from before anything was
+/// written, and the rename clobbers whatever it lands on. What is left is the
+/// microseconds between this answer and the rename itself: closing that needs
+/// a rename that refuses to replace, which no platform offers through `std`.
+fn link(stable: &Path, target: &Path) -> Result<(), Failure> {
+    let dir = parent(stable)?;
+    create_dir(dir)?;
+    let (temporary, ()) = super::temporary(dir, TEMPORARY, |path| {
+        std::os::unix::fs::symlink(target, path)
+    })?;
+    let outcome = match occupant(stable) {
+        Ok(Occupant::Foreign) => Err(super::occupied(stable)),
+        Ok(Occupant::Vacant | Occupant::Ours) => std::fs::rename(&temporary, stable).map_err(|e| {
+            Failure::Operational(format!("{} could not be replaced: {e}", stable.display()))
+        }),
+        Err(failure) => Err(failure),
+    };
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    outcome
+}
+
+fn parent(path: &Path) -> Result<&Path, Failure> {
+    path.parent()
+        .ok_or_else(|| Failure::Operational(format!("{} has no parent directory", path.display())))
+}
+
+fn create_dir(dir: &Path) -> Result<(), Failure> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| Failure::Operational(format!("{} could not be created: {e}", dir.display())))
+}
+
+/// Do the two files hold the same bytes? Streamed, a chunk of each at a time.
+fn same_bytes(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let mut a = std::fs::File::open(a)?;
+    let mut b = std::fs::File::open(b)?;
+    if a.metadata()?.len() != b.metadata()?.len() {
+        return Ok(false);
+    }
+    let mut left = vec![0u8; CHUNK];
+    let mut right = vec![0u8; CHUNK];
+    loop {
+        let n = fill(&mut a, &mut left)?;
+        let m = fill(&mut b, &mut right)?;
+        if left[..n] != right[..m] {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Read until `buffer` is full or the file ends, so two files are compared in
+/// chunks that line up.
+fn fill(file: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    Ok(filled)
 }
 
 fn copy_into(source: &Path, mut file: std::fs::File, temporary: &Path) -> Result<(), Failure> {
@@ -227,19 +356,15 @@ fn copy_into(source: &Path, mut file: std::fs::File, temporary: &Path) -> Result
             temporary.display()
         ))
     })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| {
-                Failure::Operational(format!(
-                    "{} could not be made executable: {e}",
-                    temporary.display()
-                ))
-            })?;
-    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| {
+            Failure::Operational(format!(
+                "{} could not be made executable: {e}",
+                temporary.display()
+            ))
+        })?;
     // Before the rename, not after: a crash between the two would otherwise put
-    // an empty file at the path every hook entry names.
+    // an empty file behind the path every hook entry names.
     file.sync_all().map_err(|e| {
         Failure::Operational(format!("{} could not be flushed: {e}", temporary.display()))
     })?;
@@ -279,5 +404,19 @@ mod tests {
     fn a_file_without_the_marker_is_foreign() {
         let bytes = vec![b'x'; CHUNK * 2 + 17];
         assert!(!carries_marker(bytes.as_slice()).unwrap());
+    }
+
+    /// `install.sh` decides ownership of the stable path with its own copy of
+    /// the marker, so the two must not drift apart.
+    #[test]
+    fn install_sh_holds_the_same_marker() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh");
+        let text = std::fs::read_to_string(&script)
+            .unwrap_or_else(|e| panic!("read {}: {e}", script.display()));
+        let held: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("marker="))
+            .collect();
+        assert_eq!(held, [format!("'{MARKER}'")], "{}", script.display());
     }
 }

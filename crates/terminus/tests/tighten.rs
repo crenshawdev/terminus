@@ -12,8 +12,6 @@
 //! which moves the data directory's own ctime on every single run and has
 //! nothing to do with whether a `chmod` happened.
 
-#![cfg(unix)]
-
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

@@ -17,16 +17,16 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::blob::BlobReader;
 use crate::config::Config;
 use crate::error::Result;
 use crate::observe::egress::Redaction;
 use crate::recall::scope::{self, Reason, Scope};
 use crate::recall::{excerpt, Query};
+use crate::store::archive;
 
 /// The most turns one call may ask for on either side of the anchor.
 ///
-/// A window is read out of one decompressed session and every turn in it is
+/// A window is read out of one session's block rows and every turn in it is
 /// projected, so an unbounded `before` returns the whole session as prose - the
 /// thing `recall_get` exists for, arrived at by accident.
 pub const MAX_CONTEXT_SIDE: usize = 25;
@@ -62,6 +62,9 @@ pub struct Window {
     pub continues_from: Option<String>,
     /// Set when the window is empty for a reason rather than by accident.
     pub reason: Option<Reason>,
+    /// Block rows fetched and blocks decompressed to fill the turns' text: only
+    /// the rows the window's turns cover (D-13, D-14).
+    pub reads: excerpt::Reads,
 }
 
 impl Window {
@@ -76,8 +79,8 @@ impl Window {
 /// The turns around `anchor`, `before` of them earlier and `after` later.
 ///
 /// Exclusion is applied on the same projection the search scopes through
-/// (D-21): a turn of an excluded project returns an empty window with a reason,
-/// because a context call that answered would be the read-path half of
+/// (D-21): a turn of an excluded project returns an empty window answered as
+/// `NoSuchTurn`, because a context call that answered would be the read-path half of
 /// exclusion leaking through a second door.
 pub fn window(
     conn: &Connection,
@@ -119,11 +122,9 @@ pub fn window(
         .optional()?;
     let (project, pre_worktree, continues_from) = meta.unwrap_or((None, None, None));
 
-    // Scope FIRST, then exclusion - the order is the finding, not a style
-    // choice. Both arms refuse the anchor; only one of them names a path, and
-    // an excluded project is outside the caller's scope at every scope but
-    // `*`, so checking exclusion first answered "<absolute path> is excluded by
-    // config" for a turn the caller was never entitled to hear about.
+    // Both arms refuse the anchor as `NoSuchTurn`, and neither names a path:
+    // naming the excluded project, at `*` or anywhere, would confirm the turn
+    // exists and say what the project is called.
     //
     // The scoping half of the same door. RCL-10 auto-scopes all three MCP
     // tools to the current project with `project: "*"` opting out, and this is
@@ -150,9 +151,7 @@ pub fn window(
     if hidden(&project, scoped.excluded_projects())
         || hidden(&pre_worktree, scoped.excluded_pre_worktree())
     {
-        return Ok(Window::nothing(Reason::ProjectExcluded {
-            project: project.or(pre_worktree).unwrap_or_default(),
-        }));
+        return Ok(Window::nothing(Reason::NoSuchTurn { turn_id: anchor }));
     }
 
     let low = seq - before.min(MAX_CONTEXT_SIDE) as i64;
@@ -194,7 +193,7 @@ pub fn window(
     // D-01). A context window is model-facing - `recall_context` is one of the
     // three MCP tools - so its turns are an egress boundary in exactly the way
     // a search excerpt is, and they go through the same argument.
-    fill_text(
+    let reads = fill_text(
         conn,
         &session_key,
         &rows,
@@ -213,13 +212,15 @@ pub fn window(
         // a fact about the session rather than about this call.
         continues_from,
         reason: None,
+        reads,
     })
 }
 
-/// Project every turn of the window out of the one session blob.
+/// Project every turn of the window out of its session's block rows, fetching
+/// only the rows those turns cover, each once.
 ///
-/// One `SELECT blob` for the whole window, which is free here in a way it is
-/// not for a search: a context window is one session by definition (D-06).
+/// One read for the whole window, which is free here in a way it is not for a
+/// search: a context window is one session by definition (D-06).
 ///
 /// `redaction` is the caller's, and it is applied by [`excerpt::of_record_with`]
 /// to the FULL projection before the window is cut (phase 4 D-02) - the same
@@ -232,32 +233,28 @@ fn fill_text(
     session_key: &str,
     rows: &[(ContextTurn, (i64, i64))],
     turns: &mut [ContextTurn],
-    redaction: &Redaction<'_>,
-) -> Result<()> {
+    redaction: &Redaction,
+) -> Result<excerpt::Reads> {
+    let mut reads = excerpt::Reads::default();
     if rows.is_empty() {
-        return Ok(());
+        return Ok(reads);
     }
-    let blob: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [session_key],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(blob) = blob else { return Ok(()) };
-    let Ok(reader) = BlobReader::open(&blob) else {
-        return Ok(());
+    let wanted: Vec<(u64, u64)> = rows
+        .iter()
+        .map(|(_, (offset, len))| (*offset as u64, *len as u64))
+        .collect();
+    let Some(read) = archive::ranges(conn, session_key, &wanted)? else {
+        return Ok(reads);
     };
+    reads.add(&read);
 
     // An empty query, so the projection is taken from its head rather than
     // windowed around a match: a context turn is being read for what it says,
     // not for why it matched.
     let query = Query::default();
-    for (index, (_, (offset, len))) in rows.iter().enumerate() {
-        let Ok(bytes) = reader.read_range(*offset as u64, *len as u64) else {
-            continue;
-        };
+    for (index, bytes) in read.bytes.into_iter().enumerate() {
+        let Ok(bytes) = bytes else { continue };
         turns[index].text = excerpt::of_record_with(&query, &bytes, redaction);
     }
-    Ok(())
+    Ok(reads)
 }

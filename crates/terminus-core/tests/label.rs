@@ -501,6 +501,21 @@ fn a_logged_decision_is_labelled_end_to_end() {
     assert_eq!(labelled.outcomes.count("false positive"), 1, "{labelled:?}");
     assert_eq!(labelled.outcomes.count("wasted budget"), 1, "{labelled:?}");
 
+    // Labelling is what a healthy pass does, so it is said in `runs.notes` and
+    // `runs.error` stays null: `doctor` flags any non-null `error`, and every
+    // user with injection on would otherwise fail it after ordinary use.
+    let (error, notes): (Option<String>, Option<String>) = bench
+        .conn()
+        .query_row(
+            "SELECT error, notes FROM runs ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(error, None, "labelling was reported as an error");
+    let notes = notes.expect("the labels written have to be said");
+    assert!(notes.starts_with("labelled "), "{notes}");
+
     assert_eq!(
         bench.labels_of(bench.decision_of(referenced)),
         vec![("hit".to_owned(), Some(bench.turn(IDLE, 0)), None)]

@@ -127,7 +127,6 @@ fn two_walks_of_one_tree_return_the_same_order() {
 
 /// D-17. The root is canonicalized once and every entry is joined onto it, so a
 /// root reached through a symlink still produces the session keys ingest writes.
-#[cfg(unix)]
 #[test]
 fn every_path_begins_with_the_canonical_root_even_through_a_symlink() {
     let (dir, root) = tree();
@@ -239,7 +238,6 @@ fn a_missing_root_is_empty_rather_than_an_error() {
 
 /// An unreadable directory is named and skipped: one of them is not a reason to
 /// archive nothing.
-#[cfg(unix)]
 #[test]
 fn an_unreadable_directory_is_reported_and_the_rest_is_still_walked() {
     use std::os::unix::fs::PermissionsExt;

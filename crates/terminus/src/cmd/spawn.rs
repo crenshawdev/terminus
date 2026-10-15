@@ -26,16 +26,16 @@
 //!
 //! # `std` alone (D-04)
 //!
-//! No `libc`, no `nix`, no `windows-sys`.
-//! [`std::os::unix::process::CommandExt::process_group`] and
-//! [`std::os::windows::process::CommandExt::creation_flags`] are the whole
+//! No `libc`, no `nix`.
+//! [`std::os::unix::process::CommandExt::process_group`] is the whole
 //! mechanism, exactly as `ingest::lock` uses [`std::fs::File::try_lock`] rather
-//! than naming `flock` and `LockFileEx` itself. Every dependency in the root
-//! `Cargo.toml` carries a comment justifying its cost against a measured
-//! 0.408 ms startup floor, and this path is the floor's whole reason to exist.
+//! than naming `flock` itself. Every dependency in the root `Cargo.toml`
+//! carries a comment justifying its cost against a measured 0.408 ms startup
+//! floor, and this path is the floor's whole reason to exist.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -61,12 +61,6 @@ use std::process::{Command, Stdio};
 /// unexpected argument (exit 2) rather than accepting it as a positional.
 pub const HANDOFF: &str = "--reparent";
 
-/// Windows: no console, and no parent to be killed with.
-#[cfg(windows)]
-const DETACHED_PROCESS: u32 = 0x0000_0008;
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
 /// Start this binary again with `args`, detached, and return without waiting.
 ///
 /// The environment is inherited unchanged, which is how `TERMINUS_DATA_DIR`,
@@ -77,12 +71,10 @@ pub fn detached<S: AsRef<OsStr>>(args: &[S]) -> io::Result<()> {
 
 /// [`detached`], but from a named executable rather than this one.
 ///
-/// `install` needs this and nothing else does. It has just renamed a new binary
-/// over the stable path, which unlinks the inode the running process was
-/// exec'd from - so by the time it asks for the backfill, its own
-/// `current_exe()` names a deleted file and the spawn fails `ENOENT`. Passing
-/// the stable path spawns the build install just placed, which is also the
-/// build every hook entry points at.
+/// `install` needs this and nothing else does. It starts the backfill from the
+/// stable path, which is the build every hook entry runs, rather than from
+/// wherever install itself was run, such as a `target/release/terminus` the
+/// next build replaces.
 ///
 /// Only the first hop needs it. The intermediate is exec'd from `exe`, so its
 /// own `current_exe()` is that path and the hand-off below resolves correctly
@@ -134,18 +126,9 @@ fn spawn_from<S: AsRef<OsStr>>(exe: &Path, args: &[S]) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // 0 means "a new group led by the child", which is what takes it out of
-        // the group `kill(-pid)` names.
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
-    }
+    // 0 means "a new group led by the child", which is what takes it out of
+    // the group `kill(-pid)` names.
+    command.process_group(0);
 
     // Spawned and dropped: waiting is the one thing a detached spawn must never
     // do. The intermediate exits within microseconds and is reaped by whatever

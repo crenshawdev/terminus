@@ -176,7 +176,7 @@ pub struct Fired {
     /// At most [`MAX_TURNS`], in the ranked order. Empty is the ordinary
     /// answer.
     pub hits: Vec<Hit>,
-    /// How many session blobs were materialized to produce them. An
+    /// Block rows fetched and blocks decompressed to produce them. An
     /// instrument, not an answer: a prompt that fires on nothing must read
     /// none, and that is a claim about a number (D-13).
     pub reads: excerpt::Reads,

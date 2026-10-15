@@ -3,19 +3,27 @@
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::error::{Error, Result};
 
 /// The archive format this build writes and understands.
 ///
-/// Bumped only when the bytes in `sessions` change meaning. The archive table
-/// never migrates (`DESIGN-BRIEF.md:94`), so a bump rebuilds derived tables.
-pub const ARCHIVE_FORMAT: i64 = 1;
+/// Bumped only when the archived bytes change meaning. The archive tables never
+/// migrate (`DESIGN-BRIEF.md:94`) and there is no conversion, so a store
+/// written in an older format is refused ([`Error::ArchiveFormatTooOld`]) rather
+/// than rebuilt: a rebuild would read the old bytes as the new format and fail
+/// every session.
+///
+/// 2 as of v0.0.1 phase 7: a session is numbered block rows in `blocks`, each
+/// with its compressed bytes and a BLAKE3 hash of its uncompressed bytes, and
+/// `session_meta` holds the block size and a checksum over those hashes. Format
+/// 1 kept the whole session as one blob in a `sessions.blob` column.
+pub const ARCHIVE_FORMAT: i64 = 2;
 
 /// The derived-table schema this build writes.
 ///
-/// Bumped whenever anything rebuildable from the blobs changes shape: `turns`,
+/// Bumped whenever anything rebuildable from the archive changes shape: `turns`,
 /// `compaction_boundaries`, `turns_fts`, `entities`, `paths`. Two integers
 /// rather than one, because one cannot tell "derived tables need a rebuild"
 /// from "the archive itself changed" (D-09).
@@ -33,12 +41,12 @@ pub const ARCHIVE_FORMAT: i64 = 1;
 ///
 /// 4 as of v0.1.1 phase 1 (D-03): `turns` gained `is_typed`, the per-turn
 /// discriminator INJ-07's resume brief reads. The bump is what makes
-/// [`crate::reindex::reindex`] the blob-only backfill that fills the column on
+/// [`crate::reindex::reindex`] the archive-only backfill that fills the column on
 /// a store an earlier build wrote - the bring-forward `ALTER` adds it empty, and
 /// nothing else would ever populate a turn already archived. Note the naming
 /// collision: `crate::ingest::backfill` is the parallel transcript-reading pass
 /// and is NOT this mechanism; it reads the files on disk, and this reads only
-/// `sessions.blob`.
+/// the archive.
 pub const DERIVED_SCHEMA: i64 = 4;
 
 /// The store file inside the data directory.
@@ -54,11 +62,13 @@ pub const META_DERIVED_SCHEMA: &str = "derived_schema";
 /// so a short overlap with a reader is not an error.
 const BUSY_TIMEOUT_MS: u32 = 5_000;
 
-/// The store is older than this build and its derived tables need rebuilding.
+/// The store's derived schema differs from this build's and its derived tables
+/// need rebuilding.
 ///
 /// Returned as an inspectable outcome rather than acted on here: the rebuild
-/// lives in `reindex`, which does not exist yet (PLAN-2 task 6 wires this to
-/// it). The archive is never part of the rebuild (STOR-05).
+/// lives in `reindex`. The archive is never part of the rebuild, and an archive
+/// format other than this build's never gets this far: newer and older are both
+/// refused by the gate (STOR-10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebuildRequired {
     pub store_archive_format: i64,
@@ -181,6 +191,7 @@ impl Store {
             // opener; the destructive derived-table rebuild stays exactly where
             // it is, outside this function and inside the ingest lock.
             bring_forward(&store.conn)?;
+            drop_summary_columns(&store.conn)?;
         }
         Ok(store)
     }
@@ -399,7 +410,6 @@ impl Store {
 /// ingest that stops dead on a store whose files another account owns, or one on
 /// a read-only mount, which trades a mode this build cannot fix for a product
 /// that does not run.
-#[cfg(unix)]
 fn tighten(data_dir: &Path) {
     narrow_directory(data_dir);
 
@@ -433,16 +443,10 @@ fn tighten(data_dir: &Path) {
     }
 }
 
-/// The Windows arm (D-15): owner-only there is an ACL, and this build sets none.
-#[cfg(not(unix))]
-fn tighten(_data_dir: &Path) {}
-
-#[cfg(unix)]
 fn narrow_directory(path: &Path) {
     narrow(path, crate::owner_only::DIR_MODE, std::fs::FileType::is_dir);
 }
 
-#[cfg(unix)]
 fn narrow_file(path: &Path) {
     narrow(
         path,
@@ -459,7 +463,6 @@ fn narrow_file(path: &Path) {
 /// anywhere on the machine and be nothing of terminus's. A path that is not
 /// there at all is the ordinary case, not a failure: most of this list is
 /// absent on most stores.
-#[cfg(unix)]
 fn narrow(path: &Path, mode: u32, wanted: fn(&std::fs::FileType) -> bool) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -487,34 +490,20 @@ fn narrow(path: &Path, mode: u32, wanted: fn(&std::fs::FileType) -> bool) {
 /// Nothing is written when nothing is missing - the common case is three read
 /// queries and no transaction at all - so a plain reopen of an up-to-date store
 /// still touches no byte of it.
+///
+/// When something is missing, the list is read again inside an IMMEDIATE
+/// transaction before anything is altered, as [`drop_summary_columns`] does.
+/// Two processes opening one older store at once would otherwise both see the
+/// same column missing, and the second `ALTER TABLE ADD COLUMN` would fail on a
+/// column the first had just added.
 fn bring_forward(conn: &Connection) -> Result<()> {
-    let present_tables = table_names(conn)?;
-    let missing_tables: Vec<&&str> = crate::store::schema::TABLES
-        .iter()
-        .filter(|t| !present_tables.iter().any(|p| p == *t))
-        .collect();
-
-    let mut missing_columns: Vec<(&str, &str, &str)> = Vec::new();
-    for (table, columns) in crate::store::schema::BRING_FORWARD_COLUMNS {
-        // A table this build is about to create arrives with every column
-        // already on it, so asking `PRAGMA table_info` about it would only
-        // schedule columns that are not missing.
-        if missing_tables.iter().any(|t| **t == *table) {
-            continue;
-        }
-        let present = column_names(conn, table)?;
-        for (name, declaration) in *columns {
-            if !present.iter().any(|c| c == name) {
-                missing_columns.push((table, name, declaration));
-            }
-        }
-    }
-
+    let (missing_tables, missing_columns) = missing(conn)?;
     if missing_tables.is_empty() && missing_columns.is_empty() {
         return Ok(());
     }
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let (missing_tables, missing_columns) = missing(&tx)?;
     if !missing_tables.is_empty() {
         // Every statement in it is `IF NOT EXISTS`, so this creates exactly the
         // tables and indexes that are absent and leaves the rest alone. One
@@ -529,6 +518,72 @@ fn bring_forward(conn: &Connection) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+/// A column this build declares: `(table, column, declaration)`.
+type Column = (&'static str, &'static str, &'static str);
+
+/// The tables and the columns this build declares and the open store lacks.
+fn missing(conn: &Connection) -> Result<(Vec<&'static str>, Vec<Column>)> {
+    let present_tables = table_names(conn)?;
+    let missing_tables: Vec<&'static str> = crate::store::schema::TABLES
+        .iter()
+        .copied()
+        .filter(|t| !present_tables.iter().any(|p| p == t))
+        .collect();
+
+    let mut missing_columns = Vec::new();
+    for (table, columns) in crate::store::schema::BRING_FORWARD_COLUMNS {
+        // A table this build is about to create arrives with every column
+        // already on it, so asking `PRAGMA table_info` about it would only
+        // schedule columns that are not missing.
+        if missing_tables.contains(table) {
+            continue;
+        }
+        let present = column_names(conn, table)?;
+        for (name, declaration) in *columns {
+            if !present.iter().any(|c| c == name) {
+                missing_columns.push((*table, *name, *declaration));
+            }
+        }
+    }
+    Ok((missing_tables, missing_columns))
+}
+
+/// Drop the session-summary columns from `observations`, and their meta key,
+/// on a store that still has them.
+///
+/// Kept out of [`bring_forward`] because it is destructive. The usual case is
+/// one `PRAGMA` read and nothing written. When a column is there, the list is
+/// read again inside an IMMEDIATE transaction, so two processes opening the
+/// same old store at once cannot both attempt the drop and have the second
+/// fail on a column the first already removed.
+fn drop_summary_columns(conn: &Connection) -> Result<()> {
+    if summary_columns(conn)?.is_empty() {
+        return Ok(());
+    }
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    for column in summary_columns(&tx)? {
+        // Identifiers come from a `const` in this crate, never from a caller.
+        tx.execute_batch(&format!("ALTER TABLE observations DROP COLUMN {column}"))?;
+    }
+    tx.execute(
+        "DELETE FROM meta WHERE key = ?1",
+        [crate::store::schema::DROPPED_META_KEY],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Which of [`crate::store::schema::DROPPED_OBSERVATION_COLUMNS`] the store
+/// still carries.
+fn summary_columns(conn: &Connection) -> Result<Vec<&'static str>> {
+    let present = column_names(conn, "observations")?;
+    Ok(crate::store::schema::DROPPED_OBSERVATION_COLUMNS
+        .iter()
+        .copied()
+        .filter(|name| present.iter().any(|p| p == name))
+        .collect())
 }
 
 /// Which of [`crate::store::schema::BRING_FORWARD_COLUMNS`] the open store does
@@ -651,7 +706,8 @@ fn inspect(path: &Path) -> Result<StoreState> {
 /// Read the two version integers off an existing store and decide.
 ///
 /// Runs no DDL and no DML. Returns `Ok(None)` when the store matches this
-/// build, `Ok(Some(..))` when it is older, and an error when it is newer.
+/// build, `Ok(Some(..))` when only its derived schema differs, and an error
+/// when its archive format is newer or older.
 fn gate(path: &Path) -> Result<Option<RebuildRequired>> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let mut conn = Connection::open_with_flags(path, flags).map_err(|source| Error::NotAStore {
@@ -706,9 +762,22 @@ fn read_versions(conn: &Connection, path: &Path) -> Result<Option<RebuildRequire
         });
     }
 
-    let outcome = if store_archive < ARCHIVE_FORMAT || store_derived != DERIVED_SCHEMA {
+    // Refused, never rebuilt (STOR-10). A rebuild here would create the new
+    // archive tables empty inside the old store, fail every session in
+    // `reindex` and stamp the new format over bytes only the old one reads.
+    // Both opens reach this before any writable connection, so `bring_forward`
+    // never runs on such a store.
+    if store_archive < ARCHIVE_FORMAT {
+        return Err(Error::ArchiveFormatTooOld {
+            path: path.to_path_buf(),
+            store_format: store_archive,
+            binary_format: ARCHIVE_FORMAT,
+        });
+    }
+
+    let outcome = if store_derived != DERIVED_SCHEMA {
         // A *newer* derived_schema lands here too, and deliberately: derived
-        // tables are rebuildable from the blobs by definition, so rebuilding
+        // tables are rebuildable from the archive by definition, so rebuilding
         // them down to this build's shape is always available. Only the archive
         // can be too new to read.
         Some(RebuildRequired {
@@ -845,30 +914,6 @@ fn platform_data_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home)
         .join("Library")
         .join("Application Support")
-        .join("terminus"))
-}
-
-#[cfg(target_os = "windows")]
-fn platform_data_dir() -> Result<PathBuf> {
-    let local = non_empty_var("LOCALAPPDATA").ok_or_else(|| Error::DataDirUnresolved {
-        detail: "neither TERMINUS_DATA_DIR nor LOCALAPPDATA is set".into(),
-    })?;
-    Ok(PathBuf::from(local).join("terminus"))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn platform_data_dir() -> Result<PathBuf> {
-    // Every other Unix follows the XDG layout; only the three above are
-    // first-class targets (PROJECT.md constraints).
-    if let Some(xdg) = non_empty_var("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(xdg).join("terminus"));
-    }
-    let home = non_empty_var("HOME").ok_or_else(|| Error::DataDirUnresolved {
-        detail: "neither TERMINUS_DATA_DIR, XDG_DATA_HOME nor HOME is set".into(),
-    })?;
-    Ok(PathBuf::from(home)
-        .join(".local")
-        .join("share")
         .join("terminus"))
 }
 

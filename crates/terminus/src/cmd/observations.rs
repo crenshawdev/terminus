@@ -75,15 +75,9 @@ fn list(args: List) -> Result<(), Failure> {
         return read::empty(document(&[]), &reason.to_string(), args.json);
     }
 
-    // `o.decisions` and the `decisions` TABLE are different objects with the
-    // same name, so the column is qualified here and everywhere else it is
-    // named.
     let mut stored: BTreeMap<String, Row> = {
         let mut statement = op(conn.prepare(
-            "SELECT o.session_key, o.session_id, o.generated_at, o.mechanical,
-                    o.status, o.model, o.prompt_version, o.topic, o.outcome,
-                    o.decisions, o.learned, o.unresolved, o.raw, o.tokens
-               FROM observations o",
+            "SELECT session_key, session_id, generated_at, mechanical FROM observations",
         ))?;
         let rows = op(statement.query_map([], |r| {
             Ok((
@@ -93,16 +87,6 @@ fn list(args: List) -> Result<(), Failure> {
                     session_id: r.get(1)?,
                     generated_at: r.get(2)?,
                     mechanical: r.get(3)?,
-                    status: r.get(4)?,
-                    model: r.get(5)?,
-                    prompt_version: r.get(6)?,
-                    topic: r.get(7)?,
-                    outcome: r.get(8)?,
-                    decisions: r.get(9)?,
-                    learned: r.get(10)?,
-                    unresolved: r.get(11)?,
-                    raw: r.get(12)?,
-                    tokens: r.get(13)?,
                 },
             ))
         }))?;
@@ -159,12 +143,9 @@ fn regenerate(args: Regenerate) -> Result<(), Failure> {
     let data_dir = super::data_dir()?;
     let config = terminus_core::Config::load()?;
 
-    // The lock covers the mechanical rewrite and nothing more. Scoped to this
-    // block on purpose: the judgment half below makes HTTP calls, and D-07 bars
-    // one from being made while the ingest lock is held - a rebuild that sat on
-    // it through a run of provider calls would make every hook-spawned pass in
-    // that window exit `LockHeld` and archive nothing.
-    let mut done = {
+    // The lock covers the mechanical rewrite and is released as soon as it is
+    // done, so a hook-spawned pass waits no longer than the rewrite itself.
+    let done = {
         let _guard = match lock::try_acquire(&data_dir)? {
             // Non-zero, the way `reindex`'s contention is: a rebuild is asked
             // for explicitly, so silently not doing it would be the wrong
@@ -196,15 +177,9 @@ fn regenerate(args: Regenerate) -> Result<(), Failure> {
             &config,
             &observe::Selector {
                 since: args.since.as_deref(),
-                prompt_version: args.prompt_version.as_deref(),
             },
         )?
     };
-
-    // Outside the lock, and a no-op without a provider - which is the default,
-    // and is what lets a user with no provider rebuild facts and keep whatever
-    // judgment the rows already carry.
-    observe::rejudge(&data_dir, &config, &mut done);
 
     if args.json {
         regenerated_document(&args, &done).emit();
@@ -217,12 +192,6 @@ fn regenerate(args: Regenerate) -> Result<(), Failure> {
         "regenerated {} of {} selected observation(s)",
         done.rewritten, done.selected
     );
-    if config.provider_enabled() {
-        eprintln!(
-            "re-judged {} of {} selected observation(s)",
-            done.judged, done.selected
-        );
-    }
     for note in &done.notes {
         eprintln!("{note}");
     }
@@ -243,13 +212,6 @@ fn regenerated_document(args: &Regenerate, done: &Regenerated) -> Document {
                 None => Value::Null,
             },
         )
-        .field(
-            "prompt_version",
-            match &args.prompt_version {
-                Some(version) => Value::from(version.as_str()),
-                None => Value::Null,
-            },
-        )
         .field("selected", done.selected as i64)
         .field("regenerated", done.rewritten as i64)
         .field(
@@ -261,27 +223,13 @@ fn regenerated_document(args: &Regenerate, done: &Regenerated) -> Document {
         )
 }
 
-/// One row of the table, every column of it.
-///
-/// The judgment columns are carried even though PLAN-3 is what fills them: they
-/// are part of the row and a consumer reads one shape whether or not a provider
-/// has ever answered, the way the envelope carries `reason` as a null rather
-/// than as a missing key.
+/// One row of the table: which session it is, when it was written, and the
+/// mechanical facts.
 struct Row {
     session_key: String,
     session_id: Option<String>,
     generated_at: Option<String>,
     mechanical: Option<String>,
-    status: Option<String>,
-    model: Option<String>,
-    prompt_version: Option<String>,
-    topic: Option<String>,
-    outcome: Option<String>,
-    decisions: Option<String>,
-    learned: Option<String>,
-    unresolved: Option<String>,
-    raw: Option<String>,
-    tokens: Option<i64>,
 }
 
 impl Row {
@@ -291,16 +239,6 @@ impl Row {
             "session_id": self.session_id,
             "generated_at": self.generated_at,
             "mechanical": nested(self.mechanical.as_deref()),
-            "status": self.status,
-            "model": self.model,
-            "prompt_version": self.prompt_version,
-            "topic": self.topic,
-            "outcome": self.outcome,
-            "decisions": nested(self.decisions.as_deref()),
-            "learned": nested(self.learned.as_deref()),
-            "unresolved": nested(self.unresolved.as_deref()),
-            "raw": self.raw,
-            "tokens": self.tokens,
         })
     }
 
@@ -317,7 +255,7 @@ impl Row {
             .and_then(|text| serde_json::from_str::<Value>(text).ok())
             .unwrap_or(Value::Null);
 
-        println!(
+        outln!(
             "{}  {}  {} turn(s)  {}  {} compaction(s)",
             file_name(&self.session_key),
             text(&facts["branch"]).unwrap_or("(no branch)"),
@@ -335,23 +273,22 @@ impl Row {
         ] {
             let values = strings(&facts[field]);
             if !values.is_empty() {
-                println!("  {label:<15} {}", values.join(", "));
+                outln!("  {label:<15} {}", values.join(", "));
             }
         }
         // What the row itself says was cut, so a list a cap shortened is never
         // read as the whole of what the session did.
         let cut = strings(&facts["truncated"]);
         if !cut.is_empty() {
-            println!("  {:<15} {}", "truncated", cut.join(", "));
+            outln!("  {:<15} {}", "truncated", cut.join(", "));
         }
     }
 }
 
-/// A stored JSON column as a value, not as a string.
+/// The stored `mechanical` document as a value, not as a string.
 ///
-/// `mechanical` and the three claim lists are documents in a TEXT column, and a
-/// consumer that got them as strings would have to parse the document out of
-/// the document. A column that will not parse comes back as the raw string
+/// It is a document in a TEXT column, and a consumer that got it as a string
+/// would have to parse the document out of the document. A column that will not parse comes back as the raw string
 /// rather than as a null: a reader can tell an object from a string, and the
 /// bytes that are actually there are more use than a silent absence.
 fn nested(stored: Option<&str>) -> Value {
@@ -421,7 +358,6 @@ pub struct List {
 pub struct Regenerate {
     /// A `cmd::time_bound` bound against `session_meta.last_turn_at`.
     pub since: Option<String>,
-    pub prompt_version: Option<String>,
     pub json: bool,
 }
 
@@ -489,9 +425,6 @@ fn regenerate_args(parser: &mut lexopt::Parser) -> Result<Regenerate, Failure> {
             // wrong set and report success.
             Long("since") => {
                 args.since = Some(super::time_bound("since", &super::value(parser, "since")?)?)
-            }
-            Long("prompt-version") => {
-                args.prompt_version = Some(super::value(parser, "prompt-version")?)
             }
             Long(super::JSON_FLAG) => args.json = true,
             other => return Err(Failure::Misuse(crate::unexpected(other))),

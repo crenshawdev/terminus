@@ -49,7 +49,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
     } else {
         Some(read(conn.query_row(
             "SELECT started_at, coalesce(duration_ms, 0), files_seen, files_committed,
-                    files_failed, bytes_read, turns_added, error
+                    files_failed, bytes_read, turns_added, error, notes
              FROM runs ORDER BY id DESC LIMIT 1",
             [],
             |r| {
@@ -62,6 +62,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
                     bytes_read: r.get(5)?,
                     turns_added: r.get(6)?,
                     error: r.get(7)?,
+                    notes: r.get(8)?,
                 })
             },
         ))?)
@@ -92,6 +93,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
                         "bytes_read": run.bytes_read,
                         "turns_added": run.turns_added,
                         "error": run.error,
+                        "notes": run.notes,
                     }),
                 },
             )
@@ -99,18 +101,19 @@ pub fn run(json: bool) -> Result<(), Failure> {
         return Ok(());
     }
 
-    println!("store          {}", store.path().display());
-    println!("size           {}", size(&data_dir));
-    println!("sessions       {}", counts.sessions);
-    println!("turns          {}", counts.turns);
-    println!(
+    outln!("store          {}", store.path().display());
+    outln!("size           {}", size(&data_dir));
+    outln!("sessions       {}", counts.sessions);
+    outln!("turns          {}", counts.turns);
+    outln!(
         "watermarks     {} covering {} byte(s)",
-        counts.watermarks, counts.watermark_bytes
+        counts.watermarks,
+        counts.watermark_bytes
     );
     if !config.exclusions().is_empty() {
         // Named, because a count that dropped without explanation is a bug
         // report. The excluded sessions are still archived; they are not listed.
-        println!(
+        outln!(
             "excluded       {} project(s): {}",
             config.exclusions().len(),
             config.exclusions().join(", ")
@@ -120,24 +123,33 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let Some(run) = last else {
         // An empty store is not a failure: it is what a machine looks like
         // before the first hook has ever fired.
-        println!("last run       none");
+        outln!("last run       none");
         return Ok(());
     };
 
-    println!("last run       {}", run.started_at);
-    println!("  duration     {} ms", run.duration_ms);
-    println!(
+    outln!("last run       {}", run.started_at);
+    outln!("  duration     {} ms", run.duration_ms);
+    outln!(
         "  files        {} walked, {} committed, {} failed",
-        run.files_seen, run.files_committed, run.files_failed
+        run.files_seen,
+        run.files_committed,
+        run.files_failed
     );
-    println!("  bytes read   {}", run.bytes_read);
-    println!("  turns added  {}", run.turns_added);
+    outln!("  bytes read   {}", run.bytes_read);
+    outln!("  turns added  {}", run.turns_added);
+    // What the pass did, then what went wrong, each in full: these are the only
+    // account of that pass there is. Apart, so a routine line never reads as a
+    // failure.
+    if let Some(notes) = &run.notes {
+        outln!("  notes");
+        for line in notes.lines() {
+            outln!("    {line}");
+        }
+    }
     if let Some(error) = &run.error {
-        // In full, every line of it. This is the only account of what that pass
-        // skipped and why.
-        println!("  error");
+        outln!("  error");
         for line in error.lines() {
-            println!("    {line}");
+            outln!("    {line}");
         }
     }
 
@@ -153,6 +165,7 @@ struct Run {
     bytes_read: i64,
     turns_added: i64,
     error: Option<String>,
+    notes: Option<String>,
 }
 
 /// The store's footprint: the database and its WAL sidecars together, because

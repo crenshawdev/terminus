@@ -64,14 +64,7 @@ fn counts(conn: &Connection) -> Vec<(String, i64)> {
 }
 
 fn stream(conn: &Connection, session_key: &str) -> Vec<u8> {
-    let bytes: Vec<u8> = conn
-        .query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [session_key],
-            |r| r.get(0),
-        )
-        .unwrap();
-    blob::read_all(&bytes).unwrap()
+    testkit::stream(conn, session_key).unwrap()
 }
 
 fn watermark(conn: &Connection, key: &str) -> i64 {
@@ -276,14 +269,7 @@ fn resuming_from_a_mid_line_watermark_converges_on_a_single_pass() {
 
     // Byte-identical blobs, not merely equal streams: an append that
     // recompressed the whole session would still decompress correctly.
-    let blob_of = |key: &str| -> Vec<u8> {
-        conn.query_row(
-            "SELECT blob FROM sessions WHERE session_key = ?1",
-            [key],
-            |r| r.get(0),
-        )
-        .unwrap()
-    };
+    let blob_of = |key: &str| testkit::stored(&conn, key);
     assert_eq!(
         blob_of(&second.session_key),
         blob_of(&reference.session_key),
@@ -325,7 +311,6 @@ fn resuming_from_a_mid_line_watermark_converges_on_a_single_pass() {
 /// The same transcript reached through a symlink is one session, not two
 /// (`DESIGN-BRIEF.md:406`; CONTEXT's third flagged assumption, resolved as
 /// "canonicalize").
-#[cfg(unix)]
 #[test]
 fn two_paths_to_one_transcript_produce_one_session() {
     let bench = bench();
@@ -444,8 +429,8 @@ fn a_non_transcript_jsonl_archives_with_no_turns() {
     assert_eq!(turns, 0);
 }
 
-/// The checksum in `session_meta` is BLAKE3 over the uncompressed session bytes
-/// (D-06), and the append path is handed it to verify before it writes.
+/// The checksum in `session_meta` is BLAKE3 over the BLAKE3 of each 64 KB block
+/// of the uncompressed stream, in order, and the append path checks it first.
 #[test]
 fn the_stored_checksum_is_blake3_over_the_uncompressed_stream() {
     let bench = bench();
@@ -461,7 +446,11 @@ fn the_stored_checksum_is_blake3_over_the_uncompressed_stream() {
         )
         .unwrap();
     let source = std::fs::read(&path).unwrap();
-    assert_eq!(checksum, blake3::hash(&source).as_bytes().to_vec());
+    let hashes: Vec<u8> = source
+        .chunks(65_536)
+        .flat_map(|block| *blake3::hash(block).as_bytes())
+        .collect();
+    assert_eq!(checksum, blake3::hash(&hashes).as_bytes().to_vec());
     assert_eq!(len, source.len() as i64);
 }
 
@@ -490,6 +479,7 @@ fn a_pass_moves_the_session_its_turns_and_its_watermark_together() {
         moved,
         vec![
             "sessions",
+            "blocks",
             "session_meta",
             "turns",
             "turns_fts",
@@ -529,14 +519,14 @@ fn a_session_that_lost_its_metadata_row_is_refused_rather_than_re_ingested() {
     let (blob_before, watermark_before, session_no_before) = {
         let conn = Connection::open(&db).unwrap();
         conn.execute("DELETE FROM session_meta", []).unwrap();
-        let blob: Vec<u8> = conn
-            .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+        let (key, session_no): (String, i64) = conn
+            .query_row("SELECT session_key, session_no FROM sessions", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
+        let blob = testkit::stored(&conn, &key);
         let watermark: i64 = conn
             .query_row("SELECT byte_offset FROM watermarks", [], |r| r.get(0))
-            .unwrap();
-        let session_no: i64 = conn
-            .query_row("SELECT session_no FROM sessions", [], |r| r.get(0))
             .unwrap();
         (blob, watermark, session_no)
     };
@@ -553,9 +543,10 @@ fn a_session_that_lost_its_metadata_row_is_refused_rather_than_re_ingested() {
 
     // The archive is exactly as it was.
     let conn = Connection::open(&db).unwrap();
-    let blob_after: Vec<u8> = conn
-        .query_row("SELECT blob FROM sessions", [], |r| r.get(0))
+    let key: String = conn
+        .query_row("SELECT session_key FROM sessions", [], |r| r.get(0))
         .unwrap();
+    let blob_after = testkit::stored(&conn, &key);
     assert!(
         blob_after == blob_before,
         "the refused pass rewrote the blob"

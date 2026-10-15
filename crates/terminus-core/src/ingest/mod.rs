@@ -25,14 +25,14 @@ pub use lock::{Attempt, IngestLock, LOCK_FILE_NAME};
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::blob;
+use crate::blob::{self, Block, BLOCK_SIZE};
 use crate::config::CaptureMode;
 use crate::derive;
 use crate::error::{Error, Result};
 use crate::lineage;
 use crate::parse::{self, Scan};
 use crate::project::{Project, Resolver};
-use crate::store::Store;
+use crate::store::{archive, Store};
 
 /// What one invocation of [`run`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +63,11 @@ pub struct Pass {
     pub turns_added: usize,
     /// Where the next pass resumes: the byte just past the last `\n` (D-14).
     pub watermark: u64,
+    /// Existing block rows whose bytes were fetched for this file: at most the
+    /// tail row, or every row of a session flagged diverged (D-11, D-13).
+    /// Counted where the read happens, so a pass that read more than the tail
+    /// shows up in this number and not only in its timing.
+    pub block_rows_read: usize,
 }
 
 /// Ingest one transcript into the store under `data_dir`, honoring the
@@ -106,9 +111,9 @@ pub fn run_with(
 
     // Recovery first, under the lock, before this transcript is read (ING-03).
     // `ingest::run` is a run: without this it would proceed against a watermark
-    // ahead of what this file's committed blob holds, `read_tail` would resume
+    // ahead of what this file's committed blocks hold, `read_tail` would resume
     // from an offset the archive never reached, and the gap would be lost from
-    // the blob in silence. It also brings a store older than this build forward
+    // the archive in silence. It also brings a store older than this build forward
     // (STOR-05), so a pass never appends turn rows in one shape beside rows
     // written in another.
     let (mut store, _recovered) = crate::recover::recover(data_dir)?;
@@ -153,8 +158,8 @@ pub(crate) fn ingest_locked(
 ) -> Result<Outcome> {
     // The session is keyed on the transcript FILE identity, never on the
     // record's session id (D-01): 812 real sidecar files report their parent's
-    // sessionId, and keying on that overwrites a parent session's blob with a
-    // 3 KB agent transcript. The watermark is keyed on the same value.
+    // sessionId, and keying on that writes a 3 KB agent transcript over a
+    // parent session's archive. The watermark is keyed on the same value.
     let session_key = path_key(path)?;
     let existing = Existing::read(store.conn(), &session_key)?;
     let prepared = prepare(path, session_key, &existing, mode)?;
@@ -184,13 +189,13 @@ pub(crate) struct Prepared {
 /// The compressed, parsed result of reading one file's tail.
 struct Work {
     /// Where the bytes this pass stores begin in the ARCHIVED stream: the
-    /// uncompressed length the session's blob already holds, and zero for a
-    /// session with no blob (ING-07, phase 8 D-05).
+    /// uncompressed length the session already holds, and zero for a session
+    /// never archived (ING-07, phase 8 D-05).
     ///
     /// Not the watermark. The watermark is a file offset and this is a stream
     /// offset; under `full` they are the same number and under every other mode
     /// they are not. Every `turns.stream_offset` this pass writes is measured
-    /// from here, because that is the coordinate system `blob::BlobReader`,
+    /// from here, because that is the coordinate system `store::archive`,
     /// `recall::get` and `reindex` all read.
     stream_base: u64,
     /// The `session_no` this session already has, or `None` for one that has
@@ -200,17 +205,21 @@ struct Work {
     /// The scan of the STORED bytes, not of the file's. It is what the turn rows
     /// are derived from, so their offsets address what a reader will find.
     scan: Scan,
-    /// The bytes this pass appends to the blob: the file's tail with whatever
-    /// the capture mode elided already taken out of it.
+    /// The bytes this pass appends to the session: the file's tail with
+    /// whatever the capture mode elided already taken out of it.
     stored: Vec<u8>,
-    bytes: Vec<u8>,
+    /// The block rows to write: the rewritten tail, if the stream ended
+    /// mid-block, then the new blocks.
+    blocks: Vec<Block>,
+    /// The session's block size, written to `session_meta` on its first pass.
+    block_size: u32,
     checksum: [u8; 32],
     uncompressed_len: u64,
     parent_session_key: Option<String>,
     agent_meta: Option<Vec<u8>>,
     /// The mode this pass's bytes were captured under (ING-07, D-13). Carried
     /// through to `session_meta.capture_mode` rather than re-read at the write,
-    /// so the column records the mode the blob in this same `Work` was built
+    /// so the column records the mode the blocks in this same `Work` were built
     /// under and cannot drift from it.
     capture_mode: CaptureMode,
     pass: Pass,
@@ -227,18 +236,18 @@ pub(crate) fn prepare(
     mode: CaptureMode,
 ) -> Result<Prepared> {
     // Before the file is even opened, and the only safe answer for a session
-    // retention emptied (RET-02, phase 8 D-03). `blob::append` parses a header
-    // out of the stored bytes and an emptied blob has none, so left to the
-    // ordinary path this file becomes a per-file failure on every pass forever;
-    // writing the tail as a FRESH blob instead would resurrect a session that
-    // was deliberately emptied and leave every stored `turns.stream_offset`
+    // retention emptied (RET-02, phase 8 D-03). An append checks the stored
+    // hashes and tail, and an evicted session has no block rows left, so left
+    // to the ordinary path this file becomes a per-file failure on every pass
+    // forever; writing the tail as a FRESH session instead would resurrect one
+    // that was deliberately emptied and leave every stored `turns.stream_offset`
     // pointing into bytes that are no longer there.
     //
     // So: no work, and `apply` answers `Outcome::UpToDate`. No bytes are read,
     // the watermark does not move, and the walk records no failure - the file
     // is simply one this store has nothing more to do with until the policy
     // that emptied it changes. D-13's flag is not cleared either, and cannot
-    // be: `prefix_matches` would have to decompress the blob that is gone.
+    // be: `prefix_matches` would have to decompress the blocks that are gone.
     if existing.evicted {
         return Ok(Prepared {
             session_key,
@@ -256,14 +265,14 @@ pub(crate) fn prepare(
     // truncated to half its length and then written back past the old watermark
     // passes that length test while every byte between the truncation point and
     // the watermark is different. Clearing on length alone would then append at
-    // the stale offset - splicing a record fragment onto a blob whose middle no
-    // longer exists anywhere, permanently, with `verify` reporting it clean
-    // because the blob's own checksum still matches itself.
+    // the stale offset - splicing a record fragment onto a session whose middle
+    // no longer exists anywhere, permanently, with `verify` reporting it clean
+    // because the session's own checksum still matches itself.
     //
-    // So the archived prefix is compared against the file's. This costs a
-    // decompression and a re-read of the session, and it is paid only by a
-    // session that is actually flagged - the steady state reads the flag, finds
-    // it clear, and issues neither.
+    // So the archived prefix is compared against the file's. This costs every
+    // block row and a re-read of the session, and it is paid only by a session
+    // that is actually flagged - the steady state reads the flag, finds it
+    // clear, and fetches at most the tail row (D-13).
     let mut clear_divergence = false;
     if existing.diverged {
         if !prefix_matches(path, existing, existing.watermark)? {
@@ -297,15 +306,15 @@ pub(crate) fn prepare(
     }
     let fresh = &tail[..consumed];
 
-    // The capture mode acts HERE, between the file and the blob (ING-07, phase 8
+    // The capture mode acts HERE, between the file and the archive (ING-07, phase 8
     // D-05), line by line and preserving the framing exactly. Under `full` this
     // borrows `fresh` and examines not one byte of it, which is what keeps the
     // default path identical to what it has always been.
     let stored = crate::capture::elide_stream(fresh, mode);
 
-    // Where those bytes land in the archived stream. It is the blob's own
-    // uncompressed length and NOT the watermark: `blob::append` appends at the
-    // end of the blob, so that is where the new bytes really go, and once a mode
+    // Where those bytes land in the archived stream. It is the session's own
+    // uncompressed length and NOT the watermark: an append adds at the end of
+    // the stream, so that is where the new bytes really go, and once a mode
     // elides anything the file offset stops being able to say so. Under `full`
     // the two are the same number in a healthy store, which is why every offset
     // below is arithmetically what it was before this existed.
@@ -317,24 +326,41 @@ pub(crate) fn prepare(
 
     // The SECOND scan, over the bytes actually being stored, and it is the one
     // `apply` derives turns from - so `turns.stream_offset` and `byte_len`
-    // address the stored stream, which is what `blob::BlobReader`,
-    // `recall::get` and `reindex` read. Elision preserves the line framing and
+    // address the stored stream, which is what `store::archive`, `recall::get`
+    // and `reindex` read. Elision preserves the line framing and
     // every field a record is classified on, so this scan finds the same records
     // in the same order at the same ordinals; only their lengths differ.
     let scan = parse::scan_from(&stored, stream_base, existing.turn_count);
 
-    // Compression and hashing happen here, outside the transaction. `append`
-    // takes the checksum already recorded for what the blob holds and verifies
-    // it before writing, so a re-ingest of a growing session cannot mint a
-    // fresh checksum over corruption.
-    let (bytes, checksum, uncompressed_len) = match &existing.session {
+    // Compression and hashing happen here, outside the transaction. The append
+    // is handed the stored hashes, the recorded checksum and the tail row, and
+    // checks the first two against each other and the tail against its hash
+    // before cutting anything, so a re-ingest of a growing session cannot mint
+    // a fresh checksum over corruption. A session keeps the block size it was
+    // first cut at; a new one is cut at this build's.
+    let (written, block_size) = match &existing.session {
         Some(session) => {
-            let appended = blob::append(&session.blob, &session.checksum, &stored)?;
-            (appended.bytes, appended.checksum, appended.uncompressed_len)
+            let block_size = archive::block_size(existing.block_size)?;
+            let hashes = session
+                .archive
+                .hashes
+                .as_ref()
+                .map_err(|detail| Error::BlobFormat {
+                    detail: detail.clone(),
+                })?;
+            let appended = blob::append(
+                block_size,
+                existing.uncompressed_len,
+                hashes,
+                &session.checksum,
+                session.archive.tail.as_deref(),
+                &stored,
+            )?;
+            (appended, block_size)
         }
         None => {
-            let written = blob::write(&stored)?;
-            (written.bytes, written.checksum, written.uncompressed_len)
+            let block_size = BLOCK_SIZE as u32;
+            (blob::write(&stored, block_size)?, block_size)
         }
     };
 
@@ -364,6 +390,7 @@ pub(crate) fn prepare(
         bytes_read: consumed as u64,
         turns_added: scan.turn_count(),
         watermark: file_scan.resume_offset,
+        block_rows_read: existing.session.as_ref().map_or(0, |s| s.archive.rows_read),
     };
 
     fault::stall(fault::AFTER_BLOB);
@@ -376,9 +403,10 @@ pub(crate) fn prepare(
             existing_session_no: existing.session.as_ref().map(|s| s.session_no),
             scan,
             stored: stored.into_owned(),
-            bytes,
-            checksum,
-            uncompressed_len,
+            blocks: written.blocks,
+            block_size,
+            checksum: written.checksum,
+            uncompressed_len: written.uncompressed_len,
             parent_session_key,
             agent_meta,
             capture_mode: mode,
@@ -422,7 +450,8 @@ pub(crate) fn apply(
         existing_session_no,
         scan,
         stored,
-        bytes,
+        blocks,
+        block_size,
         checksum,
         uncompressed_len,
         parent_session_key,
@@ -452,7 +481,7 @@ pub(crate) fn apply(
     // The fault the crash harness must be able to catch, and the reason that
     // harness is worth anything: with this on, the watermark commits in a
     // transaction of its own *before* the pass, so a kill in between leaves a
-    // store claiming bytes its blob does not hold. Compiled only under
+    // store claiming bytes its block rows do not hold. Compiled only under
     // `testkit`; the shipped binary has no such branch.
     if fault::split_watermark() {
         let early = store.conn_mut().transaction()?;
@@ -461,13 +490,17 @@ pub(crate) fn apply(
         fault::stall(fault::AFTER_SPLIT_WATERMARK);
     }
 
-    // One transaction, and nothing outside it mutates the store (STOR-02).
+    // One transaction, and nothing outside it mutates the store (STOR-02). The
+    // `sessions` row goes in before its blocks, because the block table's
+    // reference to it is enforced (D-09).
     let tx = store.conn_mut().transaction()?;
-    tx.execute(
-        "INSERT INTO sessions (session_key, session_no, blob) VALUES (?1, ?2, ?3)
-         ON CONFLICT(session_key) DO UPDATE SET blob = excluded.blob",
-        rusqlite::params![session_key, session_no, bytes],
-    )?;
+    if existing_session_no.is_none() {
+        tx.execute(
+            "INSERT INTO sessions (session_key, session_no) VALUES (?1, ?2)",
+            rusqlite::params![session_key, session_no],
+        )?;
+    }
+    archive::write(&tx, session_no, &blocks)?;
     write_session_meta(
         &tx,
         MetaRow {
@@ -475,6 +508,7 @@ pub(crate) fn apply(
             path,
             checksum: &checksum,
             uncompressed_len,
+            block_size,
             continues_from: continues_from.as_deref(),
             project: project.as_ref(),
             parent_session_key: parent_session_key.as_deref(),
@@ -543,7 +577,7 @@ fn agent_meta_path(transcript: &Path) -> Option<PathBuf> {
 /// the column stays null and nothing is recorded. The format is undocumented
 /// and may drift, which is the whole reason the bytes are stored rather than
 /// typed columns - phase 3 can extract `description` for ranking without a
-/// reingest, and the blob stays transcript bytes only (D-13).
+/// reingest, and the archive stays transcript bytes only (D-13).
 ///
 /// Through the counted open, like every other read of the transcript tree, so
 /// an excluded project's meta files are counted the same way its transcripts
@@ -609,7 +643,7 @@ fn write_watermark(conn: &Connection, session_key: &str, offset: u64) -> Result<
 pub mod fault {
     /// Compression and hashing are done; nothing is written yet.
     pub const AFTER_BLOB: &str = "after-blob";
-    /// Inside the transaction, after `sessions` and `session_meta`.
+    /// Inside the transaction, after the archive rows and `session_meta`.
     pub const IN_TX_AFTER_SESSION: &str = "in-tx-after-session";
     /// Inside the transaction, after every turn and its derived rows.
     pub const IN_TX_AFTER_TURNS: &str = "in-tx-after-turns";
@@ -762,8 +796,9 @@ pub mod fault {
 
 /// What the store already holds for this transcript.
 ///
-/// Read by the writer - it is four queries - and handed to [`prepare`], which
-/// is what lets prepare run on a thread with no connection of its own.
+/// Read by the writer - a handful of queries, and the bytes of at most one block
+/// row - and handed to [`prepare`], which is what lets prepare run on a thread
+/// with no connection of its own.
 pub(crate) struct Existing {
     watermark: u64,
     /// Whether `session_meta.agent_meta` already holds this sidecar's meta
@@ -778,12 +813,12 @@ pub(crate) struct Existing {
     /// the file is whole again, and read here so the steady state costs no
     /// extra query and no write at all.
     diverged: bool,
-    /// Whether retention emptied this session's blob on purpose (RET-02, phase
-    /// 8 D-03). Read off the same `session_meta` row as the two flags above, so
-    /// the steady state still costs one query and no write.
+    /// Whether retention emptied this session's block rows on purpose (RET-02,
+    /// phase 8 D-03). Read off the same `session_meta` row as the two flags
+    /// above, so the steady state still costs one query and no write.
     evicted: bool,
-    /// How many uncompressed bytes this session's blob already holds - the base
-    /// of the STORED stream's coordinate system (ING-07, phase 8 D-05).
+    /// How many uncompressed bytes this session already holds - the base of the
+    /// STORED stream's coordinate system (ING-07, phase 8 D-05).
     ///
     /// Not the same number as [`Existing::watermark`] once a capture mode elides
     /// anything: the watermark is an offset into the transcript FILE and this is
@@ -799,13 +834,18 @@ pub(crate) struct Existing {
     /// Read for one question only: whether the archived prefix and the file's
     /// prefix are comparable at all. See [`prefix_matches`].
     stored_capture_mode: Option<String>,
+    /// `session_meta.block_size` as stored. Checked where it is used, so a bad
+    /// value fails only a pass that has something to append.
+    block_size: Option<i64>,
     session: Option<ExistingSession>,
 }
 
 struct ExistingSession {
     session_no: i64,
-    blob: Vec<u8>,
     checksum: [u8; 32],
+    /// The hashes and at most the tail row (D-10, D-11), or every row of a
+    /// flagged session (D-13). Empty for an evicted session, which reads none.
+    archive: archive::AppendState,
 }
 
 impl Existing {
@@ -820,22 +860,35 @@ impl Existing {
         // All three flags off the one `session_meta` row rather than three
         // round trips: a pass reads this for every one of two thousand
         // transcripts.
-        let (agent_meta_stored, diverged, evicted, uncompressed_len, stored_capture_mode): (
-            bool,
-            bool,
-            bool,
-            i64,
-            Option<String>,
-        ) = conn
+        type MetaFlags = (bool, bool, bool, i64, Option<String>, Option<i64>);
+        let (
+            agent_meta_stored,
+            diverged,
+            evicted,
+            uncompressed_len,
+            stored_capture_mode,
+            block_size,
+        ): MetaFlags = conn
             .query_row(
                 "SELECT agent_meta IS NOT NULL, coalesce(transcript_diverged, 0) <> 0,
-                        coalesce(is_evicted, 0) <> 0, uncompressed_len, capture_mode
+                        coalesce(is_evicted, 0) <> 0, uncompressed_len, capture_mode,
+                        block_size
                  FROM session_meta WHERE session_key = ?1",
                 [session_key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
             )
             .optional()?
-            .unwrap_or((false, false, false, 0, None));
+            .unwrap_or((false, false, false, 0, None, None));
+        let uncompressed_len = uncompressed_len.max(0) as u64;
         let turn_count: i64 = conn.query_row(
             "SELECT count(*) FROM turns WHERE session_key = ?1",
             [session_key],
@@ -846,58 +899,64 @@ impl Existing {
         // no row in two very different situations - this transcript has never
         // been ingested, and this transcript IS archived but lost its
         // `session_meta` row - and the caller reads "no row" as "brand new". A
-        // pass over a grown transcript then wrote the TAIL as the whole blob,
-        // destroying every archived byte before it, allocated a second
+        // pass over a grown transcript then wrote the TAIL as the whole
+        // session, destroying every archived byte before it, allocated a second
         // `session_no` that no longer matched the `sessions` row, and left the
-        // watermark ahead of the committed blob: the one state STOR-02 says a
+        // watermark ahead of the committed stream: the one state STOR-02 says a
         // store must never reach, reached by a pass that exits 0. `verify` then
         // certified it, because the checksum had been minted over the truncated
         // stream - so the obvious response to `verify` naming a session (re-run
         // ingest) was what destroyed it.
         let session = conn
             .query_row(
-                "SELECT s.session_no, s.blob, m.checksum
+                "SELECT s.session_no, m.checksum
                  FROM sessions s LEFT JOIN session_meta m USING (session_key)
                  WHERE s.session_key = ?1",
                 [session_key],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, Vec<u8>>(1)?,
-                        r.get::<_, Option<Vec<u8>>>(2)?,
-                    ))
-                },
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)),
             )
             .optional()?;
 
         // An archived session with no metadata row is damaged, not absent.
         // Phase 1 refuses rather than guessing: there is no checksum to verify
-        // the stored bytes against, and `blob::append` requires one precisely
-        // so that a growing session cannot have corruption written into it.
+        // the stored hashes against, and an append requires one precisely so
+        // that a growing session cannot have corruption written into it.
         let session = match session {
-            Some((_, _, None)) => {
+            Some((_, None)) => {
                 return Err(Error::NotAStore {
                     path: session_key.into(),
                     detail: "session is archived but has no session_meta row; \
-                             run `terminus verify` - refusing to overwrite its blob"
+                             run `terminus verify` - refusing to overwrite its archive"
                         .into(),
                 })
             }
-            Some((session_no, blob, Some(checksum))) => Some((session_no, blob, checksum)),
+            Some((session_no, Some(checksum))) => Some((session_no, checksum)),
             None => None,
         };
 
         let session = match session {
-            Some((session_no, blob, checksum)) => Some(ExistingSession {
-                session_no,
-                blob,
-                checksum: checksum.as_slice().try_into().map_err(|_| {
-                    Error::BlobChecksumMismatch {
-                        expected: "32 bytes".into(),
-                        actual: format!("{} bytes", checksum.len()),
-                    }
-                })?,
-            }),
+            Some((session_no, checksum)) => {
+                let checksum =
+                    checksum
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Error::BlobChecksumMismatch {
+                            expected: "32 bytes".into(),
+                            actual: format!("{} bytes", checksum.len()),
+                        })?;
+                // No rows at all for an evicted session: `prepare` never
+                // appends to one, and it has none to read.
+                let archive = if evicted {
+                    archive::AppendState::empty()
+                } else {
+                    archive::append_state(conn, session_no, block_size, uncompressed_len, diverged)?
+                };
+                Some(ExistingSession {
+                    session_no,
+                    checksum,
+                    archive,
+                })
+            }
             None => None,
         };
 
@@ -907,8 +966,9 @@ impl Existing {
             turn_count,
             diverged,
             evicted,
-            uncompressed_len: uncompressed_len.max(0) as u64,
+            uncompressed_len,
             stored_capture_mode,
+            block_size,
             session,
         })
     }
@@ -934,9 +994,9 @@ pub(crate) fn path_key(path: &Path) -> Result<String> {
 /// that happens to be long enough - truncated and rewritten, or replaced
 /// outright - and the archive must not be appended to at the stale offset.
 ///
-/// A session with no archived blob cannot disagree with one, so it is treated
-/// as matching: the flag was set for a session whose bytes are gone, and
-/// refusing forever would be a permanent failure with nothing to compare.
+/// A session with nothing archived cannot disagree with the file, so it is
+/// treated as matching: the flag was set for a session whose bytes are gone,
+/// and refusing forever would be a permanent failure with nothing to compare.
 ///
 /// A session NOT captured under `full` answers `false` (ING-07, phase 8 D-05).
 /// Its archived stream and the file's first `watermark` bytes are not the same
@@ -944,8 +1004,11 @@ pub(crate) fn path_key(path: &Path) -> Result<String> {
 /// cannot say anything, and the safe answer is the one the surrounding code
 /// already chooses: still divergent. The flag stays set, the file stays skipped,
 /// and `terminus verify` keeps naming it. The alternative is appending at a
-/// stale offset onto a blob whose middle no longer exists anywhere, with
-/// `verify` reporting it clean because the blob's checksum still matches itself.
+/// stale offset onto a session whose middle no longer exists anywhere, with
+/// `verify` reporting it clean because its checksum still matches itself.
+///
+/// The one reader on the ingest path that decodes every block, from the rows
+/// [`Existing::read`] fetched for a flagged session (D-13).
 fn prefix_matches(path: &Path, existing: &Existing, watermark: u64) -> Result<bool> {
     let Some(session) = existing.session.as_ref() else {
         return Ok(true);
@@ -955,9 +1018,10 @@ fn prefix_matches(path: &Path, existing: &Existing, watermark: u64) -> Result<bo
     if !matches!(existing.stored_capture_mode.as_deref(), None | Some("full")) {
         return Ok(false);
     }
-    let archived = crate::blob::read_all(&session.blob)?;
+    let rows = session.archive.every_row.as_deref().unwrap_or_default();
+    let archived = archive::whole(existing.block_size, existing.uncompressed_len, rows)?;
     if (archived.len() as u64) < watermark {
-        // The blob is shorter than the watermark claims. That is a store
+        // The archive is shorter than the watermark claims. That is a store
         // inconsistency rather than a transcript one, and `verify` is the
         // command that reports it - here it simply is not a match.
         return Ok(false);
@@ -981,7 +1045,7 @@ fn read_tail(path: &Path, watermark: u64) -> Result<Vec<u8>> {
         // A transcript never shrinks: compaction appends to the same file
         // (`DESIGN-BRIEF.md:114`). A shorter file is a different file at the
         // same path, and guessing which bytes are still ours would corrupt the
-        // blob - so the refusal stands and there is deliberately no fallback to
+        // archive - so the refusal stands and there is deliberately no fallback to
         // offset 0, which would overwrite archived bytes on the strength of an
         // append-only property observed over one 25-day corpus rather than
         // documented anywhere (D-13).
@@ -1065,6 +1129,8 @@ struct MetaRow<'a> {
     path: &'a Path,
     checksum: &'a [u8; 32],
     uncompressed_len: u64,
+    /// Written on the session's first pass and kept after (D-05).
+    block_size: u32,
     /// In the session-id namespace, never the session-key one - see
     /// [`continues_from`].
     continues_from: Option<&'a str>,
@@ -1109,8 +1175,8 @@ fn first_cwd(scan: &Scan) -> Option<String> {
 ///
 /// - a stored null or `full` is replaced by whatever this pass captured under;
 /// - a stored `lean` or `minimal` is never moved back to `full` by a later full
-///   pass, because `blob::append` copies completed blocks across untouched and
-///   the bytes elided under the earlier mode are never revisited;
+///   pass, because an append never rewrites a completed block and the bytes
+///   elided under the earlier mode are never revisited;
 /// - a session appended to under two different REDUCED modes reads as the later
 ///   one. The guarantee the column carries is exactly "`full` means every append
 ///   was full", and a mixed reduced session has no single honest answer beyond
@@ -1134,13 +1200,14 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
             session_key, session_id, transcript_path, checksum, uncompressed_len,
             continues_from, first_turn_at, last_turn_at, cwd, branch,
             project, project_pre_worktree, parent_session_key, agent_meta,
-            capture_mode
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            capture_mode, block_size
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(session_key) DO UPDATE SET
             session_id = coalesce(session_meta.session_id, excluded.session_id),
             transcript_path = excluded.transcript_path,
             checksum = excluded.checksum,
             uncompressed_len = excluded.uncompressed_len,
+            block_size = coalesce(session_meta.block_size, excluded.block_size),
             continues_from = coalesce(session_meta.continues_from, excluded.continues_from),
             first_turn_at = coalesce(session_meta.first_turn_at, excluded.first_turn_at),
             last_turn_at = coalesce(excluded.last_turn_at, session_meta.last_turn_at),
@@ -1173,6 +1240,7 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
             row.parent_session_key,
             row.agent_meta,
             row.capture_mode.as_str(),
+            row.block_size,
         ],
     )?;
     Ok(())

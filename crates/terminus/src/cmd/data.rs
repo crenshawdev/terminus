@@ -25,8 +25,8 @@
 //! rewritten".
 //!
 //! **It warns about network filesystems and asks anyway (D-16).** No `std` API
-//! detects a network mount on any of the three first-class targets, and adding
-//! one would be a platform-specific dependency on the hook-path binary. The
+//! detects a network mount on Linux or macOS, and adding one would be a
+//! platform-specific dependency on the hook-path binary. The
 //! command asks regardless of destination, so an unconditional warning costs
 //! nothing and is the mitigation this phase ships.
 
@@ -108,17 +108,17 @@ pub fn run(options: Options) -> Result<(), Failure> {
 
     refuse_impossible_destinations(&source, &destination)?;
 
-    println!("terminus data move");
-    println!();
-    println!("  from  {}", source.display());
-    println!("  to    {}", destination.display());
-    println!("  {} byte(s), including the archive itself", bytes(&source));
-    println!();
-    println!("{NETWORK_WARNING}");
-    println!();
+    outln!("terminus data move");
+    outln!();
+    outln!("  from  {}", source.display());
+    outln!("  to    {}", destination.display());
+    outln!("  {} byte(s), including the archive itself", bytes(&source));
+    outln!();
+    outln!("{NETWORK_WARNING}");
+    outln!();
 
     if !answered(&source, options.yes)? {
-        println!("  nothing was moved.");
+        outln!("  nothing was moved.");
         return Ok(());
     }
 
@@ -147,7 +147,7 @@ pub fn run(options: Options) -> Result<(), Failure> {
     // The lock file's own bytes carry no meaning - `ingest::lock` says so, and
     // says only the OS lock attached to it does - so the destination gets a
     // fresh empty one rather than a copy of the file this process is holding
-    // locked, which Windows would refuse to read through a second handle.
+    // locked.
     //
     // Owner-only from the creating open, like the one `ingest::lock` makes at
     // the source (PRIV-04, D-10): the lock file is short, but a `data move`
@@ -169,8 +169,10 @@ pub fn run(options: Options) -> Result<(), Failure> {
     // store's address with the data still on disk.
     write_pointer(&pointer, &destination)?;
 
-    // Only now: the lock file being removed is the one this process holds, and
-    // Windows will not unlink an open file.
+    // Only now, with the pointer naming the destination: holding the lock this
+    // long kept an ingest out of the source from the copy until the pointer
+    // was written. Releasing it before the source is removed is an order kept
+    // as it was, and harmless, since Linux and macOS remove a held file anyway.
     drop(held);
     std::fs::remove_dir_all(&source).map_err(|e| {
         Failure::Operational(format!(
@@ -180,11 +182,9 @@ pub fn run(options: Options) -> Result<(), Failure> {
         ))
     })?;
 
-    println!("  moved. the store is at {}", destination.display());
-    println!("  recorded in {}", pointer.display());
-    println!(
-        "  nothing in settings.json changed: the hook and mcp entries never named a store path"
-    );
+    outln!("  moved. the store is at {}", destination.display());
+    outln!("  recorded in {}", pointer.display());
+    outln!("  nothing in settings.json changed: the hook and mcp entries never named a store path");
     Ok(())
 }
 
@@ -231,7 +231,7 @@ fn answered(source: &Path, yes: bool) -> Result<bool, Failure> {
     const QUESTION: &str = "  move it?";
 
     if yes {
-        println!("{QUESTION} [y/N] y (--yes)");
+        outln!("{QUESTION} [y/N] y (--yes)");
         return Ok(true);
     }
     super::install::confirm(QUESTION, false, false).map_err(|_| {

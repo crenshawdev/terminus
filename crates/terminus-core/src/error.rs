@@ -57,6 +57,25 @@ pub enum Error {
         binary_format: i64,
     },
 
+    /// The other side of [`Error::ArchiveFormatTooNew`]: the store was written
+    /// in an archive format this build no longer reads, and there is no
+    /// conversion (STOR-10). Refused before any writable connection opens, so
+    /// the store is left exactly as it was.
+    #[error(
+        "store at {path} has archive format {store_format}, but this build of \
+         terminus reads archive format {binary_format} and cannot convert an older store. \
+         Nothing in the store was changed. To start a new store with a clean install:\n  \
+         1. move the data folder {data_dir} aside\n  \
+         2. move the current terminus binary aside\n  \
+         3. rerun install.sh",
+        data_dir = .path.parent().unwrap_or(.path).display()
+    )]
+    ArchiveFormatTooOld {
+        path: PathBuf,
+        store_format: i64,
+        binary_format: i64,
+    },
+
     /// A file sits where the store belongs but does not carry the version
     /// integers every terminus store carries.
     #[error("{path} exists but is not a terminus store ({detail})")]
@@ -100,8 +119,9 @@ pub enum Error {
     )]
     InvalidTimeFilter { field: &'static str, value: String },
 
-    /// The bytes in `sessions.blob` are not a blob this build can read.
-    #[error("malformed session blob: {detail}")]
+    /// A block row's bytes, or a session's recorded block size, are not
+    /// something this build can read.
+    #[error("malformed session archive: {detail}")]
     BlobFormat { detail: String },
 
     /// A read asked for bytes the session stream does not contain. Reading past
@@ -117,14 +137,16 @@ pub enum Error {
         uncompressed_len: u64,
     },
 
-    /// A blob's stored stream does not hash to the checksum recorded for it.
+    /// The two checks an append makes before it writes: a session's stored
+    /// block hashes do not reproduce its recorded checksum, or its partial tail
+    /// block does not decode to its stored hash.
     ///
     /// Raised before an append, never after: an append that trusted the bytes
-    /// it copied would mint a fresh checksum over the corruption and destroy
-    /// the only evidence that anything was ever wrong (D-06's checksum is the
-    /// evidence). A live session is re-ingested repeatedly as it grows, so the
-    /// very next append is what would certify the damage permanently.
-    #[error("session blob failed its recorded checksum: expected {expected}, found {actual}")]
+    /// it built on would mint a fresh checksum over the corruption and destroy
+    /// the only evidence that anything was ever wrong. A live session is
+    /// re-ingested repeatedly as it grows, so the very next append is what would
+    /// certify the damage permanently.
+    #[error("session archive failed its recorded checksum: expected {expected}, found {actual}")]
     BlobChecksumMismatch { expected: String, actual: String },
 
     /// zstd failed to compress or decompress a block.
@@ -147,6 +169,16 @@ pub enum Error {
     /// detail carries the parser's own position.
     #[error("{path} is not valid TOML: {detail}")]
     ConfigParse { path: PathBuf, detail: String },
+
+    /// A config file still has a `[provider]` table.
+    ///
+    /// Its own variant and not [`Error::ConfigParse`], because the file is valid
+    /// TOML. It carries the path and nothing from the table.
+    #[error(
+        "{path} still has a [provider] table. Model calls were removed from Terminus, \
+         so nothing reads that table any more. Delete it from the file to continue."
+    )]
+    ProviderRemoved { path: PathBuf },
 
     /// No config directory, or no home directory to derive one from.
     #[error("cannot resolve a config directory: {detail}")]

@@ -5,7 +5,9 @@
 //! `TERMINUS_DATA_DIR`, `TERMINUS_CONFIG_DIR` and `HOME` at temporary
 //! directories, for the reason `tests/install.rs` states: without them a test
 //! would read - and its `install` half would write - the settings files and the
-//! `~/.local/bin/terminus` this machine is actually running on.
+//! `~/.local/bin/terminus` this machine is actually running on. `PATH` is a
+//! fixture directory holding a fake `claude` and nothing else, so no test can
+//! start the real one.
 //!
 //! The assertions read the report rather than grepping it. Doctor prints one
 //! line per check, `<state>  <name>  <finding>`, with a `fix` line under any
@@ -14,9 +16,10 @@
 //! the wrong reason.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+use terminus_core::testkit::{self, NONESSENTIAL_TRAFFIC};
 
 /// The events install writes an entry for. `cmd::hook::EVENTS` spelled again:
 /// `terminus` is a binary crate with no library target, so a test cannot name
@@ -53,12 +56,23 @@ const SETTINGS: &str = r#"{
 }
 "#;
 
+/// `.claude.json` with terminus's entry already current for the fixture's
+/// stable path, which the fixture fills in for `{STABLE}`. Install places the
+/// entry through `claude`, and the fake writes nothing, so a fresh install
+/// runs no `claude` and leaves doctor an entry to call ok.
 const CLAUDE_JSON: &str = r#"{
   "numStartups": 412,
   "mcpServers": {
     "context7": {
       "type": "http",
       "url": "https://example.invalid/mcp"
+    },
+    "terminus": {
+      "type": "stdio",
+      "command": {STABLE},
+      "args": [
+        "mcp"
+      ]
     }
   }
 }"#;
@@ -68,6 +82,8 @@ struct Fixture {
     root: PathBuf,
     bin_dir: PathBuf,
     claude_dir: PathBuf,
+    /// The whole of every spawned terminus's `PATH`.
+    path_dir: PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -78,80 +94,51 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
     std::fs::write(claude_dir.join("settings.json"), SETTINGS).unwrap();
-    std::fs::write(claude_dir.join(".claude.json"), CLAUDE_JSON).unwrap();
+    let stable = serde_json::Value::from(bin_dir.join("terminus").display().to_string());
+    std::fs::write(
+        claude_dir.join(".claude.json"),
+        CLAUDE_JSON.replace("{STABLE}", &stable.to_string()),
+    )
+    .unwrap();
+    let path_dir = root.join("path");
+    std::fs::create_dir_all(&path_dir).unwrap();
+    testkit::fake_claude(&path_dir, &root.join("claude.log"), "", 0);
     Fixture {
         _dir: dir,
         root,
         bin_dir,
         claude_dir,
+        path_dir,
     }
 }
 
 impl Fixture {
     fn stable(&self) -> PathBuf {
-        self.bin_dir.join(if cfg!(windows) {
-            "terminus.exe"
-        } else {
-            "terminus"
-        })
+        self.bin_dir.join("terminus")
     }
 
     fn settings(&self) -> PathBuf {
         self.claude_dir.join("settings.json")
     }
 
-    /// Where the shared credentials file is looked for, for this fixture only.
-    ///
-    /// Pinned like every other directory here, and for a sharper reason: the
-    /// loader falls back to `XDG_CONFIG_HOME` before `HOME`, and this harness
-    /// inherits the developer's `XDG_CONFIG_HOME`. Without this a doctor run
-    /// would report on the real `~/.config/jcrenshaw/credentials.toml`.
-    fn shared_dir(&self) -> PathBuf {
-        self.root.join("shared")
-    }
-
-    fn credentials(&self) -> PathBuf {
-        self.shared_dir().join("credentials.toml")
-    }
-
-    /// Write the shared credentials file at `mode`, creating its directory.
-    fn write_credentials(&self, body: &str, mode: u32) -> PathBuf {
-        let path = self.credentials();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, body).unwrap();
-        set_mode(&path, mode);
-        path
-    }
-
-    /// Terminus's own config directory, and the file inside it doctor reports
-    /// the mode of. Neither is created by the fixture: an absent
+    /// Terminus's own config directory. Not created by the fixture: an absent
     /// `terminus.toml` is the state of every machine that never wrote one.
     fn config_dir(&self) -> PathBuf {
         self.root.join("config")
     }
 
-    fn config_file(&self) -> PathBuf {
-        self.config_dir().join("terminus.toml")
-    }
-
-    /// Write `terminus.toml` at `mode`, creating its directory.
-    fn write_config(&self, body: &str, mode: u32) -> PathBuf {
-        let path = self.config_file();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, body).unwrap();
-        set_mode(&path, mode);
-        path
-    }
-
+    /// `PATH` holds the fake `claude` and nothing else, and the traffic
+    /// variable is taken out so a logged value can only have come from
+    /// terminus.
     fn env(&self, command: &mut Command) {
         command
+            .env("PATH", &self.path_dir)
+            .env_remove(NONESSENTIAL_TRAFFIC)
             .env("TERMINUS_BIN_DIR", &self.bin_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("TERMINUS_DATA_DIR", self.root.join("data"))
             .env("TERMINUS_CONFIG_DIR", self.config_dir())
-            .env("JCRENSHAW_CONFIG_DIR", self.shared_dir())
-            .env("HOME", &self.root)
-            .env("USERPROFILE", &self.root);
+            .env("HOME", &self.root);
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -173,10 +160,9 @@ impl Fixture {
             .expect("the binary runs")
     }
 
-    /// Wire terminus in, the way a user would, answering every question with
-    /// its default.
+    /// Wire terminus in, the way a user would.
     fn install(&self) -> &Self {
-        let out = self.run(&["install", "--yes"]);
+        let out = self.run(&["install"]);
         assert!(
             out.status.success(),
             "install did not succeed: {}",
@@ -208,21 +194,15 @@ impl Fixture {
     ///
     /// The point of AC6 is that the command in the report is a command: not a
     /// description, not a sentence with a path in it. So the test runs the
-    /// string rather than asserting on its text, and answers the confirmation
-    /// `install` asks (INST-03) the way a user at a terminal would.
-    #[cfg(unix)]
+    /// string rather than asserting on its text. Stdin is null: nothing a fix
+    /// runs may wait on an answer.
     fn shell(&self, line: &str) -> Output {
-        let mut command = Command::new("sh");
+        // By absolute path: a bare `sh` is looked up on the child's `PATH`,
+        // which holds only the fake `claude`.
+        let mut command = Command::new("/bin/sh");
         command.arg("-c").arg(line);
         self.env(&mut command);
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("sh runs");
-        child.stdin.take().unwrap().write_all(b"y\n").unwrap();
-        child.wait_with_output().unwrap()
+        command.stdin(Stdio::null()).output().expect("sh runs")
     }
 }
 
@@ -354,6 +334,15 @@ fn after_install_every_wiring_check_is_ok() {
         "the binary check should name the version it found: {}",
         report.check("binary").finding
     );
+    // The `claude` doctor found is the fixture's fake, never one on the
+    // machine's own `PATH`.
+    let fake = fixture.path_dir.join("claude").display().to_string();
+    assert_eq!(report.state("claude_code"), "ok", "{}", report.whole);
+    assert!(
+        report.check("claude_code").finding.contains(&fake),
+        "doctor found a claude other than the fixture's fake: {}",
+        report.check("claude_code").finding
+    );
 }
 
 /// AC6, the whole of it: a problem, a command, and the command works.
@@ -361,7 +350,6 @@ fn after_install_every_wiring_check_is_ok() {
 /// The command is run rather than matched, because the requirement is not that
 /// doctor prints a plausible string - it is that what it prints fixes the thing
 /// it reported.
-#[cfg(unix)]
 #[test]
 fn a_missing_binary_is_a_problem_whose_printed_command_fixes_it() {
     let fixture = fixture();
@@ -488,7 +476,8 @@ fn a_settings_file_that_is_not_json_is_reported_as_itself() {
 }
 
 /// An mcp registration pointing at a binary that has moved is a problem, and
-/// install is the fix: it repairs a registration of its own in place.
+/// with `claude` on `PATH` install is the fix: it repairs the registration
+/// through `claude mcp`.
 #[test]
 fn an_mcp_registration_that_points_elsewhere_is_a_problem() {
     let fixture = fixture();
@@ -509,7 +498,81 @@ fn an_mcp_registration_that_points_elsewhere_is_a_problem() {
         "{}",
         report.check("mcp_server").finding
     );
-    assert!(report.check("mcp_server").fix.is_some());
+    assert_eq!(
+        report.check("mcp_server").fix.as_deref(),
+        Some(install_fix().as_str())
+    );
+}
+
+/// `<this build> install`, the fix doctor prints when `claude` is on `PATH`.
+fn install_fix() -> String {
+    format!("{} install", env!("CARGO_BIN_EXE_terminus"))
+}
+
+/// The two broken registrations: no entry, and an entry naming another binary.
+fn break_registration(fixture: &Fixture, missing: bool) {
+    let claude_json = fixture.claude_dir.join(".claude.json");
+    let mut value = read(&claude_json);
+    let servers = value["mcpServers"].as_object_mut().unwrap();
+    if missing {
+        servers.remove("terminus");
+    } else {
+        servers["terminus"]["command"] = serde_json::Value::from("/old/bin/terminus");
+    }
+    write(&claude_json, &value);
+}
+
+/// D-16: with no `claude` on `PATH`, install cannot place the entry either, so
+/// the fix is the `claude mcp` command itself. With the remove in front when an
+/// entry is there, because `add-json` refuses a name that exists.
+#[test]
+fn without_claude_on_path_the_mcp_fix_is_the_claude_mcp_command() {
+    for missing in [true, false] {
+        let fixture = fixture();
+        fixture.install();
+        break_registration(&fixture, missing);
+        let empty = fixture.root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let (_, report) = fixture.doctor_with(&[("PATH", empty.to_str().unwrap())]);
+        assert_eq!(report.state("mcp_server"), "problem");
+        let fix = report.check("mcp_server").fix.clone().unwrap();
+        let add = "claude mcp add-json --scope user terminus '";
+        if missing {
+            assert!(fix.starts_with(add), "{fix}");
+        } else {
+            assert!(
+                fix.starts_with(&format!("claude mcp remove --scope user terminus && {add}")),
+                "{fix}"
+            );
+        }
+        assert!(
+            fix.contains(&fixture.stable().display().to_string()),
+            "{fix}"
+        );
+
+        // The same state with the fake on `PATH` is fixed by install.
+        let (_, report) = fixture.doctor();
+        assert_eq!(
+            report.check("mcp_server").fix.as_deref(),
+            Some(install_fix().as_str())
+        );
+    }
+}
+
+/// D-04: doctor's own `claude --version` carries the traffic variable. The
+/// fixture takes it out of doctor's environment, so a logged `1` can only have
+/// come from doctor.
+#[test]
+fn doctors_claude_version_runs_with_nonessential_traffic_off() {
+    let fixture = fixture();
+    fixture.doctor();
+    let calls = testkit::fake_claude_calls(&fixture.root.join("claude.log"));
+    let version = calls
+        .iter()
+        .find(|call| call.args == ["--version"])
+        .unwrap_or_else(|| panic!("doctor never ran claude --version: {calls:?}"));
+    assert_eq!(version.traffic.as_deref(), Some("1"), "{calls:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +652,46 @@ fn after_one_ingest_the_store_and_the_last_run_are_reported() {
         last.starts_with("20") && last.contains("committed"),
         "the last run should be reported by its timestamp: {last}"
     );
+}
+
+/// A last run with routine notes and no error is a healthy run.
+///
+/// `doctor` flags any non-null `runs.error`, and labels written and sessions
+/// retention evicted used to land there, so it failed after ordinary use with
+/// injection on. They are `runs.notes` now, and this pins that `doctor` reads
+/// them as nothing wrong.
+#[test]
+fn a_last_run_with_only_notes_is_ok() {
+    let fixture = fixture();
+    fixture.install();
+
+    let project = fixture.claude_dir.join("projects").join("-data-code-x");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("44444444-4444-4444-8444-444444444444.jsonl"),
+        terminus_core::testkit::fixture_bytes("session-basic.jsonl"),
+    )
+    .unwrap();
+    let ingest = fixture.run(&["ingest"]);
+    assert!(ingest.status.success(), "ingest failed: {}", text(&ingest));
+    rusqlite::Connection::open(
+        fixture
+            .root
+            .join("data")
+            .join(terminus_core::store::DB_FILE_NAME),
+    )
+    .unwrap()
+    .execute(
+        "UPDATE runs SET error = NULL,
+             notes = 'labelled 1 hit\nretention evicted 1 session(s)'
+         WHERE id = (SELECT max(id) FROM runs)",
+        [],
+    )
+    .unwrap();
+
+    let (code, report) = fixture.doctor();
+    assert_eq!(code, Some(0), "{}", report.whole);
+    assert_eq!(report.state("last_run"), "ok", "{}", report.whole);
 }
 
 /// Every name directly inside `dir`, sorted.
@@ -807,435 +910,24 @@ fn a_missing_binary_makes_the_document_say_so() {
     );
 }
 
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-}
-
-#[cfg(not(unix))]
-fn set_mode(_path: &Path, _mode: u32) {}
-
-// ---------------------------------------------------------------------------
-// The credentials check (PRIV-02, D-15)
-// ---------------------------------------------------------------------------
-
-/// A value distinctive enough that finding any part of it in a report is
-/// unambiguous evidence of a leak rather than a coincidence.
-const CRED_KEY: &str = "sk-TERMINUSDOCTOR-6e21b4-do-not-log";
-
-fn credentials_file() -> String {
-    format!("[openrouter]\napi_key = \"{CRED_KEY}\"\n")
-}
-
-/// Neither the human report nor the `--json` document may carry a byte of the
-/// key, whatever state the file is in.
-///
-/// Run against both outputs of every case below rather than once, because the
-/// two are built by different code and only one of them is what a script reads.
-fn assert_no_credential_reaches_a_stream(fixture: &Fixture) {
-    let human = fixture.run(&["doctor"]);
-    let json = fixture.run(&["doctor", "--json"]);
-    for out in [&human, &json] {
-        let rendered = text(out);
-        for fragment in [CRED_KEY, "TERMINUSDOCTOR", "6e21b4"] {
-            assert!(
-                !rendered.contains(fragment),
-                "doctor printed {fragment:?}:\n{rendered}"
-            );
-        }
-    }
-    // The falsifying half where there is a file: it really does hold the key,
-    // so the assertions above are about doctor and not about an empty file.
-    if let Ok(written) = std::fs::read_to_string(fixture.credentials()) {
-        assert!(written.contains(CRED_KEY));
-    }
-}
-
-/// An owner-only file is the good state, and it does not make doctor fail.
+/// The key, config-mode and provider checks went with model calls, and none of
+/// them comes back under its old name.
 #[test]
-fn an_owner_only_credentials_file_is_ok_and_doctor_still_exits_zero() {
+fn the_json_document_carries_no_key_or_provider_check() {
     let fixture = fixture();
     fixture.install();
-    let path = fixture.write_credentials(&credentials_file(), 0o600);
-
-    let (code, report) = fixture.doctor();
-
-    assert_eq!(report.state("credentials"), "ok", "{}", report.whole);
-    assert!(
-        report
-            .check("credentials")
-            .finding
-            .contains(&path.display().to_string()),
-        "the check does not say where it looked: {}",
-        report.check("credentials").finding
-    );
-    assert_eq!(code, Some(0));
-    assert_no_credential_reaches_a_stream(&fixture);
-}
-
-/// PRIV-02, end to end: a group-readable file is a problem, doctor exits 1, and
-/// the command it prints is a command that fixes it.
-#[cfg(unix)]
-#[test]
-fn a_group_readable_credentials_file_is_a_problem_whose_printed_command_fixes_it() {
-    let fixture = fixture();
-    fixture.install();
-    fixture.write_credentials(&credentials_file(), 0o644);
-
-    let (code, report) = fixture.doctor();
-
-    assert_eq!(report.state("credentials"), "problem", "{}", report.whole);
-    assert_eq!(
-        code,
-        Some(1),
-        "a world-readable credentials file must not exit 0"
-    );
-    assert!(
-        report.check("credentials").finding.contains("644"),
-        "the check does not name the mode: {}",
-        report.check("credentials").finding
-    );
-    assert_no_credential_reaches_a_stream(&fixture);
-
-    let fix = report
-        .check("credentials")
-        .fix
-        .clone()
-        .unwrap_or_else(|| panic!("the problem printed no command:\n{}", report.whole));
-    let out = fixture.shell(&fix);
-    assert!(
-        out.status.success(),
-        "`{fix}` did not succeed: {}",
-        text(&out)
-    );
-
-    let (code, report) = fixture.doctor();
-    assert_eq!(report.state("credentials"), "ok", "{}", report.whole);
-    assert_eq!(code, Some(0));
-}
-
-/// The ordinary state of every machine, including this one: no shared file at
-/// all. It is reported, and it is not a failure.
-#[test]
-fn no_credentials_file_is_reported_without_being_a_problem() {
-    let fixture = fixture();
-    fixture.install();
-
-    let (code, report) = fixture.doctor();
-
-    assert_eq!(report.state("credentials"), "note", "{}", report.whole);
-    assert_eq!(code, Some(0));
-    assert!(
-        !report.problems().contains(&"credentials"),
-        "an absent file was counted as a problem: {}",
-        report.whole
-    );
-    assert_no_credential_reaches_a_stream(&fixture);
-}
-
-/// Doctor never writes, and this check must not be the one that changes that:
-/// asking about a credentials file must not create one, nor the directory it
-/// would live in.
-#[test]
-fn the_credentials_check_creates_nothing() {
-    let fixture = fixture();
-    fixture.install();
-
-    let (_, report) = fixture.doctor();
-    let _ = fixture.run(&["doctor", "--json"]);
-
-    assert_eq!(report.state("credentials"), "note");
-    assert!(
-        !fixture.shared_dir().exists(),
-        "doctor created {}",
-        fixture.shared_dir().display()
-    );
-}
-
-// ---------------------------------------------------------------------------
-// The config_mode and mode_checks checks (PRIV-02, D-14, D-17)
-// ---------------------------------------------------------------------------
-
-/// A `terminus.toml` carrying a provider key, which is what makes its mode
-/// matter at all.
-fn keyed_config() -> String {
-    format!("[provider]\nname = \"openrouter\"\napi_key = \"{CRED_KEY}\"\n")
-}
-
-/// The `terminus.toml` half of PRIV-02, end to end: a group-readable file
-/// holding a key is a problem, and the command doctor prints fixes it.
-#[cfg(unix)]
-#[test]
-fn a_group_readable_config_holding_a_key_is_a_problem_whose_command_fixes_it() {
-    let fixture = fixture();
-    fixture.install();
-    let path = fixture.write_config(&keyed_config(), 0o644);
-
-    let (code, report) = fixture.doctor();
-
-    assert_eq!(report.state("config_mode"), "problem", "{}", report.whole);
-    assert_eq!(code, Some(1), "a wide config holding a key must not exit 0");
-    let finding = &report.check("config_mode").finding;
-    assert!(
-        finding.contains("644"),
-        "the check does not name the mode: {finding}"
-    );
-    assert!(
-        finding.contains(&path.display().to_string()),
-        "the check does not name the file: {finding}"
-    );
-    // The key is in that file and may not be in either output.
-    assert_no_credential_reaches_a_stream(&fixture);
-
-    let fix = report
-        .check("config_mode")
-        .fix
-        .clone()
-        .unwrap_or_else(|| panic!("the problem printed no command:\n{}", report.whole));
-    let out = fixture.shell(&fix);
-    assert!(
-        out.status.success(),
-        "`{fix}` did not succeed: {}",
-        text(&out)
-    );
-
-    let (code, report) = fixture.doctor();
-    assert_eq!(report.state("config_mode"), "ok", "{}", report.whole);
-    assert_eq!(code, Some(0));
-}
-
-/// A wide config with no key in it is not a credentials file, and nothing
-/// refuses to read it - so calling it a problem would send most users to fix
-/// something that is not broken.
-#[cfg(unix)]
-#[test]
-fn a_group_readable_config_holding_no_key_is_reported_without_being_a_problem() {
-    let fixture = fixture();
-    fixture.install();
-    fixture.write_config("exclude = []\n", 0o644);
-
-    let (code, report) = fixture.doctor();
-
-    assert_eq!(report.state("config_mode"), "ok", "{}", report.whole);
-    assert_eq!(code, Some(0));
-    assert!(
-        report.check("config_mode").finding.contains("644"),
-        "the mode is still reported: {}",
-        report.check("config_mode").finding
-    );
-}
-
-/// The ordinary state of a machine that never wrote one: reported, not a
-/// failure, and doctor still creates nothing.
-#[test]
-fn no_config_file_at_all_is_a_note() {
-    let fixture = fixture();
-    fixture.install();
-
-    let (code, report) = fixture.doctor();
-
-    assert_eq!(report.state("config_mode"), "note", "{}", report.whole);
-    assert_eq!(code, Some(0));
-    assert!(
-        report
-            .check("config_mode")
-            .finding
-            .contains(&fixture.config_file().display().to_string()),
-        "the check does not say where it looked: {}",
-        report.check("config_mode").finding
-    );
-    assert!(
-        !fixture.config_file().exists(),
-        "doctor created {}",
-        fixture.config_file().display()
-    );
-}
-
-/// AC6: both credential files wide at once print one runnable `chmod` each, and
-/// running both is what makes the next run clean.
-#[cfg(unix)]
-#[test]
-fn both_wide_credential_files_print_a_chmod_each_and_running_them_clears_the_report() {
-    let fixture = fixture();
-    fixture.install();
-    let shared = fixture.write_credentials(&credentials_file(), 0o644);
-    let own = fixture.write_config(&keyed_config(), 0o644);
-
-    let (code, report) = fixture.doctor();
-
-    assert_eq!(code, Some(1));
-    assert_eq!(report.state("credentials"), "problem", "{}", report.whole);
-    assert_eq!(report.state("config_mode"), "problem", "{}", report.whole);
-    let fixes: Vec<String> = ["credentials", "config_mode"]
-        .iter()
-        .map(|name| {
-            report
-                .check(name)
-                .fix
-                .clone()
-                .unwrap_or_else(|| panic!("{name} printed no command:\n{}", report.whole))
-        })
-        .collect();
-    assert!(
-        fixes[0].contains(&shared.display().to_string()),
-        "the shared file's fix names the wrong path: {}",
-        fixes[0]
-    );
-    assert!(
-        fixes[1].contains(&own.display().to_string()),
-        "the config's fix names the wrong path: {}",
-        fixes[1]
-    );
-    assert_ne!(fixes[0], fixes[1], "one line was printed for two files");
-    assert_no_credential_reaches_a_stream(&fixture);
-
-    for fix in &fixes {
-        let out = fixture.shell(fix);
-        assert!(
-            out.status.success(),
-            "`{fix}` did not succeed: {}",
-            text(&out)
-        );
-    }
-
-    let (code, report) = fixture.doctor();
-    assert_eq!(report.state("credentials"), "ok", "{}", report.whole);
-    assert_eq!(report.state("config_mode"), "ok", "{}", report.whole);
-    assert_eq!(code, Some(0));
-}
-
-/// D-17: the deferral is stated in words on THIS machine, not only inside an
-/// arm a Unix build never reaches - and in both outputs, because only one of
-/// them is what a script reads.
-#[test]
-fn the_windows_acl_deferral_is_stated_on_every_platform_in_both_outputs() {
-    let fixture = fixture();
-    fixture.install();
-
-    let (code, report) = fixture.doctor();
-    assert_eq!(code, Some(0));
-    assert_eq!(report.state("mode_checks"), "note", "{}", report.whole);
-    let finding = &report.check("mode_checks").finding;
-    for word in ["Windows", "ACL", "credentials", "config_mode"] {
-        assert!(
-            finding.contains(word),
-            "the deferral does not say {word:?}: {finding}"
-        );
-    }
 
     let out = fixture.run(&["doctor", "--json"]);
     let document: serde_json::Value =
         serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).expect("valid JSON");
-    let check = &document["data"]["mode_checks"];
-    assert_eq!(check["state"], serde_json::Value::from("note"), "{check}");
-    let json_finding = check["finding"].as_str().expect("a finding");
-    assert!(
-        json_finding.contains("Windows") && json_finding.contains("ACL"),
-        "{json_finding}"
-    );
-    assert_eq!(check["fix"], serde_json::Value::Null, "{check}");
-}
+    let data = document["data"].as_object().expect("data is an object");
 
-// ---------------------------------------------------------------------------
-// The provider_local check (D-13, D-15, D-16)
-// ---------------------------------------------------------------------------
-
-/// A `[provider]` block declaring itself local against a chosen address.
-fn local_provider(base_url: &str) -> String {
-    format!("[provider]\nlocal = true\nbase_url = \"{base_url}\"\n")
-}
-
-/// D-13's mistake, named: `local = true` is what turns the egress filter off,
-/// and it is believed whatever the address says - so an address that is not on
-/// this machine is worth a line. A note and not a problem, because doctor does
-/// not overrule the declaration and a CI health check must not read this as a
-/// broken install.
-#[test]
-fn a_local_provider_that_is_not_on_loopback_is_a_note_and_still_exits_zero() {
-    let fixture = fixture();
-    fixture.install();
-
-    for (base_url, host) in [
-        ("http://example.invalid:11434", "example.invalid"),
-        // The one a user could be fooled by: the loopback address is USERINFO
-        // here and the host is not local at all.
-        ("http://127.0.0.1:11434@evil.example/", "evil.example"),
-        ("https://10.0.0.5/v1", "10.0.0.5"),
+    for gone in [
+        "credentials",
+        "config_mode",
+        "mode_checks",
+        "provider_local",
     ] {
-        fixture.write_config(&local_provider(base_url), 0o600);
-
-        let (code, report) = fixture.doctor();
-
-        assert_eq!(
-            report.state("provider_local"),
-            "note",
-            "{base_url}:\n{}",
-            report.whole
-        );
-        assert_eq!(code, Some(0), "{base_url} made doctor exit non-zero");
-        let finding = &report.check("provider_local").finding;
-        assert!(finding.contains(host), "{base_url}: {finding}");
-        assert!(
-            finding.contains("unfiltered"),
-            "{base_url}: the note does not say what it costs: {finding}"
-        );
-        // The configured URL is never echoed: it may carry userinfo.
-        assert!(
-            !finding.contains(base_url),
-            "{base_url} was printed back: {finding}"
-        );
+        assert!(!data.contains_key(gone), "{gone} is still a check");
     }
-}
-
-/// The falsifying half: a local provider that really is on this machine, in
-/// each of the four spellings a host is written in, says nothing.
-#[test]
-fn a_local_provider_on_loopback_is_ok() {
-    let fixture = fixture();
-    fixture.install();
-
-    for base_url in [
-        "http://localhost:11434",
-        "http://127.0.0.1:11434/",
-        "http://[::1]:11434",
-        "HTTP://LOCALHOST/",
-    ] {
-        fixture.write_config(&local_provider(base_url), 0o600);
-
-        let (code, report) = fixture.doctor();
-
-        assert_eq!(
-            report.state("provider_local"),
-            "ok",
-            "{base_url}:\n{}",
-            report.whole
-        );
-        assert_eq!(code, Some(0), "{base_url}");
-        assert!(
-            !report
-                .check("provider_local")
-                .finding
-                .contains("unfiltered"),
-            "{base_url} was warned about: {}",
-            report.check("provider_local").finding
-        );
-    }
-}
-
-/// Absent means remote and therefore filtered, which is the default and is not
-/// a finding about anything.
-#[test]
-fn a_remote_provider_that_never_declared_itself_local_is_ok() {
-    let fixture = fixture();
-    fixture.install();
-    fixture.write_config(
-        "[provider]\nbase_url = \"https://openrouter.ai/api/v1\"\n",
-        0o600,
-    );
-
-    let (code, report) = fixture.doctor();
-
-    assert_eq!(report.state("provider_local"), "ok", "{}", report.whole);
-    assert_eq!(code, Some(0));
 }

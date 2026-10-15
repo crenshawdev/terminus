@@ -1,0 +1,66 @@
+{
+  "phase": "7",
+  "trigger": "plan",
+  "discriminator": "plan-712843b",
+  "round": 1,
+  "base": "712843bbfb34cf2a5659628e464c9c9ab9627705",
+  "head": "712843bbfb34cf2a5659628e464c9c9ab9627705",
+  "base_id": "712843bbfb34cf2a5659628e464c9c9ab9627705",
+  "head_id": "712843bbfb34cf2a5659628e464c9c9ab9627705",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/7/PLAN-2.md",
+      "line": 151,
+      "severity": "high",
+      "claim": "The ingest design reads every block row for a flagged session, contradicting AC1's unconditional requirement that each walked file read at most the session's last block row.",
+      "failure_scenario": "When a walked file belongs to a session flagged as diverged, `Existing::read` fetches all of that session's rows. The AC1 test deliberately uses only an unflagged session (PLAN-2 line 207), so all specified verification can pass while AC1 in CONTEXT line 38 remains false for flagged sessions.",
+      "ruling": "survived",
+      "convergent": false,
+      "fix_commit": "b6c0036499ca79239862a777465d539733dfcea0",
+      "citation_missing": true,
+      "base_id": "712843bbfb34cf2a5659628e464c9c9ab9627705",
+      "head_id": "712843bbfb34cf2a5659628e464c9c9ab9627705"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/7/PLAN-3.md",
+      "line": 59,
+      "severity": "high",
+      "claim": "Checksum failures are intentionally reported with no block number, leaving STOR-09's requirement to name a block number for every failure unmet.",
+      "failure_scenario": "Alter only `session_meta.checksum` while all block bytes and stored block hashes remain valid. The plan emits a session-level failure with `block: null`, as reinforced by PLAN-3 lines 124-126 and CONTEXT D-16, but STOR-09 at REQUIREMENTS line 32 requires the session key and block number of every failure. The plan's verification explicitly expects null, so it passes while the requirement remains unmet.",
+      "ruling": "survived",
+      "convergent": false,
+      "fix_commit": "b6c0036499ca79239862a777465d539733dfcea0",
+      "citation_missing": true,
+      "base_id": "712843bbfb34cf2a5659628e464c9c9ab9627705",
+      "head_id": "712843bbfb34cf2a5659628e464c9c9ab9627705"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/7/PLAN-4.md",
+      "line": 60,
+      "severity": "high",
+      "claim": "The command-refusal test explicitly excludes commands that open or cause opening of the store but do not exit non-zero, contradicting AC4's universal exit requirement.",
+      "failure_scenario": "Run `terminus hook` against a format-1 store. The plan states that `hook` returns 0 regardless and excludes it because its spawned ingest covers the refusal. AC4 in CONTEXT line 41 requires every command that opens the store against format 1 to exit non-zero with the clean-install message. Thus the listed 19 invocations can all pass while the hook command still violates AC4; the analogous exclusion of `mcp` also substitutes an error response for the required non-zero exit.",
+      "ruling": "survived",
+      "convergent": false,
+      "fix_commit": "b6c0036499ca79239862a777465d539733dfcea0",
+      "citation_missing": true,
+      "base_id": "712843bbfb34cf2a5659628e464c9c9ab9627705",
+      "head_id": "712843bbfb34cf2a5659628e464c9c9ab9627705"
+    }
+  ]
+}

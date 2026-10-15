@@ -57,16 +57,18 @@ pub fn run(args: Args) -> Result<(), Failure> {
         return Ok(());
     }
 
-    println!("decisions        {}", replayed.decisions);
+    outln!("decisions        {}", replayed.decisions);
     for movement in &replayed.labels {
         // The arrow is the point of the line: a per-label count on its own says
         // what the store holds, and what a replay is asked is what would change.
-        println!(
+        outln!(
             "{:<16} {} -> {}",
-            movement.label, movement.old, movement.new
+            movement.label,
+            movement.old,
+            movement.new
         );
     }
-    println!("changed          {} decision(s)", replayed.changed.len());
+    outln!("changed          {} decision(s)", replayed.changed.len());
     Ok(())
 }
 

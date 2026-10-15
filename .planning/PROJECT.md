@@ -16,7 +16,11 @@ The verbatim transcript is the record: every session archived losslessly and per
 
 ### Active
 
-No cycle open.
+**v0.0.1, opened 2026-10-12.**
+
+Nine phases. Four bring Terminus in line with Baley's ADR 0038 and 0039: no model calls and so no API keys and no network use, Linux and macOS only with the npm package removed, an install that asks nothing and registers the MCP server through `claude mcp`, and a one-command installer script. The fifth points that script at GitHub releases by default, and the sixth has it refuse a release whose signature does not verify against the crenshawdev release key pinned in the script. The seventh stores each session's archive as blocks, one row each, in place of one whole-session blob. The eighth builds each release in CI, and John signs and publishes it from his own machine. The ninth writes the README the public repository does not have yet. An update is a rerun of the install command, so it gets the same check.
+
+No release ships until phase 7's blocks as rows is done. That phase has no conversion tool: an existing store is not converted, and the owner's store is rebuilt by a clean install; one can come later if it is needed. Phase 8 then publishes the first release, signed, without waiting for Baley. Version numbers started over with the rename: Verbatim's tags were local test builds and were never released (now `verbatim-v0.1.0` and `verbatim-v0.1.1`), so unreleased cycles are 0.0.x and the first release will be 0.1.0.
 
 **Shipped: v0.1.1, closed 2026-09-04.**
 
@@ -89,7 +93,6 @@ Merged to `main` and tagged `v0.1.0`.
 **Open items (dispositions settled in the brief):**
 
 - Auto-tuner for injection thresholds — hypothesis, not a plan. Ship logging + replay; gate the tuner behind evidence it converges.
-- `UserPromptSubmit` cost on Windows — to be measured during the injection phase; the FTS query is microseconds, process spawn (10–30 ms) is the real budget.
 - Import of `/data/verbatim-legacy` (801 MB) — deferred.
 - crates.io name `terminus` is taken — skip crates.io; how Terminus is delivered is still open.
 
@@ -97,10 +100,10 @@ Merged to `main` and tagged `v0.1.0`.
 
 - **Tech stack**: Rust, single static binary — no Node, Bun, Python, or native shared libraries at runtime; `rusqlite` with `bundled` feature; zstd; `rayon` for backfill fan-out; no async runtime (cold start is the metric; the hook path must not pay for a runtime it doesn't use)
 - **Performance**: SessionStart synchronous work in single-digit milliseconds; UserPromptSubmit under a hard deadline, fail open; hook cold start under an asserted budget in CI — startup time is the product
-- **Compatibility**: Linux / macOS / Windows first-class; `LockFileEx` not `flock` on Windows, `DETACHED_PROCESS | CREATE_NO_WINDOW`, rename-then-replace for a running exe, `\\?\` long paths, case-folded path comparison, UNC paths
-- **Privacy**: no telemetry; no network connections except the configured model provider; redaction at egress only; credentials `0600`-enforced and redacted at the boundary
-- **Licensing**: Apache-2.0, public OSS — an explicit override of the private-by-default rule, scoped to this project; all dependencies permissive
-- **Distribution**: npm primary with no postinstall script; `origin` (self-hosted) is the only remote
+- **Compatibility**: Linux and macOS only. Windows was dropped, as it is across all of the owner's products, and a build for any other system fails at compile time. Path comparison is case-folded on macOS
+- **Privacy**: no telemetry; the Terminus binary opens no network connection, and `install.sh`'s `curl` download is the one network use
+- **Licensing**: MIT, public OSS — an explicit override of the private-by-default rule, scoped to this project; all dependencies permissive
+- **Distribution**: there is no npm channel, because the npm package was removed; `install.sh` is the one-command installer, and no release is published yet. `origin` (self-hosted) is the only remote
 - **Testing**: real SQLite temp databases, never mocks; private real-corpus fixture reached via env var, small synthetic set in-repo for CI
 
 ## Key Decisions
@@ -113,7 +116,7 @@ Settled in DESIGN-BRIEF.md; outcomes pending until shipped and validated.
 | SQLite via rusqlite `bundled` as the one store | Single-transaction consistency, no system dependency; redb (exclusive lock), Tantivy (second store), Turso (beta), Postgres (server), DuckDB (single-process) all rejected | - Pending |
 | Session blobs are truth; everything else derived and rebuildable; archive table never migrates | Store format bump rebuilds derived tables only — prevents claude-mem's 49-migration situation | - Pending |
 | Block-framed zstd blobs (64 KB), compression on by default | One turn read decompresses one block (~60 µs); ~13 GB/yr raw becomes ~2 GB/yr | - Pending |
-| Hooks call the absolute binary path, no shell; spawn fully detached | Retires claude-mem's Windows issue class (PATH probing, version resolution, inherited handles) | - Pending |
+| Hooks call the absolute binary path, no shell; spawn fully detached | Retires the failures claude-mem hit from PATH probing, version resolution and inherited handles | - Pending |
 | No daemon; the hook spawn is the scheduler; OS try-locks for exclusivity | Locks die with the process — no PID files, no stale-lock wedging, no orphans | - Pending |
 | Project identity = canonical git toplevel from the record's `cwd`, never encoded dir name or `basename()` | claude-mem's four identity bugs all trace to `basename()`; worktrees map to the parent repo | - Pending |
 | Index at turn granularity, store at session granularity | Precise recall over cheap, consistent session-level storage | - Pending |
@@ -125,13 +128,14 @@ Settled in DESIGN-BRIEF.md; outcomes pending until shipped and validated.
 | Observations opt-in; parser does mechanical, LLM only judgment; strict JSON; claims anchored to `turn_id` | claude-mem asks the LLM for what a parser can do (0 of 5,059 rows populated) and its XML drifts into silent loss | - Pending |
 | Redact at egress, never at ingest; keyed on destination, not operation | Ingest-time redaction makes the store lossy; local providers send nothing over the wire at all | - Pending |
 | Retention and exclusion off by default; excluded means never read, on ingest and read paths both | Keep everything; claude-mem honors exclusion on write and ignores it on read | - Pending |
-| npm primary: thin package, per-platform `optionalDependencies`, no postinstall; canonical stable binary path; hooks never rewritten | Sidesteps blocked-postinstall failures; one binary, no version skew, no version-check hook | - Pending |
+| Canonical stable binary path; hooks never rewritten | One binary, no version skew, no version-check hook. The npm package that used to deliver the binary was removed | - Pending |
 | No Claude Code plugin in 0.x | Versioned plugin directories are the root cause of claude-mem's path-resolution script; revisit at 1.0 | - Pending |
-| Apache-2.0, public OSS (explicit override of private-by-default) | Nobody installs a closed binary that reads every keystroke; explicit patent grant; AGPL is a documented negative signal here | - Pending |
+| MIT, public OSS (explicit override of private-by-default) | Nobody installs a closed binary that reads every keystroke; AGPL is a documented negative signal here | - Pending |
 | Auto-tuner is a hypothesis, not a plan | Per-user volume may be too low; "referenced downstream" is a weak proxy; gate behind evidence it converges | - Pending |
 | Recommend disabling auto-compact; never change it ourselves | Compaction burns tokens summarizing context already stored losslessly; fresh session + targeted recall beats self-summarization | - Pending |
 | Shared credentials at `~/.config/jcrenshaw/credentials.toml`, namespaced by provider | Cross-product infrastructure; every jcrenshawdev product reads the same keys | - Pending |
 | Renamed Verbatim to Terminus (2026-10-05), as a hard cut with no aliases or fallbacks | Named alongside Baley as part of a suite of loosely coupled tools. Nothing was ever published under the old name, so there were no users to migrate. "Verbatim" stays the archive's property, not the product's name | Shipped |
+| Linux and macOS only, with Windows dropped across all of the owner's products | The owner is removing Windows from every product, so it is removed outright rather than deferred. A build for any other system fails at compile time | - Pending |
 
 ---
 *Last updated: 2026-10-05 after the rename from Verbatim to Terminus*

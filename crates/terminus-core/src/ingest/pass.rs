@@ -64,18 +64,11 @@ pub struct Summary {
     /// RET-03, D-10). Empty and free while retention is off, which is the
     /// default and the state every user starts in.
     pub retention: crate::retention::Applied,
-    /// What the provider was asked, after the lock dropped (OBS-02, D-07).
-    ///
-    /// Empty and free while judgment is off, which is the default. Its notes do
-    /// NOT reach `runs.error`: this step runs after that row is written, so the
-    /// caller prints them on stderr instead.
-    pub judgment: crate::observe::Judged,
     /// What the rolling snapshot step did, after the lock dropped (STOR-06,
     /// D-15).
     ///
-    /// Its notes do NOT reach `runs.error` either, and for the same reason
-    /// [`Summary::judgment`] states: the row has already committed by the time
-    /// this runs.
+    /// Its notes do NOT reach `runs.error`: the row has already committed by
+    /// the time this runs, so the caller prints them on stderr instead.
     pub snapshot: Snapshotted,
     pub duration: Duration,
 }
@@ -136,31 +129,21 @@ pub fn run(data_dir: &Path) -> Result<PassOutcome> {
 ///
 /// The seam tests use, so a test never has to resolve a real transcript root.
 ///
-/// Two halves, and the boundary between them is D-07. [`locked`] is everything
-/// that touches the archive, under the ingest lock, ending with the `runs` row.
-/// The judgment call comes after it returns - which is after the guard and the
-/// store have been dropped - because a slow or hanging provider held inside the
-/// lock would make every hook-spawned pass in that window exit [`LockHeld`] and
-/// archive nothing.
-///
-/// [`LockHeld`]: PassOutcome::LockHeld
+/// Two halves. [`locked`] is everything that touches the archive, under the
+/// ingest lock, ending with the `runs` row. The snapshot comes after it
+/// returns, once the guard and the store are dropped and that row has
+/// committed, so a snapshot that failed is a note and never a failed pass.
 pub fn run_with(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
     let mut summary = match locked(data_dir, config)? {
         PassOutcome::LockHeld => return Ok(PassOutcome::LockHeld),
         PassOutcome::Ran(summary) => summary,
     };
 
-    // Outside the lock, outside the store handle, and after the row that says
-    // the pass happened. Nothing below can fail the pass: the archive is
-    // already committed and this step only ever returns notes (OBS-04).
-    summary.judgment = crate::observe::judge_new(data_dir, config);
-
-    // STOR-06 and D-15, in the same position and for the same reason: the guard
-    // and the store handle are gone, the `runs` row has committed, and nothing
-    // below can fail the pass. A snapshot is a copy of what is already safely
-    // archived, so a snapshot that could not be written is a note - failing the
-    // pass over it would stop archiving the transcripts the copy exists to
-    // protect.
+    // STOR-06 and D-15: the guard and the store handle are gone, the `runs`
+    // row has committed, and nothing below can fail the pass. A snapshot is a
+    // copy of what is already safely archived, so one that could not be
+    // written is a note - failing the pass over it would stop archiving the
+    // transcripts the copy exists to protect.
     summary.snapshot = roll(data_dir, config);
     Ok(PassOutcome::Ran(summary))
 }
@@ -185,8 +168,7 @@ fn roll(data_dir: &Path, config: &Config) -> Snapshotted {
         return out;
     }
 
-    // Its own handle, because the pass's is gone - the same shape
-    // `observe::judge_new` has, and for the same D-07 reason.
+    // Its own handle, because the pass's is gone with the lock.
     let store = match crate::store::Store::open(data_dir) {
         Ok(store) => store,
         Err(e) => {
@@ -333,18 +315,16 @@ fn locked(data_dir: &Path, config: &Config) -> Result<PassOutcome> {
     // the next one. Before `record_pass`, so whatever it could not do lands in
     // this pass's `runs.error` rather than the following pass's.
     //
-    // No model is called here and no network connection is opened. The
-    // judgment half is its own command, outside this lock (D-07): a slow
-    // provider held here would make every hook-spawned pass in that window exit
-    // as `LockHeld` and archive nothing.
+    // No model is called here and no network connection is opened.
     summary.observations = crate::observe::observe_new(store.conn(), config);
 
     // RET-03 and D-10, and both halves of the position matter. AFTER
     // `observe_new`, because that step reads one blob per newly finalized
     // session and an eviction that ran first would destroy the bytes it was
-    // about to read. BEFORE `record_pass`, because `runs.error` is the only
-    // textual channel this product has - there is no log file, by design - and
-    // a step placed after that row is written has nowhere to report.
+    // about to read. BEFORE `record_pass`, because `runs.error` and
+    // `runs.notes` are the only textual channel this product has - there is no
+    // log file, by design - and a step placed after that row is written has
+    // nowhere to report.
     //
     // Nothing here fails the pass. The archive is the work; a retention step
     // that could not run is a note, and a `?` propagated out of it is exactly
@@ -470,44 +450,47 @@ pub fn note(path: &Path, reason: &str) -> String {
 
 /// The one `runs` row a pass leaves behind (D-10).
 ///
-/// `runs.error` is the only textual channel this product has - there is no log
-/// file, by design, and `terminus status` surfaces this table - so everything
-/// worth a human's attention goes in it: the path and reason of every file that
-/// was skipped, every directory that could not be listed, every watermark
-/// recovery had to repair, and the failure that ended the pass if one did. It
-/// stays null when there is genuinely nothing to say.
+/// `runs.error` and `runs.notes` are the only textual channel this product has -
+/// there is no log file, by design, and `terminus status` surfaces this table -
+/// so everything worth a human's attention goes in one of them. `error` holds
+/// what went wrong: the path and reason of every file that was skipped, every
+/// directory that could not be listed, every watermark recovery had to repair,
+/// every step that could not run, and the failure that ended the pass if one
+/// did. `notes` holds what a healthy pass did worth saying - labels written,
+/// sessions retention evicted or deleted - so `doctor` can flag `error` alone.
+/// Each stays null when there is genuinely nothing to say.
 fn record_pass(
     conn: &rusqlite::Connection,
     summary: &Summary,
     fatal: Option<&crate::error::Error>,
 ) -> Result<()> {
-    let mut notes: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     for (path, reason) in summary.failures.iter().chain(&summary.unreadable) {
-        notes.push(note(path, reason));
+        errors.push(note(path, reason));
     }
-    notes.extend(summary.recovery.lines());
-    notes.extend(summary.feedback.lines());
-    notes.extend(summary.outcomes.lines());
-    notes.extend(summary.observations.lines());
-    notes.extend(summary.retention.lines());
+    errors.extend(summary.recovery.lines());
+    errors.extend(summary.feedback.lines());
+    errors.extend(summary.outcomes.errors());
+    errors.extend(summary.observations.lines());
+    errors.extend(summary.retention.errors());
     if let Some(e) = fatal {
-        notes.push(format!("pass failed: {e}"));
+        errors.push(format!("pass failed: {e}"));
     }
-    let error = if notes.is_empty() {
-        None
-    } else {
-        Some(notes.join("\n"))
-    };
+    let mut notes = summary.outcomes.notes();
+    notes.extend(summary.retention.notes());
+    let joined = |lines: Vec<String>| (!lines.is_empty()).then(|| lines.join("\n"));
+    let error = joined(errors);
+    let notes = joined(notes);
 
     let elapsed = summary.duration;
     conn.execute(
         "INSERT INTO runs (
             started_at, finished_at, duration_ms, files_seen, bytes_read,
-            turns_added, error, files_committed, files_failed
+            turns_added, error, files_committed, files_failed, notes
          ) VALUES (
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-            ?2, ?3, ?4, ?5, ?6, ?7, ?8
+            ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
          )",
         rusqlite::params![
             format!("-{} seconds", elapsed.as_secs_f64()),
@@ -518,6 +501,7 @@ fn record_pass(
             error,
             summary.files_committed as i64,
             summary.failures.len() as i64,
+            notes,
         ],
     )?;
     Ok(())

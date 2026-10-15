@@ -1,0 +1,125 @@
+{
+  "status": "gaps",
+  "score": "10/11",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "install.sh holds the crenshawdev release key's public line exactly once, as a literal, and a no-argument run requests the default source's manifest, manifest.sig and binary, in that order and nothing else",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "install.sh:21 release_key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDRKdhQ8g59SckbR4oYy0JQlObLTSwfVjGa9UqwoPo4q'. grep -c -F of the line in install.sh prints 1, and no other file outside .planning and the test constant holds it. ssh-keygen -l parses it as ED25519 SHA256:lc7mLR529Q+SbY9+3Y4H0YX0qwsouWSzSlbzo2IpCuk, and the first two fields of ~/.ssh/crenshawdev-release.pub match it byte for byte (cmp). Downloads at install.sh:190 (manifest), :192 (manifest.sig), :201 (binary). default_urls() at crates/terminus/tests/install_script.rs:781-788 lists the three. no_source_downloads_from_the_github_releases::{sh,dash} and a_piped_script_with_no_source_downloads_from_the_github_releases::{sh,dash} assert_eq the fake curl's log against exactly those three and pass. install_sh_pins_the_release_key_once (install_script.rs:1239-1253) asserts one occurrence and that the only release_key= line is the quoted literal, and it passes."
+    },
+    {
+      "n": 2,
+      "truth": "A missing signature, a signature by another key, a signature under baley-release and a manifest changed after signing are each refused with a reason on stderr, before the binary is requested and before the manifest is read, leaving the stable path and the versions folder unchanged; a missing signature reports `signature download failed: <url>`",
+      "status": "VERIFIED",
+      "uat_item": 2,
+      "evidence": "install.sh:192-193 fails with 'signature download failed: $source/terminus-$os-$arch.manifest.sig'. install.sh:196-199 runs ssh-keygen -Y verify and fails through fail, before the binary curl at :201 and the manifest read block at :204-211. git diff 0359b64 HEAD -- install.sh leaves the read block and verify_download untouched. Tests, each passing as ::sh and ::dash: a_missing_signature_is_refused (install_script.rs:922-928, fake curl exits 22 on the .sig), a_release_signed_by_another_key_is_refused (:953-965), a_signature_under_another_namespace_is_refused (:968-973), a_manifest_changed_after_signing_is_refused (:977-983, version 2.0.1 with the real digest, so only the signature can refuse it). Each installs 1.0.0 first. assert_refused (:644-653) checks non-zero exit, non-empty stderr, an unchanged snapshot of the stable path and the whole versions tree, and no new claude call. assert_refused_after (:887-897) checks the curl log is exactly the manifest and signature URLs (binary never requested), stdout is empty and every stderr line starts with 'terminus: '. The three bad-signature cases assert stderr equals BAD_SIGNATURE (:881-882) exactly."
+    },
+    {
+      "n": 3,
+      "truth": "With no ssh-keygen on PATH the run exits non-zero before any download, names openssh-client, openssh-clients and openssh, and changes nothing under HOME",
+      "status": "VERIFIED",
+      "uat_item": 3,
+      "evidence": "install.sh:176-177 checks with command -v and fails naming openssh-client (Debian, Ubuntu), openssh-clients (Fedora) and openssh (Arch). It sits after the uname refusals and before mktemp -d at :179 and the first curl at :190. no_ssh_keygen_is_refused_before_any_download::{sh,dash} (install_script.rs:1040-1058) uses a tools folder without ssh-keygen (PATH holds only the fake claude folder and that folder). It asserts assert_refused, an empty curl log and an empty HOME, and checks each package as a whole word, since a substring check would pass on openssh-clients alone. Passes under both shells."
+    },
+    {
+      "n": 4,
+      "truth": "A correctly signed release installs as in Phase 5 under /bin/sh and dash, with no ssh-keygen output in what the run prints; sh -n, dash -n and cargo test --workspace --all-features pass",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "sh -n install.sh exit 0 and dash -n install.sh exit 0 (run here). cargo test --workspace --all-features --offline was run once: exit 0, 64 test binaries, 827 passed, 0 failed, 0 ignored. tests/install_script.rs had 55 passed, 0 failed, every shell test as ::sh and ::dash (/bin/sh here is bash). Every success test serves a manifest that serve_manifest signs with the fixture's throwaway key under terminus-release (install_script.rs:438-468). It runs the copy of install.sh with only the pinned literal swapped (:281-283), and install_sh_pins_the_release_key_once keeps that swap honest. one_run_installs_and_wires_claude_code::{sh,dash} (:725-761) asserts the output holds no 'Good \"terminus-release\" signature' line, and install.sh:198 sends both ssh-keygen streams to /dev/null. The private half of the pinned key is not exercised here. It is first used in phase 7 (criterion 2), as SUMMARY.md says."
+    },
+    {
+      "n": 5,
+      "truth": "The unmodified install.sh refuses a release signed by a throwaway key even when $HOME/.ssh/allowed_signers lists that key under crenshawdev-release",
+      "status": "VERIFIED",
+      "uat_item": 5,
+      "evidence": "a_release_signed_by_another_key_is_refused::{sh,dash} (install_script.rs:953-965) writes $HOME/.ssh/allowed_signers as 'crenshawdev-release <throwaway .pub>' and runs script(), the shipped file. It is refused with exactly BAD_SIGNATURE, and the curl log stops after the .sig. Both shells pass. A probe in the scratchpad shows the test can catch a regression: an allowed_signers file built the way the test builds it, passed as -f, gives 'Good \"terminus-release\" signature for crenshawdev-release', exit 0, on a throwaway signature. The file install.sh:196 builds from the pinned literal refuses the same signature, 'Could not verify signature.', exit 255. install.sh:197 passes only $scratch/allowed_signers to -f and reads nothing from HOME."
+    },
+    {
+      "n": 6,
+      "truth": "CHANGELOG Unreleased, DESIGN-BRIEF §13 and the install.sh header describe the signature check, the pinned key and the need for ssh-keygen, drop 'inside verify_download' and 'unsigned development artifacts only', still say no release is published yet; PROJECT.md no longer says a release waits for the update feature or that updates come with Baley's #14 signing",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "CHANGELOG.md:20-44: the three downloads, ssh-keygen -Y verify against the pinned crenshawdev key under terminus-release, the refusals, the three package names, 'No release is published yet.' at :43-44. git diff 0359b64 HEAD -- CHANGELOG.md touches only the Unreleased section. DESIGN-BRIEF.md:381 (the refusal sentence and 'No release is published yet.'), :395 (download order), :404-412 (### Release signature: principal, namespace, allowed-signers line from the literal, nothing read from HOME, ssh-keygen required with the three packages, no override). install.sh:2 'No release is published yet.' and :5-7 describe the check, the pinned key and ssh-keygen. grep for 'inside verify_download', 'inside `verify_download`' and 'unsigned development' prints 0 in all three files. .planning/PROJECT.md:21 and :23 hold PLAN-2 Task 3's approved text word for word. grep for 'until the update feature', '#14' and 'merged but not released' in PROJECT.md finds nothing, and the diff changes exactly those two lines."
+    },
+    {
+      "n": 7,
+      "truth": "The key is never fetched, and no argument, setting or environment variable changes it (ROADMAP criterion 5)",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "install.sh:21 assigns release_key unconditionally at top level, so an inherited environment variable of that name is overwritten. Its only use is :196. The only network calls are the three curl lines at :190, :192 and :201, and the no-argument tests assert those three URLs and no others. The argument sets only $source (:126-130), and the source's .sig is still checked against the literal. There is no unsigned mode in the script. The file-based override is exercised by truth 5's test."
+    },
+    {
+      "n": 8,
+      "truth": "The SHA-256 check runs after the signature check, unchanged from Phase 5",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "verify_download at install.sh:88-92 is called at :228, after the signature check at :196-199 and the manifest read at :204-226. git diff 0359b64 HEAD -- install.sh shows no change inside verify_download or the read block. a_digest_that_does_not_match_is_refused::{sh,dash} and shasum_computes_the_digest_when_sha256sum_is_missing::{sh,dash} (install_script.rs:987-1020) serve signed manifests, so the signature passes and the SHA-256 check does the refusing. Both pass."
+    },
+    {
+      "n": 9,
+      "truth": "An update, which reruns the same command, gets the same signature check",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "The script has one path for a first install and an update. successive_installs_keep_every_version::{sh,dash} (install_script.rs:1136-1160) installs 1.0.0 then 2.0.0, and each serve re-signs the manifest (:438-445). The four refusal tests in truth 2 each refuse a 2.0.0 update over an installed 1.0.0 and leave 1.0.0's link and folder unchanged. All pass under both shells."
+    },
+    {
+      "n": 10,
+      "truth": "cargo clippy --workspace --all-targets --all-features -- -D warnings is clean (PLAN-1 gate)",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "cargo clippy --workspace --all-targets --all-features --offline -- -D warnings exited 0 here."
+    },
+    {
+      "n": 11,
+      "truth": "The DESIGN-BRIEF §13 prose this phase rewrote is grammatical",
+      "status": "FAILED",
+      "uat_item": null,
+      "evidence": "DESIGN-BRIEF.md:395, from b7eab6b, reads: 'Only then does it download `terminus-<os>-<arch>`, check the binary's SHA-256 in `verify_download`, stage it ... and moves a temporary link over the stable path with `mv -f`.' The rewrite changed the earlier verbs to follow 'does it' but left 'moves', which came from the old 'downloads ..., checks ..., stages ..., and moves' list (6c13f2f)."
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "[AC1] Pinned key appears once; downloads run manifest, signature, binary",
+      "evidence": "install.sh:21 holds the line once (grep -c -F prints 1), and it matches ~/.ssh/crenshawdev-release.pub. install_sh_pins_the_release_key_once passes. no_source_downloads_from_the_github_releases and a_piped_script_with_no_source_downloads_from_the_github_releases, ::sh and ::dash, assert the curl log is exactly the manifest, manifest.sig and binary URLs, and they pass."
+    },
+    {
+      "k": 2,
+      "name": "[AC2] Bad or missing signature is refused before the binary is requested",
+      "evidence": "install.sh:192-199 runs before the binary curl at :201 and the manifest read at :204. a_missing_signature_is_refused, a_release_signed_by_another_key_is_refused, a_signature_under_another_namespace_is_refused and a_manifest_changed_after_signing_is_refused pass as ::sh and ::dash. Each asserts non-zero exit, the curl log stops at the .sig, the stable path and versions tree are unchanged, no claude call, empty stdout, and only 'terminus: ' lines on stderr. The missing case reports 'signature download failed: <url>'."
+    },
+    {
+      "k": 3,
+      "name": "[AC3] No ssh-keygen is refused before any download",
+      "evidence": "install.sh:176-177 runs before mktemp (:179) and any curl (:190). no_ssh_keygen_is_refused_before_any_download::{sh,dash} asserts an empty curl log, an empty HOME and the three package names as whole words, and passes."
+    },
+    {
+      "k": 4,
+      "name": "[AC4] A correctly signed release installs under /bin/sh and dash",
+      "evidence": "sh -n and dash -n exit 0. cargo test --workspace --all-features exits 0 with 827 passed and 0 failed; install_script has 55 passed. one_run_installs_and_wires_claude_code::{sh,dash} installs a signed release and asserts no ssh-keygen 'Good' line in the output."
+    },
+    {
+      "k": 5,
+      "name": "[AC5] Unmodified install.sh ignores the user's allowed_signers",
+      "evidence": "a_release_signed_by_another_key_is_refused::{sh,dash} runs the shipped install.sh with $HOME/.ssh/allowed_signers listing the throwaway key and is refused with the bad-signature line. A probe shows that same allowed_signers line verifies the signature when passed as -f (exit 0), so the test would catch a script that read it."
+    },
+    {
+      "k": 6,
+      "name": "[AC6] Docs describe the signed install",
+      "evidence": "CHANGELOG.md:20-44, DESIGN-BRIEF.md:381,395,404-412 and install.sh:2,5-7 describe the check, the pinned key and ssh-keygen, and each still says no release is published yet. The stale phrases grep to 0. PROJECT.md:21,23 hold the approved text, and the stale phrases grep to nothing."
+    }
+  ],
+  "gaps": [
+    {
+      "name": "DESIGN-BRIEF §13 install.sh bullet mixes verb forms",
+      "reason": "behavior wrong - a grammar slip introduced in this phase's rewrite of the bullet",
+      "evidence": "DESIGN-BRIEF.md:395 (b7eab6b): 'Only then does it download ..., check ..., stage it ..., and moves a temporary link over the stable path with `mv -f`.' After 'does it', the last verb should be 'move'.",
+      "severity": "cosmetic",
+      "missing": "Change 'and moves a temporary link' to 'and move a temporary link' in DESIGN-BRIEF.md:395."
+    }
+  ],
+  "human_checks": []
+}

@@ -60,8 +60,13 @@ const SERVER_NAME: &str = "terminus";
 /// Read out of that bundle rather than guessed. The client sends its own in
 /// `initialize` and the server answers with one it supports; a client that
 /// cannot use the answer disconnects, and one that can proceeds.
-const PROTOCOL_VERSIONS: [&str; 6] = [
-    "2026-07-28",
+///
+/// MCP 2 (`2026-07-28`) is left out until this server implements it: it answers
+/// no `server/discover`, and its `tools/list` carries no `ttlMs` or
+/// `cacheScope`, the shape Claude Code rejected in Baley's 2026-10-02 probe.
+/// Agreeing to a revision the server does not speak is worse than answering an
+/// older one the client then falls back to.
+const PROTOCOL_VERSIONS: [&str; 5] = [
     "2025-11-25",
     "2025-06-18",
     "2025-03-26",
@@ -226,6 +231,17 @@ mod tests {
                 Value::from(asked)
             );
         }
+
+        // MCP 2 is a revision the server does not speak yet, so it is answered
+        // like any other it does not know.
+        let responses = exchange(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28"}}"#,
+        );
+        assert_eq!(
+            responses[0]["result"]["protocolVersion"],
+            Value::from(DEFAULT_PROTOCOL_VERSION),
+            "the server agreed to MCP 2, which it does not implement"
+        );
 
         let responses = exchange(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#,

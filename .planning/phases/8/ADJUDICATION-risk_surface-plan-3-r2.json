@@ -1,0 +1,38 @@
+{
+  "phase": "8",
+  "trigger": "risk_surface",
+  "discriminator": "plan-3",
+  "round": 2,
+  "base": "add6bc6",
+  "head": "8af6f7c",
+  "base_id": "add6bc60bdee376d151ff09dec9b559288305abd",
+  "head_id": "8af6f7c3c365deadac09b6031e8ea1207a551602",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "scripts/sign-release.sh",
+      "line": 60,
+      "severity": "high",
+      "claim": "The draft check is vulnerable to a time-of-check/time-of-use race, so it does not guarantee that the release is still a draft when the later upload and edit occur.",
+      "failure_scenario": "The lookup returns exactly `true`, then another actor or workflow publishes the release while this script downloads, verifies, and signs artifacts. The script subsequently continues to `release upload --clobber` and `release edit` against that now-published release, replacing its signature assets and marking it latest. Lookup failures and unexpected outputs fail closed, but this concurrent transition leaves the original finding open.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".github/workflows/release.yml",
+        "note": "Only an account with write access can publish a draft. The release workflow makes the draft once and never publishes it, and release-check.yml runs on release: published with contents: read only (PLAN-2 must-be-true; the workflow test pins it). So the only actor who can publish during the signing window is the owner himself, from a second terminal, while he is typing his passphrase into this one. GitHub offers no upload-only-if-draft call, so no script can close the window completely. The finding the fix was asked to close, running against an already-published tag, is closed at scripts/sign-release.sh:62-65 and fails closed on a lookup error. Low."
+      },
+      "base_id": "add6bc60bdee376d151ff09dec9b559288305abd",
+      "head_id": "8af6f7c3c365deadac09b6031e8ea1207a551602"
+    }
+  ]
+}

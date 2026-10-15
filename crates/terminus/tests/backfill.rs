@@ -357,11 +357,15 @@ impl Snapshot {
         // a tail expression drops the locals first.
         let snapshot = Snapshot {
             blobs: conn
-                .prepare("SELECT session_key, blob FROM sessions ORDER BY session_key")
+                .prepare("SELECT session_key FROM sessions ORDER BY session_key")
                 .unwrap()
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
                 .map(Result::unwrap)
+                .map(|key| {
+                    let stored = testkit::stored(&conn, &key);
+                    (key, stored)
+                })
                 .collect(),
             turns: conn
                 .prepare(
@@ -401,9 +405,9 @@ impl Snapshot {
     }
 }
 
-/// `SIGKILL` on Unix, `TerminateProcess` on Windows: un-catchable either way,
-/// which is the point - a signal the process could handle would let it tidy up
-/// and prove nothing.
+/// `Child::kill` sends `SIGKILL`, which cannot be caught, and that is the
+/// point - a signal the process could handle would let it tidy up and prove
+/// nothing.
 fn kill_and_reap(child: &mut Child) {
     let _ = child.kill();
     child.wait().unwrap();

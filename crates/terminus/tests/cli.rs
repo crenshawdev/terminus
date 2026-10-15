@@ -7,7 +7,7 @@
 //! ignores `CARGO_TARGET_DIR` and it names the wrong profile under `--release`.
 
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use rusqlite::Connection;
 use terminus_core::store::{
@@ -53,13 +53,18 @@ fn bench() -> Bench {
 
 impl Bench {
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_terminus"))
+        self.command(args).output().expect("spawn terminus")
+    }
+
+    /// The binary, pointed at this bench, not yet spawned.
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_terminus"));
+        command
             .args(args)
             .env("TERMINUS_DATA_DIR", &self.data_dir)
             .env("TERMINUS_CONFIG_DIR", &self.config_dir)
-            .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
-            .output()
-            .expect("spawn terminus")
+            .env("CLAUDE_CONFIG_DIR", &self.claude_dir);
+        command
     }
 
     /// Ingest a fixture through the binary, returning its session key.
@@ -127,7 +132,7 @@ fn verify_exits_zero_and_says_nothing_on_a_clean_store() {
     assert_eq!(stdout(&out), "", "a clean store names no session");
 }
 
-/// AC3. One byte flipped inside one session's blob: exit non-zero, that session
+/// AC3. One session's rows damaged: exit non-zero, that session
 /// named on stdout, no other session named.
 ///
 /// The two fixtures are D-01's colliding pair - the sidecar reports its
@@ -138,23 +143,7 @@ fn verify_names_the_corrupt_session_and_no_other() {
     let parent = bench.ingest("session-basic.jsonl");
     let sidecar = bench.ingest("subagents/agent-alpha.jsonl");
 
-    {
-        let conn = bench.conn();
-        let mut bytes: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&sidecar],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let at = bytes.len() / 2;
-        bytes[at] ^= 0xff;
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![bytes, &sidecar],
-        )
-        .unwrap();
-    }
+    testkit::damage(&bench.conn(), &sidecar);
 
     let out = bench.run(&["verify"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
@@ -288,6 +277,172 @@ fn a_store_one_archive_format_ahead_is_refused_with_both_versions_named() {
         DERIVED_SCHEMA.to_string(),
         "the refused open rewrote meta"
     );
+}
+
+/// STOR-10, at every command that opens the store. A format-1 store is refused
+/// with the clean-install steps, and its database file and WAL are left
+/// byte-for-byte as they were.
+///
+/// The store is built by hand rather than from `CREATE_SQL`, because this
+/// build's schema has no `blob` column to build one from: a `sessions` table
+/// with its `blob`, no `blocks` table, and `meta` at archive format 1. It
+/// carries a hot WAL for the same reason the newer-format test does.
+///
+/// Four commands are left out. `hook` exits 0 whatever happens, and the ingest
+/// it spawns is the `ingest` case here (INJ-06, ING-10). `mcp` answers with a
+/// reason instead of exiting (RCL-10). `uninstall` and `data move` never open
+/// the store.
+#[test]
+fn every_command_refuses_a_format_one_store_and_leaves_it_untouched() {
+    let bench = bench();
+    std::fs::create_dir_all(&bench.data_dir).unwrap();
+    let db = bench.data_dir.join(DB_FILE_NAME);
+    let wal = bench.data_dir.join(format!("{DB_FILE_NAME}-wal"));
+
+    // A copy taken while the keeper still holds the WAL, so the WAL survives.
+    let source = bench.work.join("format-one");
+    std::fs::create_dir_all(&source).unwrap();
+    let source_db = source.join(DB_FILE_NAME);
+    let keeper = Connection::open(&source_db).unwrap();
+    keeper.pragma_update(None, "journal_mode", "wal").unwrap();
+    keeper
+        .execute_batch(
+            "CREATE TABLE sessions (
+                 session_key TEXT    PRIMARY KEY,
+                 session_no  INTEGER NOT NULL UNIQUE,
+                 blob        BLOB    NOT NULL
+             );
+             CREATE TABLE meta (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             ) WITHOUT ROWID;",
+        )
+        .unwrap();
+    {
+        let writer = Connection::open(&source_db).unwrap();
+        writer
+            .execute(
+                "INSERT INTO sessions VALUES ('/old/session.jsonl', 1, x'0102030405')",
+                [],
+            )
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '1'), (?2, ?3)",
+                rusqlite::params![
+                    META_ARCHIVE_FORMAT,
+                    META_DERIVED_SCHEMA,
+                    DERIVED_SCHEMA.to_string()
+                ],
+            )
+            .unwrap();
+    }
+    std::fs::copy(&source_db, &db).unwrap();
+    std::fs::copy(source.join(format!("{DB_FILE_NAME}-wal")), &wal).unwrap();
+    drop(keeper);
+    assert!(
+        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0,
+        "this test needs a non-empty WAL to mean anything"
+    );
+
+    let before_db = std::fs::read(&db).unwrap();
+    let before_wal = std::fs::read(&wal).unwrap();
+
+    // `install` runs under its own `HOME`, bin directory and a `PATH` holding a
+    // fake `claude`, as in `tests/install.rs`.
+    let root = bench.work.parent().unwrap().to_path_buf();
+    let path_dir = root.join("path");
+    std::fs::create_dir_all(&path_dir).unwrap();
+    testkit::fake_claude(&path_dir, &root.join("claude.log"), "", 0);
+
+    let fixture = testkit::fixture_path("session-basic.jsonl");
+    let fixture = fixture.to_str().unwrap().to_owned();
+    let dest = bench.work.join("export-refused");
+    let dest_arg = dest.to_str().unwrap().to_owned();
+    let commands: [&[&str]; 19] = [
+        &["ingest"],
+        &["ingest", &fixture],
+        &["backfill"],
+        &["search", "cargo"],
+        &["show", "1"],
+        &["sessions"],
+        &["verify"],
+        &["reindex"],
+        &["status"],
+        &["compact"],
+        &["usage"],
+        &["export", &dest_arg],
+        &["stats"],
+        &["observations"],
+        &["observations", "regenerate"],
+        &["replay"],
+        &["retention", "--dry-run"],
+        &["doctor"],
+        &["install"],
+    ];
+
+    for args in commands {
+        let name = args.join(" ");
+        let out = if args == ["install"] {
+            Command::new(env!("CARGO_BIN_EXE_terminus"))
+                .args(args)
+                .env("PATH", &path_dir)
+                .env_remove(testkit::NONESSENTIAL_TRAFFIC)
+                .env("HOME", &root)
+                .env("TERMINUS_BIN_DIR", root.join("bin"))
+                .env("TERMINUS_DATA_DIR", &bench.data_dir)
+                .env("TERMINUS_CONFIG_DIR", &bench.config_dir)
+                .env("CLAUDE_CONFIG_DIR", &bench.claude_dir)
+                .output()
+                .expect("spawn terminus")
+        } else {
+            bench.run(args)
+        };
+
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "`{name}` opened a format-1 store"
+        );
+        if args == ["doctor"] {
+            assert_eq!(out.status.code(), Some(1), "`{name}`");
+        }
+        let said = format!("{}{}", stdout(&out), stderr(&out));
+        for needed in ["data folder", "terminus binary", "install.sh"] {
+            assert!(
+                said.contains(needed),
+                "`{name}` does not name {needed:?}: {said}"
+            );
+        }
+        assert!(
+            std::fs::read(&db).unwrap() == before_db,
+            "`{name}` changed terminus.db"
+        );
+        assert!(
+            std::fs::read(&wal).unwrap() == before_wal,
+            "`{name}` changed the WAL"
+        );
+    }
+    assert!(!dest.exists(), "a refused export created its destination");
+
+    // Only now: a connection opened earlier could checkpoint on close.
+    let after = bench.conn();
+    let blocks: i64 = after
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'blocks'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(blocks, 0, "a block table appeared in a format-1 store");
+    let format: String = after
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [META_ARCHIVE_FORMAT],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(format, "1", "a refused open restamped the archive format");
 }
 
 /// AC4, end to end through the command. Drop `turns`, `turns_fts`, `entities`
@@ -543,23 +698,7 @@ fn verify_json_names_the_corrupt_session_and_still_exits_one() {
     let parent = bench.ingest("session-basic.jsonl");
     let sidecar = bench.ingest("subagents/agent-alpha.jsonl");
 
-    {
-        let conn = bench.conn();
-        let mut bytes: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&sidecar],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let at = bytes.len() / 2;
-        bytes[at] ^= 0xff;
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![bytes, &sidecar],
-        )
-        .unwrap();
-    }
+    testkit::damage(&bench.conn(), &sidecar);
 
     let out = bench.run(&["verify", "--json"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
@@ -583,6 +722,47 @@ fn verify_json_names_the_corrupt_session_and_still_exits_one() {
         !document.to_string().contains(&parent),
         "the document named a session that verified: {document}"
     );
+}
+
+/// AC3 at the process boundary: a changed byte in a middle block is pinned to
+/// that block in the text line and in `--json`'s `block` field, and a checksum
+/// that no longer matches names the session with `block` null.
+#[test]
+fn verify_names_the_damaged_block_in_text_and_json() {
+    let bench = bench();
+    let other = bench.ingest("session-basic.jsonl");
+    let big = bench.ingest("session-large-record.jsonl");
+    assert!(testkit::block_count(&bench.conn(), &big) >= 3);
+
+    testkit::flip_block_byte(&bench.conn(), &big, 1);
+    let out = bench.run(&["verify"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.starts_with(&format!("{big}: block 1: ")), "{text}");
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(!text.contains(&other), "{text}");
+
+    let flipped = document(&bench.run(&["verify", "--json"]));
+    let failures = flipped["data"]["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1, "{flipped}");
+    assert_eq!(failures[0]["session_key"], big);
+    assert_eq!(failures[0]["block"], 1, "{flipped}");
+
+    // Undo the flip, then break only the checksum.
+    testkit::flip_block_byte(&bench.conn(), &big, 1);
+    bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET checksum = zeroblob(32) WHERE session_key = ?1",
+            [&big],
+        )
+        .unwrap();
+    let checksum = document(&bench.run(&["verify", "--json"]));
+    let failures = checksum["data"]["failures"].as_array().unwrap();
+    assert_eq!(failures.len(), 1, "{checksum}");
+    assert_eq!(failures[0]["session_key"], big);
+    assert_eq!(failures[0]["block"], serde_json::Value::Null, "{checksum}");
+    assert!(!checksum.to_string().contains(&other), "{checksum}");
 }
 
 /// `reindex --json` on a store whose lock another process holds: the refusal is
@@ -802,13 +982,7 @@ const DATA_COMMANDS: &[(&str, &[&str], &[&str])] = &[
     (
         "observations regenerate",
         &[],
-        &[
-            "since",
-            "prompt_version",
-            "selected",
-            "regenerated",
-            "notes",
-        ],
+        &["since", "selected", "regenerated", "notes"],
     ),
     // RET-03 and D-17, on exactly the terms this table's own comment states: a
     // report of what the NEXT ingest pass would evict and delete is a data
@@ -1127,27 +1301,62 @@ fn an_operational_failure_exits_one_with_ok_false() {
     bench.ingest("session-basic.jsonl");
     let sidecar = bench.ingest("subagents/agent-alpha.jsonl");
 
-    {
-        let conn = bench.conn();
-        let mut bytes: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [&sidecar],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let at = bytes.len() / 2;
-        bytes[at] ^= 0xff;
-        conn.execute(
-            "UPDATE sessions SET blob = ?1 WHERE session_key = ?2",
-            rusqlite::params![bytes, &sidecar],
-        )
-        .unwrap();
-    }
+    testkit::damage(&bench.conn(), &sidecar);
 
     let out = bench.run(&["verify", "--json"]);
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
     let value = document(&out);
     assert_eq!(value["ok"], false, "{value}");
     assert!(value["reason"].is_string(), "{value}");
+}
+
+/// A reader that closes the pipe changes no exit code and prints no panic.
+///
+/// `println!` panicked with exit 101 on a closed stdout, so `terminus sessions |
+/// head` printed a Rust panic. The read end is dropped before the child can
+/// write, which is where `head` leaves a command once it has its lines.
+#[test]
+fn a_closed_stdout_changes_no_exit_code() {
+    let bench = bench();
+    bench.ingest("session-recall.jsonl");
+    let id: i64 = bench
+        .conn()
+        .query_row("SELECT min(id) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    let id = id.to_string();
+
+    for args in [
+        vec!["sessions", "--project", "*"],
+        vec!["sessions", "--project", "*", "--json"],
+        vec!["search", "the", "--project", "*"],
+        vec!["show", &id, "--project", "*"],
+        vec!["status"],
+    ] {
+        let read = bench.run(&args);
+        assert!(
+            !read.stdout.is_empty(),
+            "{args:?} wrote nothing to close on"
+        );
+
+        let mut child = bench
+            .command(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn terminus");
+        drop(child.stdout.take());
+        let closed = child.wait_with_output().unwrap();
+
+        assert!(
+            !stderr(&closed).contains("panicked"),
+            "{args:?}: {}",
+            stderr(&closed)
+        );
+        assert_eq!(
+            closed.status.code(),
+            read.status.code(),
+            "{args:?}: {}",
+            stderr(&closed)
+        );
+    }
 }

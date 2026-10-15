@@ -30,9 +30,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use terminus_core::blob;
 use terminus_core::config::visible;
-use terminus_core::store::{ARCHIVE_FORMAT, META_ARCHIVE_FORMAT};
+use terminus_core::store::{archive, ARCHIVE_FORMAT, META_ARCHIVE_FORMAT};
 
 use super::json::Document;
 use super::read::{self, Opened, Reader};
@@ -93,22 +92,22 @@ pub fn run(args: Args) -> Result<(), Failure> {
     // The notice first and the counts after it, so a user who reads one line
     // reads the one that matters.
     for line in NOTICE.lines() {
-        println!("{line}");
+        outln!("{line}");
     }
-    println!();
-    println!("wrote          {}", args.destination.display());
-    println!("sessions       {}", written.sessions);
-    println!(
+    outln!();
+    outln!("wrote          {}", args.destination.display());
+    outln!("sessions       {}", written.sessions);
+    outln!(
         "  evicted      {} (written as empty files, no body to write)",
         written.evicted
     );
-    println!("turns          {}", written.turns);
-    println!(
+    outln!("turns          {}", written.turns);
+    outln!(
         "bytes          {} byte(s) ({})",
         written.bytes,
         human(written.bytes)
     );
-    println!(
+    outln!(
         "manifest       {}",
         args.destination.join(MANIFEST).display()
     );
@@ -180,30 +179,32 @@ fn write_export(reader: &Reader, destination: &Path) -> Result<Written, Failure>
     let mut last: Option<String> = None;
 
     for session in &sessions {
-        let row: (Vec<u8>, i64, Option<String>, Option<String>, Option<String>) = conn
+        let row: (i64, Option<String>, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT s.blob, coalesce(m.is_evicted, 0) <> 0, m.session_id,
+                "SELECT coalesce(m.is_evicted, 0) <> 0, m.session_id,
                         m.first_turn_at, m.last_turn_at
                    FROM sessions s LEFT JOIN session_meta m USING (session_key)
                   WHERE s.session_key = ?1",
                 [&session.session_key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .map_err(|e| Failure::Operational(format!("{}: {e}", session.session_key)))?;
-        let (bytes, evicted, session_id, session_first, session_last) = row;
+        let (evicted, session_id, session_first, session_last) = row;
 
-        // An evicted session's blob is `x''` and `blob::read_all` cannot parse
-        // a header out of nothing (RET-02, D-03). Its file is written empty
+        // An evicted session has no block rows, on purpose, so there is no
+        // stream to read out of it (RET-02, phase 7 D-09). Its file is written empty
         // rather than skipped: the manifest names it either way, and a missing
         // file would read as an export that lost something.
         let stream = match evicted != 0 {
             true => Vec::new(),
-            false => blob::read_all(&bytes).map_err(|e| {
-                Failure::Operational(format!(
-                    "{} could not be read out of the archive: {e}",
-                    session.session_key
-                ))
-            })?,
+            false => archive::stream(conn, &session.session_key)
+                .map_err(|e| Failure::Operational(format!("{}: {e}", session.session_key)))?
+                .map_err(|e| {
+                    Failure::Operational(format!(
+                        "{} could not be read out of the archive: {e}",
+                        session.session_key
+                    ))
+                })?,
         };
         let name = file_name(session.session_no, &session.session_key);
         write_owner_only(&destination.join(&name), &stream)
@@ -230,9 +231,9 @@ fn write_export(reader: &Reader, destination: &Path) -> Result<Written, Failure>
     }
 
     // The archive format the STORE reports, not the constant this build was
-    // compiled with. They are the same on any store this binary can open, and
-    // the manifest is read by whatever opens it later, for which the store's
-    // own answer is the honest one.
+    // compiled with. Every store this build opens answers 2, since any other
+    // format is refused at open, and the manifest is read by whatever opens it
+    // later, for which the store's own answer is the honest one.
     let archive_format = reader
         .store()
         .meta_int(META_ARCHIVE_FORMAT)
@@ -295,9 +296,8 @@ fn extend(bound: &mut Option<String>, candidate: &Option<String>, wider: fn(&str
 /// under different parents cannot collide - the number is unique per store by
 /// declaration. The transcript's own name follows it because that is what makes
 /// a directory listing recognizable, reduced to the characters a filename may
-/// safely carry on all three platforms: the source is a path off the user's
-/// filesystem, and nothing about a name that arrived from outside gets to
-/// decide where a byte lands.
+/// safely carry: the source is a path off the user's filesystem, and nothing
+/// about a name that arrived from outside gets to decide where a byte lands.
 fn file_name(session_no: i64, session_key: &str) -> String {
     let stem: String = Path::new(session_key)
         .file_name()

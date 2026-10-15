@@ -6,8 +6,9 @@
 //! It is not redaction. Ingest-time redaction is barred outright
 //! (`.planning/PROJECT.md`: it makes the store lossy, defeats "verbatim" and
 //! destroys what it strips; redaction is egress-only). What happens here is
-//! ELISION: a whole named subtree is dropped and a mark is left saying how many
-//! bytes stood there. Nothing is rewritten in place, nothing is scanned for
+//! ELISION: a whole named subtree is dropped and a mark is left with its size,
+//! measured as the subtree re-encoded as compact JSON (`serde_json::to_vec`),
+//! not the source bytes it covered. Nothing is rewritten in place, nothing is scanned for
 //! sensitive content, and no value is ever partially kept.
 //!
 //! And it is not a filter on what gets indexed. It changes the bytes the ARCHIVE
@@ -167,7 +168,8 @@ fn mark(bytes: usize) -> Value {
     Value::Object(marker)
 }
 
-/// Is this value an elision mark, and if so how many bytes did it stand in for?
+/// Is this value an elision mark, and if so how many bytes of re-encoded JSON
+/// did it stand in for?
 ///
 /// The one reader of the mark's shape, so a caller asking "was this elided"
 /// never spells the key itself. An object carrying [`ELISION_MARK`] and nothing

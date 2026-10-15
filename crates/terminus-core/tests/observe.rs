@@ -365,7 +365,8 @@ impl PassBench {
 ///
 /// The insert-only rule is what the second half is about, and it is not
 /// tidiness: `terminus observations regenerate` is the only rebuild path (D-02)
-/// precisely so a pass cannot discard a judgment half somebody paid for.
+/// precisely so a pass cannot discard a row whose blob retention may since have
+/// emptied.
 #[test]
 fn a_pass_observes_every_newly_finalized_session_exactly_once() {
     let bench = pass_bench();

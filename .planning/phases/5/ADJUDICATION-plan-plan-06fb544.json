@@ -1,0 +1,70 @@
+{
+  "phase": "5",
+  "trigger": "plan",
+  "discriminator": "plan-06fb544",
+  "round": 1,
+  "base": "06fb54407ed454dc38883dd0358eaa2eb90630bc",
+  "head": "06fb54407ed454dc38883dd0358eaa2eb90630bc",
+  "base_id": "06fb54407ed454dc38883dd0358eaa2eb90630bc",
+  "head_id": "06fb54407ed454dc38883dd0358eaa2eb90630bc",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/5/PLAN-1.md",
+      "line": 142,
+      "severity": "medium",
+      "claim": "The cut-off verification can pass even if a truncated script invokes the install body, because it sets HOME to `h` without requiring `h` to be an absolute path.",
+      "failure_scenario": "If `h` is the relative scratch folder described by the plan, an incorrectly wrapped or flat truncated script enters the body but fails at the existing relative-HOME check before reaching `uname`, `mktemp`, or `curl`. HOME remains empty and none of the three forbidden trace names appears, so every stated assertion passes even though AC4's intended guarantee—that no install body command runs—has been violated. The check must use an absolute scratch HOME and should reject trace evidence that the body was entered, not only those three commands.",
+      "ruling": "survived",
+      "convergent": false,
+      "fix_commit": "2cb563c491613c5495dcab80aac019a03a431e1b",
+      "citation_missing": true,
+      "base_id": "06fb54407ed454dc38883dd0358eaa2eb90630bc",
+      "head_id": "06fb54407ed454dc38883dd0358eaa2eb90630bc"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/5/PLAN-2.md",
+      "line": 63,
+      "severity": "medium",
+      "claim": "The dash cut-off verification inherits Plan 1's relative-HOME false positive.",
+      "failure_scenario": "Repeating the loop with dash does not qualify cut-off behavior if HOME is the relative `h` path from Plan 1. A truncated script that wrongly starts its body can stop at the relative-HOME refusal before `uname`, `mktemp`, or `curl`, leaving `h` empty and satisfying the stated checks. Dash's cut-off acceptance criterion can therefore be reported as passing while the wrapper is wrong.",
+      "ruling": "survived",
+      "convergent": false,
+      "fix_commit": "2cb563c491613c5495dcab80aac019a03a431e1b",
+      "citation_missing": true,
+      "base_id": "06fb54407ed454dc38883dd0358eaa2eb90630bc",
+      "head_id": "06fb54407ed454dc38883dd0358eaa2eb90630bc"
+    },
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": ".planning/phases/5/PLAN-1.md",
+      "line": 153,
+      "severity": "low",
+      "claim": "The artifact deliberately contradicts CONTEXT's locked `Plan shape: one plan` decision by splitting the phase into two plans.",
+      "failure_scenario": "Execution requires a second plan and an ordering dependency even though the locked phase context requires one plan. If the phase runner or completion process treats the single planned artifact as the phase unit, Plan 1 can complete without dash qualification or documentation updates, leaving AC5 and AC6 undelivered. The plan acknowledges the contradiction rather than reconciling or amending the locked decision.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/config.json",
+        "line": 15,
+        "note": "workflow.max_plan_tasks is 4 and the phase has six single-concern tasks, so one plan cannot hold it; /cad-plan lets the planner override the Plan shape directive when it records why, which PLAN-1.md:153 and PLAN-2.md Notes do, and /cad-execute runs every PLAN-<k>.md of the phase in order, so plan 1 cannot complete the phase alone."
+      },
+      "citation_missing": true,
+      "base_id": "06fb54407ed454dc38883dd0358eaa2eb90630bc",
+      "head_id": "06fb54407ed454dc38883dd0358eaa2eb90630bc"
+    }
+  ]
+}

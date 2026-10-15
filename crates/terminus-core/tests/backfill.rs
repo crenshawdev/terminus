@@ -127,7 +127,7 @@ struct Snapshot {
     /// One count per table in `store::TABLES`, in that order, minus
     /// [`POST_WALK_TABLES`].
     counts: Vec<(String, i64)>,
-    /// The per-session blob checksum, keyed by session.
+    /// The per-session checksum over the block hashes, keyed by session.
     checksums: BTreeMap<String, String>,
     watermarks: BTreeMap<String, i64>,
     /// A digest over every `sessions` and `session_meta` row, blobs included.

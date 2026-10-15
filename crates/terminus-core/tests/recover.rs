@@ -94,13 +94,7 @@ impl Bench {
         )
         .unwrap();
 
-        let blob: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [self.key()],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let blob = testkit::stored(&conn, &self.key());
         let checksum: Vec<u8> = conn
             .query_row(
                 "SELECT checksum FROM session_meta WHERE session_key = ?1",
@@ -125,18 +119,12 @@ impl Bench {
         assert_eq!(
             self.watermarks(),
             vec![(self.key(), committed)],
-            "the watermark must come back to the bytes the blob holds, and the \
+            "the watermark must come back to the bytes the archive holds, and the \
              orphan must be gone"
         );
 
         let conn = self.conn();
-        let blob_after: Vec<u8> = conn
-            .query_row(
-                "SELECT blob FROM sessions WHERE session_key = ?1",
-                [self.key()],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let blob_after = testkit::stored(&conn, &self.key());
         let checksum_after: Vec<u8> = conn
             .query_row(
                 "SELECT checksum FROM session_meta WHERE session_key = ?1",

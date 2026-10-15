@@ -4,9 +4,13 @@
 //! Every spawn here points `TERMINUS_BIN_DIR`, `CLAUDE_CONFIG_DIR`,
 //! `TERMINUS_DATA_DIR`, `TERMINUS_CONFIG_DIR` and `HOME` at temporary
 //! directories. That is not tidiness: without `TERMINUS_BIN_DIR` a test would
-//! copy a binary over the developer's real `~/.local/bin/terminus`, and without
+//! move a link over the developer's real `~/.local/bin/terminus`, without `HOME`
+//! it would store a version in their real versions folder, and without
 //! `CLAUDE_CONFIG_DIR` it would edit the `settings.json` and `.claude.json`
 //! this machine is running on.
+//!
+//! `PATH` is a fixture directory holding a fake `claude` and nothing else, so
+//! no test can start the real one.
 //!
 //! The assertions are the ones AC4 and AC5 are written in, spelled in Rust
 //! rather than in `jq`: "every other key byte-identical" is a comparison of the
@@ -15,9 +19,11 @@
 //! order, which is why these tests read key order out of the raw text instead
 //! of parsing into a map that would sort it.
 
-use std::io::{BufRead, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+
+use terminus_core::testkit::{self, FakeCall, NONESSENTIAL_TRAFFIC};
 
 /// The events install writes an entry for. `cmd::hook::EVENTS` spelled again:
 /// `terminus` is a binary crate with no library target, so a test cannot name
@@ -88,6 +94,9 @@ struct Fixture {
     root: PathBuf,
     bin_dir: PathBuf,
     claude_dir: PathBuf,
+    /// The whole of every spawned terminus's `PATH`: the fake `claude` and
+    /// nothing else.
+    path_dir: PathBuf,
 }
 
 fn fixture() -> Fixture {
@@ -95,24 +104,37 @@ fn fixture() -> Fixture {
     let root = dir.path().to_path_buf();
     let bin_dir = root.join("bin");
     let claude_dir = root.join("claude");
+    let path_dir = root.join("path");
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
-    Fixture {
+    std::fs::create_dir_all(&path_dir).unwrap();
+    let fixture = Fixture {
         _dir: dir,
         root,
         bin_dir,
         claude_dir,
-    }
+        path_dir,
+    };
+    fixture.fake_claude("", 0);
+    fixture
 }
 
 impl Fixture {
     /// Where install will put this build.
     fn stable(&self) -> PathBuf {
-        self.bin_dir.join(if cfg!(windows) {
-            "terminus.exe"
-        } else {
-            "terminus"
-        })
+        self.bin_dir.join("terminus")
+    }
+
+    /// Where install stores each version, under the fixture's `HOME`.
+    fn versions(&self) -> PathBuf {
+        self.root.join(".local/lib/crenshawdev/terminus/versions")
+    }
+
+    /// The file the stable path links to after an install from this build.
+    fn version_file(&self) -> PathBuf {
+        self.versions()
+            .join(env!("CARGO_PKG_VERSION"))
+            .join("terminus")
     }
 
     fn settings(&self) -> PathBuf {
@@ -137,76 +159,45 @@ impl Fixture {
     ///
     /// Only the stable-path rerun needs it: running install *from* the copy it
     /// placed last time is the case where `current_exe()` stops resolving.
+    ///
+    /// `PATH` is the fixture's own directory and nothing else, because a system
+    /// directory can hold a real `claude`. The traffic variable is taken out so
+    /// a logged value can only have come from terminus.
     fn command_at(&self, exe: &Path, args: &[&str]) -> Command {
         let mut command = Command::new(exe);
         command
             .args(args)
+            .env("PATH", &self.path_dir)
+            .env_remove(NONESSENTIAL_TRAFFIC)
             .env("TERMINUS_BIN_DIR", &self.bin_dir)
             .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
             .env("TERMINUS_DATA_DIR", self.root.join("data"))
             .env("TERMINUS_CONFIG_DIR", self.root.join("config"))
-            .env("HOME", &self.root)
-            .env("USERPROFILE", &self.root);
+            .env("HOME", &self.root);
         command
     }
 
-    /// Run with stdin at end of file, which is what a script that did not
-    /// answer looks like.
+    /// Put a fake `claude` on the fixture's `PATH` that prints `stderr` and
+    /// exits with `status`.
+    fn fake_claude(&self, stderr: &str, status: i32) {
+        testkit::fake_claude(&self.path_dir, &self.claude_log(), stderr, status);
+    }
+
+    fn claude_log(&self) -> PathBuf {
+        self.root.join("claude.log")
+    }
+
+    /// Every `claude` call terminus made, oldest first.
+    fn calls(&self) -> Vec<FakeCall> {
+        testkit::fake_claude_calls(&self.claude_log())
+    }
+
+    /// Run with stdin at end of file, which is what a command in a script sees.
     fn run(&self, args: &[&str]) -> Output {
         self.command(args)
             .stdin(Stdio::null())
             .output()
             .expect("the binary runs")
-    }
-
-    /// Run and write `answer` to the confirmation.
-    fn answer(&self, args: &[&str], answer: &str) -> Output {
-        let mut child = self
-            .command(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("the binary runs");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(answer.as_bytes())
-            .unwrap();
-        child.wait_with_output().unwrap()
-    }
-
-    /// Spawn install and read up to its confirmation, leaving the question
-    /// unanswered.
-    ///
-    /// The pause is the point: it is the one moment install has decided
-    /// everything it will do and has done none of it, which is where a check
-    /// made before the answer and a write made after it come apart.
-    // The child is waited on in `Paused::answer`, which is the only way to end
-    // one; clippy cannot see across the return.
-    #[allow(clippy::zombie_processes)]
-    fn at_the_prompt(&self, args: &[&str]) -> Paused {
-        let mut child = self
-            .command(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("the binary runs");
-        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
-        let mut shown = String::new();
-        loop {
-            let mut line = String::new();
-            assert!(
-                out.read_line(&mut line).unwrap() > 0,
-                "install never asked:\n{shown}"
-            );
-            shown.push_str(&line);
-            if line.contains("apply these changes?") {
-                return Paused { child, out, shown };
-            }
-        }
     }
 
     fn backups(&self) -> Vec<String> {
@@ -220,40 +211,63 @@ impl Fixture {
     }
 }
 
-/// An install stopped at its confirmation, with everything it printed so far.
-struct Paused {
-    child: Child,
-    out: std::io::BufReader<std::process::ChildStdout>,
-    shown: String,
+/// The arguments of `claude mcp add-json --scope user terminus <JSON>`, up to
+/// the JSON.
+const ADD: [&str; 5] = ["mcp", "add-json", "--scope", "user", "terminus"];
+
+/// The arguments of `claude mcp remove --scope user terminus`.
+const REMOVE: [&str; 5] = ["mcp", "remove", "--scope", "user", "terminus"];
+
+/// The entry a logged add carried, after checking the call was the add and
+/// carried the traffic variable.
+fn added_entry(call: &FakeCall) -> serde_json::Value {
+    assert_eq!(call.args.len(), 6, "{call:?}");
+    assert_eq!(call.args[..5], ADD, "{call:?}");
+    assert_eq!(call.traffic.as_deref(), Some("1"), "{call:?}");
+    serde_json::from_str(&call.args[5]).expect("the add's last argument is JSON")
 }
 
-impl Paused {
-    /// The pid install is running under, and so the pid its temporary file
-    /// names are built from.
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
+/// `type` `"stdio"`, `command` the stable path, `args` `["mcp"]`.
+fn assert_current(entry: &serde_json::Value, stable: &Path) {
+    assert_eq!(entry["type"], "stdio", "{entry}");
+    assert_eq!(
+        entry["command"],
+        serde_json::Value::from(stable.display().to_string()),
+        "{entry}"
+    );
+    assert_eq!(entry["args"], serde_json::json!(["mcp"]), "{entry}");
+}
 
-    /// Answer the question and collect what install did with the answer.
-    fn answer(mut self, answer: &str) -> (std::process::ExitStatus, String) {
-        self.child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(answer.as_bytes())
-            .unwrap();
-        let mut rest = String::new();
-        self.out.read_to_string(&mut rest).unwrap();
-        let mut errors = String::new();
-        self.child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut errors)
-            .unwrap();
-        let status = self.child.wait().unwrap();
-        (status, format!("{}{rest}{errors}", self.shown))
-    }
+/// This build's bytes.
+fn build_bytes() -> Vec<u8> {
+    std::fs::read(env!("CARGO_BIN_EXE_terminus")).unwrap()
+}
+
+/// Copy this build to `to` with `extra` appended, executable.
+///
+/// The copy is written by a child shell, not by this process. A file this
+/// process had open for writing could be inherited by another test's fork,
+/// and running it would then fail with ETXTBSY.
+fn copy_build(to: &Path, extra: &str) {
+    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+    let status = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "cat \"$1\" > \"$2\" && printf %s \"$3\" >> \"$2\" && chmod 755 \"$2\"",
+            "sh",
+            env!("CARGO_BIN_EXE_terminus"),
+            &to.display().to_string(),
+            extra,
+        ])
+        .env("PATH", "/usr/bin:/bin")
+        .status()
+        .unwrap();
+    assert!(status.success(), "the copy of this build failed");
+}
+
+fn inode(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).unwrap().ino()
 }
 
 fn text(output: &Output) -> String {
@@ -373,33 +387,133 @@ fn without_ours(
 // Task 1: the binary at the stable path
 // ---------------------------------------------------------------------------
 
-/// The copy is this build, it is executable, and a second run over it is fine.
+/// The stable path is a link to this build stored under its version, the file
+/// is executable, every settings entry names the stable path, and a second run
+/// over it is fine.
 #[test]
 fn install_places_this_build_at_the_stable_path() {
+    use std::os::unix::fs::PermissionsExt;
+
     let fixture = fixture();
     fixture.seed();
 
-    let first = fixture.run(&["install", "--yes"]);
+    let first = fixture.run(&["install"]);
     assert!(first.status.success(), "{}", text(&first));
 
     let stable = fixture.stable();
-    let version = Command::new(&stable).arg("--version").output().unwrap();
-    assert!(version.status.success(), "{}", text(&version));
-    let ours = Command::new(env!("CARGO_BIN_EXE_terminus"))
-        .arg("--version")
+    let version_file = fixture.version_file();
+    assert!(
+        std::fs::symlink_metadata(&stable)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the stable path is not a link"
+    );
+    assert_eq!(std::fs::read_link(&stable).unwrap(), version_file);
+    assert_eq!(std::fs::read(&version_file).unwrap(), build_bytes());
+    let mode = std::fs::metadata(&version_file)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0o111, "the version file is not executable");
+
+    let settings = read(&fixture.settings());
+    assert_eq!(our_entries(&settings, &stable).len(), 4);
+    assert!(our_entries(&settings, &version_file).is_empty());
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_current(&added_entry(&calls[0]), &stable);
+    let said = text(&first);
+    assert!(
+        said.contains(&version_file.display().to_string()),
+        "the receipt does not name the version file: {said}"
+    );
+
+    let version = fixture
+        .command_at(&stable, &["--version"])
         .output()
         .unwrap();
+    assert!(version.status.success(), "{}", text(&version));
+    let ours = fixture.command(&["--version"]).output().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&version.stdout),
         String::from_utf8_lossy(&ours.stdout),
         "the copy is not this build"
     );
 
-    let second = fixture.run(&["install", "--yes"]);
+    let second = fixture.run(&["install"]);
     assert!(
         second.status.success(),
         "a second install over our own copy failed: {}",
         text(&second)
+    );
+}
+
+/// A plain file carrying the marker, which is what an install from before the
+/// versions folder left, is replaced by the link.
+#[test]
+fn a_marked_plain_file_at_the_stable_path_becomes_the_link() {
+    let fixture = fixture();
+    fixture.seed();
+    copy_build(&fixture.stable(), "");
+    assert!(std::fs::symlink_metadata(fixture.stable())
+        .unwrap()
+        .file_type()
+        .is_file());
+
+    let output = fixture.run(&["install"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(
+        std::fs::read_link(fixture.stable()).unwrap(),
+        fixture.version_file()
+    );
+}
+
+/// D-03: a rebuild at the same version replaces that version's file, and a
+/// rerun from the same build leaves the file alone.
+#[test]
+fn a_rebuild_at_the_same_version_replaces_its_file_and_a_rerun_does_not() {
+    let fixture = fixture();
+    fixture.seed();
+    assert!(fixture.run(&["install"]).status.success());
+
+    let rebuild = fixture.root.join("build").join("terminus");
+    copy_build(&rebuild, "\nanother build\n");
+    let reported = |exe: &Path| {
+        let output = fixture.command_at(exe, &["--version"]).output().unwrap();
+        assert!(output.status.success(), "{}", text(&output));
+        output.stdout
+    };
+    assert_eq!(
+        reported(&rebuild),
+        reported(Path::new(env!("CARGO_BIN_EXE_terminus"))),
+        "the rebuild does not report the same version"
+    );
+
+    let output = fixture
+        .command_at(&rebuild, &["install"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let version_file = fixture.version_file();
+    assert_eq!(
+        std::fs::read(&version_file).unwrap(),
+        std::fs::read(&rebuild).unwrap()
+    );
+    assert_eq!(std::fs::read_link(fixture.stable()).unwrap(), version_file);
+
+    let before = inode(&version_file);
+    let again = fixture
+        .command_at(&rebuild, &["install"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(again.status.success(), "{}", text(&again));
+    assert_eq!(
+        inode(&version_file),
+        before,
+        "the same bytes were stored again"
     );
 }
 
@@ -416,7 +530,7 @@ fn a_foreign_binary_at_the_stable_path_stops_everything() {
     let settings_before = std::fs::read_to_string(fixture.settings()).unwrap();
     let claude_before = std::fs::read_to_string(fixture.claude_json()).unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(!output.status.success(), "install overwrote a stranger");
     let said = text(&output);
     assert!(
@@ -424,11 +538,15 @@ fn a_foreign_binary_at_the_stable_path_stops_everything() {
         "the refusal did not name the path: {said}"
     );
     assert!(
-        said.contains("rm -f") || said.contains("del "),
+        said.contains("rm -f"),
         "the refusal printed no command that fixes it: {said}"
     );
 
     assert_eq!(std::fs::read(fixture.stable()).unwrap(), foreign);
+    assert!(
+        !fixture.versions().exists(),
+        "a refusal created the versions folder"
+    );
     assert_eq!(
         std::fs::read_to_string(fixture.settings()).unwrap(),
         settings_before
@@ -438,6 +556,7 @@ fn a_foreign_binary_at_the_stable_path_stops_everything() {
         claude_before
     );
     assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
+    assert_eq!(fixture.calls(), Vec::new(), "a refusal ran claude");
 }
 
 /// A settings file with a repeated key is refused, loudly, and nothing is
@@ -459,7 +578,7 @@ fn a_settings_file_with_a_repeated_key_is_refused() {
     );
     std::fs::write(fixture.settings(), &duplicated).unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(!output.status.success(), "install edited an ambiguous file");
     let said = text(&output);
     assert!(
@@ -477,28 +596,52 @@ fn a_settings_file_with_a_repeated_key_is_refused() {
         CLAUDE_JSON
     );
     assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
+    assert_eq!(fixture.calls(), Vec::new(), "a refusal ran claude");
 }
 
 /// A stale file at the temporary name install is about to use is stepped over,
 /// not opened through.
 ///
-/// Both temporaries are named from the process id, so a symlink left behind by
-/// a crashed run - or one landed on by a pid that came round again - is enough
+/// Every temporary is named from the process id, so a symlink left behind by a
+/// crashed run - or one landed on by a pid that came round again - is enough
 /// for `File::create` to truncate whatever it points at and for the rename that
-/// follows to move the link rather than the file.
+/// follows to move the link rather than the file. Install makes one in the
+/// version folder, one in the stable folder and one beside `settings.json`.
+///
+/// The pause is a shell that reads one line and then `exec`s install, so the
+/// pid the test sees is the pid install runs under and the stale names can be
+/// planted before install starts.
 #[test]
-#[cfg(unix)]
 fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
     let fixture = fixture();
     fixture.seed();
-    let paused = fixture.at_the_prompt(&["install"]);
-    let pid = paused.pid();
+    let mut paused = fixture
+        .command_at(
+            Path::new("/bin/sh"),
+            &[
+                "-c",
+                "read -r line; exec \"$0\" install",
+                env!("CARGO_BIN_EXE_terminus"),
+            ],
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the shell runs");
+    let pid = paused.id();
 
     // One victim per temporary install writes, reached through the exact name
     // it builds out of its own pid.
+    let version_dir = fixture.version_file().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&version_dir).unwrap();
     let victims = [
         (
-            fixture.root.join("victim-binary"),
+            fixture.root.join("victim-version"),
+            version_dir.join(format!(".terminus-install-{pid}")),
+        ),
+        (
+            fixture.root.join("victim-link"),
             fixture.bin_dir.join(format!(".terminus-install-{pid}")),
         ),
         (
@@ -513,8 +656,12 @@ fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
         std::os::unix::fs::symlink(victim, stale).unwrap();
     }
 
-    let (status, said) = paused.answer("y\n");
-    assert!(status.success(), "{said}");
+    let mut go = paused.stdin.take().unwrap();
+    go.write_all(b"\n").unwrap();
+    drop(go);
+    let output = paused.wait_with_output().unwrap();
+    let said = text(&output);
+    assert!(output.status.success(), "{said}");
     for (victim, _) in &victims {
         assert_eq!(
             std::fs::read(victim).unwrap(),
@@ -525,7 +672,15 @@ fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
     }
 
     // And it still did the whole job, under another name.
-    assert!(fixture.stable().exists(), "{said}");
+    assert_eq!(
+        std::fs::read_link(fixture.stable()).unwrap(),
+        fixture.version_file(),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read(fixture.version_file()).unwrap(),
+        build_bytes()
+    );
     assert_eq!(
         our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
         4
@@ -539,7 +694,6 @@ fn a_stale_temporary_name_is_stepped_over_rather_than_followed() {
 /// that follows then creates the link's target, somewhere install was never
 /// asked to write.
 #[test]
-#[cfg(unix)]
 fn a_symlink_at_the_backup_name_is_not_written_through() {
     let fixture = fixture();
     fixture.seed();
@@ -550,7 +704,7 @@ fn a_symlink_at_the_backup_name_is_not_written_through() {
     )
     .unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(output.status.success(), "{}", text(&output));
     assert!(
         !victim.exists(),
@@ -563,38 +717,6 @@ fn a_symlink_at_the_backup_name_is_not_written_through() {
         our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
         4
     );
-}
-
-/// D-07 again, at the other end of the confirmation: a program that appears at
-/// the stable path while install is waiting for an answer is refused, not
-/// renamed over.
-///
-/// The check `run` makes is from before the question. The rename clobbers.
-#[test]
-fn a_binary_that_appears_during_the_confirmation_is_still_refused() {
-    let fixture = fixture();
-    fixture.seed();
-    let paused = fixture.at_the_prompt(&["install"]);
-
-    let foreign = b"#!/bin/sh\nexit 0\n";
-    std::fs::write(fixture.stable(), foreign).unwrap();
-
-    let (status, said) = paused.answer("y\n");
-    assert!(!status.success(), "install overwrote a stranger: {said}");
-    assert!(
-        said.contains("is not a terminus build"),
-        "the refusal did not say what it found: {said}"
-    );
-    assert_eq!(std::fs::read(fixture.stable()).unwrap(), foreign);
-    assert_eq!(
-        std::fs::read_to_string(fixture.settings()).unwrap(),
-        SETTINGS
-    );
-    assert_eq!(
-        std::fs::read_to_string(fixture.claude_json()).unwrap(),
-        CLAUDE_JSON
-    );
-    assert!(fixture.backups().is_empty(), "a refusal wrote a backup");
 }
 
 // ---------------------------------------------------------------------------
@@ -610,9 +732,9 @@ fn two_installs_leave_one_hook_entry_per_event_and_change_nothing_else() {
     fixture.seed();
     let before_keys = key_order(&fixture.settings());
 
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
     let after_first = std::fs::read_to_string(fixture.settings()).unwrap();
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
 
     let settings = read(&fixture.settings());
     let ours = our_entries(&settings, &fixture.stable());
@@ -648,11 +770,8 @@ fn two_installs_leave_one_hook_entry_per_event_and_change_nothing_else() {
 
     assert_eq!(
         fixture.backups(),
-        vec![
-            ".claude.json.terminus-backup",
-            "settings.json.terminus-backup"
-        ],
-        "expected exactly one backup of each file"
+        vec!["settings.json.terminus-backup"],
+        "expected exactly one backup, of settings.json"
     );
     assert_eq!(
         std::fs::read_to_string(fixture.claude_dir.join("settings.json.terminus-backup")).unwrap(),
@@ -674,7 +793,7 @@ fn two_installs_leave_one_hook_entry_per_event_and_change_nothing_else() {
 fn an_upgrade_rewrites_no_byte_of_the_hooks_object() {
     let fixture = fixture();
     fixture.seed();
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
     let hooks = read(&fixture.settings())["hooks"].clone();
     let raw = std::fs::read_to_string(fixture.settings()).unwrap();
 
@@ -683,7 +802,7 @@ fn an_upgrade_rewrites_no_byte_of_the_hooks_object() {
     replacement.extend_from_slice(b"\0a later build\0");
     std::fs::write(fixture.stable(), &replacement).unwrap();
 
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
     assert_eq!(read(&fixture.settings())["hooks"], hooks);
     assert_eq!(std::fs::read_to_string(fixture.settings()).unwrap(), raw);
 }
@@ -699,7 +818,7 @@ fn an_upgrade_rewrites_no_byte_of_the_hooks_object() {
 fn an_entry_of_ours_in_the_wrong_shape_is_repaired_rather_than_skipped() {
     let fixture = fixture();
     fixture.seed();
-    // JSON needs the Windows separators doubled; nothing else about the path
+    // JSON needs any backslash in the path doubled; nothing else about the path
     // changes.
     let stable = fixture.stable().display().to_string().replace('\\', "\\\\");
     let seeded = format!(
@@ -727,7 +846,7 @@ fn an_entry_of_ours_in_the_wrong_shape_is_repaired_rather_than_skipped() {
     );
     std::fs::write(fixture.settings(), &seeded).unwrap();
 
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
 
     let settings = read(&fixture.settings());
     let groups = settings["hooks"]["SessionStart"].as_array().unwrap();
@@ -746,7 +865,7 @@ fn an_entry_of_ours_in_the_wrong_shape_is_repaired_rather_than_skipped() {
     // AC3 still holds: with everything in the intended shape, a second install
     // rewrites nothing.
     let after_first = std::fs::read_to_string(fixture.settings()).unwrap();
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
     assert_eq!(
         std::fs::read_to_string(fixture.settings()).unwrap(),
         after_first,
@@ -758,59 +877,43 @@ fn an_entry_of_ours_in_the_wrong_shape_is_repaired_rather_than_skipped() {
 // Task 4: the MCP registration
 // ---------------------------------------------------------------------------
 
-/// AC4 for `.claude.json`: `context7` keeps its place, `terminus` is added once
-/// however many times install runs, and nothing else in the file moves.
+/// Install places the MCP entry by running `claude mcp add-json`, and never
+/// writes `.claude.json` itself.
+///
+/// The fake writes nothing, so the file is byte-identical after two installs,
+/// and each install finds no entry and asks for the add once.
 #[test]
-fn two_installs_leave_one_mcp_entry_beside_the_servers_already_there() {
+fn two_installs_leave_claude_json_alone_and_each_asks_claude_for_the_add() {
     let fixture = fixture();
     fixture.seed();
-    let before_keys = key_order(&fixture.claude_json());
 
-    assert!(fixture.run(&["install", "--yes"]).status.success());
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
 
-    let claude = read(&fixture.claude_json());
-    let servers = claude["mcpServers"].as_object().unwrap();
-    assert_eq!(servers.len(), 2);
     assert_eq!(
-        servers["terminus"]["command"],
-        serde_json::Value::from(fixture.stable().display().to_string())
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        CLAUDE_JSON,
+        "install wrote .claude.json"
     );
-    assert_eq!(servers["terminus"]["args"][0], "mcp");
-    assert_eq!(servers["terminus"]["type"], "stdio");
-    assert_eq!(
-        servers["context7"]["url"],
-        serde_json::Value::from("https://example.invalid/mcp")
-    );
-
-    // `del(.mcpServers.terminus)` is the file it was given.
-    let mut stripped = claude.clone();
-    stripped["mcpServers"]
-        .as_object_mut()
-        .unwrap()
-        .remove("terminus");
-    let seeded: serde_json::Value = serde_json::from_str(CLAUDE_JSON).unwrap();
-    assert_eq!(stripped, seeded);
-    assert_eq!(key_order(&fixture.claude_json()), before_keys);
-
-    // `mcpServers` keeps its own key order: context7 was there first.
-    let raw = std::fs::read_to_string(fixture.claude_json()).unwrap();
     assert!(
-        raw.find("\"context7\"").unwrap() < raw.find("\"terminus\"").unwrap(),
-        "the server object was reordered"
+        !fixture
+            .claude_dir
+            .join(".claude.json.terminus-backup")
+            .exists(),
+        "install backed up a file it does not write"
     );
-    // The file it read had no trailing newline, and neither has the one it wrote.
-    assert!(raw.ends_with('}'), "a trailing newline appeared");
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    for call in &calls {
+        assert_current(&added_entry(call), &fixture.stable());
+    }
 }
 
-/// A registration of terminus's that names a binary path which has moved is
-/// brought up to date.
-///
-/// This is the phase goal at its narrowest: "keeping itself current with no
-/// user action" is exactly what fails if a registration under terminus's own
-/// key is left alone whatever it holds.
+/// An entry under terminus's key in the wrong shape is removed and placed
+/// again, and the add keeps what the user put beside the three keys terminus
+/// owns (D-02, D-06).
 #[test]
-fn a_stale_mcp_registration_is_brought_up_to_date() {
+fn a_stale_mcp_registration_is_removed_and_added_again() {
     let fixture = fixture();
     fixture.seed();
     let stale = CLAUDE_JSON.replace(
@@ -821,172 +924,156 @@ fn a_stale_mcp_registration_is_brought_up_to_date() {
     );
     std::fs::write(fixture.claude_json(), &stale).unwrap();
 
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    let output = fixture.run(&["install"]);
+    assert!(output.status.success(), "{}", text(&output));
 
-    let servers = read(&fixture.claude_json())["mcpServers"].clone();
-    let ours = &servers["terminus"];
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 2, "{calls:#?}");
+    assert_eq!(calls[0].args, REMOVE);
+    assert_eq!(calls[0].traffic.as_deref(), Some("1"));
+    let entry = added_entry(&calls[1]);
+    assert_current(&entry, &fixture.stable());
     assert_eq!(
-        ours["command"],
-        serde_json::Value::from(fixture.stable().display().to_string()),
-        "the registration still names a binary that is not there"
+        entry["env"]["KEEP"], "me",
+        "a key beside ours was dropped: {entry}"
     );
-    assert_eq!(ours["type"], "stdio");
-    assert_eq!(ours["args"][0], "mcp");
     assert_eq!(
-        ours["env"]["KEEP"],
-        serde_json::Value::from("me"),
-        "a key beside ours was dropped"
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        stale
     );
-    // And the server that is not ours is exactly as it was.
-    assert_eq!(
-        servers["context7"]["url"],
-        serde_json::Value::from("https://example.invalid/mcp")
-    );
-    assert_eq!(servers.as_object().unwrap().len(), 2);
 }
 
-// ---------------------------------------------------------------------------
-// Task 5: the diff, the one confirmation, and --yes
-// ---------------------------------------------------------------------------
-
-/// Nothing to read and no `--yes`: refuse, name `--yes`, and write nothing -
-/// not the settings files, and not the binary either.
+/// An entry already current starts no `claude` at all (D-01).
 #[test]
-fn without_an_answer_and_without_yes_install_refuses_and_writes_nothing() {
+fn a_current_mcp_registration_runs_no_claude() {
     let fixture = fixture();
     fixture.seed();
+    let current = CLAUDE_JSON.replace(
+        "    \"context7\": {",
+        &format!(
+            "    \"terminus\": {{\"type\": \"stdio\", \"command\": {}, \"args\": [\"mcp\"]}},\n    \
+             \"context7\": {{",
+            serde_json::Value::from(fixture.stable().display().to_string())
+        ),
+    );
+    std::fs::write(fixture.claude_json(), &current).unwrap();
 
     let output = fixture.run(&["install"]);
-    assert!(!output.status.success());
-    let said = text(&output);
-    assert!(said.contains("--yes"), "{said}");
-
-    assert!(!fixture.stable().exists(), "a refusal placed the binary");
-    assert_eq!(
-        std::fs::read_to_string(fixture.settings()).unwrap(),
-        SETTINGS
-    );
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(fixture.calls(), Vec::new(), "a current entry ran claude");
     assert_eq!(
         std::fs::read_to_string(fixture.claude_json()).unwrap(),
-        CLAUDE_JSON
+        current
     );
-    assert!(fixture.backups().is_empty());
 }
 
-/// A declined confirmation is a success that changed nothing, and it says so.
-#[test]
-fn a_declined_confirmation_changes_nothing_and_exits_zero() {
-    let fixture = fixture();
-    fixture.seed();
-
-    let output = fixture.answer(&["install"], "n\n");
-    assert!(output.status.success(), "{}", text(&output));
-    assert!(text(&output).contains("nothing was changed"));
-
-    assert!(!fixture.stable().exists());
-    assert_eq!(
-        std::fs::read_to_string(fixture.settings()).unwrap(),
-        SETTINGS
-    );
-    assert_eq!(
-        std::fs::read_to_string(fixture.claude_json()).unwrap(),
-        CLAUDE_JSON
-    );
-    assert!(fixture.backups().is_empty());
-}
-
-/// An accepted confirmation writes all three, and the diff it showed first
-/// carried the change rather than the file.
-#[test]
-fn an_accepted_confirmation_writes_all_three_after_showing_the_diff() {
-    let fixture = fixture();
-    fixture.seed();
-
-    let output = fixture.answer(&["install"], "y\n");
-    assert!(output.status.success(), "{}", text(&output));
-    let said = text(&output);
-    let shown = said
-        .split("apply these changes?")
-        .next()
-        .expect("the confirmation is asked once");
-    assert_eq!(
-        said.matches("apply these changes?").count(),
-        1,
-        "install asked more than once: {said}"
-    );
-    assert!(
-        shown.contains("   + ") && shown.contains("PostCompact"),
-        "no hook diff was shown: {shown}"
-    );
-    assert!(
-        shown.contains("\"terminus\": {"),
-        "no mcp diff was shown: {shown}"
-    );
-    // A `-` line is only ever a reshaping install caused - `"SessionStart": []`
-    // becoming a populated array, `"PreToolUse": []` gaining a comma. None of
-    // them may carry a line the user wrote.
-    assert!(
-        !shown
-            .lines()
-            .any(|line| line.starts_with("   - ") && line.contains("terse-answers")),
-        "the diff removes the user's own hook: {shown}"
-    );
-    // And it is the change, not the file: neither of these is anywhere near
-    // an insertion point.
-    for untouched in ["oauthAccount", "numStartups", "\"theme\""] {
-        assert!(
-            !shown.contains(untouched),
-            "the diff printed {untouched}, which nothing changed: {shown}"
-        );
-    }
-
-    assert!(fixture.stable().exists());
+/// What every incomplete install must still have done, and how it must say
+/// so (D-05): the binary placed, the four hook entries merged, the backfill
+/// started, `.claude.json` untouched, the command that finishes it, and exit 1.
+fn assert_incomplete(fixture: &Fixture, output: &Output, claude_json: &str) -> String {
+    let said = text(output);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(fixture.stable().exists(), "{said}");
     assert_eq!(
         our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
-        4
+        4,
+        "{said}"
     );
-    assert!(read(&fixture.claude_json())["mcpServers"]["terminus"].is_object());
+    assert!(said.contains("incomplete"), "{said}");
+    assert!(
+        said.contains("terminus status"),
+        "the backfill was not started: {said}"
+    );
+    assert!(
+        said.lines()
+            .any(|line| line.contains("claude mcp add-json --scope user terminus '")),
+        "no command finishes the registration: {said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.claude_json()).unwrap(),
+        claude_json
+    );
+    said
 }
 
-/// INST-03: the diff is the file's own bytes against what will land on top of
-/// them, so a settings file terminus's renderer did not produce shows the whole
-/// rewrite it is about to get. A diff of two re-rendered copies would show a
-/// four-line insertion and then reformat the file.
+/// No `claude` on `PATH` leaves the registration, and only the registration,
+/// undone.
 #[test]
-fn a_differently_formatted_file_shows_the_rewrite_it_will_get() {
+fn without_claude_on_path_the_install_is_incomplete() {
+    let fixture = fixture();
+    fixture.seed();
+    std::fs::remove_file(fixture.path_dir.join("claude")).unwrap();
+
+    let output = fixture.run(&["install"]);
+    let said = assert_incomplete(&fixture, &output, CLAUDE_JSON);
+    assert!(said.contains("not on PATH"), "{said}");
+}
+
+/// A `claude` that fails is reported by the first line of what it said.
+#[test]
+fn a_claude_that_fails_leaves_the_install_incomplete_with_its_first_line() {
+    let fixture = fixture();
+    fixture.seed();
+    fixture.fake_claude("first\nsecond", 1);
+
+    let output = fixture.run(&["install"]);
+    let said = assert_incomplete(&fixture, &output, CLAUDE_JSON);
+    // The cause is the first line exactly, and the second is nowhere. Not a
+    // bare `contains("second")`: the backfill estimate can say "under a
+    // second".
+    assert!(
+        said.lines()
+            .any(|line| line.contains("mcp server") && line.ends_with("(not registered: first)")),
+        "{said}"
+    );
+    assert!(!said.lines().any(|line| line.trim() == "second"), "{said}");
+}
+
+/// A `.claude.json` that does not parse starts no `claude`, and no longer
+/// stops the rest of the install.
+#[test]
+fn an_unreadable_claude_json_leaves_the_install_incomplete_and_runs_no_claude() {
+    let fixture = fixture();
+    fixture.seed();
+    std::fs::write(fixture.claude_json(), "{").unwrap();
+
+    let output = fixture.run(&["install"]);
+    assert_incomplete(&fixture, &output, "{");
+    assert_eq!(fixture.calls(), Vec::new());
+}
+
+// ---------------------------------------------------------------------------
+// Install asks nothing (phase 3 D-08, D-12)
+// ---------------------------------------------------------------------------
+
+/// D-12: a settings file terminus's renderer did not produce is rewritten in
+/// full, two-space indented, without a question. The backup holds the original
+/// bytes and the summary says what happened to the file.
+#[test]
+fn a_differently_formatted_file_is_rewritten_in_full_and_the_summary_says_so() {
     let fixture = fixture();
     fixture.seed();
     std::fs::write(fixture.settings(), four_space(SETTINGS)).unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     assert!(output.status.success(), "{}", text(&output));
     let said = text(&output);
-    let shown = said
-        .split("apply these changes?")
-        .next()
-        .expect("the confirmation is asked once");
-
-    // The line as the file spells it, removed; the line as install will write
-    // it, added. Neither appears in a diff taken between two rendered copies,
-    // because nothing in `theme` changed - only its indentation did.
+    assert!(!said.contains("[Y/n]"), "install asked:\n{said}");
     assert!(
-        shown.contains("   -     \"theme\": \"dark\""),
-        "the diff hid the reformatting of a line it is about to rewrite:\n{shown}"
+        said.contains("rewritten in full in two-space form, keys and values unchanged"),
+        "the summary did not say the file was rewritten:\n{said}"
     );
     assert!(
-        shown.contains("   +   \"theme\": \"dark\""),
-        "the diff did not show the line it will write:\n{shown}"
-    );
-    assert!(
-        shown.contains("rewrites all of it"),
-        "the diff did not say why it is the whole file:\n{shown}"
+        said.lines()
+            .any(|line| line.contains("the original bytes are in")
+                && line.contains("settings.json.terminus-backup")),
+        "the summary did not say where the original is:\n{said}"
     );
 
-    // And what landed is what it showed.
     let after = std::fs::read_to_string(fixture.settings()).unwrap();
     assert!(
         after.contains("\n  \"theme\": \"dark\""),
-        "the file was not rewritten the way the diff said it would be"
+        "the file was not rewritten in two-space form:\n{after}"
     );
     assert_eq!(
         our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
@@ -997,6 +1084,121 @@ fn a_differently_formatted_file_shows_the_rewrite_it_will_get() {
         std::fs::read_to_string(fixture.claude_dir.join("settings.json.terminus-backup")).unwrap(),
         four_space(SETTINGS)
     );
+}
+
+/// AC1: `--yes` and `-y` are misuse now that there is nothing to say yes to.
+/// Exit 2, and nothing is placed, written or run.
+#[test]
+fn install_takes_no_yes_flag() {
+    for flag in ["--yes", "-y"] {
+        let fixture = fixture();
+        fixture.seed();
+        let output = fixture.run(&["install", flag]);
+        assert_eq!(output.status.code(), Some(2), "{flag}: {}", text(&output));
+        assert!(!fixture.stable().exists(), "{flag}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.settings()).unwrap(),
+            SETTINGS,
+            "{flag}"
+        );
+        assert_eq!(fixture.calls(), Vec::new(), "{flag}");
+    }
+}
+
+/// Wait for `child` under a deadline, so an install that blocks on stdin fails
+/// the test rather than hanging it.
+fn finish_within(mut child: Child, seconds: u64) -> Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "install was still running after {seconds}s, waiting on stdin:\n{}",
+                text(&output)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// AC1: install reads nothing from stdin. A run with stdin closed and a run
+/// with stdin open and never written both finish, ask nothing, and leave the
+/// same files and the same `claude` calls behind.
+///
+/// No test can attach a terminal. Install has no `confirm` call and no
+/// terminal check, so a terminal takes the same path as these two runs.
+#[test]
+fn install_reads_nothing_from_stdin() {
+    let closed = fixture();
+    closed.seed();
+    let held = fixture();
+    held.seed();
+
+    let first = finish_within(
+        closed
+            .command(&["install"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        30,
+    );
+    let mut child = held
+        .command(&["install"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held open, never written, and dropped only once install has exited.
+    let open_stdin = child.stdin.take();
+    let second = finish_within(child, 30);
+    drop(open_stdin);
+
+    for (fixture, output) in [(&closed, &first), (&held, &second)] {
+        let said = text(output);
+        assert!(output.status.success(), "{said}");
+        assert!(!said.contains("[Y/n]") && !said.contains("[y/N]"), "{said}");
+        assert!(
+            !said.lines().any(|line| line.trim_end().ends_with('?')),
+            "install asked a question:\n{said}"
+        );
+        assert!(fixture.stable().exists());
+    }
+
+    let root = |fixture: &Fixture, text: String| {
+        text.replace(&fixture.root.display().to_string(), "<root>")
+    };
+    let settings = |fixture: &Fixture| {
+        root(
+            fixture,
+            std::fs::read_to_string(fixture.settings()).unwrap(),
+        )
+    };
+    let calls = |fixture: &Fixture| {
+        let calls: Vec<Vec<String>> = fixture
+            .calls()
+            .into_iter()
+            .map(|call| {
+                assert_eq!(call.traffic.as_deref(), Some("1"));
+                call.args
+                    .into_iter()
+                    .map(|arg| root(fixture, arg))
+                    .collect()
+            })
+            .collect();
+        calls
+    };
+    assert_eq!(settings(&closed), settings(&held));
+    assert_eq!(
+        std::fs::read(closed.stable()).unwrap(),
+        std::fs::read(held.stable()).unwrap()
+    );
+    assert_eq!(calls(&closed), calls(&held));
+    assert_eq!(calls(&closed).len(), 1, "{:?}", calls(&closed));
 }
 
 /// D-24: `install` is human-only. `--json` is misuse, exit 2.
@@ -1013,24 +1215,97 @@ fn install_takes_no_json_flag() {
 // Task 6: the advisories, and the settings install never changes
 // ---------------------------------------------------------------------------
 
-/// INST-04: a low `cleanupPeriodDays` is reported and auto-compact is
-/// recommended, and `--yes` changes neither.
+/// INST-04 and D-11: the receipt states `cleanupPeriodDays` at every value,
+/// says what is already gone, and prints the line that raises it, and install
+/// changes neither it nor `autoCompactEnabled`. It also names every file the
+/// run touched and where to watch the backfill.
 #[test]
 fn install_reports_the_two_settings_it_never_changes() {
+    let seven = "  \"cleanupPeriodDays\": 7,\n";
+    assert!(SETTINGS.contains(seven));
+    let seeds = [
+        (SETTINGS.to_owned(), "cleanupPeriodDays is 7.", 7),
+        (
+            SETTINGS.replace(seven, "  \"cleanupPeriodDays\": 3650,\n"),
+            "cleanupPeriodDays is 3650.",
+            3650,
+        ),
+        (
+            SETTINGS.replace(seven, ""),
+            "cleanupPeriodDays is unset, so Claude Code's default of 30 applies.",
+            30,
+        ),
+    ];
+
+    for (settings, stated, days) in seeds {
+        let fixture = fixture();
+        fixture.seed();
+        std::fs::write(fixture.settings(), &settings).unwrap();
+        let before = read(&fixture.settings());
+
+        let output = fixture.run(&["install"]);
+        let said = text(&output);
+        assert!(output.status.success(), "{said}");
+
+        assert!(said.contains(stated), "{said}");
+        assert!(
+            said.contains(&format!("older than {days} days are already gone")),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!(
+                "set \"cleanupPeriodDays\": 3650 in {}",
+                fixture.settings().display()
+            )),
+            "{said}"
+        );
+        assert!(said.contains("autoCompactEnabled"), "{said}");
+
+        let backup = fixture.claude_dir.join("settings.json.terminus-backup");
+        assert!(backup.exists());
+        for named in [
+            fixture.stable(),
+            fixture.settings(),
+            backup,
+            fixture.claude_json(),
+        ] {
+            assert!(
+                said.contains(&named.display().to_string()),
+                "the receipt does not name {}: {said}",
+                named.display()
+            );
+        }
+        assert!(said.contains("terminus status"), "{said}");
+
+        let after = read(&fixture.settings());
+        assert_eq!(after["cleanupPeriodDays"], before["cleanupPeriodDays"]);
+        assert_eq!(after["autoCompactEnabled"], before["autoCompactEnabled"]);
+    }
+}
+
+/// D-10: with a transcript on disk, the receipt carries the backfill estimate.
+#[test]
+fn the_receipt_carries_the_backfill_estimate() {
     let fixture = fixture();
     fixture.seed();
-    let before = read(&fixture.settings());
+    let project = fixture.claude_dir.join("projects").join("-tmp-receipt");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::copy(
+        testkit::fixture_path("session-basic.jsonl"),
+        project.join("11111111-1111-4111-8111-111111111111.jsonl"),
+    )
+    .unwrap();
 
-    let output = fixture.run(&["install", "--yes"]);
-    assert!(output.status.success(), "{}", text(&output));
+    let output = fixture.run(&["install"]);
     let said = text(&output);
-    assert!(said.contains("cleanupPeriodDays"), "{said}");
-    assert!(said.contains("autoCompactEnabled"), "{said}");
+    assert!(output.status.success(), "{said}");
+    assert!(said.contains("transcript(s)"), "{said}");
+    assert!(said.contains("not yet archived"), "{said}");
+    assert!(said.contains("terminus status"), "{said}");
 
-    let after = read(&fixture.settings());
-    assert_eq!(after["cleanupPeriodDays"], before["cleanupPeriodDays"]);
-    assert_eq!(after["autoCompactEnabled"], before["autoCompactEnabled"]);
-    assert_eq!(after["cleanupPeriodDays"], serde_json::Value::from(7));
+    // The backfill it started runs detached; let it finish before the
+    // fixture's directory goes.
+    wait_for_sessions(&fixture, 1);
 }
 
 /// The closing summary names where things went, and the paths it names are
@@ -1041,7 +1316,7 @@ fn the_summary_names_the_data_directory_and_the_backups_it_wrote() {
     let fixture = fixture();
     fixture.seed();
 
-    let output = fixture.run(&["install", "--yes"]);
+    let output = fixture.run(&["install"]);
     let said = text(&output);
     let data_dir = said
         .lines()
@@ -1067,17 +1342,14 @@ fn the_summary_names_the_data_directory_and_the_backups_it_wrote() {
             );
         }
     }
-    assert_eq!(fixture.backups().len(), 2);
+    assert_eq!(fixture.backups().len(), 1);
 }
 
 /// AC8/ING-11, the case a user actually hits: `~/.local/bin/terminus install`.
 ///
-/// `binary::place` renames a new binary over the stable path, which unlinks the
-/// inode the running process was exec'd from. Install then asks for a backfill.
-/// Spawning `current_exe()` at that point spawns a deleted file and fails
-/// ENOENT, so the backfill install has just announced never starts and the
-/// store does not grow - silently, because a backfill cannot fail an install.
-/// The rerun install is exactly what doctor's own fix line tells a user to run.
+/// A backfill that will not start is silent, because a backfill cannot fail an
+/// install, so the store growing is the only proof it ran. The rerun install is
+/// exactly what doctor's own fix line tells a user to run.
 #[test]
 fn install_from_the_stable_path_still_starts_its_backfill() {
     let fixture = fixture();
@@ -1097,7 +1369,7 @@ fn install_from_the_stable_path_still_starts_its_backfill() {
         "11111111-1111-4111-8111-111111111111.jsonl",
         "session-basic.jsonl",
     );
-    assert!(fixture.run(&["install", "--yes"]).status.success());
+    assert!(fixture.run(&["install"]).status.success());
     wait_for_sessions(&fixture, 1);
 
     // A second session, so the rerun has work to find and the assertion is
@@ -1108,7 +1380,7 @@ fn install_from_the_stable_path_still_starts_its_backfill() {
     );
 
     let output = fixture
-        .command_at(&fixture.stable(), &["install", "--yes"])
+        .command_at(&fixture.stable(), &["install"])
         .stdin(Stdio::null())
         .output()
         .expect("the placed binary runs");
@@ -1120,6 +1392,61 @@ fn install_from_the_stable_path_still_starts_its_backfill() {
     );
 
     wait_for_sessions(&fixture, 2);
+}
+
+/// D-02: install run through the link it made last time changes neither the
+/// link nor the version file.
+#[test]
+fn install_from_the_stable_path_touches_neither_the_link_nor_the_file() {
+    let fixture = fixture();
+    fixture.seed();
+    assert!(fixture.run(&["install"]).status.success());
+
+    let stable = fixture.stable();
+    let version_file = fixture.version_file();
+    let link_before = inode(&stable);
+    let file_before = inode(&version_file);
+
+    let output = fixture
+        .command_at(&stable, &["install"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(inode(&stable), link_before, "the link was made again");
+    assert_eq!(std::fs::read_link(&stable).unwrap(), version_file);
+    assert_eq!(
+        inode(&version_file),
+        file_before,
+        "the file was stored again"
+    );
+}
+
+/// `install.sh` names the version folder from its manifest, which need not be
+/// the version the build reports. Install run through that link leaves it
+/// where it is and stores nothing under its own version.
+#[test]
+fn install_through_a_link_to_another_version_folder_leaves_it_alone() {
+    let fixture = fixture();
+    fixture.seed();
+    let other = fixture.versions().join("9.9.9").join("terminus");
+    copy_build(&other, "");
+    let stable = fixture.stable();
+    std::os::unix::fs::symlink(&other, &stable).unwrap();
+    let link_before = inode(&stable);
+
+    let output = fixture
+        .command_at(&stable, &["install"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        !fixture.versions().join(env!("CARGO_PKG_VERSION")).exists(),
+        "install stored a second copy under its own version"
+    );
+    assert_eq!(std::fs::read_link(&stable).unwrap(), other);
+    assert_eq!(inode(&stable), link_before, "the link was made again");
 }
 
 /// Block until the store holds `expected` sessions, or fail.
@@ -1147,4 +1474,54 @@ fn wait_for_sessions(fixture: &Fixture, expected: i64) {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// STOR-10 and D-07: on a store in an older archive format, install still
+/// places the binary and writes both settings files, then prints the refusal
+/// with its clean-install steps instead of promising that the next hook will
+/// archive, and exits non-zero so `install.sh` fails with it.
+#[test]
+fn an_older_archive_format_store_fails_the_install_with_the_steps() {
+    use terminus_core::store::{ARCHIVE_FORMAT, DB_FILE_NAME, META_ARCHIVE_FORMAT};
+
+    let fixture = fixture();
+    fixture.seed();
+    let data_dir = fixture.root.join("data");
+    drop(terminus_core::Store::open(&data_dir).unwrap());
+    {
+        let conn = rusqlite::Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = ?2",
+            rusqlite::params![(ARCHIVE_FORMAT - 1).to_string(), META_ARCHIVE_FORMAT],
+        )
+        .unwrap();
+    }
+    let before = std::fs::read(data_dir.join(DB_FILE_NAME)).unwrap();
+
+    let output = fixture.run(&["install"]);
+    let said = text(&output);
+    assert!(!output.status.success(), "install exited 0: {said}");
+    assert!(said.contains("cannot convert an older store"), "{said}");
+    assert!(said.contains("install.sh"), "{said}");
+    assert!(
+        !said.contains("the next hook archives the same tree"),
+        "{said}"
+    );
+
+    assert_eq!(
+        std::fs::read_link(fixture.stable()).unwrap(),
+        fixture.version_file()
+    );
+    assert_eq!(
+        our_entries(&read(&fixture.settings()), &fixture.stable()).len(),
+        4,
+        "{said}"
+    );
+    let calls = fixture.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_current(&added_entry(&calls[0]), &fixture.stable());
+    assert!(
+        std::fs::read(data_dir.join(DB_FILE_NAME)).unwrap() == before,
+        "install changed the refused store"
+    );
 }

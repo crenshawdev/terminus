@@ -1,0 +1,20 @@
+{
+  "phase": "6",
+  "trigger": "plan",
+  "discriminator": "plan-35eeda4",
+  "round": 2,
+  "base": "35eeda49fd376cd75e15170cb34cae3bff7bb144",
+  "head": "35eeda49fd376cd75e15170cb34cae3bff7bb144",
+  "base_id": "35eeda49fd376cd75e15170cb34cae3bff7bb144",
+  "head_id": "35eeda49fd376cd75e15170cb34cae3bff7bb144",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": []
+}

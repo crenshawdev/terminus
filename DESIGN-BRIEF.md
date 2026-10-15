@@ -36,7 +36,7 @@ Terminus inverts all of it: keep the truth, derive everything else, make retriev
 
 Rust. Single static binary. No Node, Bun, Python, or native shared libraries at runtime.
 
-Concurrency: no async runtime. Cold start is the metric that matters — the hook path must not pay for a runtime it doesn't use. `rayon` for backfill parse/compress fan-out; a single writer thread for SQLite; blocking HTTP scoped to the observation command only.
+Concurrency: no async runtime. Cold start is the metric that matters — the hook path must not pay for a runtime it doesn't use. `rayon` for backfill parse/compress fan-out; a single writer thread for SQLite.
 
 ---
 
@@ -54,23 +54,24 @@ One mechanism: **SQLite** via `rusqlite` with the `bundled` feature (vendored C 
 
 | Table | Role |
 |---|---|
-| `sessions` | session_id → compressed, block-framed blob + checksum |
+| `sessions` | session_key → session_no |
+| `blocks` | (session_no, block_no) → zstd-compressed bytes + BLAKE3 hash of the uncompressed bytes |
 | `session_meta` | project, cwd, branch, times, source, final?, evicted?, parent, continues-from |
-| `turns` | turn_seq, kind, tool, ts, offset/len into the blob |
+| `turns` | turn_seq, kind, tool, ts, offset/len into the session's uncompressed stream |
 | `turns_fts` | FTS5 over expanded turn text. Contentless (`content=''`, `contentless_delete=1`). Derived, droppable |
 | `entities` | (turn_id, kind, value_norm) — exact match for paths, symbols, commands, errors, tools |
 | `paths` | turn → files touched |
 | `watermarks` | transcript path → byte offset |
-| `observations` | opt-in, derived |
+| `observations` | per finalized session: mechanical facts off its block rows, kept rather than rebuilt |
 | `decisions`, `labels` | injection decision log + replay outcomes |
-| `runs` | last N ingest runs: timestamp, duration, counts, error |
+| `runs` | last N ingest runs: timestamp, duration, counts, error (what went wrong), notes (what a healthy pass did, such as labels written and sessions retention evicted) |
 | `meta` | store format version, compression flag |
 
-Blob write, turn rows, FTS rows, entities and watermark **all commit in one transaction**. Nothing can be out of sync.
+Block rows, turn rows, FTS rows, entities and watermark **all commit in one transaction**. Nothing can be out of sync.
 
-### Blob format
+### Archive format
 
-Header (format version, codec, block size, block offset table) followed by 64 KB zstd-compressed blocks. Reading one turn decompresses one block, not the whole session.
+Each session's stream is cut into blocks of the size its `session_meta` row records, 64 KB today. Each block is compressed with zstd on its own and stored as one row in `blocks` with its hash. Reading one turn fetches and decompresses only the blocks its range covers, and an append rewrites at most the last block.
 
 **Compression is on by default.** Measured corpus: 895 MB / 1,896 sessions / 25 days ≈ 13 GB/year uncompressed for very heavy use; ~2 GB/year compressed. A typical user is well under that.
 
@@ -83,23 +84,23 @@ No stored preview column — search results decompress the hit's block on demand
 | redb | Exclusive file lock blocks *all* other processes, including readers. Young library holding the only copy of user history |
 | Tantivy | Second store, second commit, divergence handling. FTS5 is adequate at this corpus size and gives single-transaction consistency |
 | Turso / limbo | Beta; maintainers explicitly advise against mission-critical use |
-| Postgres | Requires a server. Windows is the larger user base |
+| Postgres | Requires a server. |
 | DuckDB / SurrealDB embedded | Single-process write access; forces a daemon |
 | Flat files / one file per session | Rejected outright |
 
 ### Truth and derived data
 
-`sessions` is truth. Everything else — FTS, entities, observations, decisions, labels — is derived and rebuildable by replaying blobs.
+`sessions` and `blocks` are truth. Turns, FTS, entities and paths are derived and rebuildable by replaying the archived sessions. `decisions` and `labels` are kept, not rebuilt: what an injector decided at prompt time is in no archived session. `observations` is kept too: its facts come off the session's block rows, and retention eviction deletes those rows, so an evicted session's observation cannot be recomputed.
 
-**The archive table never migrates.** A store format bump rebuilds derived tables only. This is the property that prevents claude-mem's 49-migration situation.
+**The archive tables never migrate.** A store in an older archive format is refused with the clean-install steps (move the data folder and the binary aside, rerun `install.sh`), a store in a newer one is refused with a message to upgrade, and nothing converts either. Only a derived schema that differs from the binary's rebuilds the derived tables. This is the property that prevents claude-mem's 49-migration situation.
 
 ### Durability
 
-- Per-blob checksums in `session_meta`, independent of SQLite's own integrity checks, so corruption localizes to named sessions rather than "the store is gone".
-- `PRAGMA integrity_check` plus incremental blob verification during ingest.
+- A BLAKE3 hash per block, and a session checksum over the block hashes in `session_meta`, independent of SQLite's own integrity checks, so corruption is pinned to a named session and block rather than "the store is gone".
+- `PRAGMA integrity_check`, plus what each append checks: the stored block hashes against the session checksum, and the tail block against its own hash. Complete blocks are neither read nor rewritten.
 - Online backup / `VACUUM INTO` for consistent snapshots without stopping ingest.
 - Rolling snapshots on by default.
-- Upstream transcripts are a second recovery path — hence the install-time offer to raise `cleanupPeriodDays` (Claude Code default is 30 days).
+- Upstream transcripts are a second recovery path, and Claude Code deletes them after `cleanupPeriodDays` (default 30 days). The install receipt shows the current value, says that transcripts older than it are already gone, and prints the line that raises it to 3650. Terminus never changes the setting itself.
 
 ---
 
@@ -118,17 +119,17 @@ Four hooks, all spawning a **detached** ingest process and returning 0 immediate
 
 Hook command is the **absolute path to the binary**. No shell, no `$SHELL -lc` PATH probe, no version resolution. This single choice retires most of claude-mem's Windows issue class.
 
-Spawn is fully detached: stdio to null, no inherited handles, new process group, `DETACHED_PROCESS | CREATE_NO_WINDOW` on Windows.
+Spawn is fully detached: stdio to null, no inherited handles, new process group.
 
 No daemon, no systemd/launchd/Task Scheduler. The hook spawn is the scheduler.
 
 ### Ingest run
 
-1. Try-lock (`LockFileEx` / `flock`). Held → exit 0 immediately. No waiting, no retry storms.
+1. Try-lock (`flock`). Held → exit 0 immediately. No waiting, no retry storms.
 2. Read watermarks.
 3. Tail each transcript to the last complete record; skip excluded projects.
-4. Build session blob, compress.
-5. Commit blob + turns + FTS + entities + watermark in one transaction.
+4. Cut the stream into blocks, compress each one.
+5. Commit the new block rows, the replaced tail row, turns, FTS, entities and watermark in one transaction.
 6. Apply retention if configured; compact if needed.
 7. Re-check for new work; loop. Else exit, bounded by a max wall clock.
 
@@ -149,7 +150,7 @@ Recovery lives entirely in the binary at the top of every run. There is no `repa
 
 Key on the **canonical git toplevel path**, falling back to canonical cwd. Store basename only as a display label. Map worktrees to the parent repo via the git common dir and store both keys.
 
-Canonicalize everything before comparing — resolve symlinks, normalize separators, case-fold on Windows and macOS.
+Canonicalize everything before comparing — resolve symlinks, normalize separators, case-fold on macOS.
 
 ### Byte distribution (measured)
 
@@ -181,7 +182,7 @@ Three MCP tools. Not twenty. Every tool description sits in every session's cont
 - Auto-scoped to the current project; `project: "*"` opts into cross-project.
 - Hard result budget enforced server-side.
 - Errors return empty results with a reason. Never throw, never block.
-- Observations are a `kind` filter, not a separate tool.
+- Observations are not a recall target. The files, commands and errors they list are searchable through the turn index.
 - Transport: short-lived stdio server, WAL reads. No worker, no port, no HTTP, no SSE.
 
 `stats`, `usage`, `verify`, `reindex`, `export` are CLI only — never MCP.
@@ -206,7 +207,7 @@ Extract from **structured tool records**, not prose.
 
 | Kind | Source | Normalization |
 |---|---|---|
-| `path` | Read/Edit/Write inputs, Glob/Grep paths, Bash argv | canonical absolute + repo-relative, case-folded on Win/mac |
+| `path` | Read/Edit/Write inputs, Glob/Grep paths, Bash argv | canonical absolute + repo-relative, case-folded on macOS |
 | `command` | Bash tool input | `argv[0]` + significant subcommand; flags/args to a separate raw field |
 | `error` | non-zero exits, stderr, panics | **strip variable parts** (line numbers, addresses, timestamps, UUIDs); keep the stable core |
 | `symbol` | Edit/Write content, Grep patterns, code fences | whole identifier plus components; ≥4 chars with a case transition or underscore |
@@ -230,7 +231,6 @@ No query exists yet, so the signal is **continuity**, not a memory dump:
 | Block | Source |
 |---|---|
 | Last session in this project | verbatim last prompt + last assistant turn, truncated |
-| Summary / open threads | observations, if enabled |
 | Working-state delta | git HEAD then vs now, branch, dirty files — no LLM |
 | Index pointer | "N sessions, M turns indexed here; search tools available" |
 
@@ -301,46 +301,11 @@ Claude-mem cannot do any of this: it discards the turns and keeps only the model
 
 ## 9. Observations
 
-**Opt-in, off by default.** The product is complete without them.
+**Always on.** One row per finalized session, written by the ingest pass and listed by `terminus observations`.
 
-**Principle: only ask the model for what a parser cannot do.** Claude-mem asks the LLM for `files_read`/`files_edited` and has 0 of 5,059 rows populated.
+**Principle: a parser does this, never a model.** Claude-mem asks the LLM for `files_read`/`files_edited` and has 0 of 5,059 rows populated.
 
-**Mechanical** (always on, exact, free): files read/modified, tools used, commands run, errors seen, branch, commits, turn count, duration, compactions.
-
-**Judgment** (LLM, one call per finalized session):
-
-```
-session_id
-model, prompt_version, generated_at, status
-topic            one line
-outcome          completed | partial | abandoned | exploratory
-decisions[]      { what, why, turn_id }   0–5
-learned[]        { claim, turn_id }       0–5
-unresolved[]     { what, turn_id }        0–5
-```
-
-**Every claim carries a `turn_id` anchoring it to a verbatim turn.** Auditable, anti-hallucination, and a jump target for retrieval. No other memory product can do this because none keep the turn.
-
-Output is **JSON against a strict schema** — structured output or tool-calling where available. Not XML; claude-mem's XML protocol causes permanent silent loss on schema drift. Parse failure → retry once → store raw with `status = parse_failed`. Never silently drop, never block ingest. The session is still in the archive, so regeneration is always available.
-
-Cost control: skip sessions under N turns, truncate input with explicit elision markers, daily token budget, one call per session — never per turn.
-
-### Providers
-
-One config block — **base URL, model, API key** — collapsing local (Ollama/llama.cpp), OpenRouter, and any self-hosted OpenAI-compatible endpoint into a single code path. Anthropic subscription auth is a separate branch (OAuth, not a key).
-
-Base URL is a first-class setting, not a hidden env var. It was among the highest-voted unaddressed requests on claude-mem for a year.
-
-### Shared credentials
-
-```
-~/.config/jcrenshaw/credentials.toml        Linux/macOS
-%APPDATA%\jcrenshaw\credentials.toml        Windows
-```
-
-Namespaced by **provider**, not product, so every jcrenshawdev product reads the same keys. `0600`, refuse to load if group/world-readable, ACL check on Windows. Precedence: process env → product config → shared file. Values never reach logs, errors, or output — redaction at the boundary, not per call site. Migration reads a legacy `.env` once, writes the shared file, and tells the user; never deletes it.
-
-This is cross-product infrastructure and needs its own small library rather than reimplementation per repo.
+**Mechanical** (exact, free): files read/modified, tools used, commands run, errors seen, branch, commits, turn count, duration, compactions.
 
 ---
 
@@ -348,13 +313,13 @@ This is cross-product infrastructure and needs its own small library rather than
 
 Front and centre in README and docs, as a contract:
 
-> Terminus stores your sessions unmodified on your machine. Securing your machine is your responsibility. Ours begins the moment data leaves it — anything sent to a remote model is filtered; a local model receives nothing over the wire at all.
+> Terminus stores your sessions unmodified on your machine. Securing your machine is your responsibility. Terminus calls no model and handles no API key. The Terminus binary opens no network connection, and downloading it with `install.sh` is the one network use. With `redact_recall` on, recall output is filtered by the shape rules before it reaches the model's context.
 
 **Redact at egress, never at ingest.** Ingest-time redaction makes the store lossy, defeats "verbatim", and destroys what it strips. The bytes already sit in plaintext in `~/.claude/projects`, so at-rest scrubbing buys little.
 
-**Key redaction on destination, not operation.** `resolve()`, injection, and observation generation are egress when the provider is remote and not egress at all when it's local. `export` writes to a path the user chose but should still state what it contains.
+**Recall redaction.** With `[privacy] redact_recall = true` (off by default), `recall_search` excerpts, `recall_context`, `recall_get`, the `SessionStart` brief and the per-prompt injection pass through the shape rules on their way into the model's context, and each rule leaves its marker where it cut. `export` writes to a path the user chose but should still state what it contains.
 
-No encryption at rest. No telemetry. No network connections except to the model provider the user configured.
+No encryption at rest. No telemetry. No network connections from the binary: `install.sh`'s `curl` download is the one network use.
 
 ---
 
@@ -373,7 +338,7 @@ age_days = 7
 action   = "delete"
 ```
 
-| Action | Blob | Index | Result |
+| Action | Block rows | Index | Result |
 |---|---|---|---|
 | `keep` | kept | kept | default |
 | `evict` | dropped | kept, `body_evicted` | still searchable and listed, not readable |
@@ -389,17 +354,18 @@ exclude      = ["/data/clients", "~/work/nda"]
 include_only = []          # non-empty = allowlist mode
 ```
 
-Prefix match on canonicalized paths, case-insensitive on Windows/macOS. A repo-local marker file excludes a repo so client work carries its own policy. **Excluded means never read** — not ingest-then-filter. **Enforced on both ingest and injection**; claude-mem honors it on write and ignores it on read.
+Prefix match on canonicalized paths, case-insensitive on macOS. A repo-local marker file excludes a repo so client work carries its own policy. **Excluded means never read** — not ingest-then-filter. **Enforced on both ingest and injection**; claude-mem honors it on write and ignores it on read.
 
 ---
 
 ## 12. Paths and configuration
 
-| Purpose | Linux | macOS | Windows |
-|---|---|---|---|
-| Binary (canonical) | `~/.local/bin/terminus` | same | `%LOCALAPPDATA%\Programs\Terminus\terminus.exe` |
-| Data | `$XDG_DATA_HOME/terminus` | `~/Library/Application Support/terminus` | `%LOCALAPPDATA%\terminus` |
-| Config | `$XDG_CONFIG_HOME/terminus` | same convention | `%APPDATA%\terminus` |
+| Purpose | Linux | macOS |
+|---|---|---|
+| Stable link to the active version | `~/.local/bin/terminus` | same |
+| Stored versions | `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus` | same |
+| Data | `$XDG_DATA_HOME/terminus` | `~/Library/Application Support/terminus` |
+| Config | `$XDG_CONFIG_HOME/terminus` | same convention |
 
 - `TERMINUS_DATA_DIR` overrides. Resolved **once** at startup and passed down explicitly — never re-derived in a child.
 - A `location` pointer file in the config dir means nothing hardcodes the store path; `terminus data move <path>` relocates safely.
@@ -407,41 +373,63 @@ Prefix match on canonicalized paths, case-insensitive on Windows/macOS. A repo-l
 - Free-space guard before writing; refuse network mounts by default.
 - Config written atomically, temp + rename.
 
-**Windows specifics:** `LockFileEx` not `flock`; `DETACHED_PROCESS | CREATE_NO_WINDOW`; rename-then-replace for a running exe; `\\?\` prefix for long paths; case-folded comparison; UNC paths.
+**Supported systems:** Terminus supports Linux and macOS. Windows was dropped, as it is across all of the owner's products, and a build for any other system fails at compile time with "Terminus supports Linux and macOS only."
 
 ---
 
 ## 13. Install and packaging
 
-**npm is the primary channel.** Every Claude Code user has Node, and `npx terminus install` is the pattern this audience already knows.
+**There is no npm channel.** The npm package was removed. `install.sh` is the one-command installer, run as `curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh`. It downloads from the GitHub releases on crenshawdev/terminus, and one `https://` source replaces them when the line ends in `sh -s -- https://<source>` instead of `sh`. It refuses any release whose signature does not verify against the crenshawdev release key pinned in the script. No release is published yet.
 
-esbuild-style: a thin `terminus` package with `optionalDependencies` on per-platform packages (`@terminus/linux-x64`, `@terminus/darwin-arm64`, `@terminus/win32-x64`, …) each shipping the prebuilt binary. **No postinstall script** — that sidesteps the blocked-postinstall failure class entirely. Node is install-time only; nothing at runtime touches it.
-
-Secondary: GitHub releases, Homebrew, Scoop/WinGet, deb/rpm.
+Secondary: Homebrew, deb/rpm.
 
 **No Claude Code plugin in 0.x.** The plugin system installs into versioned directories, which is the root cause of claude-mem's inline path-resolution script and its version-check hook. Revisit at 1.0; if it ships, it stays a thin bootstrap.
 
 ### Binary layout
 
-`terminus install` copies the platform binary out of the npm package to the stable path. **That copy is canonical** — hooks and MCP registration point at it, and the npm shim execs it, so there's one binary and no version skew. No PATH modification.
+`~/.local/bin/terminus` is a symbolic link to `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus`, one folder per version. It is the layout Baley uses, which is why the path carries the `crenshawdev` folder. The hooks and the MCP registration name the link, so they are written once and the version behind them changes without touching them. No PATH modification.
+
+The versions folder sits under HOME and outside the data directory. The data directory moves with `TERMINUS_DATA_DIR` and `terminus data move`, and `terminus uninstall --purge` deletes it, which would delete the file every hook runs.
+
+A version gets there one of two ways:
+
+- `install.sh` downloads `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>.manifest.sig` for the machine, from the GitHub releases by default or from the given source, and verifies the signature before it reads the manifest (see Release signature below). Only then does it download `terminus-<os>-<arch>`, check the binary's SHA-256 in `verify_download`, stage it in the folder for the manifest's version through a temporary file and `mv`, and move a temporary link over the stable path with `mv -f`. It ends by running `~/.local/bin/terminus install`.
+- `terminus install` run from anywhere else stores its own binary under its own version and points the link at it. A local build is installed with `cargo build --release && target/release/terminus install`. Run from the file the link already names, as `install.sh`'s last step is, it changes neither the link nor the file.
+
+Both replace what is at the stable path only when nothing is there or it carries the Terminus marker, a fixed string every build holds, directly or through a link, so a plain-file install from before the link becomes the link. A link to nothing counts as nothing to `terminus install`, and to `install.sh` only when it points into the versions folder. Anything else is refused and left as it is.
+
+A version folder that already holds the same bytes is left alone. One holding different bytes, which is what a rebuild at the same version finds, gets the new file renamed over it, and a process running the old file keeps its inode. Old version folders are never deleted and nothing prunes them, so a running session's MCP server and the ingest its hook spawned keep their file.
+
+Uninstall removes the link and leaves the versions folder, printing its path.
+
+### Release signature
+
+A release's manifest carries an OpenSSH signature (SSHSIG) made with the crenshawdev release key, an Ed25519 key, under the namespace `terminus-release`. `install.sh` holds the key's public line once, as a literal. It writes the allowed-signers line `crenshawdev-release <pinned key>` from that literal into its `mktemp -d` folder, then runs `ssh-keygen -Y verify -f <that file> -I crenshawdev-release -n terminus-release -s <manifest.sig>` with the manifest on stdin. Nothing is read from HOME or `~/.ssh`, so a key listed in `~/.ssh/allowed_signers` counts for nothing. Any non-zero exit is a refusal, and the binary is never downloaded. The script does not check `ssh-keygen`'s version, so one too old for `-Y` fails closed.
+
+`ssh-keygen`'s output is dropped, and the script prints its own reason on stderr. A missing signature is a download failure, `signature download failed: <url>`. A signature made by another key or under another namespace, a manifest changed after signing, and anything else `ssh-keygen` refuses all print `the manifest does not verify against the pinned crenshawdev release key`.
+
+`ssh-keygen` is required. The script checks for it with `command -v` before any download, and when it is missing names `openssh-client` (Debian, Ubuntu), `openssh-clients` (Fedora) and `openssh` (Arch).
+
+Nothing overrides the key. It is never fetched, and no argument, setting or environment variable changes it, so every source, the `https://` argument included, must serve a signature made with it. There is no unsigned mode. An update is a rerun of the same command, so it gets the same check.
 
 ### `terminus install`
 
-1. Detect and canonicalize config roots; report if more than one resolves.
-2. Ask for the data directory (default shown).
-3. Show the exact `settings.json` diff, back up the file, confirm once. Merge into the existing `hooks` object, atomic temp + rename, idempotent.
-4. Register the MCP server (stdio, same binary path, same merge rules).
-5. If `cleanupPeriodDays` is low, explain that transcripts are the recovery path and **offer** to raise it.
-6. Estimate the backfill (sessions, size, time), then run it detached, chunked, resumable, with bounded parallelism. Install returns immediately.
-7. Print what changed, where data lives, how to undo it — plus the auto-compact recommendation.
+Install asks nothing. It applies its defaults, never reads stdin and takes no arguments; any argument is misuse and exits 2.
 
-`--yes` accepts defaults for scripted installs.
+1. Detect and canonicalize config roots; report if more than one resolves.
+2. Merge the four hook entries into the existing `hooks` object of `settings.json`: atomic temp + rename, idempotent, with a one-time backup of the file as it was before install first changed it. A file not in the two-space format `JSON.stringify(value, null, 2)` writes is rewritten in full, and the backup holds the original bytes.
+3. Place the MCP entry with `claude mcp add-json --scope user terminus '<JSON>'`: stdio, the stable path as `command`, and `args` of `["mcp"]`. Install reads `.mcpServers.terminus` in `~/.claude.json` and never writes that file, so Claude Code stays its only writer.
+   - An entry already in that shape runs no `claude`. An entry in any other shape is removed with `claude mcp remove --scope user terminus` and then added again. Keys the user added beside the three, such as `env`, are carried into the new entry.
+   - `claude` is found on `PATH` and run by absolute path, with no shell, stdin at null, a 30-second deadline and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, so wiring Terminus up opens no network connection.
+   - When `claude` is missing, times out or exits non-zero, or `~/.claude.json` cannot be read, the install is incomplete. The binary, the hooks and the backfill still go ahead, the receipt prints the exact command that finishes the registration, and install exits non-zero.
+4. Print the receipt: every file changed (the binary, `settings.json` and its backup, the MCP entry), where data lives, the config roots, and how to undo it with `terminus uninstall`. It also shows the current `cleanupPeriodDays`, says that transcripts older than it are already gone, and prints the line that raises it, then gives the auto-compact recommendation. Install changes neither setting.
+5. Last, estimate the backfill (sessions, size, time), add the estimate and `terminus status`, where to watch it, to the end of the receipt, and run it detached, chunked, resumable, with bounded parallelism. Install returns immediately.
 
 Hooks go in **user scope** — terminus is global, one store across all projects.
 
 ### Upgrade
 
-Package manager replaces the binary; `terminus install` re-copies to the stable path. **Hooks are never rewritten** — the path doesn't change, so there is no version-check hook and nothing to repair. Store format bumps rebuild derived tables only. Config is additive.
+Installing a new version, with `install.sh` or with the new binary's `terminus install`, moves the link to that version's file. **Hooks are never rewritten** — the path doesn't change, so there is no version-check hook and nothing to repair. A new derived schema rebuilds the derived tables, and a store in an older archive format is refused with the clean-install steps. Config is additive.
 
 ### Uninstall
 
@@ -466,15 +454,15 @@ Recommend disabling; never change it. With terminus, compaction burns tokens to 
 | `terminus status` | sizes, counts, watermarks, last ingest run and error |
 | `terminus search` / `show` / `sessions` | terminal recall |
 | `terminus ingest` | manual catch-up |
-| `terminus reindex` | rebuild derived tables from blobs |
-| `terminus verify` | walk blobs, check checksums, report bad session ids |
+| `terminus reindex` | rebuild derived tables from the block rows |
+| `terminus verify` | check every block against its hash and each session checksum, name the session and block of a failure |
 | `terminus compact` | reclaim freed space |
 | `terminus usage` | bytes per project and month |
 | `terminus data move <path>` | relocate the store safely |
 | `terminus export` | portable output for backup or migration |
 | `terminus doctor` | read-only health report |
 | `terminus install` / `uninstall` | wiring |
-| `terminus observations regenerate [--since] [--prompt-version]` | rebuild derived observations |
+| `terminus observations regenerate [--since]` | recompute stored observations from the archived block rows |
 | `terminus mcp` | stdio MCP server |
 
 Contract: human-readable by default, `--json` on every data command with a stable shape. Errors to stderr, data to stdout. Exit `0` success, `1` operational failure, `2` misuse — never non-zero for "no results". No colour when stdout isn't a TTY; honour `NO_COLOR`. Quiet unless attached to a TTY.
@@ -494,7 +482,7 @@ Contract: human-readable by default, `--json` on every data command with a stabl
 | Concurrency | N processes race the lock — exactly one works, the rest exit 0 in ms; readers during writes |
 | Hook contract | feed the exact JSON Claude Code sends; assert exit 0, bounded wall time, clean stdout, fail-open when the DB is missing |
 | Retrieval eval | labeled (query → expected turn) set; precision@k as a regression suite via the replay harness |
-| Platform CI | Linux / macOS / Windows matrix actually exercising hooks and locking |
+| Platform CI | Linux / macOS matrix actually exercising hooks and locking |
 | Startup benchmark | assert hook cold start under budget. Startup time *is* the product |
 
 Fixture data can't be committed — transcripts are private. Small synthetic/redacted set in-repo for CI, plus a local-only corpus test pointed at the real tree via env var.
@@ -508,8 +496,8 @@ No mocking SQLite — real temp databases throughout.
 ## 16. Versioning, licensing, repo
 
 - **0.0.1 onward. 1.0 only when the full feature set has landed.** Agile increments.
-- **Store format version is a separate integer** in `meta`. The binary refuses a newer format than it knows; an older one rebuilds derived tables. A product bump never implies a store rebuild.
-- **Apache-2.0.** Source must be public — nobody installs a closed binary that reads every keystroke of their work. Apache over MIT for the explicit patent grant. AGPL is a documented negative signal in this category and its network clause protects nothing here. All dependencies are permissive (SQLite public domain, rusqlite MIT, zstd BSD, rayon MIT/Apache).
+- **Store format version is a separate integer** in `meta`. The binary refuses a store whose archive format differs from its own, newer or older, and a derived schema that differs from its own rebuilds the derived tables. A product bump never implies a store rebuild.
+- **MIT.** Source must be public — nobody installs a closed binary that reads every keystroke of their work. AGPL is a documented negative signal in this category and its network clause protects nothing here. All dependencies are permissive (SQLite public domain, rusqlite MIT, zstd BSD, rayon MIT/Apache).
 - **Public OSS** — an explicit override of the private-by-default rule, scoped to this project.
 - `origin` is the self-hosted repo and the only remote. Publishing elsewhere is handled outside this project.
 - crates.io `terminus` is taken. Skip crates.io; how Terminus is delivered is still open.
@@ -521,7 +509,6 @@ No mocking SQLite — real temp databases throughout.
 | Item | Status |
 |---|---|
 | Auto-tuner for injection thresholds | Hypothesis. Ship logging + replay; gate the tuner behind evidence it converges |
-| `UserPromptSubmit` cost on Windows | Measure. The query is microseconds; **process spawn is 10–30 ms** and that's the real budget |
 | Import of `/data/verbatim-legacy` (801 MB) | Deferred |
 | Other harnesses — Codex, Cursor, OpenCode | Out of scope for 0.x |
 | Multi-machine sync | Out of scope, stated so it doesn't creep in |

@@ -35,13 +35,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use terminus_core::config::{config_dir, visible, CONFIG_FILE_NAME};
-use terminus_core::credentials::{self, Permissions};
+use terminus_core::config::visible;
 use terminus_core::Config;
 
-use super::install::binary;
 use super::install::json_file::{Document, Json};
 use super::install::targets;
+use super::install::{binary, claude};
 use super::json::Document as Envelope;
 use super::read::{self, Opened};
 use super::{hook, Failure};
@@ -71,9 +70,8 @@ const MAX_ERROR_LINE: usize = 200;
 const AUTO_COMPACT_ENV: &str = "DISABLE_AUTO_COMPACT";
 
 /// Below this many days of Claude Code's own retention, doctor says what that
-/// costs. `cmd::install` holds the same three numbers for the advisory it gives
-/// at install time; they are the same policy said in two places, and a change to
-/// one belongs in both.
+/// costs. `cmd::install` holds the default and the raise value too, for its
+/// receipt. A change to either belongs in both.
 const LOW_CLEANUP_DAYS: i64 = 90;
 
 /// What Claude Code deletes after when `cleanupPeriodDays` is not set at all.
@@ -140,9 +138,6 @@ pub fn run(json: bool) -> Result<(), Failure> {
     let mut doctor = Doctor::new();
     doctor.wiring();
     doctor.archive();
-    doctor.credentials();
-    doctor.config_mode();
-    doctor.mode_checks();
     doctor.claude_settings();
     let checks = doctor.checks;
 
@@ -482,6 +477,11 @@ impl Doctor {
     }
 
     /// The registration recall is reached through, in `.claude.json` (D-05).
+    ///
+    /// A problem's fix is `install` when `claude` is on `PATH`, because install
+    /// places the entry through it. Without `claude`, install could not finish
+    /// either, so the fix is the `claude mcp` command itself, with the remove in
+    /// front when an entry is there (phase 3 D-16).
     fn mcp_server(&mut self, stable: &Path) {
         let path = match targets::claude_json_path() {
             Ok(path) => path,
@@ -502,11 +502,15 @@ impl Doctor {
                 return;
             }
         };
-        let stable = stable.display().to_string();
         let server = document
             .value()
             .get("mcpServers")
             .and_then(|servers| servers.get(targets::MCP_SERVER_KEY));
+        let fix = match on_path("claude") {
+            Some(_) => self.install_command(),
+            None => targets::finishing_command(server, stable),
+        };
+        let stable = stable.display().to_string();
 
         let check = match server {
             None => Check::new(
@@ -519,7 +523,7 @@ impl Doctor {
                     targets::MCP_SERVER_KEY
                 ),
             )
-            .with_fix(self.install_command()),
+            .with_fix(fix),
             Some(server) => match server.get("command").and_then(Json::as_str) {
                 Some(command) if command == stable => {
                     let stdio =
@@ -547,7 +551,7 @@ impl Doctor {
                                 targets::MCP_SERVER_KEY
                             ),
                         )
-                        .with_fix(self.install_command())
+                        .with_fix(fix)
                     }
                 }
                 Some(other) => Check::new(
@@ -559,7 +563,7 @@ impl Doctor {
                         targets::MCP_SERVER_KEY
                     ),
                 )
-                .with_fix(self.install_command()),
+                .with_fix(fix),
                 None => Check::new(
                     "mcp_server",
                     State::Problem,
@@ -569,7 +573,7 @@ impl Doctor {
                         targets::MCP_SERVER_KEY
                     ),
                 )
-                .with_fix(self.install_command()),
+                .with_fix(fix),
             },
         };
         self.push(check);
@@ -578,11 +582,7 @@ impl Doctor {
     /// Is the Claude Code on this machine one terminus has seen run exec-form
     /// hooks (D-16)?
     fn claude_code(&mut self) {
-        let name = if cfg!(windows) {
-            "claude.exe"
-        } else {
-            "claude"
-        };
+        let name = "claude";
         let Some(program) = on_path(name) else {
             self.push(Check::new(
                 "claude_code",
@@ -669,7 +669,6 @@ impl Doctor {
         let config = match Config::load() {
             Ok(config) => {
                 self.roots(&config);
-                self.provider_local(&config);
                 Some(config)
             }
             Err(error) => {
@@ -678,7 +677,6 @@ impl Doctor {
                     State::Problem,
                     format!("terminus's own config could not be read: {error}"),
                 ));
-                self.unknown("provider_local", "terminus's config could not be read");
                 None
             }
         };
@@ -709,254 +707,6 @@ impl Doctor {
                 self.unknown("last_run", "terminus's config could not be read");
             }
         }
-    }
-
-    /// The shared credentials file: where it was looked for, whether it is
-    /// there, and what its permissions say (PRIV-02, D-15).
-    ///
-    /// An absent file is the ORDINARY state and not a problem. It does not
-    /// exist on this machine, most machines will never have one, and a provider
-    /// key can also come from `[provider] api_key` or from the environment - so
-    /// reporting its absence as broken would tell every user their machine is
-    /// broken.
-    ///
-    /// Reads a path and a mode. It does not open the file, so no part of a
-    /// credential can reach the report or the `--json` document, and it creates
-    /// nothing - doctor never writes, and a check that created the file it was
-    /// asked about would be reporting on its own work.
-    fn credentials(&mut self) {
-        let Some(path) = credentials::path() else {
-            self.push(Check::new(
-                "credentials",
-                State::Unknown,
-                "no config directory resolved, so there is nowhere to look for a shared \
-                 credentials file",
-            ));
-            return;
-        };
-        let where_it_is = path.display().to_string();
-        let check = match credentials::permissions(&path) {
-            Permissions::Absent => Check::new(
-                "credentials",
-                State::Note,
-                format!(
-                    "nothing at {where_it_is}; a provider key can also come from \
-                     [provider] api_key or from the environment"
-                ),
-            ),
-            Permissions::Owner { mode } => Check::new(
-                "credentials",
-                State::Ok,
-                format!("{where_it_is} is mode {mode:03o}"),
-            ),
-            // Unix only by construction: `credentials::permissions` never
-            // answers this on a build without mode bits, which is why the fix
-            // can be a bare `chmod` with no platform arm.
-            Permissions::TooOpen { mode } => Check::new(
-                "credentials",
-                State::Problem,
-                format!(
-                    "{where_it_is} is mode {mode:03o}, so it is readable beyond its owner \
-                     and terminus refuses to load a credential from it"
-                ),
-            )
-            .with_fix(format!("chmod 600 '{where_it_is}'")),
-            // D-15's deferral, said in words rather than left as an `ok` this
-            // build did not earn.
-            Permissions::Unchecked => Check::new(
-                "credentials",
-                State::Unknown,
-                format!(
-                    "{where_it_is} is there; this build does not check Windows ACLs, so \
-                     whether anyone else can read it is unverified"
-                ),
-            ),
-            Permissions::Unreadable { detail } => Check::new(
-                "credentials",
-                State::Problem,
-                format!("{where_it_is} could not be read: {detail}"),
-            ),
-        };
-        self.push(check);
-    }
-
-    /// A provider declared local whose address is not one (D-13, D-15).
-    ///
-    /// **A note, never a problem, and nothing here changes where a byte goes.**
-    /// `provider.local` describes the DESTINATION and is declared rather than
-    /// inferred: the egress filter reads that key and not the host, exactly as
-    /// `Config::provider_local` documents, because deciding from the address
-    /// would mean resolving a name and a resolution is a connection PRIV-03
-    /// bars. So this is a mistake worth naming - `local = true` against a
-    /// remote address sends session text there unfiltered - and it is not
-    /// doctor's to overrule, which is why `terminus doctor` still exits 0.
-    ///
-    /// The host is named and the configured URL is not: a `base_url` may carry
-    /// userinfo, and the one thing this report may not do is print a
-    /// credential.
-    fn provider_local(&mut self, config: &Config) {
-        let check = match (config.provider_local(), config.provider_base_url()) {
-            (false, _) => Check::new(
-                "provider_local",
-                State::Ok,
-                "the provider is not declared local, so every request is filtered at egress",
-            ),
-            (true, None) => Check::new(
-                "provider_local",
-                State::Unknown,
-                "the provider is declared local and no base_url is configured, so there is \
-                 no host to check it against",
-            ),
-            (true, Some(base_url)) => {
-                let host = host_of(base_url);
-                if is_loopback(host) {
-                    Check::new(
-                        "provider_local",
-                        State::Ok,
-                        format!(
-                            "the provider is declared local and its base_url is on {host}, \
-                             so nothing leaves this machine"
-                        ),
-                    )
-                } else {
-                    Check::new(
-                        "provider_local",
-                        State::Note,
-                        format!(
-                            "the provider is declared local but its base_url names {host}, \
-                             which is not a loopback address; the declaration decides what \
-                             is filtered and the address does not, so session text is sent \
-                             there unfiltered"
-                        ),
-                    )
-                }
-            }
-        };
-        self.push(check);
-    }
-
-    /// `terminus.toml`'s own mode, on the same test and through the same
-    /// function the refusal uses (PRIV-02, D-14).
-    ///
-    /// A config file carrying `provider.api_key` is a credentials file whatever
-    /// else is in it, and `credentials::resolve` refuses to read a key out of
-    /// one anybody else can read. So this reports what that refusal would say,
-    /// through `credentials::permissions` rather than a second mode test of its
-    /// own: a report that disagreed with the refusal would be worse than no
-    /// report.
-    ///
-    /// **Whether there is a key decides the state, not the mode alone.** A wide
-    /// `terminus.toml` holding no key is a file of preferences and nothing is
-    /// refused over it, so calling it a problem would tell most users to fix
-    /// something that is not broken. A file that did not parse is the one case
-    /// where the answer is unknowable, and it says so and still prints the
-    /// chmod.
-    ///
-    /// Reads a path, a mode, and whether one key is present. It never renders
-    /// the file, and it creates nothing.
-    fn config_mode(&mut self) {
-        // Loaded again rather than carried from `archive`: this check needs the
-        // path the values came from and whether a key is among them, and a
-        // second read of one small file is cheaper than a field threaded
-        // through the store checks. A load failure is not fatal here - it is
-        // the `Unknown` arm below.
-        let loaded = Config::load();
-        let (path, key) = match &loaded {
-            Ok(config) => (
-                config.source_path().map(Path::to_path_buf),
-                Some(config.provider_api_key().is_some()),
-            ),
-            // The file is there and did not parse, or the directory did not
-            // resolve. Either way the mode is still reportable and whether a
-            // key is in it is not.
-            Err(_) => (
-                config_dir().ok().map(|dir| dir.join(CONFIG_FILE_NAME)),
-                None,
-            ),
-        };
-        let Some(path) = path else {
-            self.push(Check::new(
-                "config_mode",
-                State::Unknown,
-                "no config directory resolved, so there is no terminus.toml to look at",
-            ));
-            return;
-        };
-        let where_it_is = path.display().to_string();
-        let fix = format!("chmod 600 '{where_it_is}'");
-        let check = match credentials::permissions(&path) {
-            Permissions::Absent => Check::new(
-                "config_mode",
-                State::Note,
-                format!("nothing at {where_it_is}; terminus is running on its defaults"),
-            ),
-            Permissions::Owner { mode } => Check::new(
-                "config_mode",
-                State::Ok,
-                format!("{where_it_is} is mode {mode:03o}"),
-            ),
-            Permissions::TooOpen { mode } => match key {
-                Some(true) => Check::new(
-                    "config_mode",
-                    State::Problem,
-                    format!(
-                        "{where_it_is} is mode {mode:03o}, so the provider key in it is \
-                         readable beyond its owner and terminus refuses to use it"
-                    ),
-                )
-                .with_fix(fix),
-                Some(false) => Check::new(
-                    "config_mode",
-                    State::Ok,
-                    format!(
-                        "{where_it_is} is mode {mode:03o} and holds no provider key, so \
-                         there is no credential in it to refuse"
-                    ),
-                ),
-                None => Check::new(
-                    "config_mode",
-                    State::Unknown,
-                    format!(
-                        "{where_it_is} is mode {mode:03o} and could not be parsed, so \
-                         whether it holds a provider key is unknown"
-                    ),
-                )
-                .with_fix(fix),
-            },
-            // D-15's deferral again. `mode_checks` is where it is said in
-            // words, so that a Unix user reads it too.
-            Permissions::Unchecked => Check::new(
-                "config_mode",
-                State::Unknown,
-                format!(
-                    "{where_it_is} is there; this build does not check Windows ACLs, so \
-                     whether anyone else can read it is unverified"
-                ),
-            ),
-            Permissions::Unreadable { detail } => Check::new(
-                "config_mode",
-                State::Problem,
-                format!("{where_it_is} could not be read: {detail}"),
-            ),
-        };
-        self.push(check);
-    }
-
-    /// What the two mode checks above actually examined (D-15, D-17).
-    ///
-    /// Its own check rather than a sentence inside either of them, because a
-    /// check line is the only thing the printed report and the `--json`
-    /// document share - and saying it inside both mode checks would say it
-    /// twice. Stated on every platform, so a Unix user reads the same caveat a
-    /// Windows user does rather than finding it only in an arm their machine
-    /// never reaches.
-    fn mode_checks(&mut self) {
-        self.push(Check::new(
-            "mode_checks",
-            State::Note,
-            "the credentials and config_mode checks read Unix mode bits; this build \
-             examines no Windows ACL, so on Windows either file is accepted unverified",
-        ));
     }
 
     /// Which Claude config roots resolved, and how many.
@@ -1026,11 +776,7 @@ impl Doctor {
                 State::Problem,
                 format!("{} is not writable, so no ingest can commit", dir.display()),
             )
-            .with_fix(if cfg!(windows) {
-                format!("attrib -r \"{}\"", dir.display())
-            } else {
-                format!("chmod u+w '{}'", dir.display())
-            }),
+            .with_fix(format!("chmod u+w '{}'", dir.display())),
             Ok(_) => Check::new("data_directory", State::Ok, dir.display().to_string()),
         };
         self.push(check);
@@ -1429,6 +1175,8 @@ fn args_of(entry: &Json) -> Vec<String> {
 fn version_of(program: &Path) -> Option<String> {
     let mut child = Command::new(program)
         .arg("--version")
+        // Every `claude` terminus starts gets it (D-04). Inert for terminus's own.
+        .env(claude::NONESSENTIAL_TRAFFIC, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1502,74 +1250,9 @@ fn precedes(version: &str, floor: &str) -> bool {
     false
 }
 
-/// The host out of a configured `base_url`, by hand (D-16).
-///
-/// No `url` crate and no regex crate: this workspace adds neither, `base_url`
-/// is already treated as a string everywhere else it is used
-/// (`observe::provider::endpoint`), and the whole question here is which of
-/// four shapes a host is written in.
-///
-/// The userinfo rule is the one that earns its keep.
-/// `http://127.0.0.1:11434@evil.example/` is a URL whose host is
-/// `evil.example`, and a scan that stopped at the first `:` or the first `@`
-/// would call it loopback and stay quiet about the one address a user could be
-/// fooled by.
-fn host_of(base_url: &str) -> &str {
-    let rest = match base_url.find("://") {
-        Some(at) => &base_url[at + 3..],
-        None => base_url,
-    };
-    // The authority ends where the path, the query or the fragment begins.
-    let authority = match rest.find(['/', '?', '#']) {
-        Some(at) => &rest[..at],
-        None => rest,
-    };
-    // Everything up to and including the LAST `@` is userinfo, which may itself
-    // contain an `@`.
-    let authority = match authority.rfind('@') {
-        Some(at) => &authority[at + 1..],
-        None => authority,
-    };
-    if let Some(inside) = authority.strip_prefix('[') {
-        // A bracketed IPv6 literal: `[::1]:11434`. The colons are the address.
-        return match inside.find(']') {
-            Some(at) => &inside[..at],
-            None => inside,
-        };
-    }
-    match authority.rfind(':') {
-        // A port, and only when what follows one could be: an unbracketed
-        // address full of colons is not a host with a port.
-        Some(at) if authority[at + 1..].bytes().all(|b| b.is_ascii_digit()) => &authority[..at],
-        _ => authority,
-    }
-}
-
-/// Is this host on this machine?
-///
-/// Exactly three shapes, and no name resolution: `localhost` however it is
-/// cased, any `127.x.x.x`, and the IPv6 loopback. Anything else is remote for
-/// the purposes of the note - including a name that happens to resolve to
-/// `127.0.0.1`, because looking that up would be the connection PRIV-03 bars.
-fn is_loopback(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
-        return true;
-    }
-    let octets: Vec<&str> = host.split('.').collect();
-    octets.len() == 4
-        && octets[0] == "127"
-        && octets
-            .iter()
-            .all(|octet| !octet.is_empty() && octet.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// The command that removes a file, on the shell the user is at.
+/// The `rm -f` command that removes a file.
 fn removal(path: &Path) -> String {
-    if cfg!(windows) {
-        format!("del \"{}\"", path.display())
-    } else {
-        format!("rm -f '{}'", path.display())
-    }
+    format!("rm -f '{}'", path.display())
 }
 
 /// A failure's own words, for a check that reports it rather than raising it.

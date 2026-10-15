@@ -2,14 +2,14 @@
 //!
 //! **Two independent tables, and they are never mixed (D-09).**
 //!
-//! The ARCHIVE table is `length(sessions.blob)` by project and, separately, by
-//! month. Its totals reconcile to `sum(length(sessions.blob))` and to nothing
-//! else - never to the size of the file on disk, which on the live store
-//! measured 2026-08-22 is 1,103,396,864 bytes against 465,985,120 bytes of
-//! archived blob, 2.4x everything the projects account for. The rest is the
-//! derived tables, and attributing them pro-rata would make every per-project
-//! number an estimate: a user comparing two projects would be comparing a model
-//! rather than a measurement.
+//! The ARCHIVE table is each session's block byte lengths summed, by project
+//! and, separately, by month. Its totals reconcile to `sum(length(bytes))` over
+//! the `blocks` table (phase 7 D-17) and to nothing else - never to the size of
+//! the file on disk, which on the live store measured 2026-08-22 is
+//! 1,103,396,864 bytes against 465,985,120 bytes of archive, 2.4x everything
+//! the projects account for. The rest is the derived tables, and attributing
+//! them pro-rata would make every per-project number an estimate: a user
+//! comparing two projects would be comparing a model rather than a measurement.
 //!
 //! The FOOTPRINT table is where that other 57% actually is, per table, out of
 //! SQLite's own `dbstat`. It reconciles to the database file's size and to
@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 use terminus_core::config::visible;
+use terminus_core::store::archive;
 
 use super::json::Document;
 use super::read::{self, Opened, Reader};
@@ -55,41 +56,41 @@ pub fn run(json: bool) -> Result<(), Failure> {
     // Two tables, printed as two, with the total each one reconciles to at its
     // foot. The totals are the point of the report and a reader who takes only
     // the last line of each block has the answer.
-    println!("archive by project");
+    outln!("archive by project");
     for bucket in &usage.by_project {
-        println!(
+        outln!(
             "  {:>14}  {:>5} session(s)  {}",
             human(bucket.bytes as u64),
             bucket.sessions,
             bucket.name()
         );
     }
-    println!(
+    outln!(
         "  {:>14}  {:>5} session(s)  total archived",
         human(usage.archive_bytes as u64),
         usage.sessions
     );
-    println!();
-    println!("archive by month");
+    outln!();
+    outln!("archive by month");
     for bucket in &usage.by_month {
-        println!(
+        outln!(
             "  {:>14}  {:>5} session(s)  {}",
             human(bucket.bytes as u64),
             bucket.sessions,
             bucket.name()
         );
     }
-    println!(
+    outln!(
         "  {:>14}  {:>5} session(s)  total archived",
         human(usage.archive_bytes as u64),
         usage.sessions
     );
-    println!();
-    println!("store footprint by table");
+    outln!();
+    outln!("store footprint by table");
     for row in &usage.footprint {
-        println!("  {:>14}  {}", human(row.bytes as u64), row.name);
+        outln!("  {:>14}  {}", human(row.bytes as u64), row.name);
     }
-    println!(
+    outln!(
         "  {:>14}  the whole database file",
         human(usage.file_bytes as u64)
     );
@@ -147,17 +148,18 @@ fn measure(reader: &Reader) -> terminus_core::Result<Usage> {
     // exists to prevent.
     let visible = visible::sessions(conn, config)?;
 
-    // The bytes and the month for every session in the store, in one pass.
-    // Keyed on `session_key` so the visible set decides which of them count.
-    let mut rows: BTreeMap<String, (Option<String>, i64)> = BTreeMap::new();
+    // The month and the stored bytes for every session in the store, keyed on
+    // `session_key` so the visible set decides which of them count.
+    let mut months: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut statement = conn.prepare(
-        "SELECT s.session_key, substr(m.first_turn_at, 1, 7), length(s.blob)
+        "SELECT s.session_key, substr(m.first_turn_at, 1, 7)
            FROM sessions s LEFT JOIN session_meta m USING (session_key)",
     )?;
     let mut cursor = statement.query([])?;
     while let Some(row) = cursor.next()? {
-        rows.insert(row.get(0)?, (row.get(1)?, row.get(2)?));
+        months.insert(row.get(0)?, row.get(1)?);
     }
+    let stored = archive::stored_bytes(conn)?;
 
     let mut usage = Usage::default();
     let mut by_project: BTreeMap<Option<String>, Bucket> = BTreeMap::new();
@@ -167,7 +169,8 @@ fn measure(reader: &Reader) -> terminus_core::Result<Usage> {
         // covers only the impossible case of a key that vanished between the
         // two statements, and counts it as a session with no bytes rather than
         // dropping it out of the session count.
-        let (month, bytes) = rows.get(&session.session_key).cloned().unwrap_or((None, 0));
+        let month = months.get(&session.session_key).cloned().flatten();
+        let bytes = stored.get(&session.session_key).copied().unwrap_or(0);
         usage.sessions += 1;
         usage.archive_bytes += bytes;
         for (buckets, key) in [
