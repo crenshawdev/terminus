@@ -1,0 +1,128 @@
+{
+  "status": "needs_human",
+  "score": "8/11",
+  "truths": [
+    {
+      "n": 1,
+      "truth": "The signing script exits non-zero, uploads nothing and leaves the release a draft when a binary does not match its manifest, when the draft is missing any of the eight files, and when a signature does not verify against the key pinned in install.sh (AC3)",
+      "status": "VERIFIED",
+      "uat_item": 1,
+      "evidence": "scripts/sign-release.sh:74-78 checks all eight names, :82-89 rechecks every SHA-256 and the exact two-line manifest before any sign, :91-104 signs and verifies each manifest with the same ssh-keygen -Y verify flags install.sh:196-198 uses, and the upload (:111) and publish (:113) come only after that loop. Ran `cargo test --offline --locked -p terminus --test sign_release`: 15 passed, 0 failed, including a_draft_missing_a_file_is_refused, a_binary_that_does_not_match_its_manifest_is_refused and a_signature_the_pinned_key_does_not_verify_is_refused, each ::sh and ::dash. assert_refused_before_signing (sign_release.rs:452-466) asserts non-zero exit, exactly two gh calls (view, download), so no upload and no edit, which leaves the draft a draft, no -Y sign, and an empty upload folder. The pinned-key test (sign_release.rs:519-539) uses the shipped install.sh, so the real release_key value is traced from install.sh:21 into allowed_signers and the verify that refuses the throwaway key's signature."
+    },
+    {
+      "n": 2,
+      "truth": "The signing script refuses a release that is not a draft before downloading or signing anything",
+      "status": "VERIFIED",
+      "uat_item": 4,
+      "evidence": "scripts/sign-release.sh:62-65 runs `gh release view <tag> --json isDraft --jq .isDraft` and fails unless it prints true, before mktemp and download (:67-72). a_published_release_is_refused::sh and ::dash passed in the run above; the test (sign_release.rs:544-559) asserts the gh log is the view call alone, no ssh-keygen call, nothing uploaded, non-zero exit and the exact refusal message."
+    },
+    {
+      "n": 3,
+      "truth": "The signing script publishes, as latest and not a prerelease, only after all four signatures verify against the pinned key (ROADMAP criterion 2)",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "scripts/sign-release.sh:92-104 completes four sign-and-verify pairs before :111 uploads and :113 runs `gh release edit --draft=false --prerelease=false --latest`. a_good_draft_is_signed_and_published::sh and ::dash passed: 4 signs with SSH_ASKPASS_REQUIRE=never and -n terminus-release, 4 verifies, then gh view, download, upload of the four .manifest.sig files with --clobber, then the publishing edit, and each uploaded signature verifies with ssh-keygen against the fixture's pinned key. sign_release_holds_no_copy_of_the_key passed: the script reads the key from install.sh's release_key= line (:52-58) and holds no copy."
+    },
+    {
+      "n": 4,
+      "truth": "No workflow names a key or a signing secret, and a test enforces it (ROADMAP criterion 3)",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "`grep -rn 'secrets\\.\\|secrets\\[\\|-Y sign\\|PRIVATE KEY' .github/` exits 1 (no match). release.yml:170-179 makes the draft with GH_TOKEN from github.token. release_workflows::workflows_hold_no_secret_and_no_signing_step passed in the run above; release_workflows.rs:8 lists the four forbidden strings and :31-38 checks every line of every file in .github/workflows against each and asserts the match list is empty, with no branch that skips a match, and :37 fails an empty folder."
+    },
+    {
+      "n": 5,
+      "truth": "AC5 in full: no forbidden string in the workflows, a test that fails when one is added, and the repository has no Actions secrets",
+      "status": "UNCERTAIN",
+      "uat_item": 2,
+      "evidence": "The first two parts are truth 4. The last part, `gh api repos/crenshawdev/terminus/actions/secrets` reporting 0, needs a call to the GitHub API, which this verification may not make. reports/plan-2.md records total_count 0, which is a report claim, not something observed here."
+    },
+    {
+      "n": 6,
+      "truth": "release.yml runs only on a pushed v<X.Y.Z> tag, builds the four targets natively with fail-fast off, checks --version against the tag and the linkage, and only one job, after all four builds, holds contents: write and makes the draft with github.token; every uses: is pinned by a full 40-character SHA",
+      "status": "VERIFIED",
+      "uat_item": 6,
+      "evidence": "release.yml:5-8 is the only trigger (grep for workflow_dispatch, pull_request and branches finds nothing). :20-35 has fail-fast: false and four native pairs: ubuntu-24.04/x86_64-unknown-linux-musl, ubuntu-24.04-arm/aarch64-unknown-linux-musl, macos-15-intel/x86_64-apple-darwin, macos-15/aarch64-apple-darwin. :10-11 sets contents: read at the top, and :140-141 in the draft job is the only contents: write. :138 `needs: build` with no `if:` override, so one failed leg skips the draft. All 3 uses: lines match `@[0-9a-f]{40} `. Spot-checks: the version-check step (:78-84) run against target/release/terminus (prints 0.1.0) exits 0 with GITHUB_REF_NAME=v0.1.0 and exits 1 with v0.1.1, printing the ::error:: line. The manifest step (:116-126) run on that binary writes exactly `version 0.1.0\\nsha256 <64 hex>\\n`, and its digest equals the text sign-release.sh:87 and install.sh:224-225 require. The eight-file check (:154-166) exits 0 on a complete folder and exits 1 naming the missing manifest and the stray file. Nothing has run on GitHub; that is items 9 and 10 in phase 10, and whether the three pinned SHAs resolve to those action releases first shows there."
+    },
+    {
+      "n": 7,
+      "truth": "release-check.yml runs only on release: published with contents: read, puts a stand-in claude on PATH, runs the one curl line from main under bash, and requires ~/.local/bin/terminus --version to print the release version on each of the four runners",
+      "status": "VERIFIED",
+      "uat_item": 7,
+      "evidence": "release-check.yml:7-9 is the only trigger, :11-12 contents: read, :17-20 the same four runners with fail-fast: false, :24-26 shell: bash (which runs with pipefail), :30-37 puts a stand-in claude that exits 0 on GITHUB_PATH before :40, which is the same curl line as CHANGELOG.md:17 and DESIGN-BRIEF.md:382, and :42-52 compares \"$HOME/.local/bin/terminus\" --version to the tag read from an env var. The stand-in is enough: install's register step (crates/terminus/src/cmd/install/mod.rs:282-317) only runs `claude mcp remove` and `claude mcp add-json` and treats exit 0 as done, never calls claude --version, and a missing ~/.claude.json reads as an empty object (install/json_file.rs:369-373). The live run is item 11 in phase 10."
+    },
+    {
+      "n": 8,
+      "truth": "Cargo.toml and Cargo.lock say 0.1.0 for terminus and terminus-core, and git.create_tag is false",
+      "status": "VERIFIED",
+      "uat_item": 8,
+      "evidence": "Cargo.toml:6 `version = \"0.1.0\"`; Cargo.lock:441-442 terminus 0.1.0 and :453-454 terminus-core 0.1.0; `jq .git.create_tag .planning/config.json` prints false in the working tree and at HEAD (`git show HEAD:.planning/config.json`). target/release/terminus --version prints 0.1.0."
+    },
+    {
+      "n": 9,
+      "truth": "mimalloc is the global allocator on musl targets only, and the musl build is statically linked (ROADMAP criterion 4, first half)",
+      "status": "VERIFIED",
+      "uat_item": null,
+      "evidence": "crates/terminus/src/main.rs:12-14 registers mimalloc::MiMalloc as #[global_allocator] under cfg(target_env = \"musl\"); crates/terminus/Cargo.toml:35-36 depends on it only for that cfg; Cargo.toml:44 mimalloc 0.1.52. `cargo tree --offline --locked -p terminus -e normal --target <t>` shows mimalloc for x86_64 and aarch64 musl and not for x86_64-gnu or either darwin target. On target/x86_64-unknown-linux-musl/release/terminus, `file` prints `static-pie linked` and `nm` shows `T mi_free` and `T mi_malloc_aligned`. That binary was built at 20:11 from 3b321c3; `git diff 3b321c3 HEAD` touches only the version lines in Cargo.toml and Cargo.lock and two new test files under crates/, so its allocator and linkage match HEAD."
+    },
+    {
+      "n": 10,
+      "truth": "A musl release build of HEAD builds with --locked, is static, uses mimalloc, and prints 0.1.0",
+      "status": "UNCERTAIN",
+      "uat_item": 5,
+      "evidence": "Static and mimalloc are observed (truth 9), but the only musl binary on disk was built at 20:11, before the version commit 3131497 at 20:15, and its --version prints 0.1.1. No musl build of HEAD was run here."
+    },
+    {
+      "n": 11,
+      "truth": "Against the owner's real corpus, the musl release build keeps every hook event under the 10 ms p99 wall (AC6)",
+      "status": "UNCERTAIN",
+      "uat_item": 3,
+      "evidence": "crates/terminus/tests/corpus.rs:429 asserts the 10.0 ms wall in release only, gated on TERMINUS_TEST_CORPUS, and writes its store and config into temp folders (:67, :438). reports/plan-1.md records a pass on the 3b321c3 musl build (SessionStart p99 4.69 ms), but that run was not observed here."
+    }
+  ],
+  "passes": [
+    {
+      "k": 1,
+      "name": "Signing script refuses a bad draft",
+      "evidence": "`cargo test --offline --locked -p terminus --test sign_release`: 15 passed. a_draft_missing_a_file_is_refused, a_binary_that_does_not_match_its_manifest_is_refused and a_signature_the_pinned_key_does_not_verify_is_refused pass under sh and dash, each asserting non-zero exit, no upload, no edit and no -Y sign before the refusal (sign_release.rs:452-539); scripts/sign-release.sh:74-104 runs every check before the upload at :111."
+    },
+    {
+      "k": 4,
+      "name": "Signing script refuses a release that is not a draft",
+      "evidence": "a_published_release_is_refused::sh and ::dash passed: the gh log is the isDraft view alone, with no download, ssh-keygen, upload or edit; scripts/sign-release.sh:62-65 runs before anything is downloaded."
+    },
+    {
+      "k": 6,
+      "name": "Release workflow builds four platforms into one draft",
+      "evidence": "release.yml:5-8 is the only trigger, :20-35 has four native runner/target pairs with fail-fast: false, :76-84 checks the version (run locally: exit 0 for v0.1.0, exit 1 for v0.1.1), :89-110 checks file/otool linkage, :138-141 is the only contents: write job and needs the build, :170-179 makes the draft with github.token, and all 3 uses: are pinned by 40-hex SHAs. The eight-file check and manifest step were run locally and behave."
+    },
+    {
+      "k": 7,
+      "name": "Check workflow installs a published release on four runners",
+      "evidence": "release-check.yml:7-12 has the release: published trigger and contents: read, :20 the four runners, :26 bash, :30-37 the stand-in claude, :40 the public curl line from main, and :42-52 the version comparison through $HOME/.local/bin/terminus. Install's registration only needs claude mcp to exit 0 (install/mod.rs:282-317)."
+    },
+    {
+      "k": 8,
+      "name": "Version 0.1.0 and no bare tag on land",
+      "evidence": "Cargo.toml:6 0.1.0; Cargo.lock:442 and :454 0.1.0 for terminus and terminus-core; `jq .git.create_tag .planning/config.json` prints false, and HEAD's copy says the same."
+    }
+  ],
+  "gaps": [],
+  "human_checks": [
+    {
+      "name": "Item 2, last clause: run `gh api repos/crenshawdev/terminus/actions/secrets --jq .total_count`",
+      "expected": "It prints 0. The rest of item 2 is verified: no forbidden string under .github/workflows, and release_workflows passes.",
+      "why_human": "Not a limit of the model: it needs a GitHub API call, and this verification may not use the network. The owner's gh is logged in on this machine, so the walk can run it as is."
+    },
+    {
+      "name": "Item 5: run `cargo build --release --locked -p terminus --target x86_64-unknown-linux-musl`, then `file`, `nm | grep -E ' (mi_free|mi_malloc_aligned)$'` and `--version` on target/x86_64-unknown-linux-musl/release/terminus",
+      "expected": "The build finishes, file says static-pie linked or statically linked, nm lists both symbols, and --version prints 0.1.0.",
+      "why_human": "Not a limit of the model: no probe here ran it. The musl binary on disk predates the 0.1.0 version commit and prints 0.1.1, and a fresh thin-LTO, codegen-units=1 release build takes minutes, far past this verification's 10-second limit per check. The musl target and /usr/bin/musl-gcc are both installed now, so the walk can run it."
+    },
+    {
+      "name": "Item 3 (AC6): run `TERMINUS_TEST_CORPUS=\"$HOME/.claude\" cargo test --release --locked -p terminus --target x86_64-unknown-linux-musl --test corpus -- --nocapture`",
+      "expected": "The corpus test passes, and every hook event's p99 is under the 10.0 ms wall.",
+      "why_human": "Not a limit of the model: no probe here ran it. It needs a musl release build of the corpus test, which takes minutes, past this verification's 10-second limit, and it reads the owner's real ~/.claude corpus. The test writes only to temp folders. The item's note that musl is absent here is out of date: the musl target and musl-gcc are installed, so the walk can run it."
+    }
+  ]
+}
