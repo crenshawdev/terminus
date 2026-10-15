@@ -47,7 +47,6 @@ It also refuses, under these conditions:
 
 ## Current state
 
-- The tests do not run in CI. The release workflow builds and drafts releases, and no workflow runs the test suite ([#47](https://github.com/crenshawdev/terminus/issues/47)).
 - `[privacy] redact_recall` misses a bare OpenAI-style `sk-` token in plain prose, because none of its rules recognizes that shape, so the token reaches Claude Code unfiltered ([#5](https://github.com/crenshawdev/terminus/issues/5)).
 - What the `recall_search`, `recall_context` and `recall_get` tools return is not documented, and the tool table in `DESIGN-BRIEF.md` is out of date ([#26](https://github.com/crenshawdev/terminus/issues/26)).
 
@@ -146,7 +145,7 @@ Each key's full effect, and the environment variables Terminus reads, are in [do
 ## How it is designed and built
 
 - **How it is designed:** the design decisions are in [DESIGN-BRIEF.md](DESIGN-BRIEF.md) and in [.planning/](.planning/).
-- **How it is built:** `main` is protected, and every change reaches it through a pull request. No status check is required and no workflow runs the tests ([#47](https://github.com/crenshawdev/terminus/issues/47)), so the tests run locally with `cargo test --workspace --all-features`.
+- **How it is built:** `main` is protected, and every change reaches it through a pull request. The test workflow, `.github/workflows/test.yml`, runs the whole suite on every push and pull request, on Linux and macOS, on x86_64 and aarch64. No status check is required. To run the tests locally, use `cargo test --workspace --all-features`.
 - **The issues:** bugs and known gaps are tracked at [github.com/crenshawdev/terminus/issues](https://github.com/crenshawdev/terminus/issues).
 
 ## Issues and contributions

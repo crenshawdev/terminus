@@ -1,0 +1,106 @@
+name: test
+
+# The whole suite on every push and pull request, on the four runners the
+# release builds on. It reads no secret, so corpus.rs skips the private corpus
+# here as it does on any machine without it.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the named Rust version
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustc --version
+
+      # macOS ships LibreSSL as openssl, no dash, and may lack sha256sum. The
+      # sha256sum link goes in a folder of its own, so the rest of the BSD
+      # tools install.sh meets on a Mac stay first on PATH.
+      - name: Install the shell-test tools macOS lacks
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          on_path() {
+            local dir
+            IFS=: read -ra dirs <<< "$PATH"
+            for dir in "${dirs[@]}"; do
+              [ -f "$dir/$1" ] && return 0
+            done
+            return 1
+          }
+          if ! on_path dash; then
+            brew install dash
+          fi
+          if ! on_path sha256sum; then
+            brew install coreutils
+            mkdir -p "$RUNNER_TEMP/tools"
+            ln -s "$(brew --prefix coreutils)/bin/gsha256sum" "$RUNNER_TEMP/tools/sha256sum"
+            echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          fi
+          server="$(openssl s_server -help 2>&1 || true)"
+          req="$(openssl req -help 2>&1 || true)"
+          if [[ $server != *-WWW* || $req != *-addext* ]]; then
+            brew install openssl@3
+            echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+          fi
+
+      # install_script.rs and sign_release.rs fail rather than skip when a
+      # tool is missing, and they find tools by scanning PATH for the exact
+      # name, so this does too. Bash builtins only, so it runs on any PATH.
+      - name: Check the shell-test tools
+        run: |
+          set -euo pipefail
+          tools=(od uname mktemp rm curl sha256sum mkdir chmod mv ln readlink grep ssh-keygen dash shasum openssl cp)
+          IFS=: read -ra dirs <<< "$PATH"
+          missing=()
+          for tool in "${tools[@]}"; do
+            found=
+            for dir in "${dirs[@]}"; do
+              if [ -f "$dir/$tool" ]; then
+                found=1
+                break
+              fi
+            done
+            [ -n "$found" ] || missing+=("$tool")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::not on PATH: ${missing[*]}"
+            exit 1
+          fi
+          server="$(openssl s_server -help 2>&1 || true)"
+          if [[ $server != *-WWW* ]]; then
+            echo "::error::openssl s_server has no -WWW"
+            exit 1
+          fi
+          req="$(openssl req -help 2>&1 || true)"
+          if [[ $req != *-addext* ]]; then
+            echo "::error::openssl req has no -addext"
+            exit 1
+          fi
+
+      # The debug build, as the suite runs locally. The timing budgets in
+      # hook.rs, backfill.rs, lock_race.rs and corpus.rs are not loosened here.
+      - name: Test
+        run: cargo test --workspace --all-features --locked
