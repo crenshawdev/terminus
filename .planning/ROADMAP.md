@@ -15,7 +15,7 @@ The archive is the product, so it is built first and everything else is built on
 - [x] **Phase 7: Blocks as rows** - each session's archive is stored as numbered blocks, one row each, so an append writes only the tail block
 - [x] **Phase 8: Release Builds** - the release machinery: a tag builds four platforms in CI into a draft, and the owner's script signs and publishes it
 - [x] **Phase 9: README and User Docs** - a README, user docs and a trust page for someone who has never heard of Terminus, leading with the signed release
-- [ ] **Phase 10: Publish 0.1.0** - phases 1 to 9 land on `main`, `v0.1.0` is tagged, signed and published, and it installs on every platform
+- [x] **Phase 10: Publish 0.1.0** - phases 1 to 9 land on `main`, `v0.1.0` is tagged, signed and published, and it installs on every platform
 - [ ] **Phase 11: How Terminus Works** - design docs with diagrams of the system as it stands, in the shape of Baley's `docs/design/`
 - [ ] **Phase 12: Quick Issue Fixes** - thirteen small open issues are fixed and closed before the release is announced
 - [ ] **Phase 13: CI and Data Integrity** - the test suite runs in CI, and the archive and decision fixes land under it
