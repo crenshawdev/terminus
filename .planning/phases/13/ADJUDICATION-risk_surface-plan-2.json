@@ -1,0 +1,39 @@
+{
+  "phase": "13",
+  "trigger": "risk_surface",
+  "discriminator": "plan-2",
+  "round": 1,
+  "base": "6e8e0f5",
+  "head": "66396b2",
+  "base_id": "6e8e0f50aaa18ca0764811820fe3e6e9427d1ab5",
+  "head_id": "66396b2b51384bf3c9b602e0401a1beb228e35ed",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus-core/src/store/schema.rs",
+      "line": 482,
+      "severity": "high",
+      "claim": "The bring-forward migration cannot preserve the promised fresh-schema column order when an existing `decisions` table already has `dropped` but lacks `compacted`.",
+      "failure_scenario": "Open a partially migrated store whose trailing column is `dropped` and whose `compacted` column is absent. SQLite skips the existing `dropped` column and `ALTER TABLE ... ADD COLUMN compacted` appends `compacted` after it, producing `..., thresholds, dropped, compacted` instead of the fresh schema's `..., thresholds, compacted, dropped`. The added test only covers both columns being absent, so this state is missed. Any positional schema comparison, `SELECT *` copy/rebuild, or older code relying on the documented stable order can then mis-store the dropped JSON and compacted flag or reject the schema.",
+      "ruling": "refuted",
+      "convergent": false,
+      "counter_evidence": {
+        "file": "crates/terminus-core/src/store/open.rs",
+        "line": 515,
+        "note": "bring_forward adds every missing column inside one IMMEDIATE transaction (open.rs:515-529), and both decisions columns first appear in e7c0486, listed compacted then dropped. No Terminus build ever carried dropped without compacted, and an interrupted open commits neither, so the store state the scenario needs cannot be produced. The only positional read of decisions is the test helper at crates/terminus-core/tests/feedback.rs:419."
+      },
+      "base_id": "6e8e0f50aaa18ca0764811820fe3e6e9427d1ab5",
+      "head_id": "66396b2b51384bf3c9b602e0401a1beb228e35ed"
+    }
+  ]
+}

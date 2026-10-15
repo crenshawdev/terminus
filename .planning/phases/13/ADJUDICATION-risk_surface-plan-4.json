@@ -1,0 +1,39 @@
+{
+  "phase": "13",
+  "trigger": "risk_surface",
+  "discriminator": "plan-4",
+  "round": 1,
+  "base": "718341d",
+  "head": "9606ed1",
+  "base_id": "718341d77b4f956eea9a43ea6bc6616a8cf38880",
+  "head_id": "9606ed1b26de30324b5746088ed6b38bb8ee00c3",
+  "voices": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol"
+    }
+  ],
+  "citations": {
+    "checked": true
+  },
+  "entries": [
+    {
+      "voice": "openai",
+      "model": "gpt-5.6-sol",
+      "file": "crates/terminus-core/src/ingest/mod.rs",
+      "line": 1008,
+      "severity": "high",
+      "claim": "Using one file descriptor prevents pathname replacement from mixing files, but it does not make the prefix verification and tail read atomic; an in-place truncate/rewrite can still append bytes from a different transcript version to the archived prefix and clear the divergence flag.",
+      "failure_scenario": "For a flagged session, `prefix_matches` successfully verifies bytes `[0, watermark)` from the open descriptor. Before `rest_of` seeks back to `watermark`, another process truncates that same inode and rewrites it with different content whose length reaches beyond the watermark. `rest_of` then reads the rewritten tail, ingest commits it after the previously archived prefix, and `clear_divergence` is true. The archive therefore contains one version's prefix and another version's tail—the splice this change is intended to prevent—without retaining the divergence warning.",
+      "ruling": "downgraded",
+      "convergent": false,
+      "counter_evidence": {
+        "file": ".planning/phases/13/CONTEXT.md",
+        "line": 30,
+        "note": "Accurate, and already decided: D-09 scopes the one-handle read to a file replaced at its path (rename, or unlink and recreate) and accepts an in-place rewrite of the same inode during the read, with no identity or length re-check. read_flagged documents the same limit at crates/terminus-core/src/ingest/mod.rs:1001-1002. The finding names a residual risk the owner accepted, not a defect in this range, so it does not hold at high."
+      },
+      "base_id": "718341d77b4f956eea9a43ea6bc6616a8cf38880",
+      "head_id": "9606ed1b26de30324b5746088ed6b38bb8ee00c3"
+    }
+  ]
+}
