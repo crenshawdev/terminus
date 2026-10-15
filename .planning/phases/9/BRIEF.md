@@ -43,7 +43,7 @@ Add TRUST.md at the repo root with exactly this content. It is shared word for w
 ```markdown
 # Trust
 
-This is the standard every project published by crenshawdev is held to, for the software itself and for the platforms it runs on. Each project's README carries a short version of it, plus a statement of exactly what that project sends off your machine.
+This is the standard every project published by John Crenshaw is held to, for the software itself and for the platforms it runs on. Each project's README carries a short version of it, plus a statement of exactly what that project sends off your machine.
 
 ## The software
 
