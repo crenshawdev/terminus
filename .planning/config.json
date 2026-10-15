@@ -1,6 +1,5 @@
 {
   "granularity": "standard",
-  "stakes": "shipped",
   "model": {
     "escalate_on_failure": false,
     "effort": {
@@ -46,33 +45,7 @@
   },
   "review": {
     "mode": "adjudicated",
-    "reviewers": [
-      "openai"
-    ],
     "key_file": null,
-    "providers": {
-      "openai": {
-        "tiers": {
-          "flagship": "gpt-5.5",
-          "balanced": "gpt-5.4-mini",
-          "cheap": "gpt-5.4-nano"
-        }
-      },
-      "gemini": {
-        "tiers": {
-          "flagship": null,
-          "balanced": null,
-          "cheap": null
-        }
-      },
-      "deepseek": {
-        "tiers": {
-          "flagship": null,
-          "balanced": null,
-          "cheap": null
-        }
-      }
-    },
     "consult": {
       "enabled": false,
       "tier": "flagship",
