@@ -184,6 +184,37 @@ fn status_reports_the_counts_and_the_last_runs_numbers() {
     assert!(!text.contains("size           0 byte(s)"), "{text}");
 }
 
+/// `terminus ingest <path>` writes its own `runs` row, and that row has to
+/// count the one file it committed, or `status` reads it as a file walked and
+/// neither committed nor failed.
+#[test]
+fn status_counts_the_file_a_single_file_ingest_committed() {
+    let bench = bench();
+    let path = bench.place(&format!("{}.jsonl", uuid(1)), "session-basic.jsonl");
+
+    let ingest = bench.run(&["ingest", path.to_str().unwrap()]);
+    assert_eq!(ingest.status.code(), Some(0), "{}", stderr(&ingest));
+
+    let (seen, committed, failed): (i64, i64, i64) = bench
+        .conn()
+        .query_row(
+            "SELECT files_seen, files_committed, files_failed
+             FROM runs ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((seen, committed, failed), (1, 1, 0));
+
+    let out = bench.run(&["status"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("files        1 walked, 1 committed, 0 failed"),
+        "{text}"
+    );
+}
+
 /// AC7's reporting half. A tree with one damaged transcript: the pass still
 /// ingests the rest, and `status` names that file and its error.
 #[test]
