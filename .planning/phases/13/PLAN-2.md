@@ -78,7 +78,7 @@ This plan fixes #40. The `decisions` table has no column for a record's `compact
 ### Task 3: Count compacted decisions apart from ordinary ones in `terminus stats`
 
 - **Files:** crates/terminus-core/src/feedback/stats.rs, crates/terminus/src/cmd/stats.rs, crates/terminus/tests/cli.rs, crates/terminus/tests/replay.rs, crates/terminus-core/tests/feedback.rs, docs/json-shapes.md, docs/commands.md, CHANGELOG.md
-- **Action:** `Stats` gains two counts: decisions recorded with `compacted` = 1, and decisions recorded with `compacted` = 0. A decision whose `compacted` is null was drained before this build and is in neither count. `decisions` still counts every row, so the gap between `decisions` and the two new counts is exactly the decisions whose kind is unknown (D-12). `terminus stats --json` gains one key for each count. No shipped key is renamed, moved or removed, and the two new keys are permanent once shipped (D-14, phase 12 D-01). Name them in the same snake_case as the existing keys. The human output gains one line for each, aligned like the existing lines. When the store lacks the columns, stats checks `Store::missing_columns` instead of naming them, and both counts are 0 (D-15). Stats opens read-only and never brings a store forward.
+- **Action:** `Stats` gains two counts: decisions recorded with `compacted` = 1, and decisions recorded with `compacted` = 0. A decision whose `compacted` is null was drained before this build and is in neither count. `decisions` still counts every row, so the gap between `decisions` and the two new counts is exactly the decisions whose kind is unknown (D-12). `terminus stats --json` gains one key for each count. No shipped key is renamed, moved or removed, and the two new keys are permanent once shipped (D-14, phase 12 D-01). Name them `compacted_decisions` and `ordinary_decisions`, the owner's choice (2026-10-15). The human output gains one line for each, aligned like the existing lines. When the store lacks the columns, stats checks `Store::missing_columns` instead of naming them, and both counts are 0 (D-15). Stats opens read-only and never brings a store forward.
 
   In the same commit (D-14):
   - DATA_COMMANDS's `stats` entry in tests/cli.rs lists both keys.
@@ -87,12 +87,12 @@ This plan fixes #40. The `decisions` table has no column for a record's `compact
 
   Add an `[Unreleased]` entry to CHANGELOG.md for the new counts. Read `~/.claude/john-voice.md` in full before writing any of this prose.
 - **Verify:**
-  - `cargo test -p terminus --test cli` passes with the two keys in DATA_COMMANDS.
+  - `cargo test -p terminus --test cli` passes with `compacted_decisions` and `ordinary_decisions` in DATA_COMMANDS.
   - `cargo test -p terminus-core --features testkit --test feedback` passes. The report test (`the_report_adds_up_the_known_mix`, or a new sibling) asserts both counts over a mix of rows whose `compacted` is 1, 0 and null, with the null rows in neither count.
   - `cargo test -p terminus --test replay` passes, including a new test: on a store whose `decisions` table had both columns dropped, `terminus stats --json` exits 0 with `ok` true, both new counts 0, and `decisions` equal to the row count.
   - Every key `terminus stats --json` emitted before this change is still present under the same name, and `terminus stats` without `--json` prints the two new lines.
 
 ## Notes
 
-- The two new `stats --json` key names are the executor's choice within the constraints in Task 3. D-14 makes them permanent once shipped, so the review should look at the names themselves, not only at the counts.
+- The two new `stats --json` keys are `compacted_decisions` and `ordinary_decisions`, chosen by the owner on 2026-10-15. D-14 makes them permanent once shipped.
 - Planning choice: stats gets two counts, not three. A third key for the unknown decisions would be more than D-14 states, and the gap from `decisions` already gives that number, which the json-shapes bullet explains.

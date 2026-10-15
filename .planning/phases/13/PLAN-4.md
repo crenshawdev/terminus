@@ -53,7 +53,7 @@ This plan fixes the two archive issues.
 
 ### Task 1: Read a diverged session's prefix and tail through one file handle
 
-- **Files:** crates/terminus-core/src/ingest/mod.rs, crates/terminus-core/tests/compaction.rs
+- **Files:** crates/terminus-core/src/ingest/mod.rs, crates/terminus-core/tests/compaction.rs, CHANGELOG.md
 - **Action:** D-08, D-09 and D-10. In `prepare`, a flagged session (`existing.diverged`) opens its transcript once, through `discover::open_transcript`. That one handle does three things in order:
   1. It checks the length. A file shorter than the watermark is still `Error::TranscriptDiverged`.
   2. It reads `[0, watermark)` for the comparison `prefix_matches` makes today.
@@ -67,6 +67,8 @@ This plan fixes the two archive issues.
   A mismatch is still `Error::TranscriptRewritten`, with the flag left set. The order of the errors is unchanged: a shorter file is `TranscriptDiverged` before any question about its prefix is asked. An unflagged session keeps today's path, which seeks to the watermark and reads only the tail (`read_tail`), never the prefix.
 
   The single handle protects against the file being replaced between reads, whether by rename or by unlink and recreate. It does not protect against an in-place rewrite of the same inode during the read, and no identity or length re-check is added (D-09). Say both in the doc comments of the functions this changes, and remove the comment text that describes two opens.
+
+  Add an `[Unreleased]` entry to CHANGELOG.md. It says the prefix check and the tail read for a diverged session used to open the transcript separately, so a file replaced between the two could put one file's tail after another file's prefix in the archive. It says both now read through one handle (#15). Read `~/.claude/john-voice.md` in full before writing the entry.
 - **Verify:** `cargo test -p terminus-core --features testkit --test compaction` passes, including new tests:
   - A session is flagged, its transcript is restored or grown, and a pass runs. `discover::opened::under` shows exactly one new entry for that transcript's path. Count the entries before and after the pass rather than calling the global `reset`, because the log is shared by the whole test binary and its tests run in parallel.
   - The same holds for a flagged session whose transcript was rewritten under its watermark: still flagged, and still one open.
@@ -78,7 +80,7 @@ This plan fixes the two archive issues.
 - **Files:** crates/terminus-core/src/store/schema.rs, crates/terminus-core/src/store/open.rs, crates/terminus-core/src/derive.rs, crates/terminus-core/src/reindex.rs, crates/terminus-core/src/inject/compaction.rs, crates/terminus-core/src/observe/mechanical.rs, crates/terminus-core/src/retention/apply.rs, crates/terminus-core/tests/compaction.rs, crates/terminus-core/tests/derive.rs, crates/terminus-core/tests/inject_compaction.rs, crates/terminus-core/tests/reindex.rs, crates/terminus-core/tests/retention.rs, crates/terminus-core/tests/snapshot.rs, crates/terminus/tests/crash.rs, crates/terminus/tests/suppression.rs
 - **Action:** D-20, D-21 and D-22. Most of this task's file count is the old table's name being retargeted in tests. The concern is one change: boundary rows get a new key.
 
-  **The table.** Replace `compaction_boundaries` with a new derived table under a new name. It is keyed by `(session_key, stream_offset)` and keeps the metadata bytes verbatim, as today. It has to be a new table rather than the old one re-keyed, for two reasons. The old `turn_id INTEGER PRIMARY KEY` would give a null `turn_id` the next turn's id. And `CREATE TABLE IF NOT EXISTS` would never reach a re-keyed shape on the reindex path that keeps evicted sessions. Make these changes:
+  **The table.** Replace `compaction_boundaries` with a new derived table named `compactions`, the owner's choice (2026-10-15). It is keyed by `(session_key, stream_offset)` and keeps the metadata bytes verbatim, as today. It has to be a new table rather than the old one re-keyed, for two reasons. The old `turn_id INTEGER PRIMARY KEY` would give a null `turn_id` the next turn's id. And `CREATE TABLE IF NOT EXISTS` would never reach a re-keyed shape on the reindex path that keeps evicted sessions. Make these changes:
   - In `CREATE_SQL`, the new table replaces the `compaction_boundaries` block. Rewrite its comment: rows are keyed by stream position so that a boundary with no turn behind it has a place (D-19, D-20).
   - In `TABLES` and `DERIVED_TABLES`, the new table replaces `compaction_boundaries`, placed so that reindex's drop-in-reverse order still satisfies every enforced foreign key.
   - Its `stream_offset` is the same uncompressed-stream coordinate `turns.stream_offset` uses (see the `turns` comment in schema.rs), so the two compare correctly under every capture mode.
@@ -111,6 +113,7 @@ This plan fixes the two archive issues.
   - `cargo test -p terminus-core --features testkit --test inject_compaction` passes with its existing dropped-set assertions unchanged.
   - `grep -rn compaction_boundaries crates/terminus-core/src crates/terminus/src` matches only reindex.rs's retirement step and the history paragraphs in open.rs's `DERIVED_SCHEMA` doc.
   - `grep -n "DERIVED_SCHEMA: i64 = 5" crates/terminus-core/src/store/open.rs` matches.
+  - `grep -n "CREATE TABLE IF NOT EXISTS compactions" crates/terminus-core/src/store/schema.rs` matches.
 
 ### Task 3: Give a boundary with no `uuid` or no `timestamp` a row at its own offset
 
@@ -136,5 +139,5 @@ This plan fixes the two archive issues.
 
 ## Notes
 
-- Planning choice: Task 2 carries each evicted session's old boundary rows into the new table during the version 4 to 5 rebuild. CONTEXT says boundary rows "move" to the new table (D-20) but does not spell out the evicted case. Dropping those rows would break the rule shipped in phase 8 D-03, that an evicted session's derived rows are the only copy. Raised in the return so the owner can confirm.
-- The new table's name is the executor's choice.
+- Planning choice: Task 2 carries each evicted session's old boundary rows into the new table during the version 4 to 5 rebuild. CONTEXT says boundary rows "move" to the new table (D-20) but does not spell out the evicted case. Dropping those rows would break the rule shipped in phase 8 D-03, that an evicted session's derived rows are the only copy. The owner confirmed it on 2026-10-15.
+- The new table is named `compactions`, chosen by the owner on 2026-10-15.

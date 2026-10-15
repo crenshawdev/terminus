@@ -60,13 +60,15 @@ This plan fixes the drain's two problems with half-finished files.
 
 ### Task 2: Leave a decision reservation that is still in flight for the next pass
 
-- **Files:** crates/terminus-core/src/inject/decision.rs, crates/terminus-core/src/feedback/mod.rs, crates/terminus-core/tests/feedback.rs
+- **Files:** crates/terminus-core/src/inject/decision.rs, crates/terminus-core/src/feedback/mod.rs, crates/terminus-core/tests/feedback.rs, CHANGELOG.md
 - **Action:** Fix the race on the drain side (D-17). A zero-length `.json` whose mtime is younger than Task 1's age is a reservation still in flight. It is not inserted, not deleted and not reported, so the next pass reads the record renamed over it. An older zero-length `.json` is deleted and named as malformed, as today. A non-empty file that does not parse is still deleted and named at once.
   - **Where the facts come from.** The length and age that classify a file must describe the same file the bytes were read from. Take them from the metadata of the open handle the read went through, never from a second lookup of the path. The rename can land between the read and a second lookup, and the path would then look like a non-empty file that did not parse, which gets deleted. That is the race this task closes.
   - **What the drain gets.** `read_all`, or `Found`, carries what the drain needs to tell the three cases apart.
   - **What it deletes.** The delete loop after the commit removes only files whose bytes were inserted or judged malformed.
 
   Update the doc comments of `read_all`, `Found` and `drain` to describe the in-flight case. `write_file` does not change.
+
+  Add an `[Unreleased]` entry to CHANGELOG.md. It says a drain that ran while a decision record was being written could read the empty placeholder `write_file` reserves, then delete the path after the record was renamed over it, so the record was lost unread. It says the drain now leaves a placeholder younger than ten minutes for the next pass. The race has no issue number. Read `~/.claude/john-voice.md` in full before writing the entry.
 - **Verify:** `cargo test -p terminus-core --features testkit --test feedback` passes, including new tests:
   - A zero-length `.json` with a record-shaped name and mtime now survives a pass and adds no `decisions` row and no `discarded` entry. A record is then written to a temp file and renamed over it, and the next pass inserts that record and removes the file.
   - A zero-length `.json` whose mtime is 11 minutes back is removed and named in `feedback.discarded`.
