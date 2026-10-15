@@ -30,7 +30,7 @@ use rusqlite::Connection;
 use terminus_core::config::Config;
 use terminus_core::ingest::pass;
 use terminus_core::store::{schema, Store, DB_FILE_NAME};
-use terminus_core::{ingest, reindex, testkit, verify};
+use terminus_core::{discover, ingest, reindex, testkit, verify};
 
 /// A transcript large enough to fill at least one 64 KB block, so
 /// "every completed block is byte-identical" is a claim about something.
@@ -662,6 +662,16 @@ impl Tree {
     fn restore(&self) {
         std::fs::write(&self.subject, &self.original).unwrap();
     }
+
+    /// Grow the transcript by one compaction boundary.
+    fn append_boundary(&self) {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.subject)
+            .unwrap();
+        file.write_all(&testkit::boundary_line()).unwrap();
+        file.write_all(b"\n").unwrap();
+    }
 }
 
 /// D-13 end to end. A shortened transcript is skipped, the archive is left
@@ -837,6 +847,68 @@ fn a_transcript_rewritten_under_its_watermark_stays_flagged() {
         error.contains("are not the ones archived"),
         "the failure must say the bytes differ: {error}"
     );
+}
+
+/// How many times the open log says the pass opened this transcript.
+///
+/// Counted per path and compared before and after, never `reset`: the log is
+/// shared by every test in this binary, and they run in parallel.
+fn opens_of(path: &Path) -> usize {
+    discover::opened::under(path).len()
+}
+
+/// #15. A flagged session's pass reads its prefix and its tail through one
+/// handle, so a file swapped between two opens cannot put one file's tail after
+/// another file's prefix in the archive. Both ways a flagged file comes back
+/// are covered: restored as it was, and restored then grown.
+#[test]
+fn a_flagged_session_opens_its_transcript_once_per_pass() {
+    let tree = tree();
+    tree.pass();
+    tree.truncate();
+    tree.pass();
+    assert!(tree.diverged(&tree.subject));
+
+    tree.restore();
+    let before = opens_of(&tree.subject);
+    tree.pass();
+    assert!(!tree.diverged(&tree.subject), "the restore did not clear");
+    assert_eq!(opens_of(&tree.subject) - before, 1, "restored");
+
+    tree.truncate();
+    tree.pass();
+    assert!(tree.diverged(&tree.subject));
+    tree.restore();
+    tree.append_boundary();
+    let before = opens_of(&tree.subject);
+    let summary = tree.pass();
+    assert_eq!(summary.files_committed, 1, "{summary:?}");
+    assert!(!tree.diverged(&tree.subject), "the growth did not clear");
+    assert_eq!(opens_of(&tree.subject) - before, 1, "grown");
+}
+
+/// The same single open when the prefix comparison fails, so the refusal is
+/// answered from the handle the length check used.
+#[test]
+fn a_flagged_session_rewritten_under_its_watermark_opens_it_once() {
+    let tree = tree();
+    tree.pass();
+    tree.truncate();
+    tree.pass();
+    assert!(tree.diverged(&tree.subject));
+
+    let mut rewritten = Vec::new();
+    while rewritten.len() <= tree.original.len() {
+        rewritten.extend_from_slice(&testkit::boundary_line());
+        rewritten.push(b'\n');
+    }
+    std::fs::write(&tree.subject, &rewritten).unwrap();
+
+    let before = opens_of(&tree.subject);
+    let summary = tree.pass();
+    assert_eq!(summary.failures.len(), 1, "{summary:?}");
+    assert!(tree.diverged(&tree.subject), "still flagged");
+    assert_eq!(opens_of(&tree.subject) - before, 1);
 }
 
 /// Half of the discrimination the dedicated error variant exists for: the

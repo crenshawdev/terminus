@@ -72,6 +72,12 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   place, then delete that path after the record had landed there, so the record
   was lost unread. The ingest now leaves an empty placeholder younger than ten
   minutes for the next pass, which reads the record.
+- For a session whose transcript had stopped matching the archive, the ingest
+  opened the transcript once to check its earlier bytes against the archive and
+  again to read what came after them. A file replaced at that path between the
+  two opens could put one file's tail after another file's prefix in the
+  archive. Both reads now go through one open file (#15). A file rewritten in
+  place while it is being read is still not caught.
 
 ## [0.1.1] - 2026-10-15
 
