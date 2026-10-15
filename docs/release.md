@@ -15,7 +15,7 @@ The one network use in installing or updating Terminus is `install.sh`'s `curl` 
 From [`.github/workflows/release.yml`](../.github/workflows/release.yml):
 
 1. Pushing a tag of the form `v<X.Y.Z>` starts the workflow. Nothing else does.
-2. Four build jobs, each on its own runner, build `terminus-linux-x86_64`, `terminus-linux-aarch64`, `terminus-macos-x86_64` and `terminus-macos-aarch64` with `cargo build --release --locked` and no features. Each job checks that the binary's `--version` matches the tag, that a Linux binary is statically linked and that a macOS binary links nothing outside `/usr/lib/`.
+2. Four build jobs, each on its own runner, build `terminus-linux-x86_64`, `terminus-linux-aarch64`, `terminus-macos-x86_64` and `terminus-macos-aarch64` with `cargo build --release --locked` and no features. Each job checks that the binary's `--version` matches the tag, that a Linux binary is statically linked, that a macOS binary links nothing outside `/usr/lib/`, and that the binary carries the marker `install.sh` and `terminus install` look for.
 3. Each build job writes the binary's manifest, `terminus-<os>-<arch>.manifest`, which is exactly two lines:
 
    ```
