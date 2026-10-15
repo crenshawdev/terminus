@@ -168,6 +168,7 @@ Explicit exclusions. The reason prevents scope creep later.
 | STOR-08 | Phase 7 | Complete |
 | STOR-10 | Phase 7 | Complete |
 | STOR-09 | Phase 7 | Complete |
+| REL-01 | Phase 8 | Pending |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 
