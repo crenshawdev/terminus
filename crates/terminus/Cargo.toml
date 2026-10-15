@@ -56,3 +56,23 @@ mimalloc.workspace = true
 terminus-core = { workspace = true, features = ["testkit"] }
 rusqlite.workspace = true
 tempfile = "3"
+
+# Test files gated as a whole on `testkit`. Declaring them makes
+# `cargo test --test <name>` without the feature fail and name `testkit`,
+# instead of passing with zero tests (#44). A package-wide `cargo test -p` still
+# skips them without a word, so run the suite with `--all-features`.
+
+[[test]]
+name = "datamove"
+path = "tests/datamove.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "mcp"
+path = "tests/mcp.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "recall_cli"
+path = "tests/recall_cli.rs"
+required-features = ["testkit"]

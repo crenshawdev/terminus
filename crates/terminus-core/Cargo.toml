@@ -29,3 +29,128 @@ serde_json.workspace = true
 # (DESIGN-BRIEF.md:504). A dev-dependency rather than a `testkit` dependency so
 # tests that need a temp dir but no fixture need no cargo feature.
 tempfile = "3"
+
+# Test files gated as a whole on `testkit`. Declaring them makes
+# `cargo test --test <name>` without the feature fail and name `testkit`,
+# instead of passing with zero tests (#44). A package-wide `cargo test -p` still
+# skips them without a word, so run the suite with `--all-features`.
+
+[[test]]
+name = "backfill"
+path = "tests/backfill.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "capture"
+path = "tests/capture.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "compaction"
+path = "tests/compaction.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "derive"
+path = "tests/derive.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "feedback"
+path = "tests/feedback.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "fixtures"
+path = "tests/fixtures.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "index"
+path = "tests/index.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "ingest"
+path = "tests/ingest.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "inject_brief"
+path = "tests/inject_brief.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "inject_compaction"
+path = "tests/inject_compaction.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "inject_prompt"
+path = "tests/inject_prompt.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "label"
+path = "tests/label.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "lineage"
+path = "tests/lineage.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "observe"
+path = "tests/observe.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "parse"
+path = "tests/parse.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "pass"
+path = "tests/pass.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "recall_golden"
+path = "tests/recall_golden.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "recall"
+path = "tests/recall.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "recover"
+path = "tests/recover.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "redacted_recall"
+path = "tests/redacted_recall.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "reindex"
+path = "tests/reindex.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "retention"
+path = "tests/retention.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "snapshot"
+path = "tests/snapshot.rs"
+required-features = ["testkit"]
+
+[[test]]
+name = "verify"
+path = "tests/verify.rs"
+required-features = ["testkit"]
