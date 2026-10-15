@@ -255,15 +255,6 @@ had was mostly not running.
   The archive on disk is never touched in either setting, and `verbatim export`
   stays unfiltered with the notice it already carries.
 
-### Known issues
-
-- With `redact_recall` on, `recall_get` runs its body through a lossy UTF-8
-  round trip, so an archived line that is not valid UTF-8 comes back with
-  U+FFFD replacement characters even when it carries no secret. All 47,157
-  archived records measured on the development corpus are valid UTF-8, so this
-  costs nothing observable there. Tracked as
-  [#1](https://github.com/crenshawdev/verbatim/issues/1).
-
 ## [Verbatim 0.1.0] - 2026-08-23 (local test build, never released)
 
 First release. A single static Rust binary that tails Claude Code's session

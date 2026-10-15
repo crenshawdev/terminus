@@ -49,7 +49,6 @@ It also refuses, under these conditions:
 
 - The tests do not run in CI. The release workflow builds and drafts releases, and no workflow runs the test suite ([#47](https://github.com/crenshawdev/terminus/issues/47)).
 - `[privacy] redact_recall` misses a bare OpenAI-style `sk-` token in plain prose, because none of its rules recognizes that shape, so the token reaches Claude Code unfiltered ([#5](https://github.com/crenshawdev/terminus/issues/5)).
-- With `[privacy] redact_recall` on, `terminus show` runs each archived line through a lossy UTF-8 round trip before it filters it, so a line that is not valid UTF-8 prints changed even when it holds no secret ([#1](https://github.com/crenshawdev/terminus/issues/1)).
 - What the `recall_search`, `recall_context` and `recall_get` tools return is not documented, and the tool table in `DESIGN-BRIEF.md` is out of date ([#26](https://github.com/crenshawdev/terminus/issues/26)).
 
 ## How it works
