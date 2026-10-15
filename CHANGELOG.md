@@ -18,6 +18,11 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `ordinary_decisions`, and the human output prints them under `decisions`.
   Decisions logged before this release are in neither count, so the two can add
   up to less than `decisions`.
+- The test suite runs on GitHub for every push and pull request, on the four
+  runners the release builds on: `ubuntu-24.04`, `ubuntu-24.04-arm`,
+  `macos-15-intel` and `macos-15`. Each job checks that every tool the shell
+  tests need is on PATH before `cargo test --workspace --all-features --locked`
+  starts, and fails naming the one that is missing (#47).
 
 ### Fixed
 
@@ -84,6 +89,11 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   boundary now gets a row at its own place in the session, and the prompt after
   it offers back what fell out (#17). The first ingest after upgrading rebuilds
   the derived tables once, which moves the boundary rows into their new table.
+- A test file gated on the `testkit` feature, run by name without
+  `--features testkit` (`cargo test --test mcp`), compiled to an empty binary,
+  ran no tests and passed. The 27 such files are now declared with
+  `required-features = ["testkit"]`, so cargo refuses to run one named without
+  the feature and says it needs `testkit` (#44).
 
 ## [0.1.1] - 2026-10-15
 
