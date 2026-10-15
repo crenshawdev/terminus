@@ -36,8 +36,8 @@
 //! whose `--version` printed `verbatim 0.1.0`, byte-identical to this build's
 //! output at the time. So identity cannot be a
 //! version string and cannot be a filename. It is [`MARKER`]: a fixed ASCII
-//! sentinel in this binary's image, referenced from [`carries_marker`] so it
-//! survives the release profile's `strip = "debuginfo"`, and looked for in
+//! sentinel in this binary's image, read through a volatile load in
+//! [`carries_marker`] so the optimizer cannot fold it away, and looked for in
 //! whatever file already sits at the stable path. A file that does not carry it
 //! is somebody else's and is refused, not overwritten.
 //!
@@ -62,10 +62,12 @@ pub const BIN_DIR_ENV: &str = "TERMINUS_BIN_DIR";
 
 /// The sentinel that says a file at the stable path is a terminus build.
 ///
-/// A `static` referenced from [`carries_marker`] rather than a `const` folded
-/// into nothing: it has to be *in the image* of every binary this project
-/// ships, including a release build that strips debug info, because the next
-/// install is going to look for it there.
+/// It has to be *in the image* of every binary this project ships, because the
+/// next install looks for it there. Being a `static` does not guarantee that:
+/// 0.1.0's aarch64 builds folded the comparison into instructions and left the
+/// string out, so they refused to install themselves. [`carries_marker`] reads
+/// it through a volatile load, which the compiler may not elide, and the
+/// release workflow checks every build for it.
 ///
 /// The UUID is the whole of the uniqueness argument. Nothing else in a
 /// filesystem is going to carry these 36 bytes by accident, and a program that
@@ -164,7 +166,10 @@ pub fn occupant(path: &Path) -> Result<Occupant, Failure> {
 
 /// Does this file carry [`MARKER`] anywhere in it?
 fn carries_marker(mut file: impl Read) -> std::io::Result<bool> {
-    let needle = MARKER.as_bytes();
+    // SAFETY: the pointer comes from a reference to a static of the type being
+    // read, so it is aligned and initialised.
+    let marker: &str = unsafe { std::ptr::read_volatile(&MARKER) };
+    let needle = marker.as_bytes();
     let overlap = needle.len() - 1;
     let mut buffer = vec![0u8; CHUNK + overlap];
     let mut carried = 0usize;
@@ -375,10 +380,9 @@ fn copy_into(source: &Path, mut file: std::fs::File, temporary: &Path) -> Result
 mod tests {
     use super::*;
 
-    /// The sentinel is in this test binary's own image, which is the property
-    /// every install run depends on: `carries_marker` is asked about a file,
-    /// and the answer is only worth anything if a real terminus build answers
-    /// yes.
+    /// The sentinel is in this test binary's own image. The other tests copy
+    /// its bytes in too, so this passes whatever the scan does and does not
+    /// guard a shipped binary; the release workflow's marker check does.
     #[test]
     fn this_build_carries_its_own_marker() {
         let exe = std::env::current_exe().unwrap();
