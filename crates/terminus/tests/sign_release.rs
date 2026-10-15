@@ -37,6 +37,19 @@ const TAG: &str = "v0.1.0";
 
 const REPO: [&str; 2] = ["--repo", "crenshawdev/terminus"];
 
+/// The call that asks whether the release is still a draft.
+const VIEW: [&str; 9] = [
+    "release",
+    "view",
+    TAG,
+    "--repo",
+    "crenshawdev/terminus",
+    "--json",
+    "isDraft",
+    "--jq",
+    ".isDraft",
+];
+
 /// The shell a test runs the script under.
 #[derive(Clone, Copy)]
 enum Shell {
@@ -205,6 +218,10 @@ fn fixture(shell: Shell) -> Fixture {
     let gh = r#"#!/bin/sh
 printf '%s\n' "$*" >> '@LOG@'
 case $1/$2 in
+    release/view)
+        read -r is_draft < '@IS_DRAFT@'
+        printf '%s\n' "$is_draft"
+        ;;
     release/download)
         dir=
         while [ "$#" -gt 0 ]; do
@@ -224,10 +241,12 @@ case $1/$2 in
 esac
 "#
     .replace("@LOG@", &fx.gh_log().display().to_string())
+    .replace("@IS_DRAFT@", &fx.is_draft().display().to_string())
     .replace("@CP@", &cp.display().to_string())
     .replace("@DRAFT@", &fx.draft.display().to_string())
     .replace("@UPLOADED@", &fx.uploaded.display().to_string());
     write_executable(&fx.fake.join("gh"), &gh);
+    std::fs::write(fx.is_draft(), "true\n").unwrap();
 
     for tool in TOOLS {
         let target = which(tool).unwrap_or_else(|| panic!("{tool} is not on PATH"));
@@ -257,6 +276,17 @@ impl Fixture {
             .take(2)
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// The release as published: the stand-in `gh` answers `false` for
+    /// `isDraft` from now on.
+    fn publish(&self) {
+        std::fs::write(self.is_draft(), "false\n").unwrap();
+    }
+
+    /// What the stand-in `gh` answers for `isDraft`.
+    fn is_draft(&self) -> PathBuf {
+        self.root.join("is-draft")
     }
 
     fn gh_log(&self) -> PathBuf {
@@ -341,11 +371,13 @@ fn a_good_draft_is_signed_and_published(shell: Shell) {
     assert_eq!(ssh.len(), 8, "{ssh:?}");
 
     let gh = fx.gh_calls();
-    assert_eq!(gh.len(), 3, "{gh:?}");
+    assert_eq!(gh.len(), 4, "{gh:?}");
     for call in &gh {
         assert!(call.windows(2).any(|pair| pair == REPO), "{call:?}");
     }
-    assert_eq!(gh[0][..3], ["release", "download", TAG]);
+    assert_eq!(gh[0], VIEW);
+    assert_eq!(gh[1][..3], ["release", "download", TAG]);
+    let gh = &gh[1..];
     assert_eq!(gh[1][..3], ["release", "upload", TAG]);
     let named: Vec<_> = gh[1][3..7]
         .iter()
@@ -415,14 +447,15 @@ fn a_bad_tag_is_refused(shell: Shell) {
 }
 
 /// Run the script on `fx`'s draft and assert it was refused before anything
-/// was signed: non-zero, the draft downloaded and nothing more asked of `gh`,
-/// no `ssh-keygen -Y sign` and nothing uploaded. Returns stderr.
+/// was signed: non-zero, the draft checked and downloaded and nothing more
+/// asked of `gh`, no `ssh-keygen -Y sign` and nothing uploaded. Returns stderr.
 fn assert_refused_before_signing(fx: &Fixture) -> String {
     let output = fx.run(TAG);
     assert!(!output.status.success(), "{}", text(&output));
     let gh = fx.gh_calls();
-    assert_eq!(gh.len(), 1, "{gh:?}");
-    assert_eq!(gh[0][..2], ["release", "download"]);
+    assert_eq!(gh.len(), 2, "{gh:?}");
+    assert_eq!(gh[0], VIEW);
+    assert_eq!(gh[1][..2], ["release", "download"]);
     let ssh = fx.ssh_calls();
     assert!(
         !ssh.iter().any(|call| call[1..3] == ["-Y", "sign"]),
@@ -488,8 +521,9 @@ fn a_signature_the_pinned_key_does_not_verify_is_refused(shell: Shell) {
     fx.use_shipped_install_sh();
     let output = fx.run(TAG);
     let gh = fx.gh_calls();
-    assert_eq!(gh.len(), 1, "{gh:?}");
-    assert_eq!(gh[0][..2], ["release", "download"]);
+    assert_eq!(gh.len(), 2, "{gh:?}");
+    assert_eq!(gh[0], VIEW);
+    assert_eq!(gh[1][..2], ["release", "download"]);
     assert_eq!(std::fs::read_dir(&fx.uploaded).unwrap().count(), 0);
     assert!(!output.status.success(), "{}", text(&output));
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -504,6 +538,26 @@ fn a_signature_the_pinned_key_does_not_verify_is_refused(shell: Shell) {
     assert_eq!(verbs, ["sign", "verify"], "{ssh:?}");
 }
 
+/// A release that is already published is refused before anything is
+/// downloaded, so its signatures are never replaced and it is never marked
+/// latest again.
+fn a_published_release_is_refused(shell: Shell) {
+    let fx = fixture(shell);
+    fx.publish();
+    let output = fx.run(TAG);
+    let gh = fx.gh_calls();
+    assert_eq!(gh, [VIEW], "{gh:?}");
+    assert_eq!(std::fs::read_dir(&fx.uploaded).unwrap().count(), 0);
+    assert!(fx.ssh_calls().is_empty(), "{:?}", fx.ssh_calls());
+    assert!(!output.status.success(), "{}", text(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "terminus: the release {TAG} is not a draft; only a draft is signed and published\n"
+        )
+    );
+}
+
 both_shells!(
     a_good_draft_is_signed_and_published,
     a_bad_tag_is_refused,
@@ -511,6 +565,7 @@ both_shells!(
     a_binary_that_does_not_match_its_manifest_is_refused,
     a_manifest_naming_another_version_is_refused,
     a_signature_the_pinned_key_does_not_verify_is_refused,
+    a_published_release_is_refused,
 );
 
 /// The script reads the pinned key from `install.sh` and keeps no copy of it.

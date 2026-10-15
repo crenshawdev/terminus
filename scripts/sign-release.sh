@@ -1,7 +1,7 @@
 #!/bin/sh
 # Sign and publish a draft release of Terminus, on the owner's machine:
 #   sh scripts/sign-release.sh v<X.Y.Z>
-# It downloads the draft's four binaries and four manifests, checks each binary
+# It refuses a release that is not a draft, downloads the draft's four binaries and four manifests, checks each binary
 # against its manifest, signs each manifest with ~/.ssh/crenshawdev-release and
 # verifies each signature the way install.sh does. Only when all four pass does it
 # upload the .sig files and publish the release as latest.
@@ -56,6 +56,13 @@ key=${line#release_key=\'}
 key=${key%\'}
 case $key in '' | *"'"*) fail "$install_sh: the release_key= line is not release_key='<key>'" ;; esac
 [ "$line" = "release_key='$key'" ] || fail "$install_sh: the release_key= line is not release_key='<key>'"
+
+# Only a draft is signed. On a published release the upload would replace the
+# signatures users already verify against, and the edit would mark it latest.
+is_draft=$(gh release view "$tag" --repo "$repo" --json isDraft --jq .isDraft) ||
+    fail "cannot read the release $tag from $repo"
+[ "$is_draft" = true ] ||
+    fail "the release $tag is not a draft; only a draft is signed and published"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' 0
