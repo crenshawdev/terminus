@@ -142,6 +142,8 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   under `notes` rather than `error`, `status --json` carries `notes` beside
   `error` in `last_run`, and `terminus doctor` no longer reports a problem for a
   pass that only did routine work.
+- The license is now MIT. It was Apache-2.0. `LICENSE` holds the MIT text, and
+  the workspace `Cargo.toml` says `license = "MIT"`, which both crates inherit.
 
 ### Removed
 

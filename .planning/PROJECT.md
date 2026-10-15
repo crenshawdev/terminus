@@ -102,7 +102,7 @@ Merged to `main` and tagged `v0.1.0`.
 - **Performance**: SessionStart synchronous work in single-digit milliseconds; UserPromptSubmit under a hard deadline, fail open; hook cold start under an asserted budget in CI — startup time is the product
 - **Compatibility**: Linux and macOS only. Windows was dropped, as it is across all of the owner's products, and a build for any other system fails at compile time. Path comparison is case-folded on macOS
 - **Privacy**: no telemetry; the Terminus binary opens no network connection, and `install.sh`'s `curl` download is the one network use
-- **Licensing**: Apache-2.0, public OSS — an explicit override of the private-by-default rule, scoped to this project; all dependencies permissive
+- **Licensing**: MIT, public OSS — an explicit override of the private-by-default rule, scoped to this project; all dependencies permissive
 - **Distribution**: there is no npm channel, because the npm package was removed; `install.sh` is the one-command installer, and no release is published yet. `origin` (self-hosted) is the only remote
 - **Testing**: real SQLite temp databases, never mocks; private real-corpus fixture reached via env var, small synthetic set in-repo for CI
 
@@ -130,7 +130,7 @@ Settled in DESIGN-BRIEF.md; outcomes pending until shipped and validated.
 | Retention and exclusion off by default; excluded means never read, on ingest and read paths both | Keep everything; claude-mem honors exclusion on write and ignores it on read | - Pending |
 | Canonical stable binary path; hooks never rewritten | One binary, no version skew, no version-check hook. The npm package that used to deliver the binary was removed | - Pending |
 | No Claude Code plugin in 0.x | Versioned plugin directories are the root cause of claude-mem's path-resolution script; revisit at 1.0 | - Pending |
-| Apache-2.0, public OSS (explicit override of private-by-default) | Nobody installs a closed binary that reads every keystroke; explicit patent grant; AGPL is a documented negative signal here | - Pending |
+| MIT, public OSS (explicit override of private-by-default) | Nobody installs a closed binary that reads every keystroke; AGPL is a documented negative signal here | - Pending |
 | Auto-tuner is a hypothesis, not a plan | Per-user volume may be too low; "referenced downstream" is a weak proxy; gate behind evidence it converges | - Pending |
 | Recommend disabling auto-compact; never change it ourselves | Compaction burns tokens summarizing context already stored losslessly; fresh session + targeted recall beats self-summarization | - Pending |
 | Shared credentials at `~/.config/jcrenshaw/credentials.toml`, namespaced by provider | Cross-product infrastructure; every jcrenshawdev product reads the same keys | - Pending |

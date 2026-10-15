@@ -497,7 +497,7 @@ No mocking SQLite — real temp databases throughout.
 
 - **0.0.1 onward. 1.0 only when the full feature set has landed.** Agile increments.
 - **Store format version is a separate integer** in `meta`. The binary refuses a store whose archive format differs from its own, newer or older, and a derived schema that differs from its own rebuilds the derived tables. A product bump never implies a store rebuild.
-- **Apache-2.0.** Source must be public — nobody installs a closed binary that reads every keystroke of their work. Apache over MIT for the explicit patent grant. AGPL is a documented negative signal in this category and its network clause protects nothing here. All dependencies are permissive (SQLite public domain, rusqlite MIT, zstd BSD, rayon MIT/Apache).
+- **MIT.** Source must be public — nobody installs a closed binary that reads every keystroke of their work. AGPL is a documented negative signal in this category and its network clause protects nothing here. All dependencies are permissive (SQLite public domain, rusqlite MIT, zstd BSD, rayon MIT/Apache).
 - **Public OSS** — an explicit override of the private-by-default rule, scoped to this project.
 - `origin` is the self-hosted repo and the only remote. Publishing elsewhere is handled outside this project.
 - crates.io `terminus` is taken. Skip crates.io; how Terminus is delivered is still open.
