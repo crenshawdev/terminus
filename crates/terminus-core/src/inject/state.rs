@@ -67,6 +67,11 @@ const MAX_NAME: usize = 64;
 /// grow by ten a prompt for as long as a session lasts.
 const MAX_SUPPRESSED: usize = 100;
 
+/// How a write's temporary is named. The drain's sweep matches on these same
+/// two, so a change here changes what it deletes.
+pub(crate) const TEMPORARY_PREFIX: &str = ".inject-";
+pub(crate) const TEMPORARY_SUFFIX: &str = ".tmp";
+
 /// Why a candidate turn was not injected (INJ-04).
 ///
 /// Exactly the three distinctions INJ-04 draws and no more. Entities,
@@ -319,7 +324,9 @@ fn create_temporary(dir: &Path) -> Option<(PathBuf, std::fs::File)> {
 
     let pid = std::process::id();
     for attempt in 0..ATTEMPTS {
-        let path = dir.join(format!(".inject-{pid}-{attempt}.tmp"));
+        let path = dir.join(format!(
+            "{TEMPORARY_PREFIX}{pid}-{attempt}{TEMPORARY_SUFFIX}"
+        ));
         match crate::owner_only::options()
             .write(true)
             .create_new(true)

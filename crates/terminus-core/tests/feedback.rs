@@ -14,7 +14,8 @@
 
 #![cfg(feature = "testkit")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use rusqlite::types::Value;
 use rusqlite::Connection;
@@ -24,7 +25,7 @@ use terminus_core::feedback::stats;
 use terminus_core::ingest::pass::{self, PassOutcome, Summary};
 use terminus_core::inject::decision::{self, Decision};
 use terminus_core::inject::prompt::Thresholds;
-use terminus_core::inject::state::Reason;
+use terminus_core::inject::state::{self, Reason};
 use terminus_core::inject::{prompt, Payload};
 use terminus_core::recall::{search, Query, Request, Scope};
 use terminus_core::store::{schema, Store, DB_FILE_NAME};
@@ -600,6 +601,92 @@ fn a_file_that_is_not_a_record_is_removed_and_named() {
         error.contains(&garbage.display().to_string()),
         "the note does not name the file: {error}"
     );
+}
+
+/// Far enough back that the drain treats a writer's leftover as abandoned.
+const ELEVEN_MINUTES: Duration = Duration::from_secs(11 * 60);
+
+/// Move a file's or a directory's mtime back by `by`.
+fn age(path: &Path, by: Duration) {
+    std::fs::File::open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - by)
+        .unwrap();
+}
+
+/// The `error` of the last `runs` row.
+fn last_error(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT error FROM runs ORDER BY id DESC LIMIT 1", [], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+/// #38: a pass deletes the writers' own `.tmp` files once they are old, and
+/// nothing else in either directory, and says nothing about it.
+///
+/// `decisions/` holds no `.json` here, so this is also the drain that finds no
+/// record and used to return before doing anything.
+#[test]
+fn a_pass_sweeps_the_writers_old_temporaries_and_nothing_else() {
+    let bench = bench();
+    let outside = bench._dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let mut swept = Vec::new();
+    let mut kept = Vec::new();
+    for (dir, writer) in [
+        (decision::DIR_NAME, "decision"),
+        (state::DIR_NAME, "inject"),
+    ] {
+        let dir = bench.data_dir.join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let abandoned = dir.join(format!(".{writer}-4242-0.tmp"));
+        std::fs::write(&abandoned, b"{\"prompt\": \"cut off").unwrap();
+        age(&abandoned, ELEVEN_MINUTES);
+        swept.push(abandoned);
+
+        let writing = dir.join(format!(".{writer}-4242-1.tmp"));
+        std::fs::write(&writing, b"{").unwrap();
+
+        // Old enough to go if the sweep followed the link.
+        let target = outside.join(format!("{writer}-target"));
+        std::fs::write(&target, b"not ours").unwrap();
+        age(&target, ELEVEN_MINUTES);
+        let link = dir.join(format!(".{writer}-4242-2.tmp"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let directory = dir.join(format!(".{writer}-4242-3.tmp"));
+        std::fs::create_dir(&directory).unwrap();
+        age(&directory, ELEVEN_MINUTES);
+
+        let other = dir.join(format!("{writer}-4242-0.tmp"));
+        std::fs::write(&other, b"not ours either").unwrap();
+        age(&other, ELEVEN_MINUTES);
+
+        kept.extend([writing, target, link, directory, other]);
+    }
+    assert!(bench.files().is_empty(), "the premise: no record on disk");
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 0, "{summary:?}");
+    assert!(summary.feedback.discarded.is_empty(), "{summary:?}");
+    for path in &swept {
+        assert!(
+            std::fs::symlink_metadata(path).is_err(),
+            "{} was not swept",
+            path.display()
+        );
+    }
+    for path in &kept {
+        assert!(
+            std::fs::symlink_metadata(path).is_ok(),
+            "{} was swept",
+            path.display()
+        );
+    }
+    assert_eq!(last_error(&bench.conn()), None);
 }
 
 /// The `compacted` flag and the dropped turns of each record, read off its

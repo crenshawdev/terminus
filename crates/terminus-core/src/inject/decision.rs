@@ -68,6 +68,11 @@ const MAX_NAME: usize = 64;
 /// that, something is wrong with the directory rather than with the name.
 const ATTEMPTS: u32 = 64;
 
+/// How a write's temporary is named. The drain's sweep matches on these same
+/// two, so a change here changes what it deletes.
+pub(crate) const TEMPORARY_PREFIX: &str = ".decision-";
+pub(crate) const TEMPORARY_SUFFIX: &str = ".tmp";
+
 /// One turn the index offered, with everything the threshold judged it on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Candidate {
@@ -357,7 +362,9 @@ fn file_stem(session_id: &str) -> Option<String> {
 fn create_temporary(dir: &Path) -> Option<(PathBuf, std::fs::File)> {
     let pid = std::process::id();
     for attempt in 0..ATTEMPTS {
-        let path = dir.join(format!(".decision-{pid}-{attempt}.tmp"));
+        let path = dir.join(format!(
+            "{TEMPORARY_PREFIX}{pid}-{attempt}{TEMPORARY_SUFFIX}"
+        ));
         match crate::owner_only::options()
             .write(true)
             .create_new(true)

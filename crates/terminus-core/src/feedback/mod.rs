@@ -25,11 +25,23 @@ pub mod replay;
 pub mod stats;
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::inject::decision::{self, Decision};
+use crate::inject::state;
+
+/// How old a writer's `.tmp` has to be before the drain deletes it.
+///
+/// A hook process lives for its `DRAIN_DEADLINE` (500 ms) and `INJECT_DEADLINE`
+/// (50 ms), both in `crates/terminus/src/cmd/hook.rs`, plus its startup. Ten
+/// minutes is over a thousand times that, so no hook still writing owns a file
+/// this old, and it is short enough that an abandoned copy of a prompt is gone
+/// by the first pass after ten minutes. It lives here and not beside the
+/// deadlines because the drain is in this crate and they are in the binary.
+const ABANDONED_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// What one drain did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -132,7 +144,11 @@ pub fn outcomes(conn: &mut Connection) -> Labeled {
 /// build can read and never will be (there is no migration - see
 /// [`crate::inject::decision`]), so leaving it would mean re-reading it on every
 /// pass forever.
+///
+/// Every drain first sweeps the writers' abandoned `.tmp` files (see
+/// [`sweep`]), including one that finds no record or whose insert fails.
 pub fn drain(conn: &mut Connection, data_dir: &Path) -> Result<Drained> {
+    sweep(data_dir);
     let found = decision::read_all(data_dir);
     if found.is_empty() {
         return Ok(Drained::default());
@@ -170,6 +186,58 @@ pub fn drain(conn: &mut Connection, data_dir: &Path) -> Result<Drained> {
         }
     }
     Ok(drained)
+}
+
+/// Delete the writers' temporaries once they are older than
+/// [`ABANDONED_AFTER`].
+///
+/// A decision or state write cut off at the hook's deadline leaves its `.tmp`
+/// behind, and a decision's holds the whole prompt. Only names the writers make
+/// are candidates, and only regular files: `symlink_metadata`, so a symlink with
+/// such a name is left alone rather than judged by its target. This is
+/// housekeeping, so nothing it deletes or fails to delete is reported.
+fn sweep(data_dir: &Path) {
+    let writers = [
+        (
+            decision::DIR_NAME,
+            decision::TEMPORARY_PREFIX,
+            decision::TEMPORARY_SUFFIX,
+        ),
+        (
+            state::DIR_NAME,
+            state::TEMPORARY_PREFIX,
+            state::TEMPORARY_SUFFIX,
+        ),
+    ];
+    for (dir, prefix, suffix) in writers {
+        let Ok(entries) = std::fs::read_dir(data_dir.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !(name.starts_with(prefix) && name.ends_with(suffix)) {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_file() && older(meta.modified().ok()) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// Whether `modified` is further back than [`ABANDONED_AFTER`]. An mtime that
+/// could not be read, or is in the future, is not.
+fn older(modified: Option<SystemTime>) -> bool {
+    modified
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age > ABANDONED_AFTER)
 }
 
 /// One record, as a row.

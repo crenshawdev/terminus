@@ -63,6 +63,10 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   replay scores a compacted decision through the compacted window and its own
   dropped turns, so `--compacted-ranked` moves it. Decisions logged before this
   release carry neither and replay as ordinary ones.
+- A decision or injection-state write cut off at the hook's deadline left a
+  `.tmp` file in `decisions/` or `injection/` that nothing deleted, and the
+  decision ones held the whole prompt. The ingest now deletes those files once
+  they are older than ten minutes (#38).
 
 ## [0.1.1] - 2026-10-15
 
