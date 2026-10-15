@@ -54,8 +54,12 @@ pub struct TurnRow<'a> {
 
 impl TurnRow<'_> {
     /// D-21: is this turn the record a compaction left behind?
+    ///
+    /// The type is checked as well as the subtype, because the parser reads
+    /// `subtype` off any record that carries one. The same rule as
+    /// [`crate::parse::Record::is_compact_boundary`].
     fn is_compact_boundary(&self) -> bool {
-        self.subtype == Some(crate::parse::COMPACT_BOUNDARY)
+        self.turn.record_type == "system" && self.subtype == Some(crate::parse::COMPACT_BOUNDARY)
     }
 }
 

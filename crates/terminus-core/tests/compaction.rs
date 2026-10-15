@@ -325,6 +325,47 @@ fn no_ordinary_turn_gets_a_boundary_row() {
     );
 }
 
+/// The boundary line retyped, with a fresh `uuid` so it is a new turn.
+fn retyped_boundary(record_type: &str, uuid: &str) -> Vec<u8> {
+    let mut record: serde_json::Value = serde_json::from_slice(&testkit::boundary_line()).unwrap();
+    record["type"] = record_type.into();
+    record["uuid"] = uuid.into();
+    serde_json::to_vec(&record).unwrap()
+}
+
+/// #17: `subtype` is read off any record, so only a `system` record carrying
+/// `compact_boundary` is a boundary. The others are still archived as turns.
+#[test]
+fn a_boundary_subtype_on_a_record_that_is_not_system_gets_no_row() {
+    let bench = bench(BIG_FIXTURE);
+    let conn = bench.conn();
+    let turns_before = turn_rows(&conn).len();
+
+    let types = ["user", "assistant", "attachment"];
+    for (n, record_type) in types.iter().enumerate() {
+        bench.append_line(&retyped_boundary(
+            record_type,
+            &format!("00000000-0000-4000-8000-00000000017{n}"),
+        ));
+    }
+    match bench.ingest() {
+        ingest::Outcome::Committed(_) => {}
+        other => panic!("the appended records must commit: {other:?}"),
+    }
+
+    assert!(
+        boundaries(&conn).is_empty(),
+        "a non-system record got a boundary row"
+    );
+    let turns_after = turn_rows(&conn);
+    assert_eq!(turns_after.len(), turns_before + types.len());
+    let appended: Vec<&str> = turns_after[turns_before..]
+        .iter()
+        .map(|row| row.2.as_str())
+        .collect();
+    assert_eq!(appended, types);
+}
+
 /// The whole fixture, ingested in one pass rather than appended: the boundary
 /// lands on the same turn with the same bytes either way. A boundary that only
 /// appeared on the append path would leave every backfilled session without one.
