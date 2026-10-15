@@ -7,6 +7,7 @@ files:
   - docs/configuration.md
   - docs/commands.md
   - docs/install.md
+  - docs/json-shapes.md
 ---
 
 # Phase 9: README and User Docs - Plan 2

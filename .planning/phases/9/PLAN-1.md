@@ -10,6 +10,7 @@ files:
   - CHANGELOG.md
   - TRUST.md
   - SECURITY.md
+  - .planning/phases/9/BRIEF.md
 ---
 
 # Phase 9: README and User Docs - Plan 1

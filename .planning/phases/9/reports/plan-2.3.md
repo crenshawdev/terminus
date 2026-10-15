@@ -1,0 +1,10 @@
+PLAN CHECKPOINT: human-verify
+Plan: .planning/phases/9/PLAN-2.md
+Tasks: 3 of 4
+| Task | Commit | Note |
+|---|---|---|
+| 1 - Write the release page | 939d53a | docs/release.md written. Verify: key grep 2, title trust grep 0, copied ssh-keygen -Y verify exits 0 on a throwaway-key manifest and 255 after one byte changed, sha256sum and shasum -a 256 lines present, protected/unprotected terms found, status grep empty, all 6 relative links resolve. clippy and cargo check clean. Owner reviewed it in RustRover and accepted it (D-16). |
+| 2 - Write the configuration page | e3862df | docs/configuration.md written from config.rs, inject/brief.rs, inject/prompt.rs, retention/, ingest/pass.rs, capture.rs, observe/egress.rs, store/open.rs, install/targets.rs and doctor.rs. Verify: all 20 term greps succeed; 6000, 4000 and 10,000 lines found; TERMINUS_ list is exactly BIN_DIR, CONFIG_DIR, DATA_DIR; all 8 path/setting terms found; the one relative link (release.md#what-installsh-checks) resolves; status grep empty. clippy and cargo check clean. Commit signed (G). Owner reviewed it in RustRover and accepted it, including the four additions (D-16). |
+| 3 - Write the commands page | 9f61d13 | docs/commands.md written from main.rs USAGE and each command's parse function (ingest, backfill, hook, search, show, sessions, observations, replay, retention, export, data, install, uninstall, mcp/mod.rs, json_flag in cmd/mod.rs), with behavior read from each run function, recall/search.rs, recall/query.rs, recall/context.rs, mcp/tools.rs, inject/prompt.rs (Thresholds), feedback/finalize.rs (IDLE_HOURS) and ingest/pass.rs. Verify: all 21 long options plus --json found, -V/-h/-y found with -w, --work count 0, all 22 "terminus <command>" greps succeed, 4 events and 3 MCP tools found, json-shapes.md link found, both relative link targets (configuration.md, json-shapes.md) resolve, status grep and other-tool grep empty. clippy and cargo check clean. Commit signed (G). Awaiting the owner's RustRover review (D-16). |
+Deviations: none
+Open items: none
