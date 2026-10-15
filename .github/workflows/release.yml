@@ -109,6 +109,22 @@ jobs:
             fi
           fi
 
+      # 0.1.0's aarch64 binaries shipped without the marker and refused to
+      # install themselves. The marker comes from install.sh, so there is no
+      # third copy, and an empty read fails rather than matching everything.
+      - name: Check the marker
+        run: |
+          set -euo pipefail
+          marker="$(sed -n "s/^marker='\(.*\)'\$/\1/p" install.sh)"
+          if [ -z "$marker" ]; then
+            echo "::error::no marker= line in install.sh"
+            exit 1
+          fi
+          if ! grep -q -F -e "$marker" "target/$TARGET/release/terminus"; then
+            echo "::error::$ASSET does not carry the marker install looks for"
+            exit 1
+          fi
+
       # install.sh reads exactly these two lines, with only the hash on the
       # second, not the file name sha256sum prints after it.
       - name: Write the manifest

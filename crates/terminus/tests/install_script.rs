@@ -1204,6 +1204,36 @@ fn a_dangling_link_into_the_versions_folder_is_replaced(shell: Shell) {
     fx.assert_linked("2.0.0", &bytes);
 }
 
+/// A link into the versions folder is the script's own layout, so it is
+/// replaced even when its file lacks the marker, as 0.1.0's aarch64 builds do.
+fn a_link_to_an_unmarked_version_is_replaced(shell: Shell) {
+    let fx = fixture(shell);
+    let old = fx.version_file("1.0.0");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::create_dir_all(fx.stable().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&old, fx.stable()).unwrap();
+
+    let bytes = fx.serve("2.0.0", "b");
+    let output = fx.run();
+    assert!(output.status.success(), "{}", text(&output));
+    fx.assert_linked("2.0.0", &bytes);
+    assert_eq!(std::fs::read(&old).unwrap(), b"#!/bin/sh\nexit 0\n");
+}
+
+/// A link outside the versions folder still needs the marker.
+fn a_link_outside_the_versions_folder_to_an_unmarked_file_is_refused(shell: Shell) {
+    let fx = fixture(shell);
+    let elsewhere = fx.root.join("elsewhere/terminus");
+    std::fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+    std::fs::write(&elsewhere, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::create_dir_all(fx.stable().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, fx.stable()).unwrap();
+    fx.serve("1.0.0", "");
+    fx.assert_refused(fx.command(&[fx.server.url()]));
+    assert_eq!(std::fs::read_link(fx.stable()).unwrap(), elsewhere);
+}
+
 both_shells!(
     one_run_installs_and_wires_claude_code,
     no_claude_exits_non_zero_after_the_link_is_placed,
@@ -1232,6 +1262,8 @@ both_shells!(
     a_rebuild_at_the_same_version_replaces_its_file,
     a_marked_plain_file_is_replaced_by_the_link,
     a_dangling_link_into_the_versions_folder_is_replaced,
+    a_link_to_an_unmarked_version_is_replaced,
+    a_link_outside_the_versions_folder_to_an_unmarked_file_is_refused,
 );
 
 /// `install.sh` holds the pinned line once, as the `release_key` literal, so
