@@ -13,8 +13,10 @@ The archive is the product, so it is built first and everything else is built on
 - [x] **Phase 5: Install from GitHub Releases** - `install.sh` downloads from the GitHub releases by default, so the whole install is one curl line piped into `sh`
 - [x] **Phase 6: Signed Install** - `install.sh` verifies each release's signature against a pinned key before it reads the manifest
 - [x] **Phase 7: Blocks as rows** - each session's archive is stored as numbered blocks, one row each, so an append writes only the tail block
-- [ ] **Phase 8: Release Builds** - a tagged version builds four platforms in CI, and the owner signs and publishes the release on his own machine
-- [ ] **Phase 9: README** - a README at the repo root for someone who has never heard of Terminus
+- [ ] **Phase 8: Release Builds** - the release machinery: a tag builds four platforms in CI into a draft, and the owner's script signs and publishes it
+- [ ] **Phase 9: README and User Docs** - a README, user docs and a trust page for someone who has never heard of Terminus, leading with the signed release
+- [ ] **Phase 10: Publish 0.1.0** - phases 1 to 9 land on `main`, `v0.1.0` is tagged, signed and published, and it installs on every platform
+- [ ] **Phase 11: How Terminus Works** - design docs with diagrams of the system as it stands, in the shape of Baley's `docs/design/`
 
 ## Phase Details
 
@@ -98,22 +100,45 @@ The archive is the product, so it is built first and everything else is built on
 4. A clean install on the owner's machine ingests every session still on disk, and `terminus verify` then reports no mismatch.
 
 ### Phase 8: Release Builds
-**Goal:** A tagged version produces a GitHub release that Phase 6's `install.sh` accepts. A GitHub Actions workflow builds `terminus-<os>-<arch>` for Linux and macOS on x86_64 and aarch64, writes each manifest, and attaches both to a draft release. CI never holds the key. A script on the owner's machine downloads the four manifests, signs each with `ssh-keygen -Y sign -n terminus-release`, uploads the `.sig` files and publishes the release.
+**Goal:** The machinery that produces a GitHub release Phase 6's `install.sh` accepts. A GitHub Actions workflow builds `terminus-<os>-<arch>` for Linux and macOS on x86_64 and aarch64, writes each manifest, and attaches both to a draft release. CI never holds the key. A script on the owner's machine downloads the four manifests, signs each with `ssh-keygen -Y sign -n terminus-release`, uploads the `.sig` files and publishes the release. The Linux binaries are static musl builds with mimalloc. Running it for real is Phase 10, after the README.
 **Depends on:** Phase 7
 **Requirements:** REL-01
 **Success Criteria:**
-1. Pushing a version tag builds all four platforms and leaves a draft release holding each binary and its manifest, at the workspace `Cargo.toml` version.
-2. The signing script publishes only when all four signatures verify against the pinned key.
+1. The release workflow builds the four platforms on a `v<X.Y.Z>` tag and makes one draft only when all four pass at the tag's version, and the check workflow installs a published release on the four runners.
+2. The signing script publishes only when all four signatures verify against the pinned key, and refuses a release that is not a draft.
 3. No workflow names a key or a signing secret.
-4. After publishing, a workflow run on each of the four runners installs the release with the one curl line and runs `terminus --version`. This is the first time Terminus runs on macOS.
+4. The musl build is static, uses mimalloc, and keeps every hook event under its 10 ms p99 wall on the owner's corpus.
 
-### Phase 9: README
-**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, and what it refuses to do. Last, because it describes the installer from Phases 4 to 6, the release from Phase 8 and the platform support from Phase 2. The owner's README brief is in `.planning/phases/9/BRIEF.md`, word for word, and its differences from DOC-01 are settled at context.
+### Phase 9: README and User Docs
+**Goal:** The repository is public and has no README at its root. The only user-facing one is `npm/terminus/README.md`, which Phase 2 deletes; git keeps it to draw from. Write `README.md` for someone who has never heard of Terminus: the reader's problem and what Terminus does about it first, then how it works, how to install it, every command and setting, and what it refuses to do. The README leans into the security and the signed release. Beside it, user docs cover installing, every command and every setting in full, and a trust page explains how a release is built and signed, what `install.sh` checks before it installs anything, and how to verify a release by hand. It lands before the release (Phase 10), and describes the installer from Phases 4 to 6, the release machinery from Phase 8 and the platform support from Phase 2. The owner's README brief is in `.planning/phases/9/BRIEF.md`, word for word, and its differences from DOC-01 are settled at context. The owner reviews each file in RustRover before it stands.
 **Depends on:** Phase 8
-**Requirements:** DOC-01
+**Requirements:** DOC-01, DOC-02, DOC-03
 **Success Criteria:**
 1. The README opens on the reader's problem and what Terminus does about it, before any mechanism.
-2. The install section is the one installer command, says it checks the release's signature, and that rerunning it is how Terminus updates, plus how to install a local build, and says Linux and macOS only.
-3. Every command is listed with one line on what it does, and every `terminus.toml` setting with its key and default.
-4. It states what Terminus refuses to do: no daemon, no telemetry, no model calls, no API keys and no network use at all.
-5. `/cad-docs-verify` reports no stale claim: every command, path and key the README names matches the code.
+2. The README makes the security model prominent: every release is signed on the owner's machine and never in CI, `install.sh` checks the signature against a pinned key before it installs anything, and the binary opens no network connection.
+3. The install section is the one installer command, says it checks the release's signature, and that rerunning it is how Terminus updates, plus how to install a local build, and says Linux and macOS only.
+4. Every command is listed with one line on what it does, and every `terminus.toml` setting with its key and default; the user docs cover each in full.
+5. It states what Terminus refuses to do: no daemon, no telemetry, no model calls, no API keys and no network use at all.
+6. The trust page shows how to check a downloaded release by hand with `ssh-keygen -Y verify` against the pinned key.
+7. `/cad-docs-verify` reports no stale claim: every command, path and key the README and the user docs name matches the code.
+
+### Phase 10: Publish 0.1.0
+**Goal:** Terminus 0.1.0 is published. Phases 1 to 9 land on `main`, `v0.1.0` is tagged there, the release workflow from Phase 8 makes the draft, and the owner signs and publishes it with the signing script. The check installs it on all four runners, the owner removes his local install entirely and installs the release from nothing, and then the docs stop saying no release is published. A published release cannot be taken back, so every step before publishing stays reversible. Moved out of Phase 8 so the README is in place before anyone can install.
+**Depends on:** Phase 9
+**Requirements:** REL-02
+**Success Criteria:**
+1. Pushing `v0.1.0` on `main` builds all four platforms and leaves a draft release holding each binary and its manifest, at the workspace `Cargo.toml` version; the Linux binaries are static and the macOS binaries link only `/usr/lib/` libraries.
+2. After the owner runs the signing script, the release is published as latest with twelve files: four binaries, four manifests and four signatures.
+3. After publishing, a workflow run on each of the four runners installs the release with the one curl line and runs `terminus --version`. This is the first time Terminus runs on macOS.
+4. On the owner's machine, a fresh install after `terminus uninstall --purge` installs 0.1.0, registers the MCP server, and rebuilds the archive with `terminus verify` clean.
+5. None of the README, `install.sh`, `DESIGN-BRIEF.md`, `CHANGELOG.md` or `.planning/PROJECT.md` says no release is published, and the CHANGELOG has a 0.1.0 section.
+
+### Phase 11: How Terminus Works
+**Goal:** How Terminus works, with pictures, for an engineer who wants to see inside it. Design docs in the shape of Baley's `docs/design/`: an overview first, with one diagram of the whole system from the hook to ingest to the archive to search to recall, then one doc per part, each describing the system as it stands now and never as a log of changes. Diagrams are Mermaid in Markdown, so GitHub renders them with no other tool. The owner reviews each file in RustRover before it stands.
+**Depends on:** Phase 10
+**Requirements:** DOC-04
+**Success Criteria:**
+1. An overview doc opens with one diagram of the whole system, and links to a doc for each part.
+2. Each part has its own doc with at least one diagram: the hooks, ingest, the archive and its block rows, search, recall through the MCP server, injection, and install and release.
+3. Every diagram is Mermaid in Markdown, renders on GitHub, and stays readable in GitHub's dark theme.
+4. `/cad-docs-verify` reports no stale claim: every path, command, table and key the docs name matches the code.

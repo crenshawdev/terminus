@@ -34,11 +34,15 @@ under `## Shipped` as written, because they record what shipped then.
 
 ### Release (REL)
 
-- **REL-01**: A tagged version produces a published GitHub release on crenshawdev/terminus that holds, for Linux and macOS on x86_64 and aarch64, `terminus-<os>-<arch>`, its manifest and the manifest's signature. CI builds, the owner signs on his own machine, and no workflow holds the key.
+- **REL-01**: A pushed `v<X.Y.Z>` tag builds, in CI, `terminus-<os>-<arch>` and its manifest for Linux and macOS on x86_64 and aarch64 into one draft GitHub release on crenshawdev/terminus, and a script on the owner's machine signs each manifest, verifies each signature against the key pinned in `install.sh`, and publishes the draft. CI builds, the owner signs on his own machine, and no workflow holds the key.
+- **REL-02**: Terminus 0.1.0 is published as the latest GitHub release on crenshawdev/terminus, holding for Linux and macOS on x86_64 and aarch64 `terminus-<os>-<arch>`, its manifest and the manifest's signature, and the one-line install puts it on each of the four platforms and on the owner's machine from nothing.
 
 ### Docs (DOC)
 
 - **DOC-01**: The repository has a `README.md` at its root, written for someone who has never heard of Terminus. It opens on the reader's problem and what Terminus does about it, gives the one-command install and how to install a local build, says Linux and macOS only, lists every command and every `terminus.toml` setting with its key and default, states what Terminus refuses to do (no model calls, no API keys, no network use at all), and names no command, path or key the code does not have.
+- **DOC-02**: User docs beside the README cover installing (the one-line install, a local build, updating by rerunning `install.sh`, and uninstalling), every command with its options, and every `terminus.toml` setting with its key, default and effect, and name no command, option, path or key the code does not have.
+- **DOC-03**: A trust page explains how a release is built in CI and signed on the owner's machine, what `install.sh` checks before it installs anything, which key it pins, what the binary never does (no network connection, no model call, no API key), and how to verify a downloaded release by hand with `ssh-keygen -Y verify`.
+- **DOC-04**: Design docs explain how Terminus works as it stands, for an engineer: an overview with one diagram of the whole system, then one doc per part (hooks, ingest, the archive and its block rows, search, recall through the MCP server, injection, install and release), each with at least one Mermaid diagram that GitHub renders.
 
 ## Shipped
 
@@ -169,6 +173,7 @@ Explicit exclusions. The reason prevents scope creep later.
 | STOR-10 | Phase 7 | Complete |
 | STOR-09 | Phase 7 | Complete |
 | REL-01 | Phase 8 | Pending |
+| REL-02 | Phase 10 | Pending |
 
 Bare headers — `/cad-plan` seeds a row per requirement when its phase is planned.
 
