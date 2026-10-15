@@ -1,0 +1,52 @@
+name: release-check
+
+# Installs a published release with the public one-line command on every
+# platform it ships for. The owner's own gh login publishes the release, which
+# is what starts this: a release published with a workflow's token starts no
+# other workflow.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    # No checkout: the command under test fetches install.sh from main itself.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+    runs-on: ${{ matrix.runner }}
+    # Named outright, so the step runs with pipefail and a failed curl in
+    # `curl | sh` fails it. A step with no shell set runs without pipefail.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # terminus install exits non-zero when it cannot register the MCP server
+      # through claude, and these runners have no Claude Code.
+      - name: Put a stand-in claude on PATH
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/stand-in"
+          mkdir -p "$dir"
+          printf '#!/bin/sh\nexit 0\n' > "$dir/claude"
+          chmod +x "$dir/claude"
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Install with the one-line command
+        run: curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh
+
+      - name: Check the installed version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          installed="$("$HOME/.local/bin/terminus" --version)"
+          released="${TAG#v}"
+          if [ "$installed" != "$released" ]; then
+            echo "::error::installed terminus reports $installed but the release is $released"
+            exit 1
+          fi
