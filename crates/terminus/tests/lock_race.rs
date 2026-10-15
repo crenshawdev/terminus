@@ -105,10 +105,17 @@ fn a_contended_ingest_exits_zero_fast_and_writes_nothing() {
     );
 }
 
-/// The lock dies with the process holding it, which is why it is an OS lock and
-/// not a PID file (`DESIGN-BRIEF.md:135`): a killed ingest leaves no wedge.
+/// A second attempt fails at once while the guard is held, and the lock is free
+/// again once the guard is dropped. This covers the drop inside one process and
+/// kills nothing.
+///
+/// The lock is an OS lock and not a PID file because it dies with the process
+/// holding it, so a killed ingest leaves no wedge (`DESIGN-BRIEF.md:135`). Real
+/// ingest processes are killed, and the next ingest still runs, in
+/// `killing_ingest_anywhere_leaves_a_store_that_converges` in
+/// `crates/terminus/tests/crash.rs`.
 #[test]
-fn the_lock_is_released_by_process_death() {
+fn a_held_lock_refuses_a_second_attempt_and_frees_when_dropped() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
 
