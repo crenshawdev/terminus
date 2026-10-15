@@ -23,7 +23,7 @@ pub mod json_file;
 pub mod targets;
 
 use std::io::{BufRead, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use terminus_core::Config;
 
@@ -438,7 +438,14 @@ fn outcome(wrote: bool, yes: &str, no: &str) -> String {
 }
 
 fn current_exe_display() -> String {
-    match std::env::current_exe() {
+    resolved_display(std::env::current_exe())
+}
+
+/// On macOS `current_exe` is the path the program was started by, so run as
+/// `~/.local/bin/terminus` it is the link, and a command naming it would
+/// delete the link and then run it. Resolved, it names this build's file.
+fn resolved_display(exe: std::io::Result<PathBuf>) -> String {
+    match exe.and_then(std::fs::canonicalize) {
         Ok(path) => path.display().to_string(),
         Err(_) => "this build".to_owned(),
     }
@@ -501,4 +508,24 @@ pub(super) fn occupied(stable: &Path) -> Failure {
         stable.display(),
         current_exe_display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Handed the link, as macOS's `current_exe` hands it over, the refusal
+    /// names the file behind it, so its `rm -f` never removes what it runs.
+    #[test]
+    fn the_refusal_names_the_file_behind_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("terminus");
+        std::fs::write(&file, b"").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+
+        let shown = resolved_display(Ok(link));
+
+        assert_eq!(shown, file.canonicalize().unwrap().display().to_string());
+    }
 }
