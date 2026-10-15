@@ -409,7 +409,79 @@ fn a_bad_tag_is_refused(shell: Shell) {
     assert!(fx.ssh_calls().is_empty(), "{:?}", fx.ssh_calls());
 }
 
-both_shells!(a_good_draft_is_signed_and_published, a_bad_tag_is_refused);
+/// Run the script on `fx`'s draft and assert it was refused before anything
+/// was signed: non-zero, the draft downloaded and nothing more asked of `gh`,
+/// no `ssh-keygen -Y sign` and nothing uploaded. Returns stderr.
+fn assert_refused_before_signing(fx: &Fixture) -> String {
+    let output = fx.run(TAG);
+    assert!(!output.status.success(), "{}", text(&output));
+    let gh = fx.gh_calls();
+    assert_eq!(gh.len(), 1, "{gh:?}");
+    assert_eq!(gh[0][..2], ["release", "download"]);
+    let ssh = fx.ssh_calls();
+    assert!(
+        !ssh.iter().any(|call| call[1..3] == ["-Y", "sign"]),
+        "{ssh:?}"
+    );
+    assert_eq!(std::fs::read_dir(&fx.uploaded).unwrap().count(), 0);
+    String::from_utf8(output.stderr).unwrap()
+}
+
+/// A draft missing any one of its eight files is refused, naming the file.
+fn a_draft_missing_a_file_is_refused(shell: Shell) {
+    for platform in PLATFORMS {
+        for name in [
+            format!("terminus-{platform}"),
+            format!("terminus-{platform}.manifest"),
+        ] {
+            let fx = fixture(shell);
+            std::fs::remove_file(fx.draft.join(&name)).unwrap();
+            let stderr = assert_refused_before_signing(&fx);
+            assert_eq!(stderr, format!("terminus: the draft {TAG} has no {name}\n"));
+        }
+    }
+}
+
+/// A binary that is not the one its manifest names is refused before any
+/// passphrase is asked for.
+fn a_binary_that_does_not_match_its_manifest_is_refused(shell: Shell) {
+    let fx = fixture(shell);
+    let binary = fx.draft.join("terminus-linux-aarch64");
+    let mut bytes = std::fs::read(&binary).unwrap();
+    bytes.extend_from_slice(b"appended");
+    std::fs::write(&binary, bytes).unwrap();
+    let stderr = assert_refused_before_signing(&fx);
+    assert!(
+        stderr.starts_with("terminus: terminus-linux-aarch64: SHA-256 mismatch"),
+        "{stderr}"
+    );
+}
+
+/// A manifest `install.sh` would read as another version is never signed.
+fn a_manifest_naming_another_version_is_refused(shell: Shell) {
+    let fx = fixture(shell);
+    let binary = fx.draft.join("terminus-macos-x86_64");
+    std::fs::write(
+        fx.draft.join("terminus-macos-x86_64.manifest"),
+        format!("version 0.2.0\nsha256 {}\n", sha256(&binary)),
+    )
+    .unwrap();
+    let stderr = assert_refused_before_signing(&fx);
+    assert!(
+        stderr.starts_with(
+            "terminus: terminus-macos-x86_64.manifest: not exactly the lines version 0.1.0"
+        ),
+        "{stderr}"
+    );
+}
+
+both_shells!(
+    a_good_draft_is_signed_and_published,
+    a_bad_tag_is_refused,
+    a_draft_missing_a_file_is_refused,
+    a_binary_that_does_not_match_its_manifest_is_refused,
+    a_manifest_naming_another_version_is_refused,
+);
 
 /// The script reads the pinned key from `install.sh` and keeps no copy of it.
 #[test]
