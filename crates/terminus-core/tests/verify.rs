@@ -433,6 +433,44 @@ fn an_evicted_session_can_still_report_a_divergence() {
     assert!(!text.contains("checksum"), "{text}");
 }
 
+/// Eviction promises the session has no block rows left. A session marked
+/// evicted whose rows are still there broke that promise, so it is one failure
+/// for the whole session, saying how many rows remain, and never one per block.
+///
+/// Marked with a direct UPDATE because `testkit::evict` would clear the rows,
+/// and the rows staying behind is the state under test.
+#[test]
+fn an_evicted_session_that_still_has_block_rows_is_one_failure() {
+    let bench = big_bench();
+    let marked = bench.keys[3].clone();
+    let rows = testkit::block_count(&bench.conn(), &marked);
+    let changed = bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET is_evicted = 1 WHERE session_key = ?1",
+            [&marked],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "no session_meta row for {marked}");
+
+    let report = verify::verify(&bench.store()).unwrap();
+    assert_eq!(report.checked, 4);
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    let failure = &report.failures[0];
+    assert_eq!(failure.session_key, marked);
+    assert_eq!(failure.block, None);
+    assert!(
+        failure.detail.contains(&format!("{rows} block row(s)")),
+        "the detail must carry the {rows} rows that remain: {}",
+        failure.detail
+    );
+
+    let text = report.render();
+    for other in others(&bench.keys, &[&marked]) {
+        assert!(!text.contains(other.as_str()), "named {other}: {text}");
+    }
+}
+
 /// AC3, a changed byte: one middle block's compressed bytes are altered and
 /// its hash is not, so that block fails its own check and the session checksum
 /// over the untouched hashes still holds.
