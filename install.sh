@@ -91,20 +91,25 @@ verify_download() {
         fail "download SHA-256 is $actual, but the manifest names $sha256"
 }
 
+in_versions_folder() {
+    target=$(readlink "$stable") || fail "$stable: cannot read symbolic link"
+    rest=${target#"$versions/"}
+    folder=${rest%%/*}
+    file=${rest#*/}
+    [ "$rest" != "$target" ] && [ "$file" = terminus ] && valid_version "$folder"
+}
+
 # Whatever carries the marker is a terminus build and may be replaced, as
-# terminus install decides it. A link to nothing is replaced only when it points
-# into the versions folder, which is what is left after that folder is deleted.
+# terminus install decides it. A link to $versions/<version>/terminus is this
+# script's own layout and is replaced without that check, whether or not its
+# file is still there: 0.1.0's aarch64 builds lack the marker.
 check_stable_path() {
     if [ -d "$stable" ]; then
         fail "$stable: a folder is there, or a symbolic link to one"
+    elif [ -L "$stable" ] && in_versions_folder; then
+        :
     elif [ -L "$stable" ] && [ ! -e "$stable" ]; then
-        target=$(readlink "$stable") || fail "$stable: cannot read symbolic link"
-        rest=${target#"$versions/"}
-        folder=${rest%%/*}
-        file=${rest#*/}
-        if [ "$rest" = "$target" ] || [ "$file" != terminus ] || ! valid_version "$folder"; then
-            fail "$stable: symbolic link to nothing, outside $versions/ ($target)"
-        fi
+        fail "$stable: symbolic link to nothing, outside $versions/ ($target)"
     elif [ -f "$stable" ]; then
         grep -q -F -e "$marker" "$stable" ||
             fail "$stable: a file that is not a terminus build is there"
