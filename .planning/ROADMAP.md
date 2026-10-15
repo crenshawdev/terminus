@@ -17,6 +17,8 @@ The archive is the product, so it is built first and everything else is built on
 - [x] **Phase 9: README and User Docs** - a README, user docs and a trust page for someone who has never heard of Terminus, leading with the signed release
 - [ ] **Phase 10: Publish 0.1.0** - phases 1 to 9 land on `main`, `v0.1.0` is tagged, signed and published, and it installs on every platform
 - [ ] **Phase 11: How Terminus Works** - design docs with diagrams of the system as it stands, in the shape of Baley's `docs/design/`
+- [ ] **Phase 12: Quick Issue Fixes** - thirteen small open issues are fixed and closed before the release is announced
+- [ ] **Phase 13: CI and Data Integrity** - the test suite runs in CI, and the archive and decision fixes land under it
 
 ## Phase Details
 
@@ -143,3 +145,28 @@ The archive is the product, so it is built first and everything else is built on
 2. Each part has its own doc with at least one diagram: the hooks, ingest, the archive and its block rows, search, recall through the MCP server, injection, and install and release.
 3. Every diagram is Mermaid in Markdown, renders on GitHub, and stays readable in GitHub's dark theme.
 4. `/cad-docs-verify` reports no stale claim: every path, command, table and key the docs name matches the code.
+
+### Phase 12: Quick Issue Fixes
+**Goal:** Thirteen open GitHub issues are small enough to fix inside one function or one doc section, with no design question left, and fixing them before the release is announced cuts the open list from 39 to 26. The MCP server stops offering `2025-03-26`, which requires batches it does not answer (#30), refuses a request id that is not an integer that fits (#28), and removes duplicate `recall_get` ids before the 25-id cap (#29). `Projector::push` charges its separator so the indexed text stays inside `MAX_BODY_BYTES` (#20), a compaction boundary needs `type` `system` (#17), and the miss-labelling query drops its `recall_get` arm and matches `recall_search` by the extractor's rule (#39). `initialize` runs in an IMMEDIATE transaction (#33), a single-file ingest records its committed and failed counts (#14), `reindex` prints its preserved count (#41), and `verify` fails an evicted session that still has block rows (#42). `brief.rs` calls the shared `chars` and `clip` (#35), the process-death lock test is renamed and points to the crash harness (#10), and `docs/json-shapes.md` says which fields can be null (#25). Each issue's text was checked against the code on 2026-10-15.
+**Depends on:** Phase 10
+**Requirements:** None. These fix shipped behaviour and are tracked as GitHub issues.
+**Success Criteria:**
+1. The MCP server never agrees to `2025-03-26`, a request whose id is fractional or outside the i64 and u64 range gets an invalid-request error, and a `recall_get` call with duplicate ids reads every distinct id up to 25.
+2. No indexed turn body is longer than `MAX_BODY_BYTES`, a record that is not `system` but carries subtype `compact_boundary` gets no boundary row, and the miss-labelling query matches neither `recall_get` nor a name like `xrecall_search`.
+3. `Store::open` creates the tables of a fresh store in an IMMEDIATE transaction, so a second open waits for the lock rather than failing.
+4. `terminus status` after `terminus ingest <path>` reports the file committed, `terminus reindex` prints the preserved count and its `--json` and `docs/json-shapes.md` carry it, and `terminus verify` fails a store where an evicted session still has block rows.
+5. `brief.rs` defines no `chars` or `clip` of its own, no test name claims a process is killed when none is, and `docs/json-shapes.md` marks every `sessions` and `show` field that can be null.
+6. Each of the thirteen issues is closed by the change that fixes it, and `cargo test --workspace --all-features` passes.
+
+### Phase 13: CI and Data Integrity
+**Goal:** The test suite has never run on GitHub. The release workflow only builds, and anything narrower than `cargo test --workspace --all-features` passes while skipping the testkit-gated files (#47, #44). With CI running, the data fixes land under it. A diverged session's prefix check and tail read each open the file, so a file replaced between them can splice one file's tail onto another's prefix, the one known way to write wrong bytes into the archive (#15). The decisions table has no columns for a record's `compacted` flag and dropped turns, so every drained decision loses them for good (#40). A decision or state write cut off at the hook's deadline leaves a `.tmp` file nothing deletes, the decision ones holding the whole prompt, and two comments say otherwise (#38). And the drain can delete a real decision record unread: `write_file` reserves an empty `.json` and renames the record over it, so a drain that reads the empty placeholder and deletes the path after the rename lands loses the record (not yet filed as an issue).
+**Depends on:** Phase 12
+**Requirements:** None. These fix shipped behaviour and are tracked as GitHub issues.
+**Success Criteria:**
+1. A workflow runs `cargo test --workspace --all-features` on every push and pull request, on Linux and macOS, with `dash` and `ssh-keygen` installed, and a failing test fails the run.
+2. Every testkit-gated test file is declared with `required-features = ["testkit"]`, so `cargo test -p terminus --test mcp` without the feature is refused rather than passing with zero tests.
+3. Ingest reads a diverged session's prefix and its new tail through one open file handle.
+4. The decisions table stores `compacted` and `dropped`, an existing store gains both columns when it is opened, and `replay` and `stats` can tell a decision made after a compaction from an ordinary one.
+5. The drain deletes `.tmp` decision and state files older than the hook's deadline, and the comments that say the abandoned thread writes nothing and that state files hold prompt text are corrected.
+6. A decision record renamed into place while a drain runs is inserted on that pass or the next, never deleted unread.
+7. Issues #47, #44, #15, #40 and #38 are closed by the changes that fix them, and the suite passes in CI.
