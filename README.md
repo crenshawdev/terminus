@@ -34,7 +34,7 @@ Every release is signed on the maintainer's machine, never in CI. The release wo
 - It calls no model. The facts it records about each session come from the transcript's own records.
 - It reads no API key. A `terminus.toml` that still has a `[provider]` table fails to load until the table is deleted.
 - The binary opens no network connection.
-- It has no encryption at rest. Every file Terminus writes is readable only by your user, and the transcripts it copies sit unencrypted in Claude Code's own folder as well.
+- It has no encryption at rest. Every file Terminus writes in its data directory is readable only by your user, and the transcripts it copies sit unencrypted in Claude Code's own folder as well.
 
 It also refuses, under these conditions:
 
@@ -49,7 +49,7 @@ It also refuses, under these conditions:
 
 - The tests do not run in CI. The release workflow builds and drafts releases, and no workflow runs the test suite ([#47](https://github.com/crenshawdev/terminus/issues/47)).
 - `[privacy] redact_recall` misses a bare OpenAI-style `sk-` token in plain prose, because none of its rules recognizes that shape, so the token reaches Claude Code unfiltered ([#5](https://github.com/crenshawdev/terminus/issues/5)).
-- With `[privacy] redact_recall` on, the body `recall_get` returns goes through a lossy UTF-8 round trip, so an archived line that is not valid UTF-8 comes back changed even when it holds no secret ([#1](https://github.com/crenshawdev/terminus/issues/1)).
+- With `[privacy] redact_recall` on, `terminus show` runs each archived line through a lossy UTF-8 round trip before it filters it, so a line that is not valid UTF-8 prints changed even when it holds no secret ([#1](https://github.com/crenshawdev/terminus/issues/1)).
 - What the `recall_search`, `recall_context` and `recall_get` tools return is not documented, and the tool table in `DESIGN-BRIEF.md` is out of date ([#26](https://github.com/crenshawdev/terminus/issues/26)).
 
 ## How it works
@@ -113,7 +113,7 @@ Every command is `terminus <command>`.
 - `retention --dry-run`: prints what the next ingest pass would evict and delete, and changes nothing.
 - `doctor`: reports what is wired into Claude Code and what is not.
 - `install`: wires Terminus into Claude Code's hooks and MCP servers, then starts a backfill.
-- `uninstall`: removes what `install` added and keeps the archive. `--purge` also deletes the data directory, after asking.
+- `uninstall`: removes the hook entries, the MCP entry and the `~/.local/bin/terminus` link that `install` added. It keeps the archive, and keeps the versions folder because a session that is already running may be running from it. `--purge` also deletes the data directory, after asking.
 - `data move <path>`: moves the data directory and records where it went.
 
 Claude Code runs two more, which are never typed:
@@ -121,7 +121,7 @@ Claude Code runs two more, which are never typed:
 - `hook <event>`: runs on `SessionStart`, `UserPromptSubmit`, `SessionEnd` and `PostCompact`, starts an ingest, and may hand Claude Code the brief or earlier turns.
 - `mcp`: serves `recall_search`, `recall_context` and `recall_get` over stdio.
 
-Every command above except `ingest`, `backfill`, `install`, `uninstall` and `data move` accepts `--json`, and then writes one JSON document on stdout ([docs/json-shapes.md](docs/json-shapes.md)). Every option of every command is in [docs/commands.md](docs/commands.md).
+Every command above except `ingest`, `backfill`, `install`, `uninstall`, `data move`, `hook` and `mcp` accepts `--json`, and then writes one JSON document on stdout ([docs/json-shapes.md](docs/json-shapes.md)). Every option of every command is in [docs/commands.md](docs/commands.md).
 
 ## Settings
 
