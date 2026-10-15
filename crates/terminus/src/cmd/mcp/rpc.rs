@@ -95,9 +95,10 @@ pub fn parse(line: &str) -> Incoming {
         return Incoming::Invalid {
             id: None,
             code: code::INVALID_REQUEST,
-            // A batch arrives here too. The MCP revisions this server speaks do
-            // not use JSON-RPC batching, and answering half a batch would be
-            // worse than saying so.
+            // A batch arrives here too, and gets this one error with a null id
+            // rather than half an answer. No revision this server offers uses
+            // JSON-RPC batching; `2025-03-26`, the one that requires it, is not
+            // offered for that reason.
             message: "a JSON-RPC message is an object".to_owned(),
         };
     };
