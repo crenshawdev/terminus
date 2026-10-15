@@ -24,7 +24,7 @@ pub const ARCHIVE_FORMAT: i64 = 2;
 /// The derived-table schema this build writes.
 ///
 /// Bumped whenever anything rebuildable from the archive changes shape: `turns`,
-/// `compaction_boundaries`, `turns_fts`, `entities`, `paths`. Two integers
+/// `compactions`, `turns_fts`, `entities`, `paths`. Two integers
 /// rather than one, because one cannot tell "derived tables need a rebuild"
 /// from "the archive itself changed" (D-09).
 ///
@@ -47,7 +47,15 @@ pub const ARCHIVE_FORMAT: i64 = 2;
 /// collision: `crate::ingest::backfill` is the parallel transcript-reading pass
 /// and is NOT this mechanism; it reads the files on disk, and this reads only
 /// the archive.
-pub const DERIVED_SCHEMA: i64 = 4;
+///
+/// 5 after 0.1.1 (D-20, D-22): the boundary rows moved from
+/// `compaction_boundaries`, keyed by the boundary's turn, to `compactions`, keyed
+/// by `(session_key, stream_offset)`, so a boundary with no `uuid` or
+/// `timestamp`, which is not a turn, still gets a row. The first ingest after the
+/// upgrade rebuilds every session's derived tables, and
+/// [`crate::reindex::reindex`] carries an evicted session's old boundary rows
+/// across before it drops the old table.
+pub const DERIVED_SCHEMA: i64 = 5;
 
 /// The store file inside the data directory.
 pub const DB_FILE_NAME: &str = "terminus.db";

@@ -62,7 +62,7 @@ impl Bench {
     ///
     /// Children first, so in reverse: `DERIVED_TABLES` is in creation order and
     /// the bundled SQLite enforces foreign keys, so dropping `turns` while
-    /// `compaction_boundaries` still holds a row for one of its ids fails with a
+    /// `entities` or `paths` still holds a row for one of its ids fails with a
     /// constraint violation. `reindex` itself drops in this order for the same
     /// reason.
     fn drop_derived(&self) {
@@ -267,9 +267,10 @@ fn an_ingest_brings_an_older_store_forward_first() {
             rusqlite::params![(DERIVED_SCHEMA - 1).to_string(), META_DERIVED_SCHEMA],
         )
         .unwrap();
-        // Every child row goes first: `compaction_boundaries`, `entities` and
-        // `paths` all reference `turns(id)` and the bundled SQLite enforces it.
-        for table in ["compaction_boundaries", "entities", "paths"] {
+        // Every child row goes first: `entities` and `paths` reference
+        // `turns(id)` and the bundled SQLite enforces it. `compactions` goes
+        // with them, so the rebuild is what restores every boundary row.
+        for table in ["compactions", "entities", "paths"] {
             conn.execute(&format!("DELETE FROM {table}"), []).unwrap();
         }
         conn.execute("DELETE FROM turns", []).unwrap();
@@ -859,4 +860,110 @@ fn a_previous_builds_store_gains_is_typed_and_is_filled_from_the_blobs() {
     let report = verify::verify(&store).unwrap();
     assert!(report.is_ok(), "{}", report.render());
     assert!(report.checked > 0);
+}
+
+// ---------------------------------------------------------------------------
+// D-22: a store at derived schema 4 keeps its boundary rows in the old
+// `compaction_boundaries` table, keyed by turn id.
+// ---------------------------------------------------------------------------
+
+/// Put a store into the shape a version-4 build left: the boundary rows in
+/// `compaction_boundaries` under its old DDL, no `compactions` table, and
+/// `derived_schema` 4.
+fn into_version_4(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE compaction_boundaries (
+             turn_id  INTEGER PRIMARY KEY REFERENCES turns(id),
+             metadata BLOB
+         );
+         INSERT INTO compaction_boundaries (turn_id, metadata)
+             SELECT t.id, c.metadata FROM compactions c
+               JOIN turns t
+                 ON t.session_key = c.session_key AND t.stream_offset = c.stream_offset;
+         DROP TABLE compactions;",
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE meta SET value = '4' WHERE key = ?1",
+        [META_DERIVED_SCHEMA],
+    )
+    .unwrap();
+}
+
+fn has_table(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Every boundary row, as `(session_key, stream_offset, metadata)`.
+fn boundary_rows(conn: &Connection) -> Vec<(String, i64, Vec<u8>)> {
+    conn.prepare(
+        "SELECT session_key, stream_offset, metadata FROM compactions
+          ORDER BY session_key, stream_offset",
+    )
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// Sets up the version-4 shape and checks it took, answering the boundary
+/// rows the store held before.
+fn version_4_bench(evict: Option<&str>) -> (Bench, Vec<(String, i64, Vec<u8>)>) {
+    let bench = bench();
+    let before = boundary_rows(&bench.conn());
+    assert!(
+        !before.is_empty(),
+        "the compacted fixture must archive a boundary"
+    );
+    if let Some(suffix) = evict {
+        bench.evict(&bench.key_ending(suffix));
+    }
+    into_version_4(&bench.conn());
+    let conn = bench.conn();
+    assert!(has_table(&conn, "compaction_boundaries"));
+    assert!(!has_table(&conn, "compactions"));
+    (bench, before)
+}
+
+/// D-22 on the drop-and-recreate path: the old table is gone and the new one
+/// holds the same rows at the same offsets with the same metadata.
+#[test]
+fn a_version_4_store_moves_its_boundary_rows_to_compactions() {
+    let (bench, before) = version_4_bench(None);
+
+    let store = reindex::open_up_to_date(&bench.data_dir).unwrap();
+    assert_eq!(store.meta_int(META_DERIVED_SCHEMA).unwrap(), Some(5));
+    drop(store);
+
+    let conn = bench.conn();
+    assert!(!has_table(&conn, "compaction_boundaries"));
+    assert_eq!(boundary_rows(&conn), before);
+}
+
+/// D-22 on the preserving path. The evicted session's blob is empty, so its
+/// boundary row can only come from the old table, and it is carried across.
+#[test]
+fn a_version_4_store_carries_an_evicted_sessions_boundary_rows_across() {
+    let (bench, before) = version_4_bench(Some("session-compacted.jsonl"));
+
+    let store = reindex::open_up_to_date(&bench.data_dir).unwrap();
+    assert_eq!(store.meta_int(META_DERIVED_SCHEMA).unwrap(), Some(5));
+    drop(store);
+
+    let conn = bench.conn();
+    assert!(!has_table(&conn, "compaction_boundaries"));
+    assert_eq!(boundary_rows(&conn), before);
+    drop(conn);
+
+    // Still evicted and still preserved, and its row survives a rebuild that
+    // has no old table to copy from.
+    let rebuilt = reindex::reindex(&mut bench.store()).unwrap();
+    assert_eq!(rebuilt.preserved, 1);
+    assert_eq!(boundary_rows(&bench.conn()), before);
 }

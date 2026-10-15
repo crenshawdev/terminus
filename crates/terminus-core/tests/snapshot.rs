@@ -3,8 +3,9 @@
 //!
 //! The comparison here is deliberately NOT built out of
 //! `crates/terminus/tests/crash.rs`'s `Snapshot` struct: phase 2's summary
-//! records that it excludes `compaction_boundaries`, so a reused comparison is
-//! blind on exactly the table a boundary-carrying fixture exercises. These
+//! records that it excludes the boundary rows, now the `compactions` table, so
+//! a reused comparison is blind on exactly the table a boundary-carrying
+//! fixture exercises. These
 //! tests read the snapshot as a store instead - `verify::verify` over every
 //! blob, and the session keys themselves.
 

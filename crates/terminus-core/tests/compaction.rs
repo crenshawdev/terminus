@@ -151,14 +151,16 @@ fn turn_rows(conn: &Connection) -> Vec<TurnRowValues> {
     .collect()
 }
 
-/// Every boundary row in the store, as `(turn_id, metadata bytes)`.
+/// Every boundary row in the store, as `(stream_offset, metadata bytes)`.
 fn boundaries(conn: &Connection) -> Vec<(i64, Vec<u8>)> {
-    conn.prepare("SELECT turn_id, metadata FROM compaction_boundaries ORDER BY turn_id")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
+    conn.prepare(
+        "SELECT stream_offset, metadata FROM compactions ORDER BY session_key, stream_offset",
+    )
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
 }
 
 /// The `compactMetadata` of a boundary line, read independently of the parser
@@ -170,9 +172,19 @@ fn expected_metadata(line: &[u8]) -> serde_json::Value {
     record["compactMetadata"].clone()
 }
 
+/// The id of the bench session's turn at `stream_offset`.
+fn turn_at(conn: &Connection, stream_offset: i64) -> i64 {
+    conn.query_row(
+        "SELECT id FROM turns WHERE stream_offset = ?1",
+        [stream_offset],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
 fn drop_derived(conn: &Connection) {
-    // Children first: the bundled SQLite enforces foreign keys, so
-    // `compaction_boundaries` has to go before `turns`.
+    // Children first: the bundled SQLite enforces foreign keys, so `entities`
+    // and `paths` have to go before `turns`.
     for table in schema::DERIVED_TABLES.iter().rev() {
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))
             .unwrap();
@@ -214,7 +226,7 @@ fn appending_a_boundary_records_it_and_disturbs_nothing_already_archived() {
     // One boundary row, and its bytes are the appended record's own.
     let rows = boundaries(&conn);
     assert_eq!(rows.len(), 1, "one boundary appeared, exactly once");
-    let (turn_id, metadata) = &rows[0];
+    let (offset, metadata) = &rows[0];
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(metadata).unwrap(),
         expected_metadata(&line),
@@ -225,9 +237,9 @@ fn appending_a_boundary_records_it_and_disturbs_nothing_already_archived() {
         "the stored metadata is not a byte slice of the record, so it was re-serialized"
     );
 
-    // It is keyed on the turn that IS the boundary: reading that turn out of
-    // the archive returns the record that was appended (D-21).
-    let (bytes, _) = testkit::read_turn(&conn, *turn_id);
+    // It sits at the offset of the turn that IS the boundary: reading that
+    // turn out of the archive returns the record that was appended (D-20, D-21).
+    let (bytes, _) = testkit::read_turn(&conn, turn_at(&conn, *offset));
     assert_eq!(bytes, line, "the boundary row names the wrong turn");
 
     // Nothing the first pass wrote moved.
@@ -313,7 +325,7 @@ fn no_ordinary_turn_gets_a_boundary_row() {
 
     let rows = boundaries(&conn);
     assert_eq!(rows.len(), 1);
-    let boundary_id = rows[0].0;
+    let boundary_id = turn_at(&conn, rows[0].0);
     let others: Vec<i64> = turn_rows(&conn)
         .into_iter()
         .map(|row| row.0)
@@ -385,10 +397,14 @@ fn ingesting_a_compacted_transcript_whole_records_the_same_boundary() {
 
     // The boundary is the fixture's last turn, and reading it back gives the
     // record verbatim.
-    let (bytes, _) = testkit::read_turn(&conn, rows[0].0);
+    let boundary_id = turn_at(&conn, rows[0].0);
+    let (bytes, _) = testkit::read_turn(&conn, boundary_id);
     assert_eq!(bytes, line);
     let last = turn_rows(&conn).last().unwrap().0;
-    assert_eq!(last, rows[0].0, "the boundary is the last turn of the file");
+    assert_eq!(
+        last, boundary_id,
+        "the boundary is the last turn of the file"
+    );
 }
 
 /// A session with no boundary contributes no row, whatever else it holds. The

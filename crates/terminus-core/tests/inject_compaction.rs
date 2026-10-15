@@ -76,9 +76,7 @@ impl Bench {
     fn metadata(&self) -> serde_json::Value {
         let bytes: Vec<u8> = self
             .conn()
-            .query_row("SELECT metadata FROM compaction_boundaries", [], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT metadata FROM compactions", [], |r| r.get(0))
             .expect("the fixture archived a boundary");
         serde_json::from_slice(&bytes).expect("the stored metadata is JSON")
     }
@@ -187,10 +185,7 @@ fn a_boundary_that_cannot_be_read_drops_nothing() {
     ] {
         bench
             .conn()
-            .execute(
-                "UPDATE compaction_boundaries SET metadata = ?1",
-                [&metadata],
-            )
+            .execute("UPDATE compactions SET metadata = ?1", [&metadata])
             .unwrap();
         assert!(
             bench.dropped().is_empty(),
@@ -201,7 +196,7 @@ fn a_boundary_that_cannot_be_read_drops_nothing() {
 
     bench
         .conn()
-        .execute("UPDATE compaction_boundaries SET metadata = NULL", [])
+        .execute("UPDATE compactions SET metadata = NULL", [])
         .unwrap();
     assert!(bench.dropped().is_empty(), "a null metadata dropped turns");
 }
@@ -222,7 +217,7 @@ fn a_session_with_no_boundary_is_not_a_session_that_dropped_nothing() {
     );
 
     let conn = bench.conn();
-    conn.execute("UPDATE compaction_boundaries SET metadata = x'6e6f'", [])
+    conn.execute("UPDATE compactions SET metadata = x'6e6f'", [])
         .unwrap();
     assert_eq!(
         compaction::dropped(&conn, &bench.session_key),
@@ -230,7 +225,6 @@ fn a_session_with_no_boundary_is_not_a_session_that_dropped_nothing() {
         "an unreadable boundary is still a boundary"
     );
 
-    conn.execute("DELETE FROM compaction_boundaries", [])
-        .unwrap();
+    conn.execute("DELETE FROM compactions", []).unwrap();
     assert_eq!(compaction::dropped(&conn, &bench.session_key), None);
 }

@@ -307,17 +307,22 @@ CREATE TABLE IF NOT EXISTS turns (
 CREATE INDEX IF NOT EXISTS idx_turns_uuid ON turns(uuid);
 CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns(ts);
 
--- One row per compaction boundary, keyed on the turn that IS the boundary
--- (D-21: a `type: system` record with `subtype: compact_boundary` already
--- classifies as a turn, so this is a derived row and not a new record class).
--- `metadata` holds that record's `compactMetadata` object bytes verbatim
--- (D-08). No dropped-turn set is computed: exactly one real boundary exists in
--- 300,556 measured records and its own token counts contradict the design
--- brief's reading of `preservedMessages.uuids`, so the complement is derived at
--- query time in phase 5 (INJ-05) where a wrong reading costs no reingest.
-CREATE TABLE IF NOT EXISTS compaction_boundaries (
-    turn_id  INTEGER PRIMARY KEY REFERENCES turns(id),
-    metadata BLOB
+-- One row per compaction boundary, keyed by where its record sits in the
+-- session stream rather than by a turn, so a boundary with no turn behind it -
+-- one missing its `uuid` or `timestamp` - still has a place (D-19, D-20).
+-- `stream_offset` is the same uncompressed-stream coordinate as
+-- `turns.stream_offset`, so the two compare correctly under every capture mode,
+-- and the dropped set is the turns at a lower offset than the boundary.
+-- `metadata` holds the record's `compactMetadata` object bytes verbatim (D-08).
+-- No dropped-turn set is computed: exactly one real boundary exists in 300,556
+-- measured records and its own token counts contradict the design brief's
+-- reading of `preservedMessages.uuids`, so the complement is derived at query
+-- time in phase 5 (INJ-05) where a wrong reading costs no reingest.
+CREATE TABLE IF NOT EXISTS compactions (
+    session_key   TEXT    NOT NULL REFERENCES sessions(session_key),
+    stream_offset INTEGER NOT NULL,
+    metadata      BLOB,
+    PRIMARY KEY (session_key, stream_offset)
 );
 
 -- content='' because the text lives in the archive and storing it twice would
@@ -403,7 +408,7 @@ pub const TABLES: &[&str] = &[
     // same arm, with no `DERIVED_SCHEMA` bump and so no forced reindex.
     "observations",
     "turns",
-    "compaction_boundaries",
+    "compactions",
     "turns_fts",
     "entities",
     "paths",
@@ -420,16 +425,12 @@ pub const TABLES: &[&str] = &[
 /// retention eviction deletes its block rows, so a `reindex` that dropped the
 /// table could not recompute an evicted session's row.
 ///
-/// In creation order, because `reindex` drops in reverse: a boundary row
-/// references `turns(id)`, so `compaction_boundaries` sits **after** `turns`
-/// here and is therefore dropped **before** it.
-pub const DERIVED_TABLES: &[&str] = &[
-    "turns",
-    "compaction_boundaries",
-    "turns_fts",
-    "entities",
-    "paths",
-];
+/// In creation order, because `reindex` drops in reverse: `entities` and
+/// `paths` reference `turns(id)`, so they sit **after** `turns` here and are
+/// therefore dropped **before** it. `compactions` references only
+/// `sessions(session_key)`, which no rebuild drops, so its place among them is
+/// free.
+pub const DERIVED_TABLES: &[&str] = &["turns", "compactions", "turns_fts", "entities", "paths"];
 
 /// Columns added to an existing table after that table first shipped, with the
 /// type clause that adds each one back.

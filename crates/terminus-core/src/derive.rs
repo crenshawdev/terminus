@@ -8,8 +8,9 @@
 //!
 //! What the function writes: one `turns_fts` row per turn at rowid `turns.id`,
 //! carrying [`crate::index::project`]'s text projection of the record rather
-//! than the record's raw line (D-01), and one `compaction_boundaries` row for
-//! the rare turn that is a boundary (D-21).
+//! than the record's raw line (D-01), and one `compactions` row for the rare
+//! turn that is a boundary (D-21), keyed by the turn's `(session_key,
+//! stream_offset)` rather than its id (D-20).
 //!
 //! The record is parsed to a `serde_json::Value` **here**, once, and handed to
 //! every rule that needs it. `parse::Record` deliberately does not keep the
@@ -160,11 +161,21 @@ pub fn derive_turn(tx: &Connection, row: TurnRow<'_>) -> Result<i64> {
     // complement of `preservedMessages.uuids` is derived at query time in phase
     // 5 (INJ-05), where a wrong reading of an upstream format that has exactly
     // one real example costs a query and not a reingest.
-    tx.execute("DELETE FROM compaction_boundaries WHERE turn_id = ?1", [id])?;
+    //
+    // Keyed by where the record sits in the stream, not by the turn id, so a
+    // boundary and the turns it dropped compare by `stream_offset` (D-20, D-21).
+    tx.execute(
+        "DELETE FROM compactions WHERE session_key = ?1 AND stream_offset = ?2",
+        rusqlite::params![row.session_key, row.stream_offset as i64],
+    )?;
     if row.is_compact_boundary() {
         tx.execute(
-            "INSERT INTO compaction_boundaries (turn_id, metadata) VALUES (?1, ?2)",
-            rusqlite::params![id, row.compact_metadata],
+            "INSERT INTO compactions (session_key, stream_offset, metadata) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                row.session_key,
+                row.stream_offset as i64,
+                row.compact_metadata
+            ],
         )?;
     }
 

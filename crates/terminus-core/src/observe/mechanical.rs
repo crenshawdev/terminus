@@ -10,8 +10,8 @@
 //! `turns.tool_name` says whether the turn that named one was writing it;
 //! `entities` of kind `tool` and `error` give the tools and the failures;
 //! `session_meta` gives the branch and the two timestamps the duration is the
-//! difference of; `turns` gives the count; `compaction_boundaries` joined
-//! through `turns` gives the compactions.
+//! difference of; `turns` gives the count; `compactions` gives the
+//! compactions, counted by `session_key`.
 //!
 //! **The two exceptions, and why they cost a blob read.** Commands-with-
 //! arguments and commits cannot come out of SQL:
@@ -153,9 +153,7 @@ pub fn observe(conn: &Connection, session_key: &str) -> Result<Mechanical> {
         |r| r.get(0),
     )?;
     let compactions = conn.query_row(
-        "SELECT count(*) FROM compaction_boundaries c
-           JOIN turns t ON t.id = c.turn_id
-          WHERE t.session_key = ?1",
+        "SELECT count(*) FROM compactions WHERE session_key = ?1",
         [session_key],
         |r| r.get(0),
     )?;

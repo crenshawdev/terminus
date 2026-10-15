@@ -1,8 +1,8 @@
 //! Rebuilding every derived table from the block rows alone (STOR-04).
 //!
 //! The input is the block rows and nothing else. Every table in
-//! `schema::DERIVED_TABLES` - `turns`, `compaction_boundaries`, `turns_fts`,
-//! `entities` and `paths` - is dropped before a single row is read, so a
+//! `schema::DERIVED_TABLES` - `turns`, `compactions`, `turns_fts`, `entities`
+//! and `paths` - is dropped before a single row is read, so a
 //! rebuild cannot quietly carry forward a value only the old rows knew, which
 //! is the property "everything else is derived" has to mean if it is to mean
 //! anything.
@@ -46,6 +46,18 @@
 //! them inside the ingest lock - `open_up_to_date` runs at the top of every
 //! pass - with a `Rebuilt::failed` note to show for it, which is silent data
 //! loss reporting as retention working correctly.
+//!
+//! # Retiring the old boundary table (D-22)
+//!
+//! Builds before `DERIVED_SCHEMA` 5 kept boundary rows in
+//! `compaction_boundaries`, keyed by `turns.id` with an enforced foreign key to
+//! it. Every rebuild retires that table first, on both paths, before `turns` is
+//! dropped or a session's turns are deleted, either of which the foreign key
+//! would refuse. On the preserving path an evicted session's old rows are first
+//! copied into `compactions` at the `(session_key, stream_offset)` of their
+//! turn, because its emptied blob cannot rebuild them and its derived rows are
+//! the only copy left. On a store that never had the old table both steps do
+//! nothing.
 
 use std::path::Path;
 
@@ -120,6 +132,8 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
         ..Rebuilt::default()
     };
 
+    retire_old_boundaries(&tx, preserved > 0)?;
+
     if preserved == 0 {
         // Every store until a user writes a `[retention]` table, and the
         // stronger guarantee: nothing survives that the block rows did not produce.
@@ -128,10 +142,11 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
         // compiled with `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`
         // (libsqlite3-sys-0.38.1/build.rs:126), so foreign keys are enforced on
         // every connection whatever `crates/terminus-core/src/store/schema.rs`
-        // says about the pragma, and dropping `turns` while `entities`, `paths`
-        // or `compaction_boundaries` still hold rows fails with a constraint
-        // violation. `DERIVED_TABLES` is in creation order, so a rebuild drops
-        // in reverse.
+        // says about the pragma, and dropping `turns` while `entities` or
+        // `paths` still hold rows fails with a constraint violation.
+        // `DERIVED_TABLES` is in creation order, so a rebuild drops in reverse.
+        // The pre-5 boundary table, which also references `turns(id)`, is
+        // already gone: `retire_old_boundaries` ran first.
         for table in schema::DERIVED_TABLES.iter().rev() {
             tx.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
         }
@@ -221,10 +236,12 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
 /// The preserving path's stand-in for `DROP TABLE`, scoped to one session
 /// (phase 8 D-03). Children first for the reason the drop order documents: the
 /// bundled SQLite is compiled with `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`, so
-/// `paths`, `entities` and `compaction_boundaries` really do reference
-/// `turns(id)` on every connection, and deleting the parent first fails with a
-/// constraint violation. `turns_fts` is contentless with `rowid` IS `turns.id`,
-/// so it is cleared by the same subquery rather than by a join it cannot serve.
+/// `paths` and `entities` really do reference `turns(id)` on every connection,
+/// and deleting the parent first fails with a constraint violation. `turns_fts`
+/// is contentless with `rowid` IS `turns.id`, so it is cleared by the same
+/// subquery rather than by a join it cannot serve. `compactions` is cleared by
+/// `session_key` and never through the turn ids, because its rows are keyed by
+/// position in the stream and need not have a turn behind them (D-20).
 ///
 /// The subquery is re-evaluated per statement rather than materialized into a
 /// list: the ids are `turns.id` values this transaction is about to overwrite
@@ -235,12 +252,47 @@ fn clear_derived(tx: &rusqlite::Connection, session_key: &str) -> Result<()> {
     for statement in [
         format!("DELETE FROM paths WHERE turn_id IN ({TURN_IDS})"),
         format!("DELETE FROM entities WHERE turn_id IN ({TURN_IDS})"),
-        format!("DELETE FROM compaction_boundaries WHERE turn_id IN ({TURN_IDS})"),
+        "DELETE FROM compactions WHERE session_key = ?1".to_owned(),
         format!("DELETE FROM turns_fts WHERE rowid IN ({TURN_IDS})"),
         "DELETE FROM turns WHERE session_key = ?1".to_owned(),
     ] {
         tx.execute(&statement, [session_key])?;
     }
+    Ok(())
+}
+
+/// Drop the pre-5 `compaction_boundaries` table, carrying the evicted sessions'
+/// rows into `compactions` first when `preserving` (D-22, phase 8 D-03).
+///
+/// Runs before anything drops `turns` or deletes from it, because the old
+/// table's foreign key to `turns(id)` is enforced and would refuse either. A
+/// session that is not evicted needs nothing carried: the rebuild writes its
+/// rows again from its blob.
+fn retire_old_boundaries(tx: &rusqlite::Connection, preserving: bool) -> Result<()> {
+    let present: bool = tx.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master
+          WHERE type = 'table' AND name = 'compaction_boundaries'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !present {
+        return Ok(());
+    }
+    if preserving {
+        // The new table has to exist to be copied into, and the rebuild runs
+        // the same `IF NOT EXISTS` schema again below.
+        tx.execute_batch(schema::CREATE_SQL)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO compactions (session_key, stream_offset, metadata)
+             SELECT t.session_key, t.stream_offset, b.metadata
+               FROM compaction_boundaries b
+               JOIN turns t ON t.id = b.turn_id
+               JOIN session_meta m ON m.session_key = t.session_key
+              WHERE coalesce(m.is_evicted, 0) <> 0",
+            [],
+        )?;
+    }
+    tx.execute_batch("DROP TABLE compaction_boundaries")?;
     Ok(())
 }
 

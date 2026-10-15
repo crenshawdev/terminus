@@ -769,17 +769,17 @@ fn a_compaction_whose_boundary_is_not_committed_yet_keeps_the_debt() {
     let compacted = bench.compacted();
     let asked = format!("what happened to {SYMBOL} in {GADGET}");
 
-    let row: (i64, Vec<u8>) = bench
+    let row: (String, i64, Vec<u8>) = bench
         .store()
         .query_row(
-            "SELECT turn_id, metadata FROM compaction_boundaries",
+            "SELECT session_key, stream_offset, metadata FROM compactions",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .expect("the compacted session archived a boundary");
     bench
         .store()
-        .execute("DELETE FROM compaction_boundaries", [])
+        .execute("DELETE FROM compactions", [])
         .unwrap();
 
     injected(&bench.session_start(SESSION, "compact"), "SessionStart");
@@ -797,8 +797,8 @@ fn a_compaction_whose_boundary_is_not_committed_yet_keeps_the_debt() {
     bench
         .store()
         .execute(
-            "INSERT INTO compaction_boundaries (turn_id, metadata) VALUES (?1, ?2)",
-            rusqlite::params![row.0, row.1],
+            "INSERT INTO compactions (session_key, stream_offset, metadata) VALUES (?1, ?2, ?3)",
+            rusqlite::params![row.0, row.1, row.2],
         )
         .unwrap();
 
