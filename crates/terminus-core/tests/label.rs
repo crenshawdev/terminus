@@ -604,3 +604,46 @@ fn a_recall_call_for_something_the_injector_declined_is_a_miss() {
     let again = bench.pass();
     assert!(again.outcomes.labels.is_empty(), "{again:?}");
 }
+
+/// #39: the miss query counts a call as a `recall_search` by the extractor's
+/// rule, exact and case-sensitive, and never counts `recall_get`.
+///
+/// The entity is planted by hand, because the extractor writes none for the
+/// names that must not match, and without it the old SQL and the new would
+/// both find nothing.
+#[test]
+fn the_miss_query_matches_recall_search_by_the_extractors_rule() {
+    let cases = [
+        ("recall_search", true),
+        ("mcp__terminus__recall_search", true),
+        ("recall_get", false),
+        ("xrecall_search", false),
+        ("MCP__TERMINUS__RECALL_SEARCH", false),
+    ];
+    for (name, matches) in cases {
+        let bench = bench();
+        let call = serde_json::json!({
+            "type": "tool_use",
+            "id": "toolu_recall",
+            "name": name,
+            "input": {"query": "the retry budget"},
+        });
+        bench.transcript(IDLE, "project-alpha", &[(ts("-450 minutes"), call)]);
+        bench.pass();
+
+        let turn = bench.turn(IDLE, 0);
+        let conn = bench.conn();
+        conn.execute(
+            "INSERT INTO entities (turn_id, kind, value_norm) VALUES (?1, 'path', ?2)",
+            rusqlite::params![turn, RETRY],
+        )
+        .unwrap();
+        let decision = bench.decide(IDLE, &ts("-480 minutes"), &[], 0, &[RETRY]);
+
+        let spellings = serde_json::to_string(&[RETRY]).unwrap();
+        let found =
+            terminus_core::feedback::label::sought(&conn, decision, &spellings, "[]").unwrap();
+        let expected = matches.then(|| RETRY.to_owned());
+        assert_eq!(found, expected, "{name}");
+    }
+}
