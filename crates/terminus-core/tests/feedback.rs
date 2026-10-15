@@ -689,6 +689,64 @@ fn a_pass_sweeps_the_writers_old_temporaries_and_nothing_else() {
     assert_eq!(last_error(&bench.conn()), None);
 }
 
+/// An empty decision file named like a record, as `write_file` reserves one
+/// before renaming the record over it.
+fn reserve(bench: &Bench) -> PathBuf {
+    let dir = bench.data_dir.join(decision::DIR_NAME);
+    std::fs::create_dir_all(&dir).unwrap();
+    let reserved = dir.join(format!("{SESSION}-4242-1760000000000-0.json"));
+    std::fs::File::create(&reserved).unwrap();
+    reserved
+}
+
+/// The drain race: a pass that finds the empty reservation of a write still in
+/// flight leaves it alone, and the next pass inserts the record renamed over
+/// it.
+#[test]
+fn a_young_empty_reservation_is_left_for_the_next_pass() {
+    let bench = bench();
+    let cwd = bench.project();
+    let reserved = reserve(&bench);
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 0, "{summary:?}");
+    assert!(summary.feedback.discarded.is_empty(), "{summary:?}");
+    assert!(reserved.exists(), "the reservation was deleted");
+    let rows: i64 = bench
+        .conn()
+        .query_row("SELECT count(*) FROM decisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+
+    // The writer's rename lands.
+    let prompt = "written while a pass was draining";
+    let record = Decision::opened(Some(SESSION), Some(&cwd), prompt);
+    let temporary = reserved.with_file_name(".decision-4242-0.tmp");
+    std::fs::write(&temporary, serde_json::to_vec(&record).unwrap()).unwrap();
+    std::fs::rename(&temporary, &reserved).unwrap();
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 1, "{summary:?}");
+    assert!(summary.feedback.discarded.is_empty(), "{summary:?}");
+    assert!(!reserved.exists(), "the drained record is still there");
+    row_of(&bench.conn(), prompt);
+}
+
+/// An empty reservation older than any hook's life is not a write in flight,
+/// and goes the way of any other file that is not a record.
+#[test]
+fn an_old_empty_reservation_is_removed_and_named() {
+    let bench = bench();
+    let reserved = reserve(&bench);
+    age(&reserved, ELEVEN_MINUTES);
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 0, "{summary:?}");
+    assert_eq!(summary.feedback.discarded.len(), 1, "{summary:?}");
+    assert_eq!(summary.feedback.discarded[0].0, reserved);
+    assert!(!reserved.exists(), "the old reservation is still there");
+}
+
 /// The `compacted` flag and the dropped turns of each record, read off its
 /// row by prompt.
 fn compaction_of(conn: &Connection, prompt: &str) -> (Option<i64>, Option<String>) {

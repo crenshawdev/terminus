@@ -33,7 +33,8 @@ use crate::error::Result;
 use crate::inject::decision::{self, Decision};
 use crate::inject::state;
 
-/// How old a writer's `.tmp` has to be before the drain deletes it.
+/// How old a writer's leftover has to be before the drain treats it as
+/// abandoned: a `.tmp` it sweeps, or an empty decision reservation it deletes.
 ///
 /// A hook process lives for its `DRAIN_DEADLINE` (500 ms) and `INJECT_DEADLINE`
 /// (50 ms), both in `crates/terminus/src/cmd/hook.rs`, plus its startup. Ten
@@ -145,11 +146,20 @@ pub fn outcomes(conn: &mut Connection) -> Labeled {
 /// [`crate::inject::decision`]), so leaving it would mean re-reading it on every
 /// pass forever.
 ///
+/// An empty file younger than [`ABANDONED_AFTER`] is the exception. It is the
+/// reservation a write makes before renaming the record over it, so it is not
+/// inserted, deleted or reported, and the next pass reads the record. An older
+/// empty one is no write still running, and is deleted and named like any other
+/// file that does not parse.
+///
 /// Every drain first sweeps the writers' abandoned `.tmp` files (see
 /// [`sweep`]), including one that finds no record or whose insert fails.
 pub fn drain(conn: &mut Connection, data_dir: &Path) -> Result<Drained> {
     sweep(data_dir);
-    let found = decision::read_all(data_dir);
+    let found: Vec<decision::Found> = decision::read_all(data_dir)
+        .into_iter()
+        .filter(|entry| !in_flight(entry))
+        .collect();
     if found.is_empty() {
         return Ok(Drained::default());
     }
@@ -230,6 +240,12 @@ fn sweep(data_dir: &Path) {
             }
         }
     }
+}
+
+/// Whether `entry` is a reservation whose record has not been renamed over it
+/// yet.
+fn in_flight(entry: &decision::Found) -> bool {
+    entry.decision.is_none() && entry.empty && !older(entry.modified)
 }
 
 /// Whether `modified` is further back than [`ABANDONED_AFTER`]. An mtime that

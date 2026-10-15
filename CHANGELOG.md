@@ -67,6 +67,11 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `.tmp` file in `decisions/` or `injection/` that nothing deleted, and the
   decision ones held the whole prompt. The ingest now deletes those files once
   they are older than ten minutes (#38).
+- An ingest that ran while a hook was writing a decision record could read the
+  empty placeholder file the hook reserves before renaming the record into
+  place, then delete that path after the record had landed there, so the record
+  was lost unread. The ingest now leaves an empty placeholder younger than ten
+  minutes for the next pass, which reads the record.
 
 ## [0.1.1] - 2026-10-15
 
