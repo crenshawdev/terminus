@@ -290,8 +290,18 @@ impl Store {
     /// two halves are one fix: without the transaction the rollback could stop
     /// half way and leave tables behind, and without `inspect` the rolled-back
     /// file would still be non-empty and read as a store that lost its `meta`.
+    ///
+    /// The transaction is IMMEDIATE because two opens of a fresh directory can
+    /// both read it as fresh. When the other open has already created the
+    /// tables, every `CREATE TABLE IF NOT EXISTS` here only reads, so a deferred
+    /// transaction holds a read lock by the time the `meta` insert needs to
+    /// write. SQLite does not call the busy handler for a read lock upgrading to
+    /// a write lock, so that insert failed at once with "database is locked"
+    /// instead of waiting out `BUSY_TIMEOUT_MS`. Taking the write lock first
+    /// means the wait happens, and the statements are idempotent, so running
+    /// them again on a store the other open finished is harmless.
     fn initialize(&self) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         tx.execute_batch(crate::store::schema::CREATE_SQL)?;
         tx.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2), (?3, ?4)",
@@ -923,5 +933,51 @@ fn non_empty_var(name: &str) -> Option<std::ffi::OsString> {
     match std::env::var_os(name) {
         Some(v) if !v.is_empty() => Some(v),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// The losing open of a fresh directory, made deterministic. Both opens
+    /// read the directory as fresh, the winner has already written the
+    /// tables, and its backfill holds the write lock when the loser's
+    /// `initialize` starts. The lock is released on a timer well inside the
+    /// busy timeout, so a deferred transaction fails before it is released.
+    #[test]
+    fn a_losing_initialize_waits_for_the_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let winner = Store::open(dir.path()).unwrap();
+        let loser = Store::open(dir.path()).unwrap();
+
+        let path = winner.path().to_path_buf();
+        let (held, lock_held) = mpsc::channel();
+        let backfill = std::thread::spawn(move || {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "BEGIN IMMEDIATE; \
+                 INSERT OR REPLACE INTO meta (key, value) VALUES ('backfill', '1');",
+            )
+            .unwrap();
+            held.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        lock_held.recv().unwrap();
+
+        loser.initialize().unwrap();
+        backfill.join().unwrap();
+
+        let read = |key: &str| -> String {
+            loser
+                .conn()
+                .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(read(META_ARCHIVE_FORMAT), ARCHIVE_FORMAT.to_string());
+        assert_eq!(read(META_DERIVED_SCHEMA), DERIVED_SCHEMA.to_string());
     }
 }
