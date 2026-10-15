@@ -25,13 +25,20 @@
 //! "without touching the live store" is enforced by connection flags rather
 //! than by discipline (D-15).
 //!
-//! **What it cannot reconstruct.** The compacted pool (INJ-05) is not replayed:
-//! whether the one prompt after a compaction was in force, and which turns had
-//! fallen out of context, live in the decision FILE and not in the `decisions`
-//! table, so a replay would have to re-derive them from session state - exactly
-//! what the paragraph above rules out. Those decisions are replayed through the
-//! ordinary ranked window, which is what they would have got had the compaction
-//! not happened.
+//! **The compacted pool is replayed from what the decision stored.** The one
+//! prompt after a compaction (INJ-05) searched a wider window and was offered
+//! only the turns that had fallen out of context. Whether that was in force and
+//! which turns those were are both columns of the row, `compacted` and
+//! `dropped`, so a decision with `compacted` = 1 replays through
+//! `compacted_ranked` and its own dropped set, in the live arm's order, and
+//! `--compacted-ranked` moves it. Nothing is re-derived from session state, for
+//! the reason the paragraph above gives.
+//!
+//! A decision drained before those columns existed carries null in both, and
+//! nothing can say now whether it ran under the pool. It replays through the
+//! ordinary ranked window, as does every decision on a store that has not been
+//! opened for writing since the columns were added: a read never brings a store
+//! forward, so the query does not name columns that are not there.
 
 use std::collections::BTreeSet;
 
@@ -80,6 +87,10 @@ struct Logged {
     watermark_session_no: Option<i64>,
     /// The turns this prompt refused, as the decision recorded them.
     refused: BTreeSet<i64>,
+    /// The turns a compaction had dropped, for a decision recorded as made
+    /// under the compacted pool, and `None` for every other decision -
+    /// ordinary, or of unknown kind.
+    dropped: Option<BTreeSet<i64>>,
 }
 
 /// Re-score every eligible decision under `thresholds` and diff the labels.
@@ -90,7 +101,11 @@ struct Logged {
 /// equal output, which is what makes a diff evidence rather than an anecdote.
 pub fn replay(store: &Store, config: &Config, thresholds: &Thresholds) -> Result<Replayed> {
     let conn = store.conn();
-    let logged = eligible(conn)?;
+    let recorded = !store
+        .missing_columns()
+        .iter()
+        .any(|missing| missing.table == "decisions");
+    let logged = eligible(conn, recorded)?;
 
     let mut totals: Vec<usize> = vec![0; label::LABELS.len()];
     let mut stored: Vec<usize> = vec![0; label::LABELS.len()];
@@ -129,10 +144,24 @@ pub fn replay(store: &Store, config: &Config, thresholds: &Thresholds) -> Result
 /// a second copy of the predicate. A decision of a session that is not final
 /// carries no stored label, so scoring it would diff a recomputed label against
 /// an absence and report movement for every open session in the archive.
-fn eligible(conn: &Connection) -> Result<Vec<Logged>> {
+///
+/// `recorded` is false on a store whose `decisions` table lacks `compacted` or
+/// `dropped`. The query then names neither and every decision reads as one of
+/// unknown kind.
+fn eligible(conn: &Connection, recorded: bool) -> Result<Vec<Logged>> {
+    // The dropped set only where the decision ran under the pool. An unreadable
+    // set admits nothing, which is what an empty one admitted at the prompt.
+    let dropped = if recorded {
+        "CASE WHEN d.compacted = 1
+              THEN CASE WHEN json_valid(d.dropped) THEN d.dropped ELSE '[]' END
+         END"
+    } else {
+        "NULL"
+    };
     let sql = format!(
         "SELECT d.id, d.cwd, coalesce(d.prompt, ''), d.watermark_session_no,
-                CASE WHEN json_valid(d.suppressed) THEN d.suppressed ELSE '[]' END
+                CASE WHEN json_valid(d.suppressed) THEN d.suppressed ELSE '[]' END,
+                {dropped}
            FROM decisions d
           WHERE {}
           ORDER BY d.id",
@@ -147,6 +176,9 @@ fn eligible(conn: &Connection) -> Result<Vec<Logged>> {
                 prompt: row.get(2)?,
                 watermark_session_no: row.get(3)?,
                 refused: refused(&row.get::<_, String>(4)?),
+                dropped: row
+                    .get::<_, Option<String>>(5)?
+                    .map(|document| turn_ids(&document)),
             })
         })?
         .collect::<rusqlite::Result<Vec<Logged>>>()?;
@@ -166,6 +198,11 @@ fn refused(document: &str) -> BTreeSet<i64> {
         .iter()
         .filter_map(|entry| entry.get("turn_id").and_then(serde_json::Value::as_i64))
         .collect()
+}
+
+/// The turn ids out of a decision's stored dropped set, a JSON array of them.
+fn turn_ids(document: &str) -> BTreeSet<i64> {
+    serde_json::from_str::<BTreeSet<i64>>(document).unwrap_or_default()
 }
 
 /// The labels this decision would carry under `thresholds`, counted by label.
@@ -210,11 +247,12 @@ fn recomputed(
 /// The turns this decision's prompt would be given today, under `thresholds`,
 /// beside the spellings it would ask about.
 ///
-/// The same four steps the live arm takes, through the same functions
+/// The same steps the live arm takes, through the same functions
 /// (`prompt::candidates`, `prompt::query_of`, `prompt::eligible`,
-/// `prompt::capped`) and with the same request shape - candidates, the scope of
-/// the stored `cwd`, excerpts off. A second implementation of any of them would
-/// make the diff a measurement of the replay engine.
+/// `prompt::within`, `prompt::capped`) and with the same request shape -
+/// candidates, the scope of the stored `cwd`, excerpts off, and the compacted
+/// window for a decision made under the pool. A second implementation of any of
+/// them would make the diff a measurement of the replay engine.
 fn would_inject(
     conn: &Connection,
     config: &Config,
@@ -238,14 +276,20 @@ fn would_inject(
         prompt::query_of(&decision.prompt, Some(cwd)),
         Scope::Directory(cwd.into()),
     )
-    .limit(thresholds.ranked)
+    .limit(if decision.dropped.is_some() {
+        thresholds.compacted_ranked
+    } else {
+        thresholds.ranked
+    })
     .candidates(candidates)
     .excerpts(false)
     .before_turn_id(bound(decision.watermark_session_no));
 
     let hits = search::run(conn, config, &request)?.hits;
     let admitted = prompt::eligible(hits, thresholds);
-    let injected = prompt::capped(admitted, &decision.refused, thresholds.max_turns)
+    // After the threshold, as the live arm filters: see `prompt::within`.
+    let pooled = prompt::within(admitted, decision.dropped.as_ref());
+    let injected = prompt::capped(pooled, &decision.refused, thresholds.max_turns)
         .iter()
         .map(|hit| hit.turn_id)
         .collect();

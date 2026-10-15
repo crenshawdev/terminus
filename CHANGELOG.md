@@ -46,6 +46,13 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   were still there passed. Such a session is now one failure for the whole
   session, with `block` `null` under `--json`, saying how many block rows
   remain, and `terminus verify` exits 1.
+- `terminus replay` scored a decision made after a compaction through the
+  ordinary window, because the decision log did not keep whether the compacted
+  pool was in force or which turns the compaction had dropped, so
+  `--compacted-ranked` changed nothing. Each decision now stores both, and
+  replay scores a compacted decision through the compacted window and its own
+  dropped turns, so `--compacted-ranked` moves it. Decisions logged before this
+  release carry neither and replay as ordinary ones.
 
 ## [0.1.1] - 2026-10-15
 

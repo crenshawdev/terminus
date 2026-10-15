@@ -1126,6 +1126,144 @@ fn a_decision_is_never_scored_against_a_session_archived_after_it() {
     );
 }
 
+/// How many turns a replay injected across every decision: each one earns
+/// exactly one `hit` or one `false positive`.
+fn injected_total(replayed: &Replayed) -> (usize, usize) {
+    let (hit_old, hit_new) = movement(replayed, "hit");
+    let (fp_old, fp_new) = movement(replayed, "false positive");
+    (hit_old + fp_old, hit_new + fp_new)
+}
+
+/// #40, D-13: a decision made under the compacted pool replays through the
+/// compacted window and its own dropped set, so `compacted_ranked` moves it,
+/// and decisions recorded as ordinary or of unknown kind replay as they always
+/// have.
+///
+/// Three decisions alike in everything but `compacted`. Each one's stored
+/// `injected` is what the live arm gave it, so the shipped thresholds reproduce
+/// every label and any movement is the change under test.
+#[test]
+fn a_compacted_decision_replays_through_the_compacted_pool() {
+    let bench = bench();
+    let session = "88888888-8888-4888-8888-888888888888";
+    let project = "project-delta";
+    let file = "/code/delta/src/anchor.rs";
+    let cwd = bench.root.join(project).to_string_lossy().into_owned();
+
+    archive_at(
+        &bench,
+        "delta.jsonl",
+        project,
+        session,
+        &[
+            ("2026-08-14T10:00:00.000Z", read_call(file)),
+            ("2026-08-14T10:01:00.000Z", read_call(file)),
+            ("2026-08-14T10:02:00.000Z", read_call(file)),
+            ("2026-08-14T10:03:00.000Z", read_call(file)),
+            ("2026-08-14T12:00:00.000Z", read_call(file)),
+        ],
+    );
+    bench.pass();
+
+    // The ranked order this store produces, read the way the injector reads it.
+    let raw = format!("what happened in {file}");
+    let (_, candidates) = prompt::candidates(&raw, Some(&cwd), prompt::MAX_CANDIDATES);
+    let request = Request::new(
+        prompt::query_of(&raw, Some(&cwd)),
+        Scope::Directory(bench.root.join(project)),
+    )
+    .candidates(candidates)
+    .excerpts(false)
+    .limit(prompt::RANKED);
+    let hits = search::run(&bench.conn(), &Config::default(), &request)
+        .unwrap()
+        .hits;
+    let ranked: Vec<i64> = hits.iter().map(|hit| hit.turn_id).collect();
+    assert!(ranked.len() >= 4, "{hits:?}");
+    // The ordinary arm gives the top three. The compacted one is given only
+    // the third, the one turn of the three the compaction dropped.
+    let ordinary: Vec<(i64, usize)> = ranked[..prompt::MAX_TURNS]
+        .iter()
+        .map(|turn_id| (*turn_id, 100))
+        .collect();
+    let dropped = ranked[2];
+
+    let watermark = bench.watermark();
+    let at = "2026-08-14T11:00:00.000Z";
+    let compacted = decide(
+        &bench,
+        session,
+        at,
+        &cwd,
+        &raw,
+        watermark,
+        &[(dropped, 100)],
+        100,
+        &[],
+    );
+    let plain = decide(
+        &bench,
+        session,
+        at,
+        &cwd,
+        &raw,
+        watermark,
+        &ordinary,
+        300,
+        &[],
+    );
+    let unknown = decide(
+        &bench,
+        session,
+        at,
+        &cwd,
+        &raw,
+        watermark,
+        &ordinary,
+        300,
+        &[],
+    );
+    let conn = bench.conn();
+    conn.execute(
+        "UPDATE decisions SET compacted = 1, dropped = ?1 WHERE id = ?2",
+        rusqlite::params![format!("[{dropped}]"), compacted],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE decisions SET compacted = 0, dropped = '[]' WHERE id = ?1",
+        [plain],
+    )
+    .unwrap();
+    let kinds: Vec<Option<i64>> = [compacted, plain, unknown]
+        .iter()
+        .map(|id| {
+            conn.query_row("SELECT compacted FROM decisions WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(kinds, vec![Some(1), Some(0), None], "the premise");
+    bench.pass();
+
+    // The shipped numbers reproduce all three. For the compacted decision that
+    // is one injected turn, not three: nothing outside its dropped set got in.
+    let shipped = replayed(&bench, &Thresholds::default());
+    assert_eq!(shipped.decisions, 3, "{shipped:?}");
+    assert_eq!(shipped.changed, Vec::<i64>::new(), "{shipped:?}");
+    assert_eq!(injected_total(&shipped), (7, 7), "{shipped:?}");
+
+    // No compacted window at all: the compacted decision is given nothing, and
+    // the other two do not notice.
+    let closed = Thresholds {
+        compacted_ranked: 0,
+        ..Thresholds::default()
+    };
+    let diff = replayed(&bench, &closed);
+    assert_eq!(diff.changed, vec![compacted], "{diff:?}");
+    assert_eq!(injected_total(&diff), (7, 6), "{diff:?}");
+}
+
 // ---------------------------------------------------------------------------
 // FEED-04: what the log adds up to
 // ---------------------------------------------------------------------------
