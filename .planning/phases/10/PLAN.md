@@ -52,6 +52,7 @@ This plan is the live release. Phases 1 to 9 land on `main`, `v0.1.0` is tagged 
     - Phase 8's plan 1 set `git.create_tag` to `false`, so `/cad-land` cuts no bare `0.1.0` tag (D-03).
     - The work goes to `origin`, not `forgejo`.
     - The PR description says `Fixes #13`, so issue #13 closes on merge. Commit 65ef2d1 fixed it.
+    - The PR description carries the list in `.planning/phases/9/CLAIMS.md`: each claim in the README's Trust and Current state sections, beside the file or issue that backs it (phase 9, D-15).
   - **If the branch is reaped.** `/cad-land`'s cleanup may remove the integration branch. If it does, Task 4's edits go on a new branch from `main`.
 - **Verify:** human-verify. The owner runs these, and each must hold:
   - After `git fetch origin`, `git ls-tree --name-only origin/main install.sh README.md .github/workflows/release.yml .github/workflows/release-check.yml scripts/sign-release.sh` lists all five paths.
