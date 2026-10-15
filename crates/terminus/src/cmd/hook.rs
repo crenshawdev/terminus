@@ -236,8 +236,9 @@ pub(crate) fn arm(event: &str) -> Option<Arm> {
 /// files: both arms save the session's state file (`State::save`), and the
 /// prompt arm saves a decision file (`Decision::save`), each creating its
 /// directory if it has to. Abandoning it is still safe because both writes go
-/// through a temp file and a rename, so a write cut off here leaves at most a
-/// `.tmp`, which the ingest's drain deletes once it is old. The thread never
+/// through a temp file and a rename. A write cut off here leaves a `.tmp`, and a
+/// decision write cut off after it reserves its `.json` also leaves that empty
+/// `.json`. The ingest's drain deletes both once they are old. The thread never
 /// writes SQLite and never takes the ingest lock (INJ-06). This is the second
 /// of D-03's two mechanisms: the busy
 /// timeout `terminus_core::inject` sets turns lock contention into an immediate
