@@ -20,6 +20,7 @@ use rusqlite::Connection;
 
 use super::label;
 use crate::error::Result;
+use crate::store::Store;
 
 /// What the decision log adds up to.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -27,6 +28,14 @@ pub struct Stats {
     /// Prompts that produced a record, including every one that injected
     /// nothing (D-11).
     pub decisions: usize,
+    /// Decisions recorded as made under the compacted pool (INJ-05).
+    pub compacted_decisions: usize,
+    /// Decisions recorded as made outside it.
+    ///
+    /// A decision drained before the `compacted` column existed is in neither
+    /// count, because whether it ran under the pool is unknown. So `decisions`
+    /// minus these two is exactly the number of those.
+    pub ordinary_decisions: usize,
     /// Turns handed to the model across all of them.
     pub injected_turns: usize,
     /// Injected turns something later referred to.
@@ -63,7 +72,12 @@ pub struct Stats {
 /// one table, the decision counts are aggregates over another, and forcing them
 /// into a single query would multiply rows through the join and make every
 /// count wrong in a way that still returns numbers.
-pub fn stats(conn: &Connection) -> Result<Stats> {
+///
+/// A store whose `decisions` table lacks `compacted` has not been opened for
+/// writing since the column was added, and a read cannot add it. The split is
+/// then two zeroes, and the query that would name the column is not run.
+pub fn stats(store: &Store) -> Result<Stats> {
+    let conn = store.conn();
     let (decisions, chars_injected) = conn.query_row(
         "SELECT count(*), coalesce(sum(chars_injected), 0) FROM decisions",
         [],
@@ -84,8 +98,25 @@ pub fn stats(conn: &Connection) -> Result<Stats> {
 
     let mut counted =
         conn.prepare("SELECT label, count(*) FROM labels GROUP BY label ORDER BY label")?;
+    let recorded = !store
+        .missing_columns()
+        .iter()
+        .any(|missing| missing.table == "decisions" && missing.column == "compacted");
+    let (compacted_decisions, ordinary_decisions) = if recorded {
+        conn.query_row(
+            "SELECT coalesce(sum(compacted = 1), 0), coalesce(sum(compacted = 0), 0)
+               FROM decisions",
+            [],
+            |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize)),
+        )?
+    } else {
+        (0, 0)
+    };
+
     let mut stats = Stats {
         decisions,
+        compacted_decisions,
+        ordinary_decisions,
         injected_turns: injected_turns as usize,
         chars_injected,
         ..Stats::default()

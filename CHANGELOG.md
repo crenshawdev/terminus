@@ -9,6 +9,16 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `terminus stats` counts compacted decisions apart from ordinary ones. A
+  compacted decision is the one taken on the prompt after a compaction, which
+  searches the wider window and is offered only the turns the compaction
+  dropped. `--json` carries the two counts as `compacted_decisions` and
+  `ordinary_decisions`, and the human output prints them under `decisions`.
+  Decisions logged before this release are in neither count, so the two can add
+  up to less than `decisions`.
+
 ### Fixed
 
 - `terminus mcp` agreed to protocol revision `2025-03-26` when a client asked

@@ -233,7 +233,8 @@ and unchanged.
 ### `stats`
 
 ```json
-{"decisions": 12, "injected_turns": 9, "hits": 5, "false_positives": 4,
+{"decisions": 12, "compacted_decisions": 1, "ordinary_decisions": 9,
+ "injected_turns": 9, "hits": 5, "false_positives": 4,
  "precision": 0.56, "misses": 0, "wasted_budget": 2,
  "chars_injected": 1840, "chars_referenced": 1020}
 ```
@@ -242,6 +243,11 @@ and unchanged.
   nothing and the ones that never opened the store. That is the denominator the
   whole report is for: a precision computed only over the prompts that fired
   would be a number about a subset that flatters itself.
+- `compacted_decisions` counts the decisions taken on the one prompt after a
+  compaction, which searched the wider window and was offered only the turns
+  the compaction dropped. `ordinary_decisions` counts the decisions taken on any
+  other prompt. A decision logged by a build that did not record which kind it
+  was is in neither, so `decisions` minus the two is the number of those.
 - `precision` is `hits / (hits + false_positives)`, and it is **null**, not
   zero, when no injected turn has been labelled yet - an archive whose sessions
   are all still open has no precision, and zero would read as "injection never

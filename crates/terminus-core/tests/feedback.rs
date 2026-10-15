@@ -1344,7 +1344,7 @@ fn the_report_adds_up_the_known_mix() {
     let bench = bench();
     known_mix(&bench);
 
-    let counted = stats::stats(&bench.conn()).unwrap();
+    let counted = stats::stats(&Store::open_read_only(&bench.data_dir).unwrap()).unwrap();
 
     // Three prompts, including the one that injected nothing (D-11).
     assert_eq!(counted.decisions, 3, "{counted:?}");
@@ -1361,6 +1361,39 @@ fn the_report_adds_up_the_known_mix() {
     assert_eq!(counted.chars_referenced, 60, "{counted:?}");
 }
 
+/// #40, D-12: compacted decisions are counted apart from ordinary ones, and a
+/// decision whose kind was never recorded is in neither count while still being
+/// one of `decisions`.
+#[test]
+fn the_report_counts_compacted_decisions_apart_from_ordinary_ones() {
+    let bench = bench();
+    known_mix(&bench);
+    logged(&bench, "after a compaction", 0, &[], &[]);
+    logged(&bench, "logged before the split", 0, &[], &[]);
+    let conn = bench.conn();
+    for (prompt, compacted) in [
+        ("the mixed one", Some(1)),
+        ("after a compaction", Some(1)),
+        ("the wasteful one", Some(0)),
+        ("the non-fire", Some(0)),
+        ("logged before the split", None),
+    ] {
+        conn.execute(
+            "UPDATE decisions SET compacted = ?1 WHERE prompt = ?2",
+            rusqlite::params![compacted, prompt],
+        )
+        .unwrap();
+    }
+
+    let counted = stats::stats(&Store::open_read_only(&bench.data_dir).unwrap()).unwrap();
+    assert_eq!(counted.decisions, 5, "{counted:?}");
+    assert_eq!(counted.compacted_decisions, 2, "{counted:?}");
+    assert_eq!(counted.ordinary_decisions, 2, "{counted:?}");
+    // The rest of the report is the known mix's, untouched by the split.
+    assert_eq!(counted.hits, 1, "{counted:?}");
+    assert_eq!(counted.chars_injected, 150, "{counted:?}");
+}
+
 /// An archive with no labels yet has no precision, and says so rather than
 /// reporting zero.
 ///
@@ -1369,7 +1402,7 @@ fn the_report_adds_up_the_known_mix() {
 #[test]
 fn an_unlabelled_archive_has_no_precision_rather_than_a_precision_of_zero() {
     let bench = bench();
-    let counted = stats::stats(&bench.conn()).unwrap();
+    let counted = stats::stats(&Store::open_read_only(&bench.data_dir).unwrap()).unwrap();
 
     assert_eq!(counted.decisions, 0, "{counted:?}");
     assert_eq!(counted.precision, None, "{counted:?}");
@@ -1378,7 +1411,7 @@ fn an_unlabelled_archive_has_no_precision_rather_than_a_precision_of_zero() {
 
     // One decision, no label: still nothing to be precise about.
     logged(&bench, "not judged yet", 40, &[(10, 40)], &[]);
-    let counted = stats::stats(&bench.conn()).unwrap();
+    let counted = stats::stats(&Store::open_read_only(&bench.data_dir).unwrap()).unwrap();
     assert_eq!(counted.decisions, 1, "{counted:?}");
     assert_eq!(counted.injected_turns, 1, "{counted:?}");
     assert_eq!(counted.precision, None, "{counted:?}");

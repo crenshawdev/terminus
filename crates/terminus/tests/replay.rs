@@ -495,3 +495,42 @@ fn replay_on_a_store_without_the_compaction_columns_still_answers() {
         stderr(&out)
     );
 }
+
+/// D-15: stats still answers on a store whose `decisions` table predates the
+/// `compacted` and `dropped` columns. Every row is of unknown kind, so both
+/// split counts are 0 while `decisions` still counts every row.
+#[test]
+fn stats_on_a_store_without_the_compaction_columns_still_answers() {
+    let bench = bench();
+    let cwd = bench.ingest_fixture();
+    let turn = bench.stored_turn();
+    bench.decide(&cwd, "what changed in crates/gizmo/lantern.rs", turn);
+    bench.decide(&cwd, "and in the other file", turn);
+    let out = bench.run(&["ingest"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // After the ingest, which would have added them back.
+    let conn = bench.conn();
+    conn.execute_batch(
+        "ALTER TABLE decisions DROP COLUMN dropped;
+         ALTER TABLE decisions DROP COLUMN compacted;",
+    )
+    .unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM decisions", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+
+    let out = bench.run(&["stats", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let value = document(&out);
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["data"]["decisions"], rows, "{value}");
+    assert_eq!(value["data"]["compacted_decisions"], 0, "{value}");
+    assert_eq!(value["data"]["ordinary_decisions"], 0, "{value}");
+    assert!(
+        !stderr(&out).contains("no such column"),
+        "stats named a column the store does not have: {}",
+        stderr(&out)
+    );
+}
