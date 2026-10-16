@@ -33,15 +33,16 @@ Terminus is audited with [sentinel](https://github.com/crenshawdev/sentinel), wh
 
 ## The full audit
 
-The full audit runs [sentinel](https://github.com/crenshawdev/sentinel)'s pipeline in seven steps. The run counts are sentinel's defaults.
+The full audit runs [sentinel](https://github.com/crenshawdev/sentinel)'s pipeline in eight steps. The run counts are sentinel's defaults.
 
 1. **Mechanical checks.** The same checks every pull request runs.
 2. **Context map.** Trail of Bits' `audit-context-building` skill maps the code. The map goes at the top of every review prompt in step 4.
 3. **Claude Security scan.** One scan of the whole repository.
 4. **Review prompts.** Eight prompts, which sentinel calls lenses, each limited to one concern: untrusted input, path handling, hook execution, permissions, data exposure, crypto and state, resource limits, and supply chain. Each prompt runs three times on Claude, each run in a fresh context, and once on OpenAI's Codex, 32 runs in all. Every run reads the same snapshot of the repository and cannot write to it. The step 3 findings are added as one more run of each prompt. Findings from the same prompt that cite the same file and overlapping lines are merged into one, with a count of how many runs reported it, and a finding only one run reported is tagged low-agreement. The merge removes which run and which model wrote each finding.
-5. **Adjudication.** A separate Claude agent goes through every merged finding without knowing where it came from and marks it confirmed, unproven or dropped. A finding is confirmed only when the agent has written a test that fails because of it. Unproven and dropped findings each carry the reason. The audit's own Claude Code session then reruns every confirmed test and checks that it fails for the reason the finding gives.
-6. **Variant analysis.** For each confirmed finding, Trail of Bits' `variant-analysis` skill looks for the same pattern elsewhere in the repository. New hits are adjudicated the same way.
-7. **Findings log.** For each step, how many findings were reported, confirmed, unproven and dropped.
+5. **Adjudication.** The merged findings are split into batches of ten, and a fresh Claude agent judges each batch in turn without knowing where the findings came from, marking each confirmed, unproven or dropped. A finding is confirmed only when the agent has written a test that fails because of it and reaches the code through a way in that THREAT-MODEL.md names. Unproven and dropped findings each carry the reason. The audit's own Claude Code session then reruns every confirmed test and checks that it fails for the reason the finding gives.
+6. **Refute.** A fresh Claude agent per batch sees only the confirmed and dropped rulings and tries to prove each one wrong: it reruns every confirmed test and checks every drop's reason against the code. Every ruling that does not hold goes to the maintainer to decide.
+7. **Variant analysis.** For each confirmed finding, Trail of Bits' `variant-analysis` skill looks for the same pattern elsewhere in the repository. New hits are adjudicated and refuted the same way.
+8. **Findings log.** For each step, how many findings were reported, confirmed, unproven and dropped, and how many rulings did not hold.
 
 ## Confirmed findings
 
