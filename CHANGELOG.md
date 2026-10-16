@@ -101,6 +101,12 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   file is a store reads it read-only, which cannot roll that journal back. The
   check now lets SQLite roll it back first, and the next ingest creates the
   store.
+- An exclusion written through a symlink excluded nothing. Claude Code names a
+  project's folder after the path the symlink resolves to, and a git project's
+  key is its resolved top level, so neither matched the exclusion as written:
+  new sessions from that project were archived, and archived ones stayed
+  visible to search, recall and injection. Each exclusion now also matches the
+  path it resolves to.
 
 ## [0.1.1] - 2026-10-15
 
