@@ -668,7 +668,8 @@ enum StoreState {
     Initialized,
 }
 
-/// Decide whether the path holds a store, without writing a byte.
+/// Decide whether the path holds a store, without writing a byte unless SQLite
+/// needs a crashed transaction rolled back first.
 ///
 /// File length is not the test, and that is the whole point of this function.
 /// `open` sets `journal_mode=wal` on the writable connection, which stamps the
@@ -681,7 +682,9 @@ enum StoreState {
 ///
 /// Presence of tables is the test instead. It reads `sqlite_master` over a
 /// **read-only** connection, so AC5's "a refused open leaves the store
-/// byte-for-byte unchanged" survives it.
+/// byte-for-byte unchanged" survives it. The one exception is a hot journal,
+/// which only a writable connection can roll back. Refusing it instead would
+/// leave a store killed during its first open refused by every open after.
 ///
 /// A database holding tables but no `meta` is somebody else's SQLite file, not
 /// a half-built store: it is refused rather than initialized over. Initializing
@@ -701,18 +704,35 @@ fn inspect(path: &Path) -> Result<StoreState> {
     })?;
     conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS.into()))?;
 
-    let tables: i64 = conn
-        .query_row(
+    let count = |conn: &Connection| {
+        conn.query_row(
             "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
             [],
-            |r| r.get(0),
+            |r| r.get::<_, i64>(0),
         )
-        .map_err(|source| Error::NotAStore {
-            path: path.to_path_buf(),
-            // The usual cause is a file that is not a database at all: SQLite
-            // opens lazily, so the first statement is where that surfaces.
-            detail: format!("reading its table list: {source}"),
-        })?;
+    };
+    let tables = match count(&conn) {
+        // A process killed mid-transaction leaves a hot journal, and SQLite
+        // will not read past it until it is rolled back, which a read-only
+        // connection cannot do. The first open of a new store is where that
+        // happens: setting WAL mode writes the header through a rollback
+        // journal. A writable connection rolls it back on its first read, to
+        // the last committed state. This is the only write `inspect` makes.
+        Err(e)
+            if e.sqlite_error().map(|e| e.extended_code)
+                == Some(rusqlite::ffi::SQLITE_READONLY_ROLLBACK) =>
+        {
+            drop(conn);
+            Connection::open(path).and_then(|conn| count(&conn))
+        }
+        counted => counted,
+    }
+    .map_err(|source| Error::NotAStore {
+        path: path.to_path_buf(),
+        // The usual cause is a file that is not a database at all: SQLite
+        // opens lazily, so the first statement is where that surfaces.
+        detail: format!("reading its table list: {source}"),
+    })?;
 
     Ok(if tables == 0 {
         StoreState::Fresh

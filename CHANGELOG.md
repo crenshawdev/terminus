@@ -94,6 +94,13 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   ran no tests and passed. The 27 such files are now declared with
   `required-features = ["testkit"]`, so cargo refuses to run one named without
   the feature and says it needs `testkit` (#44).
+- An ingest killed while it was creating a new store could leave the data
+  directory refused by every command after it, each saying `terminus.db exists
+  but is not a terminus store`. Switching a new store to WAL mode writes its
+  header through a rollback journal, and the check that decides whether the
+  file is a store reads it read-only, which cannot roll that journal back. The
+  check now lets SQLite roll it back first, and the next ingest creates the
+  store.
 
 ## [0.1.1] - 2026-10-15
 

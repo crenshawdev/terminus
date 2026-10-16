@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use terminus_core::store::{
     ARCHIVE_FORMAT, DB_FILE_NAME, DERIVED_SCHEMA, META_ARCHIVE_FORMAT, META_DERIVED_SCHEMA,
 };
@@ -680,6 +680,62 @@ fn an_initialize_that_never_committed_reopens_instead_of_bricking() {
     assert_eq!(
         store.meta_int(META_DERIVED_SCHEMA).unwrap(),
         Some(DERIVED_SCHEMA)
+    );
+}
+
+/// A store killed during its first open is rolled back and initialized, not
+/// refused by every open after.
+///
+/// Setting WAL mode on a new file writes its header through a rollback journal,
+/// so a kill in that window leaves a hot journal beside it, and a read-only
+/// connection cannot roll one back. The copy below is a database stopped
+/// mid-transaction with its journal, the state such a kill leaves.
+#[test]
+fn a_hot_journal_is_rolled_back_rather_than_refused() {
+    let source = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let journal = format!("{DB_FILE_NAME}-journal");
+    {
+        let conn = Connection::open(source.path().join(DB_FILE_NAME)).unwrap();
+        // A tiny cache, so the transaction's pages spill into the file while
+        // the journal holds what they replaced.
+        conn.pragma_update(None, "cache_size", 1).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch("CREATE TABLE scratch (x BLOB)").unwrap();
+        for _ in 0..64 {
+            tx.execute("INSERT INTO scratch VALUES (zeroblob(4096))", [])
+                .unwrap();
+        }
+        for name in [DB_FILE_NAME, journal.as_str()] {
+            std::fs::copy(source.path().join(name), dir.path().join(name)).unwrap();
+        }
+        tx.rollback().unwrap();
+    }
+
+    // The premise: a read-only connection cannot read past the journal.
+    let probe = Connection::open_with_flags(
+        dir.path().join(DB_FILE_NAME),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .expect_err("the copy has no hot journal, so this test proves nothing");
+    assert_eq!(
+        probe.sqlite_error().map(|e| e.extended_code),
+        Some(rusqlite::ffi::SQLITE_READONLY_ROLLBACK),
+        "{probe}"
+    );
+
+    let store = Store::open(dir.path()).expect("a hot journal must be rolled back, not refused");
+    assert_eq!(
+        store.meta_int(META_ARCHIVE_FORMAT).unwrap(),
+        Some(ARCHIVE_FORMAT)
+    );
+    assert!(
+        !dir.path().join(&journal).exists(),
+        "the journal is still there"
     );
 }
 
