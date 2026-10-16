@@ -145,8 +145,8 @@ static COPYING: RwLock<()> = RwLock::new(());
 /// `Command::spawn`, held off while any binary copy is in flight ([`COPYING`]).
 ///
 /// Every spawn in this file goes through here or through [`output`] - including
-/// `ps` and `kill`, which fork exactly like the ones that matter and inherit
-/// exactly the same descriptors.
+/// `ps`, which forks exactly like the ones that matter and inherits exactly the
+/// same descriptors.
 ///
 /// The guard is dropped when `spawn` returns, which is after the child has
 /// exec'd: both of the paths `std` takes on Unix (`posix_spawn`, and the
@@ -729,8 +729,19 @@ fn descendants(root: u32, table: &[Proc]) -> Vec<u32> {
     found
 }
 
-fn sigkill(target: &str) {
-    output(Command::new("kill").args(["-KILL", target])).expect("run kill");
+// kill(2) from the C library std already links, so the test does not depend on
+// which `kill` binary the system ships or how it parses `-KILL -<pid>`.
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+const SIGKILL: i32 = 9;
+
+/// SIGKILL to `pid`, or to the process group a negative `pid` names. A target
+/// that is already gone is ignored.
+fn sigkill(pid: i32) {
+    // SAFETY: kill(2) takes two integers and reads no memory of ours.
+    unsafe { kill(pid, SIGKILL) };
 }
 
 /// AC2 / D-03: the kill Claude Code actually performs, and an ingest that
@@ -801,14 +812,14 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
 
     let mut doomed = descendants(hook_pid, &ps());
     // The group, by its leader's negated pid - `process.kill(-pid)`.
-    sigkill(&format!("-{hook_pid}"));
+    sigkill(-(hook_pid as i32));
     for pid in descendants(hook_pid, &ps()) {
         if !doomed.contains(&pid) {
             doomed.push(pid);
         }
     }
     for pid in &doomed {
-        sigkill(&pid.to_string());
+        sigkill(*pid as i32);
     }
 
     let status = child.wait().expect("wait for the killed hook");
