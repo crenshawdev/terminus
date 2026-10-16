@@ -102,5 +102,7 @@ jobs:
 
       # The debug build, as the suite runs locally. The timing budgets in
       # hook.rs, backfill.rs, lock_race.rs and corpus.rs are not loosened here.
+      # --no-fail-fast runs every test file after one fails, so a run shows
+      # every failure.
       - name: Test
-        run: cargo test --workspace --all-features --locked
+        run: cargo test --workspace --all-features --locked --no-fail-fast
