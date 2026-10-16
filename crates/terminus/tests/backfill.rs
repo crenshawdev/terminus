@@ -15,9 +15,10 @@
 //!
 //! and two more that are about what the work leaves behind:
 //!
-//! 4. a backfill SIGKILLed at randomized points and rerun converges on the store
-//!    an uninterrupted one reaches (AC8, D-22) - the shape `tests/crash.rs`
-//!    already uses, aimed at the pipeline rather than at the sequential pass;
+//! 4. a backfill SIGKILLed at aimed and randomized points and rerun converges on
+//!    the store an uninterrupted one reaches (AC8, D-22) - the shape
+//!    `tests/crash.rs` already uses, aimed at the pipeline rather than at the
+//!    sequential pass;
 //! 5. over the real corpus, a backfill and a `terminus ingest` tree pass archive
 //!    the same sessions and the same turns.
 //!
@@ -36,7 +37,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
-use terminus_core::ingest::{self, Attempt};
+use terminus_core::ingest::{self, fault, Attempt};
 use terminus_core::store::DB_FILE_NAME;
 use terminus_core::testkit::{self, Rng};
 
@@ -304,8 +305,11 @@ fn an_ingest_during_a_backfill_loses_the_race_and_exits_at_once() {
     dirs.wait_for_sessions(sessions);
 }
 
-/// How many kills the convergence test aims at a backfill.
-const KILLS: usize = 8;
+/// Timed kills in the convergence test, at pseudorandom delays.
+const TIMED: usize = 8;
+
+/// How long to wait for a backfill to announce that it reached its point.
+const ARRIVAL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// What a store holds, minus everything a pass count changes.
 ///
@@ -413,6 +417,38 @@ fn kill_and_reap(child: &mut Child) {
     child.wait().unwrap();
 }
 
+/// Kill a backfill once it reports that it reached `point`, the aiming
+/// `tests/crash.rs` uses. `after_files` is the count [`fault::AFTER_FILES`]
+/// needs, and `None` for the per-file points.
+fn kill_at(dirs: &Dirs, data_dir: &Path, point: &str, after_files: Option<usize>) {
+    std::fs::create_dir_all(data_dir).unwrap();
+    let ready = data_dir.join("fault-ready");
+
+    let mut command = dirs.command_in(data_dir, &["backfill", "--work"]);
+    command.env(fault::AT, point).env(fault::READY, &ready);
+    if let Some(count) = after_files {
+        command.env(fault::AFTER_FILES_COUNT, count.to_string());
+    }
+    let mut child = command.spawn().unwrap();
+
+    let deadline = Instant::now() + ARRIVAL_TIMEOUT;
+    while !ready.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!(
+                "the backfill exited ({status}) before reaching `{point}`; \
+                 build the binary with --features testkit or the fault points are inert"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the backfill to reach `{point}`"
+        );
+        std::thread::sleep(Duration::from_micros(200));
+    }
+
+    kill_and_reap(&mut child);
+}
+
 /// Run the working process to completion.
 fn work_fully(dirs: &Dirs, data_dir: &Path) {
     let out = dirs
@@ -427,10 +463,18 @@ fn work_fully(dirs: &Dirs, data_dir: &Path) {
 }
 
 /// AC8's second half, and D-22: a killed backfill converges.
+///
+/// Aimed kills first, then timed ones, the split `tests/crash.rs` makes. A timed
+/// kill lands where the clock says, and the window is set from one
+/// uninterrupted pass. On a CI runner that pass ran up to five times slower
+/// than the passes it timed, so nearly every timed kill landed after the pass
+/// had finished. An aimed kill stalls the backfill at a named point and kills it
+/// there, so it interrupts the pass on any machine, and each one is required
+/// to. The timed kills sample the places nobody named.
 #[test]
 fn a_killed_backfill_converges_on_the_store_an_uninterrupted_one_reaches() {
     let dirs = Dirs::new();
-    build_tree(&dirs.claude);
+    let files = build_tree(&dirs.claude) as usize;
 
     // The reference: one uninterrupted run, and how long it takes.
     let reference_dir = dirs.root.join("reference");
@@ -447,17 +491,69 @@ fn a_killed_backfill_converges_on_the_store_an_uninterrupted_one_reaches() {
         reference.turns.len()
     );
 
+    // True when the kill left the store short of the reference. Either way the
+    // store is then rerun to completion and must land on the reference.
+    let converge = |label: &str, data_dir: &Path| -> bool {
+        // A store with no schema yet is a pass killed before its first commit:
+        // interrupted, and trivially unlike the reference.
+        let mid = match Snapshot::started(data_dir) {
+            Some(snapshot) => snapshot != reference,
+            None => data_dir.join(DB_FILE_NAME).exists(),
+        };
+
+        // Rerun until it completes. One completing run is enough - the
+        // watermarks say where to resume and the loop is here so that a run
+        // which loses a race to a straggler process is not a test failure.
+        for attempt in 0..3 {
+            work_fully(&dirs, data_dir);
+            if Snapshot::of(data_dir) == reference {
+                break;
+            }
+            assert!(attempt < 2, "kill {label} never converged");
+        }
+        assert_eq!(
+            Snapshot::of(data_dir),
+            reference,
+            "kill {label} converged on a different store"
+        );
+        mid
+    };
+
+    // Aimed at a file: the walk stalls between transcripts, with the tree part
+    // archived. Every count below `files` leaves at least one file to do.
+    for after in 1..files {
+        let label = format!("after-{after}");
+        let data_dir = dirs.root.join(format!("killed-{label}"));
+        kill_at(&dirs, &data_dir, fault::AFTER_FILES, Some(after));
+        assert!(
+            converge(&label, &data_dir),
+            "the kill aimed after {after} files interrupted nothing"
+        );
+    }
+
+    // Aimed at a moment: the per-file points, firing inside whichever file the
+    // writer is on when it reaches them.
+    for &point in fault::POINTS {
+        let label = format!("at-{point}");
+        let data_dir = dirs.root.join(format!("killed-{label}"));
+        kill_at(&dirs, &data_dir, point, None);
+        assert!(
+            converge(&label, &data_dir),
+            "the kill aimed at `{point}` interrupted nothing"
+        );
+    }
+
     let mut rng = Rng(testkit::seed(
         "a_killed_backfill_converges_on_the_store_an_uninterrupted_one_reaches",
     ));
     // A window a little wider than the pass itself, so a kill lands anywhere in
-    // it - including after it, which is the iteration that proves the harness
-    // is not simply always killing an empty store.
+    // it, including after it.
     let window = (pass_time.as_micros() as u64 * 3 / 2).max(1_000);
     let mut interrupted = 0usize;
 
-    for index in 0..KILLS {
-        let data_dir = dirs.root.join(format!("killed-{index}"));
+    for index in 0..TIMED {
+        let label = format!("timed-{index}");
+        let data_dir = dirs.root.join(format!("killed-{label}"));
         std::fs::create_dir_all(&data_dir).unwrap();
 
         let mut child = dirs
@@ -467,38 +563,12 @@ fn a_killed_backfill_converges_on_the_store_an_uninterrupted_one_reaches() {
         std::thread::sleep(Duration::from_micros(rng.below(window)));
         kill_and_reap(&mut child);
 
-        // A store with no schema yet is a pass killed before its first commit:
-        // interrupted, and trivially unlike the reference.
-        let mid = match Snapshot::started(&data_dir) {
-            Some(snapshot) => snapshot != reference,
-            None => data_dir.join(DB_FILE_NAME).exists(),
-        };
-        if mid {
+        if converge(&label, &data_dir) {
             interrupted += 1;
         }
-
-        // Rerun until it completes. One completing run is enough - the
-        // watermarks say where to resume and the loop is here so that a run
-        // which loses a race to a straggler process is not a test failure.
-        for attempt in 0..3 {
-            work_fully(&dirs, &data_dir);
-            if Snapshot::of(&data_dir) == reference {
-                break;
-            }
-            assert!(attempt < 2, "kill {index} never converged");
-        }
-        assert_eq!(
-            Snapshot::of(&data_dir),
-            reference,
-            "kill {index} converged on a different store"
-        );
     }
 
-    assert!(
-        interrupted >= 2,
-        "only {interrupted} of {KILLS} kills interrupted anything; the harness is testing \
-         a race it always loses"
-    );
+    println!("timed: {interrupted} of {TIMED} kills interrupted the pass");
 }
 
 /// The same two passes over the real corpus, when there is one to measure
