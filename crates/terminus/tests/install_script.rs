@@ -847,32 +847,40 @@ fn a_cut_off_script_runs_nothing(shell: Shell) {
     assert!(fx.calls().is_empty(), "{:?}", fx.calls());
 }
 
-/// A HOME holding `ü`. dash started without a UTF-8 locale, as every test
-/// starts it, adds a byte to `ü` each time it copies HOME, so the run is
-/// refused there; `/bin/sh`, and dash started with `LANG=C.UTF-8`, install.
+/// A HOME holding `ü`. dash 0.5.13 started without a UTF-8 locale, as every
+/// test starts it, adds a byte to `ü` each time it copies HOME, so the run is
+/// refused there, and the same dash started with `LANG=C.UTF-8` installs. A
+/// shell that keeps the bytes installs, and that includes dash 0.5.12, which is
+/// Ubuntu 24.04's dash and its `/bin/sh`. Which kind this machine's shell is
+/// gets read off the shell itself before the run.
 fn a_home_dash_would_change_is_refused(shell: Shell) {
+    use std::os::unix::ffi::OsStrExt;
+
     let mut fx = fixture(shell);
     fx.home = fx.root.join("jürgen");
     std::fs::create_dir_all(&fx.home).unwrap();
     let bytes = fx.serve("1.0.0", "");
-    match shell {
-        Shell::Sh => {
-            let output = fx.run();
-            assert!(output.status.success(), "{}", text(&output));
-        }
-        Shell::Dash => {
-            let output = fx.assert_refused(fx.command(&[fx.server.url()]));
-            assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("this shell changes some bytes of HOME"),
-                "{}",
-                text(&output)
-            );
-            let mut command = fx.command(&[fx.server.url()]);
-            command.env("LANG", "C.UTF-8");
-            let output = command.output().unwrap();
-            assert!(output.status.success(), "{}", text(&output));
-        }
+    let copied = fx
+        .shell(&fx.tools)
+        .args(["-c", r#"h=$HOME; printf '%s' "$h""#])
+        .output()
+        .unwrap();
+    assert!(copied.status.success(), "{}", text(&copied));
+    if copied.stdout == fx.home.as_os_str().as_bytes() {
+        let output = fx.run();
+        assert!(output.status.success(), "{}", text(&output));
+    } else {
+        let output = fx.assert_refused(fx.command(&[fx.server.url()]));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("this shell changes some bytes of HOME"),
+            "{}",
+            text(&output)
+        );
+        let mut command = fx.command(&[fx.server.url()]);
+        command.env("LANG", "C.UTF-8");
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", text(&output));
     }
     fx.assert_linked("1.0.0", &bytes);
 }
