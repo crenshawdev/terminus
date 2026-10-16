@@ -940,8 +940,13 @@ fn a_flagged_session_rewritten_under_its_watermark_opens_it_once() {
 /// a path that is not text has no session key to flag - which is exactly why
 /// `another_per_file_failure_flags_no_session` exists beside it.
 ///
-/// This needs a path that is bytes and not text.
+/// This needs a path that is bytes and not text. APFS refuses those, so the
+/// test is ignored on macOS.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses a file name that is not valid UTF-8"
+)]
 fn a_failure_that_is_not_a_divergence_flags_no_session() {
     use std::os::unix::ffi::OsStrExt;
 
