@@ -20,8 +20,9 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
     runs-on: ${{ matrix.runner }}
-    # A hung test ends the job here, with its log, instead of holding the
-    # runner for GitHub's default of six hours.
+    # The backstop behind the Test step's own 15-minute limit, instead of
+    # GitHub's default of six hours. Hung Linux jobs have run past it and lost
+    # their whole log.
     timeout-minutes: 45
     defaults:
       run:
@@ -107,5 +108,89 @@ jobs:
       # hook.rs, backfill.rs, lock_race.rs and corpus.rs are not loosened here.
       # --no-fail-fast runs every test file after one fails, so a run shows
       # every failure.
+      #
+      # A run still going at 15 minutes is stopped here, not by timeout-minutes,
+      # so the log survives. Before the kill it prints the log tail, every
+      # process with its state and group, and the open files of every process
+      # it can read. The first process listing uses the short name, which
+      # reads nothing a stuck process could hold. Processes still there 5 s
+      # after SIGKILL are listed again.
       - name: Test
-        run: cargo test --workspace --all-features --locked --no-fail-fast
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/cargo-test.log"
+          limit=$((15 * 60))
+          ( cargo test --workspace --all-features --locked --no-fail-fast 2>&1 | tee "$log" ) &
+          run=$!
+          while kill -0 "$run" 2>/dev/null && [ "$SECONDS" -lt "$limit" ]; do
+            sleep 5
+          done
+          if ! kill -0 "$run" 2>/dev/null; then
+            wait "$run"
+            exit 0
+          fi
+
+          if [ "$(uname -s)" = Linux ]; then
+            columns=pid,ppid,pgid,sid,stat,wchan:32,etime
+            bounded() { timeout -k 5 30 "$@"; }
+          else
+            columns=pid,ppid,pgid,stat,wchan,etime
+            bounded() { "$@"; }
+          fi
+
+          echo "::error::cargo test was still running after 15 minutes"
+          echo "== last 200 lines of the test log"
+          tail -n 200 "$log"
+          echo "== every process, short names"
+          ps -e -o "$columns,comm"
+          echo "== every process, full command lines"
+          bounded ps -e -ww -o "$columns,args" || echo "ps with command lines did not finish"
+          echo "== open files of every process this user can read"
+          if [ "$(uname -s)" = Linux ]; then
+            for dir in /proc/[0-9]*; do
+              files="$(ls -l "$dir/fd" 2>/dev/null)" || continue
+              echo "-- ${dir#/proc/} $(cat "$dir/comm" 2>/dev/null)"
+              printf '%s\n' "$files"
+            done
+          else
+            lsof -nP -u "$(id -u)" || true
+          fi
+
+          # The run's descendants, plus the terminus processes whose binary is
+          # in this build or the temp directory: the ingests a hook starts leave
+          # the run's tree on purpose. An installed terminus is left alone. On
+          # macOS the short name is the full path, and /private is dropped so
+          # /var and /private/var compare equal.
+          target="${GITHUB_WORKSPACE#/private}/target/"
+          tmp="${TMPDIR:-/tmp}"
+          tmp="${tmp#/private}"
+          tmp="${tmp%/}/"
+          seeds="$run"
+          while read -r pid name; do
+            [ "${name##*/}" = terminus ] || continue
+            if [ "$(uname -s)" = Linux ]; then
+              path="$(readlink "/proc/$pid/exe" 2>/dev/null)" || continue
+            else
+              path="$name"
+            fi
+            case "${path#/private}" in
+              "$target"* | "$tmp"*) seeds="$seeds $pid" ;;
+            esac
+          done < <(ps -e -o pid=,comm=)
+          victims="$(ps -e -o pid=,ppid= | awk -v seeds="$seeds" '
+            BEGIN { n = split(seeds, s, " "); for (i = 1; i <= n; i++) hit[s[i]] = 1 }
+            { pid[NR] = $1; parent[NR] = $2 }
+            END {
+              do {
+                grew = 0
+                for (i = 1; i <= NR; i++)
+                  if ((parent[i] in hit) && !(pid[i] in hit)) { hit[pid[i]] = 1; grew = 1 }
+              } while (grew)
+              for (p in hit) print p
+            }')"
+          echo "== killing: $(echo $victims)"
+          kill -KILL $victims 2>/dev/null || true
+          sleep 5
+          echo "== still there 5 s after SIGKILL"
+          ps -o "$columns,comm" -p "$(echo $victims | tr ' ' ',')" || echo "none"
+          exit 1
