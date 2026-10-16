@@ -20,6 +20,9 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
     runs-on: ${{ matrix.runner }}
+    # A hung test ends the job here, with its log, instead of holding the
+    # runner for GitHub's default of six hours.
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash

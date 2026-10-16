@@ -24,7 +24,8 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{PoisonError, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
@@ -517,19 +518,62 @@ fn an_unterminated_line_stops_being_read_at_the_cap() {
     .expect("spawn the hook");
     let mut stdin = child.stdin.take().expect("the hook's stdin");
 
-    // No newline anywhere in it, so nothing but a cap can end the read.
-    let chunk = vec![b'x'; CHUNK];
-    let mut written = 0usize;
-    let mut refused = None;
-    while written < TOTAL {
-        match stdin.write_all(&chunk) {
-            Ok(()) => written += CHUNK,
-            Err(e) => {
-                refused = Some(e);
-                break;
+    // The writes run on a thread with a deadline. A write to a full pipe waits
+    // for as long as anything holds the read end open, so without one a hook
+    // that never stops reading hangs the run instead of failing it.
+    let written = Arc::new(AtomicUsize::new(0));
+    let (done, finished) = mpsc::channel();
+    {
+        let written = Arc::clone(&written);
+        std::thread::spawn(move || {
+            // No newline anywhere in it, so nothing but a cap can end the read.
+            let chunk = vec![b'x'; CHUNK];
+            let mut refused = None;
+            while written.load(Ordering::Relaxed) < TOTAL {
+                match stdin.write_all(&chunk) {
+                    Ok(()) => {
+                        written.fetch_add(CHUNK, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        refused = Some(e);
+                        break;
+                    }
+                }
             }
-        }
+            let _ = done.send(refused);
+        });
     }
+
+    let refused = match finished.recv_timeout(WRITE_DEADLINE) {
+        Ok(refused) => refused,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the writing thread ended without saying how the writes ended")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let exited = child.try_wait().ok().flatten();
+            let _ = child.kill();
+            let ended = wait_for(&mut child, Duration::from_secs(5));
+            let stderr = match child.stderr.take() {
+                Some(pipe) => read_for(pipe, Duration::from_secs(5)),
+                None => String::new(),
+            };
+            panic!(
+                "the write was still blocked after {WRITE_DEADLINE:?}, {} bytes in; \
+                 the hook {}, and after the kill it {}; its stderr: {stderr:?}",
+                written.load(Ordering::Relaxed),
+                match exited {
+                    Some(status) => format!("had exited, {status}"),
+                    None => "had not exited".to_owned(),
+                },
+                if ended {
+                    "had ended"
+                } else {
+                    "was still running 5 s later"
+                },
+            );
+        }
+    };
+    let written = written.load(Ordering::Relaxed);
 
     let e = refused.unwrap_or_else(|| {
         panic!("the hook read all {TOTAL} bytes of a line that never ends");
@@ -557,8 +601,41 @@ fn an_unterminated_line_stops_being_read_at_the_cap() {
         String::from_utf8_lossy(&output.stdout)
     );
 
-    drop(stdin);
     drain(&hook.ingest_argv());
+}
+
+/// How long [`an_unterminated_line_stops_being_read_at_the_cap`] waits for the
+/// hook to break the pipe. A passing run takes well under a second.
+const WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Whether `child` has ended within `wait`. Polled with `try_wait` rather than
+/// `wait`, so a process the kill could not end cannot hang the caller.
+fn wait_for(child: &mut Child, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whatever `pipe` gives up within `wait`. Read on a thread, so a pipe that
+/// something else still holds open cannot hang the failure it is reported in.
+fn read_for(mut pipe: impl Read + Send + 'static, wait: Duration) -> String {
+    let (done, read) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        let _ = done.send(bytes);
+    });
+    match read.recv_timeout(wait) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => format!("still open after {wait:?}"),
+    }
 }
 
 /// The hook hands the ingest nothing the harness gave it.
