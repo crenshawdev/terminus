@@ -41,7 +41,9 @@ jobs:
 
       # macOS ships LibreSSL as openssl, no dash, and may lack sha256sum. The
       # sha256sum link goes in a folder of its own, so the rest of the BSD
-      # tools install.sh meets on a Mac stay first on PATH.
+      # tools install.sh meets on a Mac stay first on PATH. The runner images
+      # put OpenSSL 1.1.1 first, whose s_server -WWW closes without a TLS
+      # close_notify, and the Intel image's curl on OpenSSL 3 fails on that.
       - name: Install the shell-test tools macOS lacks
         if: runner.os == 'macOS'
         run: |
@@ -63,9 +65,8 @@ jobs:
             ln -s "$(brew --prefix coreutils)/bin/gsha256sum" "$RUNNER_TEMP/tools/sha256sum"
             echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
           fi
-          server="$(openssl s_server -help 2>&1 || true)"
-          req="$(openssl req -help 2>&1 || true)"
-          if [[ $server != *-WWW* || $req != *-addext* ]]; then
+          version="$(openssl version 2>&1 || true)"
+          if [[ $version != "OpenSSL "[3-9]* ]]; then
             brew install openssl@3
             echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
           fi
@@ -91,6 +92,11 @@ jobs:
           done
           if [ "${#missing[@]}" -gt 0 ]; then
             echo "::error::not on PATH: ${missing[*]}"
+            exit 1
+          fi
+          version="$(openssl version 2>&1 || true)"
+          if [[ $version != "OpenSSL "[3-9]* ]]; then
+            echo "::error::openssl is $version; the test server needs OpenSSL 3 or later"
             exit 1
           fi
           server="$(openssl s_server -help 2>&1 || true)"

@@ -6,8 +6,10 @@
 //! `curl | sh` runs under dash on Debian and Ubuntu and `/bin/sh` here is bash.
 //! Without dash on `PATH` every dash test fails; none is skipped.
 //!
-//! The server is `openssl s_server -WWW` with a certificate made for each test
-//! and named by `CURL_CA_BUNDLE`, so the script stays https-only. The served
+//! The server is `openssl s_server -WWW` from OpenSSL 3 or later, with a
+//! certificate made for each test and named by `CURL_CA_BUNDLE`, so the script
+//! stays https-only. OpenSSL 1.1.1's `-WWW` closes without a close_notify,
+//! which a curl on OpenSSL 3 reports as a failed download. The served
 //! binary is a copy of this build, with bytes appended when a test needs a
 //! different digest; it still runs and still carries the marker.
 //!
@@ -129,6 +131,23 @@ struct Server {
 
 impl Server {
     fn start(root: &Path, served: &Path) -> Server {
+        let version = Command::new("openssl")
+            .arg("version")
+            .output()
+            .expect("openssl runs");
+        let version = String::from_utf8_lossy(&version.stdout);
+        let major = version
+            .strip_prefix("OpenSSL ")
+            .and_then(|v| v.split('.').next())
+            .and_then(|m| m.parse::<u32>().ok());
+        assert!(
+            major.is_some_and(|m| m >= 3),
+            "openssl is {}; the test server needs OpenSSL 3 or later, because 1.1.1's \
+             s_server -WWW closes without a TLS close_notify and a curl on OpenSSL 3 \
+             fails the download with error 56",
+            version.trim()
+        );
+
         let cert = root.join("cert.pem");
         let key = root.join("key.pem");
         let made = Command::new("openssl")
