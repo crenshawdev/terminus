@@ -94,6 +94,23 @@ const MAX_PAYLOAD: u64 = 1 << 20;
 /// killing the hook.
 const DRAIN_DEADLINE: Duration = Duration::from_millis(500);
 
+/// [`DRAIN_DEADLINE`], or in a testkit build the milliseconds in
+/// `testkit::DRAIN_DEADLINE_ENV` when it is set. The hook kill test sets it, so
+/// a slow CI machine cannot let the hook exit before the kill lands. The
+/// shipped binary is built without testkit and reads no variable.
+#[cfg(feature = "testkit")]
+fn drain_deadline() -> Duration {
+    std::env::var(terminus_core::testkit::DRAIN_DEADLINE_ENV)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(DRAIN_DEADLINE, Duration::from_millis)
+}
+
+#[cfg(not(feature = "testkit"))]
+fn drain_deadline() -> Duration {
+    DRAIN_DEADLINE
+}
+
 /// The longest the hook waits on its own injection before abandoning it and
 /// writing nothing (INJ-06, D-03).
 ///
@@ -361,7 +378,8 @@ fn drain(event: &str) -> Payload {
         return Payload::default();
     }
 
-    match drained.recv_timeout(DRAIN_DEADLINE) {
+    let deadline = drain_deadline();
+    match drained.recv_timeout(deadline) {
         Ok((payload, None)) => payload,
         // A read that failed part way still parses what arrived, which is
         // almost always nothing. The line on stderr is the same one it was.
@@ -372,7 +390,7 @@ fn drain(event: &str) -> Payload {
         Err(RecvTimeoutError::Timeout) => {
             eprintln!(
                 "terminus: {event} stopped waiting on a stdin that stayed open for {} ms",
-                DRAIN_DEADLINE.as_millis()
+                deadline.as_millis()
             );
             Payload::default()
         }

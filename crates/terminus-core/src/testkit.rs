@@ -205,6 +205,14 @@ pub const INJECT_DEADLINE_ENV: &str = "TERMINUS_TEST_INJECT_DEADLINE_MS";
 /// ten seconds, so only a hang reaches it. The tests about time leave it unset.
 pub const CONTENT_INJECT_DEADLINE_MS: &str = "10000";
 
+/// The variable a testkit build's hook reads its stdin deadline from, in
+/// milliseconds, in place of the shipped 500 ms (`cmd/hook.rs` in the binary).
+pub const DRAIN_DEADLINE_ENV: &str = "TERMINUS_TEST_DRAIN_DEADLINE_MS";
+
+/// What the hook kill test sets [`DRAIN_DEADLINE_ENV`] to: ten seconds, so the
+/// hook is still waiting on stdin when the kill lands, however slow the machine.
+pub const KILL_TEST_DRAIN_DEADLINE_MS: &str = "10000";
+
 /// The corpus directory, or `None` with the reason already printed.
 ///
 /// Printed rather than silent: a test that skips without saying so is a test

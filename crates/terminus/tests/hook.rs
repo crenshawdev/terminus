@@ -14,10 +14,11 @@
 //! resolve the developer's real config and walk a live 2,000-file `~/.claude`
 //! tree.
 //!
-//! The kill test needs the fault points, so it needs
-//! `cargo test -p terminus --features testkit --test hook`. It is gated on the
-//! feature by itself rather than the file being gated, because a
-//! `#![cfg(feature = "testkit")]` binary runs zero tests under a bare
+//! The kill test needs a testkit build to hold the hook on stdin past its
+//! 500 ms deadline, so it needs
+//! `cargo test -p terminus --features testkit --test hook`. Without one it
+//! still runs, racing that deadline. The file is not gated on the feature,
+//! because a `#![cfg(feature = "testkit")]` binary runs zero tests under a bare
 //! `cargo test` and still reports green - which would silently retire the
 //! budget assertion this file exists to hold.
 
@@ -759,15 +760,16 @@ fn sigkill(pid: i32) {
 /// outside the union, not merely outside whichever snapshot happened to be
 /// taken first.
 ///
-/// **Everything between the spawn and the kill is on a 500 ms clock**, and that
-/// is the whole reason this test is shaped the way it is. The hook gives a
-/// writer `cmd::hook::DRAIN_DEADLINE` - 500 ms - before it stops waiting on
-/// stdin and exits 0, so a hook that is killed late is not killed at all: the
-/// group kill reaches an empty group, nothing dies, and the survival assertions
-/// below pass over a hook that was never killed. So the kill is aimed as soon
-/// as the ingest is nameable in the process table, tens of milliseconds in,
-/// rather than after waiting for the pass to commit its first file - which cost
-/// ~400 ms of the 500 on an idle machine and ran past it under a loaded one.
+/// The hook gives a writer `cmd::hook::DRAIN_DEADLINE` - 500 ms - before it
+/// stops waiting on stdin and exits 0, so a hook that is killed late is not
+/// killed at all: the group kill reaches an empty group, nothing dies, and the
+/// survival assertions below pass over a hook that was never killed. The path to
+/// the kill runs `ps` at least twice, each behind [`COPYING`], and on a loaded
+/// macOS runner it ran past the 500 ms. So the hook is spawned with
+/// `testkit::DRAIN_DEADLINE_ENV` at ten seconds, which a testkit build reads in
+/// place of the 500 ms, and the kill lands on a hook still blocked on stdin
+/// however slow the machine is. The kill is still aimed as soon as the ingest
+/// is nameable in the process table.
 /// Nothing is lost by killing early, because `SIGKILL` cannot be handled: what
 /// decides survival is whether the ingest's pid is in the group or the sweep,
 /// which its `setsid` settled at spawn and no later instant can change. The
@@ -788,6 +790,10 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
 
     let mut child = spawn(
         hook.command(&["hook", "SessionEnd"])
+            .env(
+                testkit::DRAIN_DEADLINE_ENV,
+                testkit::KILL_TEST_DRAIN_DEADLINE_MS,
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Its own group, so the group kill below names the hook and nothing
@@ -827,8 +833,9 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
         status.signal(),
         Some(9),
         "the hook did not die of the group kill: {status:?}. An exit of 0 here \
-         means the hook gave up on stdin and returned before the kill landed, \
-         so the group was empty and nothing below is evidence of anything"
+         means the hook gave up on stdin and returned before the kill landed - \
+         a binary built without testkit ignores the deadline variable - so the \
+         group was empty and nothing below is evidence of anything"
     );
     assert!(
         !doomed.contains(&ingest.pid),
