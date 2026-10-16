@@ -107,6 +107,11 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   new sessions from that project were archived, and archived ones stayed
   visible to search, recall and injection. Each exclusion now also matches the
   path it resolves to.
+- `terminus observations` could report a session one second longer than it
+  ran. The duration dropped each timestamp's fraction before subtracting, so
+  100.002 s that started at :59.998 read as 101 s. Observations already
+  recorded keep the old value until `terminus observations regenerate`
+  recomputes them.
 
 ## [0.1.1] - 2026-10-15
 
