@@ -111,7 +111,7 @@ jobs:
       #
       # The three tests that hold a hook spawn's p99 under 10 ms, two in
       # hook.rs and one in brief.rs, are skipped here and run everywhere else.
-      # On a hosted runner the p99 came out two to five times the p50, which
+      # On a hosted runner the p99 came out two to six times the p50, which
       # measures the shared VM, not the hook.
       #
       # A run still going at 15 minutes is stopped here, not by timeout-minutes,
