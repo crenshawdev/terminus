@@ -295,6 +295,16 @@ pub fn fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// The system temp directory with symlinks resolved. Terminus reports resolved
+/// paths, and on macOS `/var` links to `/private/var`, so a test expecting paths
+/// under the unresolved temp dir fails there. Make test dirs with
+/// `tempfile::tempdir_in(testkit::temp_root())`.
+pub fn temp_root() -> PathBuf {
+    let dir = std::env::temp_dir();
+    dir.canonicalize()
+        .unwrap_or_else(|e| panic!("resolve the temp directory {}: {e}", dir.display()))
+}
+
 /// The fixed query set AC4 compares before and after a rebuild.
 ///
 /// Every one of these matches at least one fixture turn, and `brillig` matches

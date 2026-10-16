@@ -37,7 +37,7 @@ struct Bench {
 }
 
 fn bench() -> Bench {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
     let data_dir = dir.path().join("data");
     let work = dir.path().join("work");
     let config_dir = dir.path().join("config");

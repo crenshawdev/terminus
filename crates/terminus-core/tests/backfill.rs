@@ -76,7 +76,7 @@ impl Tree {
     /// directory per copy. Sidecars keep their `agent-*.jsonl` names and sit at
     /// the depth real ones sit at.
     fn build() -> Tree {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
         let root = dir.path().to_path_buf();
         let claude_dir = root.join("claude");
         let projects = claude_dir.join("projects");

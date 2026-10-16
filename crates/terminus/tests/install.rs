@@ -100,7 +100,7 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
     let root = dir.path().to_path_buf();
     let bin_dir = root.join("bin");
     let claude_dir = root.join("claude");

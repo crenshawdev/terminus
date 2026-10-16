@@ -11,6 +11,12 @@ use std::process::Command;
 
 use terminus_core::project::{self, Resolver};
 
+/// A temp dir under the resolved temp root, for the reason `testkit::temp_root`
+/// gives. This file is built without testkit.
+fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+}
+
 /// A real `git init` repository at `dir`, or `false` when there is no git.
 fn git_init(dir: &Path) -> bool {
     if !project::git_available() {
@@ -35,7 +41,7 @@ fn text(path: &Path) -> String {
 /// `cwd` two directories deeper keys to the same one.
 #[test]
 fn a_cwd_inside_a_repository_resolves_to_its_toplevel() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let repo = dir.path().join("repo");
     if !git_init(&repo) {
         return;
@@ -73,7 +79,7 @@ fn a_cwd_that_does_not_exist_resolves_to_itself() {
 /// The other degrade: the directory exists and is not a repository.
 #[test]
 fn an_existing_non_repository_directory_resolves_to_itself() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let plain = dir.path().join("not-a-repo");
     std::fs::create_dir_all(&plain).unwrap();
 
@@ -86,7 +92,7 @@ fn an_existing_non_repository_directory_resolves_to_itself() {
 /// for answers it already has.
 #[test]
 fn resolving_the_same_cwd_twice_runs_git_at_most_once() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let repo = dir.path().join("repo");
     if !git_init(&repo) {
         return;
@@ -174,7 +180,7 @@ struct Tree {
 }
 
 fn tree() -> Tree {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let data_dir = dir.path().join("data");
     let claude_dir = dir.path().join("claude");
     std::fs::create_dir_all(claude_dir.join("projects")).unwrap();

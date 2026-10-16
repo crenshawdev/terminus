@@ -46,7 +46,7 @@ struct Bench {
 }
 
 fn bench(fixture: &str) -> Bench {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
     let data_dir = dir.path().join("data");
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -411,7 +411,7 @@ fn ingesting_a_compacted_transcript_whole_records_the_same_boundary() {
 /// control for every assertion above.
 #[test]
 fn a_session_that_never_compacted_has_no_boundary_row() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
     let data_dir = dir.path().join("data");
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -549,7 +549,7 @@ struct Tree {
 const PROJECT: &str = "-data-code-verbatim";
 
 fn tree() -> Tree {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
     let data_dir = dir.path().join("data");
     let claude_dir = dir.path().join("claude");
     let project = claude_dir.join("projects").join(PROJECT);

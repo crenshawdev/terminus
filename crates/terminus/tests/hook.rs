@@ -63,7 +63,7 @@ struct Hook {
 }
 
 fn hook() -> Hook {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
     let data_dir = dir.path().join("data");
     let config_dir = dir.path().join("config");
     let claude_dir = dir.path().join("claude");
