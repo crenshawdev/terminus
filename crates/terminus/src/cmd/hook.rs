@@ -107,6 +107,23 @@ const DRAIN_DEADLINE: Duration = Duration::from_millis(500);
 /// prompt has already lost the argument for existing.
 const INJECT_DEADLINE: Duration = Duration::from_millis(50);
 
+/// [`INJECT_DEADLINE`], or in a testkit build the milliseconds in
+/// `testkit::INJECT_DEADLINE_ENV` when it is set. The tests that check what a
+/// hook injects set it, so a slow CI machine cannot fail them on time. The
+/// shipped binary is built without testkit and reads no variable.
+#[cfg(feature = "testkit")]
+fn inject_deadline() -> Duration {
+    std::env::var(terminus_core::testkit::INJECT_DEADLINE_ENV)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(INJECT_DEADLINE, Duration::from_millis)
+}
+
+#[cfg(not(feature = "testkit"))]
+fn inject_deadline() -> Duration {
+    INJECT_DEADLINE
+}
+
 /// The five fields of the hook payload injection reads.
 ///
 /// Owned `String`s rather than borrows of the drained buffer, because the
@@ -278,12 +295,13 @@ fn inject(event: &str, payload: Payload) -> Option<String> {
         return None;
     }
 
-    match injected.recv_timeout(INJECT_DEADLINE) {
+    let deadline = inject_deadline();
+    match injected.recv_timeout(deadline) {
         Ok(text) => text,
         Err(RecvTimeoutError::Timeout) => {
             eprintln!(
                 "terminus: {event} abandoned its injection after {} ms",
-                INJECT_DEADLINE.as_millis()
+                deadline.as_millis()
             );
             None
         }

@@ -197,6 +197,14 @@ pub const UNIQUE_TOKEN: &str = "brillig";
 /// pointed at a real tree by copying one value between them.
 pub const CORPUS_DIR_ENV: &str = "TERMINUS_TEST_CORPUS";
 
+/// The variable a testkit build's hook reads its injection deadline from, in
+/// milliseconds, in place of the shipped 50 ms (`cmd/hook.rs` in the binary).
+pub const INJECT_DEADLINE_ENV: &str = "TERMINUS_TEST_INJECT_DEADLINE_MS";
+
+/// What the tests that check injected content set [`INJECT_DEADLINE_ENV`] to:
+/// ten seconds, so only a hang reaches it. The tests about time leave it unset.
+pub const CONTENT_INJECT_DEADLINE_MS: &str = "10000";
+
 /// The corpus directory, or `None` with the reason already printed.
 ///
 /// Printed rather than silent: a test that skips without saying so is a test

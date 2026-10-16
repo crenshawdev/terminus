@@ -79,7 +79,11 @@ impl Bench {
             .current_dir(&self.work)
             .env("TERMINUS_DATA_DIR", &self.data_dir)
             .env("TERMINUS_CONFIG_DIR", &self.config_dir)
-            .env("CLAUDE_CONFIG_DIR", &self.claude_dir);
+            .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
+            .env(
+                testkit::INJECT_DEADLINE_ENV,
+                testkit::CONTENT_INJECT_DEADLINE_MS,
+            );
         command
     }
 
