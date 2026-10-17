@@ -43,7 +43,7 @@ The owner runs [`scripts/sign-release.sh`](../scripts/sign-release.sh) on his ow
 
 [`install.sh`](../install.sh) makes these checks in this order. Each refusal prints `terminus: <reason>` to stderr and exits 1, and nothing is installed.
 
-1. **The source.** With no argument it downloads from `https://github.com/crenshawdev/terminus/releases/latest/download`. One argument names another source, and it must start with `https://`. More than one argument is refused.
+1. **The source.** With no argument it downloads from `https://github.com/jcrenshaw-dev/terminus/releases/latest/download`. One argument names another source, and it must start with `https://`. More than one argument is refused.
 2. **`TERMINUS_BIN_DIR`.** Refused when it is set, because `terminus install` would point the hooks and the MCP entry into that folder while the script links `~/.local/bin/terminus`.
 3. **`HOME`.** Refused when it is unset or empty, relative, not valid UTF-8, contains `..`, or when the shell changes its bytes on copying it, which dash does when started without a UTF-8 locale.
 4. **What sits at `~/.local/bin/terminus`.** Refused when it is a folder or a link to one, a file that is not a Terminus build, a link to nothing that does not point into `~/.local/lib/crenshawdev/terminus/versions/`, or anything other than a file or a link. Nothing there, a Terminus build, or a link to `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus` is fine.
@@ -88,9 +88,9 @@ This repeats `install.sh`'s own check. `<os>` is `linux` or `macos`, and `<arch>
 1. Download `terminus-<os>-<arch>`, `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>.manifest.sig` from the release, for example:
 
    ```sh
-   curl -fsSLO https://github.com/crenshawdev/terminus/releases/latest/download/terminus-<os>-<arch>
-   curl -fsSLO https://github.com/crenshawdev/terminus/releases/latest/download/terminus-<os>-<arch>.manifest
-   curl -fsSLO https://github.com/crenshawdev/terminus/releases/latest/download/terminus-<os>-<arch>.manifest.sig
+   curl -fsSLO https://github.com/jcrenshaw-dev/terminus/releases/latest/download/terminus-<os>-<arch>
+   curl -fsSLO https://github.com/jcrenshaw-dev/terminus/releases/latest/download/terminus-<os>-<arch>.manifest
+   curl -fsSLO https://github.com/jcrenshaw-dev/terminus/releases/latest/download/terminus-<os>-<arch>.manifest.sig
    ```
 
 2. Write an allowed-signers file holding this one line, with the full key:

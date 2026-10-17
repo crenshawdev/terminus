@@ -10,7 +10,7 @@ Terminus keeps a copy of every session you run in Claude Code and lets you and C
 
 Terminus collects nothing about you, sends no telemetry, and sends data only to services you configure. Because that guarantee depends on the operating system underneath, the same standard decides which platforms Terminus supports. Linux and macOS meet it. Windows fails it on privacy and on security and is not supported. A supported platform that stops meeting the standard loses support. The criteria and reasoning are in [TRUST.md](TRUST.md).
 
-**What leaves your machine.** Downloads when you install or update: the install line fetches `install.sh` from `raw.githubusercontent.com`, and `install.sh` uses `curl` to fetch the manifest, its signature and the binary for your system from the GitHub releases of crenshawdev/terminus, or from the `https://` source you pass it. Archived text Terminus hands Claude Code: at the start of a session the `SessionStart` hook may hand it a brief of where the last session left off, on a prompt the `UserPromptSubmit` hook may hand it earlier turns, and the `recall_search`, `recall_context` and `recall_get` tools return archived turns when Claude calls them. Claude Code sends that text to its model with the rest of the session. `[privacy] redact_recall = true` filters it on its way into Claude Code, and `[injection] brief_chars` and `prompt_chars` cap how much each hook hands over.
+**What leaves your machine.** Downloads when you install or update: the install line fetches `install.sh` from `raw.githubusercontent.com`, and `install.sh` uses `curl` to fetch the manifest, its signature and the binary for your system from the GitHub releases of jcrenshaw-dev/terminus, or from the `https://` source you pass it. Archived text Terminus hands Claude Code: at the start of a session the `SessionStart` hook may hand it a brief of where the last session left off, on a prompt the `UserPromptSubmit` hook may hand it earlier turns, and the `recall_search`, `recall_context` and `recall_get` tools return archived turns when Claude calls them. Claude Code sends that text to its model with the rest of the session. `[privacy] redact_recall = true` filters it on its way into Claude Code, and `[injection] brief_chars` and `prompt_chars` cap how much each hook hands over.
 
 Every release is signed on the maintainer's machine, never in CI. The release workflow only builds the binaries and drafts the release, and no workflow holds a signing key. `install.sh` checks the manifest's signature against the key pinned in the script before it reads the manifest or downloads the binary, then checks the binary against the manifest's SHA-256, and installs nothing that fails either check. The Terminus binary opens no network connection, and a test fails if any source file in either crate names a socket type. How a release is built, signed and checked, and how to check one by hand, is in [docs/release.md](docs/release.md).
 
@@ -47,9 +47,9 @@ It also refuses, under these conditions:
 
 ## Current state
 
-- The tests do not run in CI. The release workflow builds and drafts releases, and no workflow runs the test suite ([#47](https://github.com/crenshawdev/terminus/issues/47)).
-- `[privacy] redact_recall` misses a bare OpenAI-style `sk-` token in plain prose, because none of its rules recognizes that shape, so the token reaches Claude Code unfiltered ([#5](https://github.com/crenshawdev/terminus/issues/5)).
-- What the `recall_search`, `recall_context` and `recall_get` tools return is not documented, and the tool table in `DESIGN-BRIEF.md` is out of date ([#26](https://github.com/crenshawdev/terminus/issues/26)).
+- The tests do not run in CI. The release workflow builds and drafts releases, and no workflow runs the test suite ([#47](https://github.com/jcrenshaw-dev/terminus/issues/47)).
+- `[privacy] redact_recall` misses a bare OpenAI-style `sk-` token in plain prose, because none of its rules recognizes that shape, so the token reaches Claude Code unfiltered ([#5](https://github.com/jcrenshaw-dev/terminus/issues/5)).
+- What the `recall_search`, `recall_context` and `recall_get` tools return is not documented, and the tool table in `DESIGN-BRIEF.md` is out of date ([#26](https://github.com/jcrenshaw-dev/terminus/issues/26)).
 
 ## How it works
 
@@ -76,7 +76,7 @@ Installing needs `curl`, `ssh-keygen`, and `sha256sum` or `shasum`. It also need
 ## Installing and updating
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install.sh | sh
 ```
 
 `install.sh` checks the release's signature against the key pinned in the script before it installs anything, places the binary behind `~/.local/bin/terminus`, and runs `terminus install`, which writes the hook entries and the MCP entry and starts archiving the transcripts already on disk. Running the same line again is how Terminus updates. It installs on Linux and macOS only.
@@ -146,8 +146,8 @@ Each key's full effect, and the environment variables Terminus reads, are in [do
 ## How it is designed and built
 
 - **How it is designed:** the design decisions are in [DESIGN-BRIEF.md](DESIGN-BRIEF.md) and in [.planning/](.planning/).
-- **How it is built:** `main` is protected, and every change reaches it through a pull request. No status check is required and no workflow runs the tests ([#47](https://github.com/crenshawdev/terminus/issues/47)), so the tests run locally with `cargo test --workspace --all-features`.
-- **The issues:** bugs and known gaps are tracked at [github.com/crenshawdev/terminus/issues](https://github.com/crenshawdev/terminus/issues).
+- **How it is built:** `main` is protected, and every change reaches it through a pull request. No status check is required and no workflow runs the tests ([#47](https://github.com/jcrenshaw-dev/terminus/issues/47)), so the tests run locally with `cargo test --workspace --all-features`.
+- **The issues:** bugs and known gaps are tracked at [github.com/jcrenshaw-dev/terminus/issues](https://github.com/jcrenshaw-dev/terminus/issues).
 
 ## Issues and contributions
 
