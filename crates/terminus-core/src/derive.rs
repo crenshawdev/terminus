@@ -1,15 +1,20 @@
 //! The one seam between a turn and everything derived from it.
 //!
-//! Ingest and rebuild both call [`derive_turn`] and neither writes a derived
-//! row any other way, so a rebuild cannot drift from what ingest wrote. That is
+//! Ingest and rebuild both call [`derive_turn`] and [`derive_boundary`] and
+//! neither writes a derived row any other way, so a rebuild cannot drift from
+//! what ingest wrote. That is
 //! the whole point of the module: STOR-04 says the blobs alone reproduce the
 //! derived tables, and the cheapest way to keep that true is to give both paths
 //! one function.
 //!
 //! What the function writes: one `turns_fts` row per turn at rowid `turns.id`,
 //! carrying [`crate::index::project`]'s text projection of the record rather
-//! than the record's raw line (D-01), and one `compaction_boundaries` row for
-//! the rare turn that is a boundary (D-21).
+//! than the record's raw line (D-01), and one `compactions` row for the rare
+//! turn that is a boundary (D-21), keyed by the turn's `(session_key,
+//! stream_offset)` rather than its id (D-20). [`derive_boundary`] writes the
+//! same row for a boundary that is not a turn, because it has no `uuid` or no
+//! `timestamp` (D-19), at its own record's offset. Each boundary record gets
+//! exactly one row, from one of the two.
 //!
 //! The record is parsed to a `serde_json::Value` **here**, once, and handed to
 //! every rule that needs it. `parse::Record` deliberately does not keep the
@@ -24,7 +29,7 @@
 use rusqlite::Connection;
 
 use crate::error::Result;
-use crate::parse::Turn;
+use crate::parse::{Record, Turn};
 use crate::store::schema;
 
 /// One turn, and where its bytes live in the session's uncompressed stream.
@@ -160,13 +165,63 @@ pub fn derive_turn(tx: &Connection, row: TurnRow<'_>) -> Result<i64> {
     // complement of `preservedMessages.uuids` is derived at query time in phase
     // 5 (INJ-05), where a wrong reading of an upstream format that has exactly
     // one real example costs a query and not a reingest.
-    tx.execute("DELETE FROM compaction_boundaries WHERE turn_id = ?1", [id])?;
-    if row.is_compact_boundary() {
-        tx.execute(
-            "INSERT INTO compaction_boundaries (turn_id, metadata) VALUES (?1, ?2)",
-            rusqlite::params![id, row.compact_metadata],
-        )?;
-    }
+    //
+    // Keyed by where the record sits in the stream, not by the turn id, so a
+    // boundary and the turns it dropped compare by `stream_offset` (D-20, D-21).
+    set_boundary(
+        tx,
+        row.session_key,
+        row.stream_offset,
+        row.is_compact_boundary(),
+        row.compact_metadata,
+    )?;
 
     Ok(id)
+}
+
+/// Write the boundary row for a record that is a compaction boundary and not a
+/// turn, at `(session_key, record.offset)` (D-19, D-20).
+///
+/// A `system`/`compact_boundary` record with no `uuid` or no `timestamp` does
+/// not classify as a turn, so [`derive_turn`] never sees it, and without this
+/// it had no row and the prompt after its compaction could not say what fell
+/// out. Every other record is left alone: a turn's row is [`derive_turn`]'s,
+/// and a record that is not `system` with that subtype gets none
+/// ([`Record::is_compact_boundary`]). So callers hand it every record of a scan.
+///
+/// `record.offset` has to be in the same uncompressed-stream coordinates as
+/// `turns.stream_offset`: the dropped set is the turns at a lower offset.
+pub fn derive_boundary(tx: &Connection, session_key: &str, record: &Record) -> Result<()> {
+    if record.is_turn() || !record.is_compact_boundary() {
+        return Ok(());
+    }
+    set_boundary(
+        tx,
+        session_key,
+        record.offset,
+        true,
+        record.compact_metadata.as_deref(),
+    )
+}
+
+/// The one `compactions` row at a stream position: cleared, then written again
+/// when the record there is a boundary.
+fn set_boundary(
+    tx: &Connection,
+    session_key: &str,
+    stream_offset: u64,
+    is_boundary: bool,
+    metadata: Option<&[u8]>,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM compactions WHERE session_key = ?1 AND stream_offset = ?2",
+        rusqlite::params![session_key, stream_offset as i64],
+    )?;
+    if is_boundary {
+        tx.execute(
+            "INSERT INTO compactions (session_key, stream_offset, metadata) VALUES (?1, ?2, ?3)",
+            rusqlite::params![session_key, stream_offset as i64, metadata],
+        )?;
+    }
+    Ok(())
 }

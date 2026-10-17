@@ -26,6 +26,10 @@ const PROJECT: &str = "-data-projects-cadence";
 /// make the "strictly smaller" assertion depend on the page size.
 const SESSIONS: u8 = 8;
 
+/// The random hex in an incompressible session. It compresses to about 16 KiB
+/// at zstd level 3.
+const INCOMPRESSIBLE_CHARS: usize = 32 * 1024;
+
 /// The same isolation `cli.rs`, `status.rs` and `retention.rs` use, and for the
 /// same reason: a spawn that set only `TERMINUS_DATA_DIR` would resolve the
 /// developer's real config and walk the live `~/.claude` tree.
@@ -71,6 +75,25 @@ impl Bench {
         let dest = self.claude_dir.join("projects").join(project).join(name);
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::copy(testkit::fixture_path(fixture), &dest).unwrap();
+        dest.canonicalize().unwrap()
+    }
+
+    /// Place a one-record transcript of random hex. Its block can't compress
+    /// below a page, so it spills onto overflow pages a delete always frees.
+    fn place_incompressible(&self, project: &str, n: u8) -> PathBuf {
+        let fixture = testkit::fixture_bytes("session-large-record.jsonl");
+        let first = fixture.split(|b| *b == b'\n').next().unwrap();
+        let mut record: serde_json::Value = serde_json::from_slice(first).unwrap();
+        let mut rng = testkit::Rng(u64::from(n));
+        let text: String = (0..INCOMPRESSIBLE_CHARS / 16)
+            .map(|_| format!("{:016x}", rng.next_u64()))
+            .collect();
+        record["message"]["content"][0]["text"] = text.into();
+
+        let name = format!("{n:08x}-1111-4111-8111-111111111111.jsonl");
+        let dest = self.claude_dir.join("projects").join(project).join(name);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, format!("{record}\n")).unwrap();
         dest.canonicalize().unwrap()
     }
 
@@ -370,13 +393,18 @@ fn table_total(rows: &serde_json::Value) -> i64 {
 /// nothing has ever deleted from, `freelist_count` is zero and the footprint
 /// reconciles whether or not the freelist has a row at all - which would make
 /// this pass for the wrong reason and leave `compact`'s own number unproven.
+///
+/// The two deleted are incompressible ones placed for this. Deleting two
+/// stocked sessions freed a page only on a short temp path, because the path is
+/// in every row and its length decides how the small rows pack.
 #[test]
 fn both_archive_tables_and_the_footprint_each_reconcile_to_their_own_total() {
     let (bench, keys) = stocked();
-    let freed: Vec<&Path> = keys[(SESSIONS - 2) as usize..]
-        .iter()
-        .map(PathBuf::as_path)
+    let extra: Vec<PathBuf> = (SESSIONS..SESSIONS + 2)
+        .map(|n| bench.place_incompressible(PROJECT, n))
         .collect();
+    bench.ingest();
+    let freed: Vec<&Path> = extra.iter().map(PathBuf::as_path).collect();
     bench.delete(&freed);
     {
         let conn = bench.conn();
@@ -403,7 +431,7 @@ fn both_archive_tables_and_the_footprint_each_reconcile_to_their_own_total() {
     let value = document(&out);
     let data = &value["data"];
 
-    assert_eq!(data["sessions"], (SESSIONS - 2) as i64, "{value}");
+    assert_eq!(data["sessions"], SESSIONS as i64, "{value}");
     assert_eq!(data["archive_bytes"], expected, "{value}");
     assert_eq!(
         table_total(&data["by_project"]),

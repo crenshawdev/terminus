@@ -1,17 +1,21 @@
 //! AC6 / ING-02: a second ingest launched while the first holds `LOCK`.
 //!
-//! Ten consecutive contended runs must each exit 0 in under 50 ms and add no
-//! row to any table. The tenth run proves nothing on its own, so the test ends
-//! by releasing the lock and running once more: an ingest that never wrote
-//! anything would satisfy "no rows changed" trivially, and the control is what
-//! makes the ten silent runs mean something.
+//! Ten consecutive contended runs must each exit 0 and add no row to any table.
+//! The tenth run proves nothing on its own, so the test ends by releasing the
+//! lock and running once more: an ingest that never wrote anything would
+//! satisfy "no rows changed" trivially, and the control is what makes the ten
+//! silent runs mean something.
+//!
+//! That each of them exits in under 50 ms is a test of its own, so CI can skip
+//! it on the macOS runners, where starting any process at all has taken longer
+//! than the budget (`.github/workflows/test.yml`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
-use terminus_core::ingest::{self, Attempt};
+use terminus_core::ingest::{self, Attempt, IngestLock};
 use terminus_core::store::{Store, DB_FILE_NAME, TABLES};
 use terminus_core::testkit;
 
@@ -43,8 +47,17 @@ fn ingest_command(data_dir: &Path, transcript: &Path) -> Command {
     command
 }
 
-#[test]
-fn a_contended_ingest_exits_zero_fast_and_writes_nothing() {
+/// A store, a transcript to ingest into it, and the lock held over both.
+struct Contended {
+    _dir: tempfile::TempDir,
+    data_dir: PathBuf,
+    transcript: PathBuf,
+    db: PathBuf,
+    before: Vec<(String, i64)>,
+    guard: IngestLock,
+}
+
+fn contended() -> Contended {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     let work = dir.path().join("work");
@@ -63,9 +76,64 @@ fn a_contended_ingest_exits_zero_fast_and_writes_nothing() {
     };
     assert!(guard.path().is_file(), "the LOCK file is created by us");
 
+    Contended {
+        _dir: dir,
+        data_dir,
+        transcript,
+        db,
+        before,
+        guard,
+    }
+}
+
+#[test]
+fn a_contended_ingest_exits_zero_and_writes_nothing() {
+    let race = contended();
+
+    for run in 0..10 {
+        let output = ingest_command(&race.data_dir, &race.transcript)
+            .output()
+            .expect("spawn terminus ingest");
+
+        assert!(
+            output.status.success(),
+            "contended run {run} exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            counts(&race.db),
+            race.before,
+            "contended run {run} wrote to the store"
+        );
+    }
+
+    // The control. Without it every assertion above is satisfied by an ingest
+    // that does nothing at all.
+    drop(race.guard);
+    let output = ingest_command(&race.data_dir, &race.transcript)
+        .output()
+        .expect("spawn terminus ingest");
+    assert!(
+        output.status.success(),
+        "the uncontended run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_ne!(
+        counts(&race.db),
+        race.before,
+        "the uncontended run wrote nothing either, so the ten contended runs prove nothing"
+    );
+}
+
+/// ING-02's budget, over the same ten runs.
+#[test]
+fn a_contended_ingest_exits_inside_the_budget() {
+    let race = contended();
+
     for run in 0..10 {
         let started = Instant::now();
-        let output = ingest_command(&data_dir, &transcript)
+        let output = ingest_command(&race.data_dir, &race.transcript)
             .output()
             .expect("spawn terminus ingest");
         let elapsed = started.elapsed();
@@ -80,29 +148,7 @@ fn a_contended_ingest_exits_zero_fast_and_writes_nothing() {
             elapsed < BUDGET,
             "contended run {run} took {elapsed:?}, over the {BUDGET:?} budget"
         );
-        assert_eq!(
-            counts(&db),
-            before,
-            "contended run {run} wrote to the store"
-        );
     }
-
-    // The control. Without it every assertion above is satisfied by an ingest
-    // that does nothing at all.
-    drop(guard);
-    let output = ingest_command(&data_dir, &transcript)
-        .output()
-        .expect("spawn terminus ingest");
-    assert!(
-        output.status.success(),
-        "the uncontended run failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_ne!(
-        counts(&db),
-        before,
-        "the uncontended run wrote nothing either, so the ten contended runs prove nothing"
-    );
 }
 
 /// A second attempt fails at once while the guard is held, and the lock is free

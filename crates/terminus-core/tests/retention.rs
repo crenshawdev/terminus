@@ -332,8 +332,8 @@ impl Bench {
     /// Three fixtures in one file, and each is there for a table: the basic
     /// session carries the searchable token and the entities, the rooted edits
     /// session is the only one storing an absolute path (so `paths` has a row),
-    /// and the appended boundary line is what gives `compaction_boundaries`
-    /// one. Answers its session key.
+    /// and the appended boundary line is what gives `compactions` one. Answers
+    /// its session key.
     fn archive(&self, name: &str) -> String {
         let edits =
             testkit::copy_rooted_fixture_into("session-edits.jsonl", &self.work, &self.root);
@@ -367,7 +367,7 @@ impl Bench {
             ("turns", self.count("SELECT count(*) FROM turns WHERE session_key = ?1", key)),
             ("entities", self.count("SELECT count(*) FROM entities WHERE turn_id IN (SELECT id FROM turns WHERE session_key = ?1)", key)),
             ("paths", self.count("SELECT count(*) FROM paths WHERE turn_id IN (SELECT id FROM turns WHERE session_key = ?1)", key)),
-            ("compaction_boundaries", self.count("SELECT count(*) FROM compaction_boundaries WHERE turn_id IN (SELECT id FROM turns WHERE session_key = ?1)", key)),
+            ("compactions", self.count("SELECT count(*) FROM compactions WHERE session_key = ?1", key)),
             ("observations", self.count("SELECT count(*) FROM observations WHERE session_key = ?1", key)),
             ("watermarks", self.count("SELECT count(*) FROM watermarks WHERE transcript_path = ?1", key)),
         ]

@@ -18,10 +18,11 @@ Reports about Terminus on the `main` branch and about any published release are 
 
 ## How Terminus is checked
 
-Terminus is audited with [sentinel](https://github.com/jcrenshaw-dev/sentinel), which this repo carries as a git submodule at `.sentinel`. The audit works from [THREAT-MODEL.md](THREAT-MODEL.md), which lists what Terminus reads, writes and runs, and where untrusted data enters.
+Terminus is audited with [sentinel](https://github.com/jcrenshaw-dev/sentinel), which this repo carries as a git submodule at `.sentinel`. [THREAT-MODEL.md](THREAT-MODEL.md) lists what Terminus reads, writes and runs, and where untrusted data enters, and the pull request review works from it.
 
 - **Every pull request** runs sentinel's mechanical checks through `.github/workflows/fast.yml`: `cargo audit`, `cargo deny` against this repo's `deny.toml`, `cargo clippy` and `semgrep`. If any of them fails, the pull request fails. When they pass, a second job, on GitHub only, has Claude Code review the pull request's diff against THREAT-MODEL.md, reading only the repository's files, and posts the review as a comment on the pull request. The job fails if the review did not run. Findings don't fail it; they are posted for the author to read. It reads the `ANTHROPIC_API_KEY` secret, which GitHub does not pass to workflows run from a fork.
-- **The full audit** runs by hand, not in CI. Each of sentinel's review prompts covers one concern and runs several times through more than one model. The results are merged, and each finding is then adjudicated. A finding counts as confirmed only once a failing test demonstrates it. The steps are in sentinel's README.
+- **Every push and pull request** runs the whole test suite through `.github/workflows/test.yml`: `cargo test --workspace --all-features --locked`, on the debug and the release build, on Linux and macOS, on x86_64 and aarch64. If any test fails in any of the eight jobs, the run fails. It reads no secret.
+- **The full audit** runs by hand, not in CI. The next section says what it runs.
 - **Fuzzing.** `fuzz/` holds a cargo-fuzz target for every parser that reads input from outside Terminus: transcripts, `terminus.toml`, the command line, hook input, MCP messages and Claude Code's settings files. `cargo +nightly fuzz build` builds them all, and `cargo +nightly fuzz run <target>` runs one.
 - **Miri.** Terminus has one `unsafe` block, the volatile read of the install marker in `crates/terminus/src/cmd/install/binary.rs`. The two tests that exercise it without touching the filesystem run under Miri:
 
@@ -30,6 +31,16 @@ Terminus is audited with [sentinel](https://github.com/jcrenshaw-dev/sentinel), 
   cargo +nightly miri test -p terminus --lib -- a_marker_split_across_two_reads_is_still_found a_file_without_the_marker_is_foreign
   ```
 
-## Confirmed findings
+## The full audit
 
-Every confirmed finding becomes a regression test. The test goes into the test suite of the crate the finding is in, it fails before the fix and passes after, and it stays there so the same bug cannot come back unnoticed.
+The full audit runs sentinel's audit in three steps, and stops after each one until the maintainer says to go on.
+
+1. **Mechanical checks.** The same checks every pull request runs, with their output saved to `audit/check.txt`.
+2. **Claude Security scan.** One codebase scan of the whole repository.
+3. **Findings log.** One row per step: which mechanical checks failed, and how many findings the scan reported at each severity.
+
+The audit finds and records. It fixes no code, writes no tests and commits nothing. What happens to each finding is the maintainer's decision.
+
+## Fixed findings
+
+Every finding that is fixed gets a regression test. The test goes into the test suite of the crate the finding is in, it fails before the fix and passes after, and it stays there so the same bug cannot come back unnoticed.

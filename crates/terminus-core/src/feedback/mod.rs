@@ -25,11 +25,24 @@ pub mod replay;
 pub mod stats;
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::inject::decision::{self, Decision};
+use crate::inject::state;
+
+/// How old a writer's leftover has to be before the drain treats it as
+/// abandoned: a `.tmp` it sweeps, or an empty decision reservation it deletes.
+///
+/// A hook process lives for its `DRAIN_DEADLINE` (500 ms) and `INJECT_DEADLINE`
+/// (50 ms), both in `crates/terminus/src/cmd/hook.rs`, plus its startup. Ten
+/// minutes is over a thousand times that, so no hook still writing owns a file
+/// this old, and it is short enough that an abandoned copy of a prompt is gone
+/// by the first pass after ten minutes. It lives here and not beside the
+/// deadlines because the drain is in this crate and they are in the binary.
+const ABANDONED_AFTER: Duration = Duration::from_secs(10 * 60);
 
 /// What one drain did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -132,8 +145,21 @@ pub fn outcomes(conn: &mut Connection) -> Labeled {
 /// build can read and never will be (there is no migration - see
 /// [`crate::inject::decision`]), so leaving it would mean re-reading it on every
 /// pass forever.
+///
+/// An empty file younger than [`ABANDONED_AFTER`] is the exception. It is the
+/// reservation a write makes before renaming the record over it, so it is not
+/// inserted, deleted or reported, and the next pass reads the record. An older
+/// empty one is no write still running, and is deleted and named like any other
+/// file that does not parse.
+///
+/// Every drain first sweeps the writers' abandoned `.tmp` files (see
+/// [`sweep`]), including one that finds no record or whose insert fails.
 pub fn drain(conn: &mut Connection, data_dir: &Path) -> Result<Drained> {
-    let found = decision::read_all(data_dir);
+    sweep(data_dir);
+    let found: Vec<decision::Found> = decision::read_all(data_dir)
+        .into_iter()
+        .filter(|entry| !in_flight(entry))
+        .collect();
     if found.is_empty() {
         return Ok(Drained::default());
     }
@@ -172,6 +198,64 @@ pub fn drain(conn: &mut Connection, data_dir: &Path) -> Result<Drained> {
     Ok(drained)
 }
 
+/// Delete the writers' temporaries once they are older than
+/// [`ABANDONED_AFTER`].
+///
+/// A decision or state write cut off at the hook's deadline leaves its `.tmp`
+/// behind, and a decision's holds the whole prompt. Only names the writers make
+/// are candidates, and only regular files: `symlink_metadata`, so a symlink with
+/// such a name is left alone rather than judged by its target. This is
+/// housekeeping, so nothing it deletes or fails to delete is reported.
+fn sweep(data_dir: &Path) {
+    let writers = [
+        (
+            decision::DIR_NAME,
+            decision::TEMPORARY_PREFIX,
+            decision::TEMPORARY_SUFFIX,
+        ),
+        (
+            state::DIR_NAME,
+            state::TEMPORARY_PREFIX,
+            state::TEMPORARY_SUFFIX,
+        ),
+    ];
+    for (dir, prefix, suffix) in writers {
+        let Ok(entries) = std::fs::read_dir(data_dir.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !(name.starts_with(prefix) && name.ends_with(suffix)) {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_file() && older(meta.modified().ok()) {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// Whether `entry` is a reservation whose record has not been renamed over it
+/// yet.
+fn in_flight(entry: &decision::Found) -> bool {
+    entry.decision.is_none() && entry.empty && !older(entry.modified)
+}
+
+/// Whether `modified` is further back than [`ABANDONED_AFTER`]. An mtime that
+/// could not be read, or is in the future, is not.
+fn older(modified: Option<SystemTime>) -> bool {
+    modified
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age > ABANDONED_AFTER)
+}
+
 /// One record, as a row.
 ///
 /// The wall clock arrives as unix milliseconds and SQLite formats it, so the
@@ -179,14 +263,19 @@ pub fn drain(conn: &mut Connection, data_dir: &Path) -> Result<Drained> {
 /// crate grows no second date implementation (see
 /// [`crate::inject::decision`]). The list-shaped fields are JSON documents: they
 /// are read back whole by replay and stats and joined on by nothing.
+///
+/// `compacted` is always written as 1 or 0 and `dropped` always as a document,
+/// an empty array for an ordinary decision. Null in either column is kept for
+/// the rows drained before the columns existed, whose values are unknown.
 fn insert(conn: &Connection, decision: &Decision, watermark: Option<i64>) -> Result<()> {
     conn.execute(
         "INSERT INTO decisions (
             session_id, ts, cwd, prompt, watermark_session_no, chars_injected,
-            spellings, candidates, injected, suppressed, thresholds
+            spellings, candidates, injected, suppressed, thresholds,
+            compacted, dropped
          ) VALUES (
             ?1, strftime('%Y-%m-%dT%H:%M:%fZ', ?2 / 1000.0, 'unixepoch'), ?3, ?4,
-            ?5, ?6, ?7, ?8, ?9, ?10, ?11
+            ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
          )",
         rusqlite::params![
             decision.session_id,
@@ -202,6 +291,8 @@ fn insert(conn: &Connection, decision: &Decision, watermark: Option<i64>) -> Res
             document(&decision.injected),
             document(&decision.suppressed),
             document(&decision.thresholds),
+            i64::from(decision.compacted),
+            document(&decision.dropped),
         ],
     )?;
     Ok(())

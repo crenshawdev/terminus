@@ -14,17 +14,19 @@
 //! resolve the developer's real config and walk a live 2,000-file `~/.claude`
 //! tree.
 //!
-//! The kill test needs the fault points, so it needs
-//! `cargo test -p terminus --features testkit --test hook`. It is gated on the
-//! feature by itself rather than the file being gated, because a
-//! `#![cfg(feature = "testkit")]` binary runs zero tests under a bare
+//! The kill test needs a testkit build to hold the hook on stdin past its
+//! 500 ms deadline, so it needs
+//! `cargo test -p terminus --features testkit --test hook`. Without one it
+//! still runs, racing that deadline. The file is not gated on the feature,
+//! because a `#![cfg(feature = "testkit")]` binary runs zero tests under a bare
 //! `cargo test` and still reports green - which would silently retire the
 //! budget assertion this file exists to hold.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::{PoisonError, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
@@ -62,7 +64,7 @@ struct Hook {
 }
 
 fn hook() -> Hook {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
     let data_dir = dir.path().join("data");
     let config_dir = dir.path().join("config");
     let claude_dir = dir.path().join("claude");
@@ -144,8 +146,8 @@ static COPYING: RwLock<()> = RwLock::new(());
 /// `Command::spawn`, held off while any binary copy is in flight ([`COPYING`]).
 ///
 /// Every spawn in this file goes through here or through [`output`] - including
-/// `ps` and `kill`, which fork exactly like the ones that matter and inherit
-/// exactly the same descriptors.
+/// `ps`, which forks exactly like the ones that matter and inherits exactly the
+/// same descriptors.
 ///
 /// The guard is dropped when `spawn` returns, which is after the child has
 /// exec'd: both of the paths `std` takes on Unix (`posix_spawn`, and the
@@ -517,19 +519,62 @@ fn an_unterminated_line_stops_being_read_at_the_cap() {
     .expect("spawn the hook");
     let mut stdin = child.stdin.take().expect("the hook's stdin");
 
-    // No newline anywhere in it, so nothing but a cap can end the read.
-    let chunk = vec![b'x'; CHUNK];
-    let mut written = 0usize;
-    let mut refused = None;
-    while written < TOTAL {
-        match stdin.write_all(&chunk) {
-            Ok(()) => written += CHUNK,
-            Err(e) => {
-                refused = Some(e);
-                break;
+    // The writes run on a thread with a deadline. A write to a full pipe waits
+    // for as long as anything holds the read end open, so without one a hook
+    // that never stops reading hangs the run instead of failing it.
+    let written = Arc::new(AtomicUsize::new(0));
+    let (done, finished) = mpsc::channel();
+    {
+        let written = Arc::clone(&written);
+        std::thread::spawn(move || {
+            // No newline anywhere in it, so nothing but a cap can end the read.
+            let chunk = vec![b'x'; CHUNK];
+            let mut refused = None;
+            while written.load(Ordering::Relaxed) < TOTAL {
+                match stdin.write_all(&chunk) {
+                    Ok(()) => {
+                        written.fetch_add(CHUNK, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        refused = Some(e);
+                        break;
+                    }
+                }
             }
-        }
+            let _ = done.send(refused);
+        });
     }
+
+    let refused = match finished.recv_timeout(WRITE_DEADLINE) {
+        Ok(refused) => refused,
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the writing thread ended without saying how the writes ended")
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let exited = child.try_wait().ok().flatten();
+            let _ = child.kill();
+            let ended = wait_for(&mut child, Duration::from_secs(5));
+            let stderr = match child.stderr.take() {
+                Some(pipe) => read_for(pipe, Duration::from_secs(5)),
+                None => String::new(),
+            };
+            panic!(
+                "the write was still blocked after {WRITE_DEADLINE:?}, {} bytes in; \
+                 the hook {}, and after the kill it {}; its stderr: {stderr:?}",
+                written.load(Ordering::Relaxed),
+                match exited {
+                    Some(status) => format!("had exited, {status}"),
+                    None => "had not exited".to_owned(),
+                },
+                if ended {
+                    "had ended"
+                } else {
+                    "was still running 5 s later"
+                },
+            );
+        }
+    };
+    let written = written.load(Ordering::Relaxed);
 
     let e = refused.unwrap_or_else(|| {
         panic!("the hook read all {TOTAL} bytes of a line that never ends");
@@ -557,8 +602,41 @@ fn an_unterminated_line_stops_being_read_at_the_cap() {
         String::from_utf8_lossy(&output.stdout)
     );
 
-    drop(stdin);
     drain(&hook.ingest_argv());
+}
+
+/// How long [`an_unterminated_line_stops_being_read_at_the_cap`] waits for the
+/// hook to break the pipe. A passing run takes well under a second.
+const WRITE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Whether `child` has ended within `wait`. Polled with `try_wait` rather than
+/// `wait`, so a process the kill could not end cannot hang the caller.
+fn wait_for(child: &mut Child, wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Whatever `pipe` gives up within `wait`. Read on a thread, so a pipe that
+/// something else still holds open cannot hang the failure it is reported in.
+fn read_for(mut pipe: impl Read + Send + 'static, wait: Duration) -> String {
+    let (done, read) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        let _ = done.send(bytes);
+    });
+    match read.recv_timeout(wait) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => format!("still open after {wait:?}"),
+    }
 }
 
 /// The hook hands the ingest nothing the harness gave it.
@@ -652,8 +730,19 @@ fn descendants(root: u32, table: &[Proc]) -> Vec<u32> {
     found
 }
 
-fn sigkill(target: &str) {
-    output(Command::new("kill").args(["-KILL", target])).expect("run kill");
+// kill(2) from the C library std already links, so the test does not depend on
+// which `kill` binary the system ships or how it parses `-KILL -<pid>`.
+unsafe extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+const SIGKILL: i32 = 9;
+
+/// SIGKILL to `pid`, or to the process group a negative `pid` names. A target
+/// that is already gone is ignored.
+fn sigkill(pid: i32) {
+    // SAFETY: kill(2) takes two integers and reads no memory of ours.
+    unsafe { kill(pid, SIGKILL) };
 }
 
 /// AC2 / D-03: the kill Claude Code actually performs, and an ingest that
@@ -671,15 +760,16 @@ fn sigkill(target: &str) {
 /// outside the union, not merely outside whichever snapshot happened to be
 /// taken first.
 ///
-/// **Everything between the spawn and the kill is on a 500 ms clock**, and that
-/// is the whole reason this test is shaped the way it is. The hook gives a
-/// writer `cmd::hook::DRAIN_DEADLINE` - 500 ms - before it stops waiting on
-/// stdin and exits 0, so a hook that is killed late is not killed at all: the
-/// group kill reaches an empty group, nothing dies, and the survival assertions
-/// below pass over a hook that was never killed. So the kill is aimed as soon
-/// as the ingest is nameable in the process table, tens of milliseconds in,
-/// rather than after waiting for the pass to commit its first file - which cost
-/// ~400 ms of the 500 on an idle machine and ran past it under a loaded one.
+/// The hook gives a writer `cmd::hook::DRAIN_DEADLINE` - 500 ms - before it
+/// stops waiting on stdin and exits 0, so a hook that is killed late is not
+/// killed at all: the group kill reaches an empty group, nothing dies, and the
+/// survival assertions below pass over a hook that was never killed. The path to
+/// the kill runs `ps` at least twice, each behind [`COPYING`], and on a loaded
+/// macOS runner it ran past the 500 ms. So the hook is spawned with
+/// `testkit::DRAIN_DEADLINE_ENV` at ten seconds, which a testkit build reads in
+/// place of the 500 ms, and the kill lands on a hook still blocked on stdin
+/// however slow the machine is. The kill is still aimed as soon as the ingest
+/// is nameable in the process table.
 /// Nothing is lost by killing early, because `SIGKILL` cannot be handled: what
 /// decides survival is whether the ingest's pid is in the group or the sweep,
 /// which its `setsid` settled at spawn and no later instant can change. The
@@ -700,6 +790,10 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
 
     let mut child = spawn(
         hook.command(&["hook", "SessionEnd"])
+            .env(
+                testkit::DRAIN_DEADLINE_ENV,
+                testkit::KILL_TEST_DRAIN_DEADLINE_MS,
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Its own group, so the group kill below names the hook and nothing
@@ -724,14 +818,14 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
 
     let mut doomed = descendants(hook_pid, &ps());
     // The group, by its leader's negated pid - `process.kill(-pid)`.
-    sigkill(&format!("-{hook_pid}"));
+    sigkill(-(hook_pid as i32));
     for pid in descendants(hook_pid, &ps()) {
         if !doomed.contains(&pid) {
             doomed.push(pid);
         }
     }
     for pid in &doomed {
-        sigkill(&pid.to_string());
+        sigkill(*pid as i32);
     }
 
     let status = child.wait().expect("wait for the killed hook");
@@ -739,8 +833,9 @@ fn the_ingest_survives_a_group_kill_and_a_descendant_sweep() {
         status.signal(),
         Some(9),
         "the hook did not die of the group kill: {status:?}. An exit of 0 here \
-         means the hook gave up on stdin and returned before the kill landed, \
-         so the group was empty and nothing below is evidence of anything"
+         means the hook gave up on stdin and returned before the kill landed - \
+         a binary built without testkit ignores the deadline variable - so the \
+         group was empty and nothing below is evidence of anything"
     );
     assert!(
         !doomed.contains(&ingest.pid),

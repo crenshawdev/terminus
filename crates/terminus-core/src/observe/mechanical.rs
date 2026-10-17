@@ -10,8 +10,8 @@
 //! `turns.tool_name` says whether the turn that named one was writing it;
 //! `entities` of kind `tool` and `error` give the tools and the failures;
 //! `session_meta` gives the branch and the two timestamps the duration is the
-//! difference of; `turns` gives the count; `compaction_boundaries` joined
-//! through `turns` gives the compactions.
+//! difference of; `turns` gives the count; `compactions` gives the
+//! compactions, counted by `session_key`.
 //!
 //! **The two exceptions, and why they cost a blob read.** Commands-with-
 //! arguments and commits cannot come out of SQL:
@@ -63,6 +63,15 @@ pub const ELISION: &str = " [...]";
 /// is the safe direction to be wrong in: it understates what a session altered
 /// rather than inventing an edit that never happened.
 const WRITING_TOOLS: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
+
+/// Whole seconds from `first_turn_at` to `last_turn_at`, in SQL.
+///
+/// The difference is taken before the fraction is dropped. Dropping it from
+/// each end first, as `strftime('%s')` does, reads 100.002 s that start at
+/// :59.998 as 101 s. Rounding to the millisecond before the division absorbs
+/// `julianday`'s floating-point error, so an exact 100 s cannot read as 99.
+const DURATION_SQL: &str = "CAST(round((julianday(last_turn_at) - julianday(first_turn_at)) \
+                            * 86400000) AS INTEGER) / 1000";
 
 /// The OBS-01 fact set for one session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -131,10 +140,10 @@ pub fn observe(conn: &Connection, session_key: &str) -> Result<Mechanical> {
     // rather than failing the whole observation.
     let meta = conn
         .query_row(
-            "SELECT branch, first_turn_at, last_turn_at,
-                    CAST(strftime('%s', last_turn_at) AS INTEGER)
-                  - CAST(strftime('%s', first_turn_at) AS INTEGER)
-               FROM session_meta WHERE session_key = ?1",
+            &format!(
+                "SELECT branch, first_turn_at, last_turn_at, {DURATION_SQL}
+                   FROM session_meta WHERE session_key = ?1"
+            ),
             [session_key],
             |r| {
                 Ok(Meta {
@@ -153,9 +162,7 @@ pub fn observe(conn: &Connection, session_key: &str) -> Result<Mechanical> {
         |r| r.get(0),
     )?;
     let compactions = conn.query_row(
-        "SELECT count(*) FROM compaction_boundaries c
-           JOIN turns t ON t.id = c.turn_id
-          WHERE t.session_key = ?1",
+        "SELECT count(*) FROM compactions WHERE session_key = ?1",
         [session_key],
         |r| r.get(0),
     )?;
@@ -426,6 +433,43 @@ fn clip(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`DURATION_SQL`] between two stored timestamps.
+    fn duration(first: &str, last: &str) -> i64 {
+        Connection::open_in_memory()
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT {DURATION_SQL} FROM (SELECT ?1 AS first_turn_at, ?2 AS last_turn_at)"
+                ),
+                [first, last],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_duration_drops_the_fraction_after_subtracting_not_before() {
+        // 100.002 s, starting just before a second boundary.
+        assert_eq!(
+            duration("2026-10-16T13:24:59.998Z", "2026-10-16T13:26:40.000Z"),
+            100
+        );
+        // Exactly 100 s, which floating-point error must not make 99.
+        assert_eq!(
+            duration("2026-10-16T13:25:00.000Z", "2026-10-16T13:26:40.000Z"),
+            100
+        );
+        assert_eq!(
+            duration("2026-10-16T13:25:00.000Z", "2026-10-16T13:26:39.999Z"),
+            99
+        );
+        // Under a second, across a boundary.
+        assert_eq!(
+            duration("2026-10-16T13:24:59.998Z", "2026-10-16T13:25:00.002Z"),
+            0
+        );
+    }
 
     #[test]
     fn a_quoted_argument_stays_one_word() {

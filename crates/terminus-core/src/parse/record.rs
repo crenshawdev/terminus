@@ -104,10 +104,10 @@ impl Record {
     /// (D-21)?
     ///
     /// Not a new record class and not a classification rule: `system` is already
-    /// in [`TURN_TYPES`] and the real boundary record carries both `uuid` and
-    /// `timestamp`, so D-03 has already made it a turn. The type is checked as
-    /// well as the subtype, because `subtype` is read off any record that
-    /// carries one. The derive seam writes boundary rows by the same rule.
+    /// in [`TURN_TYPES`], so a boundary that carries both `uuid` and `timestamp`
+    /// is a turn by D-03, and one missing either is not. The derive seam gives
+    /// both a boundary row by this rule. The type is checked as well as the
+    /// subtype, because `subtype` is read off any record that carries one.
     pub fn is_compact_boundary(&self) -> bool {
         self.record_type.as_deref() == Some("system")
             && self.subtype.as_deref() == Some(COMPACT_BOUNDARY)

@@ -9,6 +9,22 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `terminus stats` counts compacted decisions apart from ordinary ones. A
+  compacted decision is the one taken on the prompt after a compaction, which
+  searches the wider window and is offered only the turns the compaction
+  dropped. `--json` carries the two counts as `compacted_decisions` and
+  `ordinary_decisions`, and the human output prints them under `decisions`.
+  Decisions logged before this release are in neither count, so the two can add
+  up to less than `decisions`.
+- The test suite runs on GitHub for every push and pull request, on the four
+  runners the release builds on: `ubuntu-24.04`, `ubuntu-24.04-arm`,
+  `macos-15-intel` and `macos-15`, once on the debug build and once on the
+  release build. Each job checks that every tool the shell tests need is on
+  PATH before `cargo test --workspace --all-features --locked` starts, and
+  fails naming the one that is missing (#47).
+
 ### Fixed
 
 - `terminus mcp` agreed to protocol revision `2025-03-26` when a client asked
@@ -46,6 +62,57 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   were still there passed. Such a session is now one failure for the whole
   session, with `block` `null` under `--json`, saying how many block rows
   remain, and `terminus verify` exits 1.
+- `terminus replay` scored a decision made after a compaction through the
+  ordinary window, because the decision log did not keep whether the compacted
+  pool was in force or which turns the compaction had dropped, so
+  `--compacted-ranked` changed nothing. Each decision now stores both, and
+  replay scores a compacted decision through the compacted window and its own
+  dropped turns, so `--compacted-ranked` moves it. Decisions logged before this
+  release carry neither and replay as ordinary ones.
+- A decision or injection-state write cut off at the hook's deadline left a
+  `.tmp` file in `decisions/` or `injection/` that nothing deleted, and the
+  decision ones held the whole prompt. The ingest now deletes those files once
+  they are older than ten minutes (#38).
+- An ingest that ran while a hook was writing a decision record could read the
+  empty placeholder file the hook reserves before renaming the record into
+  place, then delete that path after the record had landed there, so the record
+  was lost unread. The ingest now leaves an empty placeholder younger than ten
+  minutes for the next pass, which reads the record.
+- For a session whose transcript had stopped matching the archive, the ingest
+  opened the transcript once to check its earlier bytes against the archive and
+  again to read what came after them. A file replaced at that path between the
+  two opens could put one file's tail after another file's prefix in the
+  archive. Both reads now go through one open file (#15). A file rewritten in
+  place while it is being read is still not caught.
+- A compaction boundary record with no `uuid` or no `timestamp` got no boundary
+  row, so the prompt after that compaction searched as if nothing had been
+  compacted and could not offer back the turns that fell out of context. Such a
+  boundary now gets a row at its own place in the session, and the prompt after
+  it offers back what fell out (#17). The first ingest after upgrading rebuilds
+  the derived tables once, which moves the boundary rows into their new table.
+- A test file gated on the `testkit` feature, run by name without
+  `--features testkit` (`cargo test --test mcp`), compiled to an empty binary,
+  ran no tests and passed. The 27 such files are now declared with
+  `required-features = ["testkit"]`, so cargo refuses to run one named without
+  the feature and says it needs `testkit` (#44).
+- An ingest killed while it was creating a new store could leave the data
+  directory refused by every command after it, each saying `terminus.db exists
+  but is not a terminus store`. Switching a new store to WAL mode writes its
+  header through a rollback journal, and the check that decides whether the
+  file is a store reads it read-only, which cannot roll that journal back. The
+  check now lets SQLite roll it back first, and the next ingest creates the
+  store.
+- An exclusion written through a symlink excluded nothing. Claude Code names a
+  project's folder after the path the symlink resolves to, and a git project's
+  key is its resolved top level, so neither matched the exclusion as written:
+  new sessions from that project were archived, and archived ones stayed
+  visible to search, recall and injection. Each exclusion now also matches the
+  path it resolves to.
+- `terminus observations` could report a session one second longer than it
+  ran. The duration dropped each timestamp's fraction before subtracting, so
+  100.002 s that started at :59.998 read as 101 s. Observations already
+  recorded keep the old value until `terminus observations regenerate`
+  recomputes them.
 
 ## [0.1.1] - 2026-10-15
 

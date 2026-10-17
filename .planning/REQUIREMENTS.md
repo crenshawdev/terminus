@@ -173,7 +173,7 @@ Explicit exclusions. The reason prevents scope creep later.
 | STOR-10 | Phase 7 | Complete |
 | STOR-09 | Phase 7 | Complete |
 | REL-01 | Phase 8 | Complete |
-| REL-02 | Phase 10 | Pending |
+| REL-02 | Phase 10 | Complete |
 | DOC-01 | Phase 9 | Complete |
 | DOC-02 | Phase 9 | Complete |
 | DOC-03 | Phase 9 | Complete |

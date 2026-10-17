@@ -157,7 +157,7 @@ It refuses a `<path>` that is the data directory itself, is inside it, or is a f
 
 ### `terminus stats`
 
-Reports whether the text Terminus hands Claude Code on each prompt is helping: how many prompts were logged, how many turns were injected, the hits and false positives among them, the precision, the misses, the wasted budget, and the characters injected and the part of them the hits carried. The counts are characters, not tokens. An injection is labelled only once its session is closed. What each number means is in [json-shapes.md](json-shapes.md#stats).
+Reports whether the text Terminus hands Claude Code on each prompt is helping: how many prompts were logged, how many turns were injected, the hits and false positives among them, the precision, the misses, the wasted budget, and the characters injected and the part of them the hits carried. The prompt count is split into compacted decisions, taken on the one prompt after a compaction, and ordinary ones, and a prompt logged by a build that did not record which it was is in neither. The counts are characters, not tokens. An injection is labelled only once its session is closed. What each number means is in [json-shapes.md](json-shapes.md#stats).
 
 - `--json`
 

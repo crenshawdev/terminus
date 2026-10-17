@@ -89,7 +89,11 @@ impl Bench {
             .current_dir(&self.work)
             .env("TERMINUS_DATA_DIR", &self.data_dir)
             .env("TERMINUS_CONFIG_DIR", &self.config_dir)
-            .env("CLAUDE_CONFIG_DIR", &self.claude_dir);
+            .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
+            .env(
+                testkit::INJECT_DEADLINE_ENV,
+                testkit::CONTENT_INJECT_DEADLINE_MS,
+            );
         command
     }
 
@@ -157,6 +161,12 @@ impl Bench {
     /// "everything the prompt matches" or "everything still in the session"
     /// would return the preserved turn instead and be caught.
     fn compacted(&self) -> Compacted {
+        self.compacted_with(true)
+    }
+
+    /// [`Bench::compacted`], with the boundary record's `uuid` left off when
+    /// `boundary_uuid` is false, so the boundary is not a turn (#17, D-19).
+    fn compacted_with(&self, boundary_uuid: bool) -> Compacted {
         const SESSION: &str = "dddddddd-0000-4000-8000-000000000000";
         let uuid = |n: usize| format!("{SESSION}-{n}");
         let gadget = self.project().join(GADGET);
@@ -218,6 +228,9 @@ impl Bench {
                 },
             }),
         ];
+        if !boundary_uuid {
+            records[3].as_object_mut().unwrap().remove("uuid");
+        }
 
         let mut body = String::new();
         for (n, record) in records.iter_mut().enumerate() {
@@ -753,6 +766,40 @@ fn after_a_compaction_the_next_prompt_draws_from_what_fell_out() {
     );
 }
 
+/// #17's second case: a boundary record with no `uuid` is not a turn, and its
+/// compaction is still answered out of what fell out. Before the boundary had a
+/// row of its own, `compaction_owed` stuck here and the prompt stayed silent.
+#[test]
+fn a_boundary_with_no_uuid_still_offers_back_what_fell_out() {
+    const SESSION: &str = "dddddddd-2222-4000-8000-000000000001";
+
+    let bench = bench();
+    bench.ingest_fixture();
+    let compacted = bench.compacted_with(false);
+    let asked = format!("what happened to {SYMBOL} in {GADGET}");
+
+    injected(&bench.session_start(SESSION, "compact"), "SessionStart");
+    assert_eq!(bench.state(SESSION)["compaction_owed"], Value::Bool(true));
+
+    let after = injected(
+        &bench.prompt(SESSION, &compacted.path, &asked),
+        "UserPromptSubmit",
+    );
+    assert!(
+        names(&after, compacted.fell_out),
+        "the turn that fell out of context was not offered back: {after}"
+    );
+    assert!(
+        !names(&after, compacted.preserved),
+        "a turn still in the model's context was injected: {after}"
+    );
+    assert_eq!(
+        bench.state(SESSION)["compaction_owed"],
+        Value::Bool(false),
+        "the flag survived the prompt that spent it"
+    );
+}
+
 /// D-08's race, which is the reason the flag persists instead of being read
 /// off the store: the ingest that commits the boundary row is running against
 /// the prompt that needs it.
@@ -769,17 +816,17 @@ fn a_compaction_whose_boundary_is_not_committed_yet_keeps_the_debt() {
     let compacted = bench.compacted();
     let asked = format!("what happened to {SYMBOL} in {GADGET}");
 
-    let row: (i64, Vec<u8>) = bench
+    let row: (String, i64, Vec<u8>) = bench
         .store()
         .query_row(
-            "SELECT turn_id, metadata FROM compaction_boundaries",
+            "SELECT session_key, stream_offset, metadata FROM compactions",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .expect("the compacted session archived a boundary");
     bench
         .store()
-        .execute("DELETE FROM compaction_boundaries", [])
+        .execute("DELETE FROM compactions", [])
         .unwrap();
 
     injected(&bench.session_start(SESSION, "compact"), "SessionStart");
@@ -797,8 +844,8 @@ fn a_compaction_whose_boundary_is_not_committed_yet_keeps_the_debt() {
     bench
         .store()
         .execute(
-            "INSERT INTO compaction_boundaries (turn_id, metadata) VALUES (?1, ?2)",
-            rusqlite::params![row.0, row.1],
+            "INSERT INTO compactions (session_key, stream_offset, metadata) VALUES (?1, ?2, ?3)",
+            rusqlite::params![row.0, row.1, row.2],
         )
         .unwrap();
 

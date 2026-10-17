@@ -30,7 +30,7 @@ use rusqlite::Connection;
 use terminus_core::config::Config;
 use terminus_core::ingest::pass;
 use terminus_core::store::{schema, Store, DB_FILE_NAME};
-use terminus_core::{ingest, reindex, testkit, verify};
+use terminus_core::{discover, ingest, reindex, testkit, verify};
 
 /// A transcript large enough to fill at least one 64 KB block, so
 /// "every completed block is byte-identical" is a claim about something.
@@ -46,7 +46,7 @@ struct Bench {
 }
 
 fn bench(fixture: &str) -> Bench {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
     let data_dir = dir.path().join("data");
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -151,14 +151,16 @@ fn turn_rows(conn: &Connection) -> Vec<TurnRowValues> {
     .collect()
 }
 
-/// Every boundary row in the store, as `(turn_id, metadata bytes)`.
+/// Every boundary row in the store, as `(stream_offset, metadata bytes)`.
 fn boundaries(conn: &Connection) -> Vec<(i64, Vec<u8>)> {
-    conn.prepare("SELECT turn_id, metadata FROM compaction_boundaries ORDER BY turn_id")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
+    conn.prepare(
+        "SELECT stream_offset, metadata FROM compactions ORDER BY session_key, stream_offset",
+    )
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
 }
 
 /// The `compactMetadata` of a boundary line, read independently of the parser
@@ -170,9 +172,19 @@ fn expected_metadata(line: &[u8]) -> serde_json::Value {
     record["compactMetadata"].clone()
 }
 
+/// The id of the bench session's turn at `stream_offset`.
+fn turn_at(conn: &Connection, stream_offset: i64) -> i64 {
+    conn.query_row(
+        "SELECT id FROM turns WHERE stream_offset = ?1",
+        [stream_offset],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
 fn drop_derived(conn: &Connection) {
-    // Children first: the bundled SQLite enforces foreign keys, so
-    // `compaction_boundaries` has to go before `turns`.
+    // Children first: the bundled SQLite enforces foreign keys, so `entities`
+    // and `paths` have to go before `turns`.
     for table in schema::DERIVED_TABLES.iter().rev() {
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))
             .unwrap();
@@ -214,7 +226,7 @@ fn appending_a_boundary_records_it_and_disturbs_nothing_already_archived() {
     // One boundary row, and its bytes are the appended record's own.
     let rows = boundaries(&conn);
     assert_eq!(rows.len(), 1, "one boundary appeared, exactly once");
-    let (turn_id, metadata) = &rows[0];
+    let (offset, metadata) = &rows[0];
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(metadata).unwrap(),
         expected_metadata(&line),
@@ -225,9 +237,9 @@ fn appending_a_boundary_records_it_and_disturbs_nothing_already_archived() {
         "the stored metadata is not a byte slice of the record, so it was re-serialized"
     );
 
-    // It is keyed on the turn that IS the boundary: reading that turn out of
-    // the archive returns the record that was appended (D-21).
-    let (bytes, _) = testkit::read_turn(&conn, *turn_id);
+    // It sits at the offset of the turn that IS the boundary: reading that
+    // turn out of the archive returns the record that was appended (D-20, D-21).
+    let (bytes, _) = testkit::read_turn(&conn, turn_at(&conn, *offset));
     assert_eq!(bytes, line, "the boundary row names the wrong turn");
 
     // Nothing the first pass wrote moved.
@@ -313,7 +325,7 @@ fn no_ordinary_turn_gets_a_boundary_row() {
 
     let rows = boundaries(&conn);
     assert_eq!(rows.len(), 1);
-    let boundary_id = rows[0].0;
+    let boundary_id = turn_at(&conn, rows[0].0);
     let others: Vec<i64> = turn_rows(&conn)
         .into_iter()
         .map(|row| row.0)
@@ -385,17 +397,21 @@ fn ingesting_a_compacted_transcript_whole_records_the_same_boundary() {
 
     // The boundary is the fixture's last turn, and reading it back gives the
     // record verbatim.
-    let (bytes, _) = testkit::read_turn(&conn, rows[0].0);
+    let boundary_id = turn_at(&conn, rows[0].0);
+    let (bytes, _) = testkit::read_turn(&conn, boundary_id);
     assert_eq!(bytes, line);
     let last = turn_rows(&conn).last().unwrap().0;
-    assert_eq!(last, rows[0].0, "the boundary is the last turn of the file");
+    assert_eq!(
+        last, boundary_id,
+        "the boundary is the last turn of the file"
+    );
 }
 
 /// A session with no boundary contributes no row, whatever else it holds. The
 /// control for every assertion above.
 #[test]
 fn a_session_that_never_compacted_has_no_boundary_row() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
     let data_dir = dir.path().join("data");
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
@@ -533,7 +549,7 @@ struct Tree {
 const PROJECT: &str = "-data-code-verbatim";
 
 fn tree() -> Tree {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(testkit::temp_root()).unwrap();
     let data_dir = dir.path().join("data");
     let claude_dir = dir.path().join("claude");
     let project = claude_dir.join("projects").join(PROJECT);
@@ -661,6 +677,16 @@ impl Tree {
 
     fn restore(&self) {
         std::fs::write(&self.subject, &self.original).unwrap();
+    }
+
+    /// Grow the transcript by one compaction boundary.
+    fn append_boundary(&self) {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.subject)
+            .unwrap();
+        file.write_all(&testkit::boundary_line()).unwrap();
+        file.write_all(b"\n").unwrap();
     }
 }
 
@@ -839,6 +865,68 @@ fn a_transcript_rewritten_under_its_watermark_stays_flagged() {
     );
 }
 
+/// How many times the open log says the pass opened this transcript.
+///
+/// Counted per path and compared before and after, never `reset`: the log is
+/// shared by every test in this binary, and they run in parallel.
+fn opens_of(path: &Path) -> usize {
+    discover::opened::under(path).len()
+}
+
+/// #15. A flagged session's pass reads its prefix and its tail through one
+/// handle, so a file swapped between two opens cannot put one file's tail after
+/// another file's prefix in the archive. Both ways a flagged file comes back
+/// are covered: restored as it was, and restored then grown.
+#[test]
+fn a_flagged_session_opens_its_transcript_once_per_pass() {
+    let tree = tree();
+    tree.pass();
+    tree.truncate();
+    tree.pass();
+    assert!(tree.diverged(&tree.subject));
+
+    tree.restore();
+    let before = opens_of(&tree.subject);
+    tree.pass();
+    assert!(!tree.diverged(&tree.subject), "the restore did not clear");
+    assert_eq!(opens_of(&tree.subject) - before, 1, "restored");
+
+    tree.truncate();
+    tree.pass();
+    assert!(tree.diverged(&tree.subject));
+    tree.restore();
+    tree.append_boundary();
+    let before = opens_of(&tree.subject);
+    let summary = tree.pass();
+    assert_eq!(summary.files_committed, 1, "{summary:?}");
+    assert!(!tree.diverged(&tree.subject), "the growth did not clear");
+    assert_eq!(opens_of(&tree.subject) - before, 1, "grown");
+}
+
+/// The same single open when the prefix comparison fails, so the refusal is
+/// answered from the handle the length check used.
+#[test]
+fn a_flagged_session_rewritten_under_its_watermark_opens_it_once() {
+    let tree = tree();
+    tree.pass();
+    tree.truncate();
+    tree.pass();
+    assert!(tree.diverged(&tree.subject));
+
+    let mut rewritten = Vec::new();
+    while rewritten.len() <= tree.original.len() {
+        rewritten.extend_from_slice(&testkit::boundary_line());
+        rewritten.push(b'\n');
+    }
+    std::fs::write(&tree.subject, &rewritten).unwrap();
+
+    let before = opens_of(&tree.subject);
+    let summary = tree.pass();
+    assert_eq!(summary.failures.len(), 1, "{summary:?}");
+    assert!(tree.diverged(&tree.subject), "still flagged");
+    assert_eq!(opens_of(&tree.subject) - before, 1);
+}
+
 /// Half of the discrimination the dedicated error variant exists for: the
 /// failure D-13's refusal used to be indistinguishable from.
 ///
@@ -852,8 +940,13 @@ fn a_transcript_rewritten_under_its_watermark_stays_flagged() {
 /// a path that is not text has no session key to flag - which is exactly why
 /// `another_per_file_failure_flags_no_session` exists beside it.
 ///
-/// This needs a path that is bytes and not text.
+/// This needs a path that is bytes and not text. APFS refuses those, so the
+/// test is ignored on macOS.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses a file name that is not valid UTF-8"
+)]
 fn a_failure_that_is_not_a_divergence_flags_no_session() {
     use std::os::unix::ffi::OsStrExt;
 
@@ -923,5 +1016,148 @@ fn another_per_file_failure_flags_no_session() {
         tree.flagged().is_empty(),
         "a failure that is not a divergence flagged {:?}",
         tree.flagged()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #17's second case (D-19, D-20): a boundary with no `uuid` or no `timestamp`
+// is not a turn, and still gets a row at its own byte offset.
+// ---------------------------------------------------------------------------
+
+/// The boundary line with one field taken out, so it no longer classifies as
+/// a turn.
+fn boundary_without(field: &str) -> Vec<u8> {
+    let mut record: serde_json::Value = serde_json::from_slice(&testkit::boundary_line()).unwrap();
+    record
+        .as_object_mut()
+        .unwrap()
+        .remove(field)
+        .unwrap_or_else(|| panic!("the boundary line carries {field}"));
+    serde_json::to_vec(&record).unwrap()
+}
+
+/// Ordinary turns to put after the boundary, as whole lines.
+fn later_turns() -> Vec<u8> {
+    testkit::fixture_bytes("session-basic.jsonl")
+}
+
+/// Every turn's `(id, uuid)`, which is what "the turns after it keep their
+/// ids" compares. Offsets are left out: the boundary line moves them.
+fn turn_ids(conn: &Connection) -> Vec<(i64, Option<String>)> {
+    turn_rows(conn)
+        .into_iter()
+        .map(|row| (row.0, row.3))
+        .collect()
+}
+
+fn committed(outcome: ingest::Outcome) {
+    match outcome {
+        ingest::Outcome::Committed(_) => {}
+        other => panic!("the appended records must commit: {other:?}"),
+    }
+}
+
+/// The whole claim for one stripped field: the row at the line's offset with
+/// its metadata, no turn for the line, the later turns' ids unchanged, and the
+/// same row after a rebuild on either path.
+fn a_boundary_that_is_not_a_turn_gets_a_row(field: &str) {
+    let line = boundary_without(field);
+    let subject = bench(BIG_FIXTURE);
+    let conn = subject.conn();
+    let turns_before = turn_rows(&conn);
+    let offset = std::fs::metadata(&subject.transcript).unwrap().len() as i64;
+
+    // The line is the transcript's last, so this pass archives no turn at all.
+    subject.append_line(&line);
+    committed(subject.ingest());
+    assert_eq!(
+        turn_rows(&conn),
+        turns_before,
+        "the boundary line became a turn"
+    );
+    let rows = boundaries(&conn);
+    assert_eq!(rows.len(), 1, "one boundary, one row: {rows:?}");
+    assert_eq!(
+        rows[0].0, offset,
+        "the row is not at the line's byte offset"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rows[0].1).unwrap(),
+        expected_metadata(&line)
+    );
+
+    // More turns after it, and they number as if the line were not there.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&subject.transcript)
+        .unwrap();
+    file.write_all(&later_turns()).unwrap();
+    drop(file);
+    committed(subject.ingest());
+
+    let control = bench(BIG_FIXTURE);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&control.transcript)
+        .unwrap();
+    file.write_all(&later_turns()).unwrap();
+    drop(file);
+    committed(control.ingest());
+    assert!(turn_rows(&conn).len() > turns_before.len());
+    assert_eq!(
+        turn_ids(&conn),
+        turn_ids(&control.conn()),
+        "the turns after the boundary moved"
+    );
+    let after = boundaries(&conn);
+    assert_eq!(after, rows, "a later pass touched the boundary row");
+
+    // A rebuild with no evicted session drops and recreates every table.
+    let rebuilt = reindex::reindex(&mut Store::open(&subject.data_dir).unwrap()).unwrap();
+    assert_eq!(rebuilt.preserved, 0);
+    assert_eq!(boundaries(&conn), after, "the drop path lost the row");
+
+    // With a different session evicted, the rebuild takes the preserving path.
+    let other_dir = subject.data_dir.parent().unwrap().join("other");
+    std::fs::create_dir_all(&other_dir).unwrap();
+    let other = testkit::copy_fixture_into("session-basic.jsonl", &other_dir);
+    let other_key = match ingest::run(&subject.data_dir, &other).unwrap() {
+        ingest::Outcome::Committed(pass) => pass.session_key,
+        other => panic!("{other:?}"),
+    };
+    testkit::evict(&conn, &other_key);
+    let rebuilt = reindex::reindex(&mut Store::open(&subject.data_dir).unwrap()).unwrap();
+    assert_eq!(
+        rebuilt.preserved, 1,
+        "the rebuild did not take the preserving path"
+    );
+    assert_eq!(boundaries(&conn), after, "the preserving path lost the row");
+}
+
+#[test]
+fn a_boundary_with_no_uuid_gets_a_row_at_its_offset() {
+    a_boundary_that_is_not_a_turn_gets_a_row("uuid");
+}
+
+#[test]
+fn a_boundary_with_no_timestamp_gets_a_row_at_its_offset() {
+    a_boundary_that_is_not_a_turn_gets_a_row("timestamp");
+}
+
+/// The type rule holds for a record that is not a turn too: a `user` record
+/// with the subtype and no `uuid` gets no row.
+#[test]
+fn a_user_record_with_the_subtype_and_no_uuid_gets_no_row() {
+    let bench = bench(BIG_FIXTURE);
+    let mut record: serde_json::Value = serde_json::from_slice(&boundary_without("uuid")).unwrap();
+    record["type"] = "user".into();
+    bench.append_line(&serde_json::to_vec(&record).unwrap());
+    committed(bench.ingest());
+    assert!(boundaries(&bench.conn()).is_empty());
+
+    reindex::reindex(&mut Store::open(&bench.data_dir).unwrap()).unwrap();
+    assert!(
+        boundaries(&bench.conn()).is_empty(),
+        "the rebuild wrote one"
     );
 }

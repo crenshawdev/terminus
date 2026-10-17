@@ -2,14 +2,16 @@
 //!
 //! A compaction rewrites what the session is carrying and appends one
 //! `compact_boundary` record saying which messages survived. Ingest stored that
-//! record's `compactMetadata` object verbatim in `compaction_boundaries.metadata`
+//! record's `compactMetadata` object verbatim in `compactions.metadata`
 //! and derived nothing from it (phase 2 D-08), deliberately: the format has
 //! exactly one real example across 300,556 measured records, and a wrong
 //! reading derived at ingest would cost a reingest to correct while a wrong
 //! reading derived here costs a query.
 //!
 //! **The dropped set is the complement of `preservedMessages.uuids`**, over the
-//! session's own turns before the boundary. Three other readings are available
+//! session's own turns before the boundary, where "before" is a lower
+//! `stream_offset` (D-21). A boundary sits at its own byte offset whether or
+//! not it is a turn. Three other readings are available
 //! in the same object and all three are wrong, measured on 2026-08-20 against
 //! the one real boundary in the corpus:
 //!
@@ -53,11 +55,11 @@ use rusqlite::{Connection, OptionalExtension};
 /// **The most recent boundary and not every boundary.** A session compacted
 /// twice dropped the first boundary's turns long ago and the model has been
 /// through a whole context since; what INJ-05 is about is what fell out just
-/// now. Ordered by `turn_seq`, which is byte order within the transcript and
-/// total, rather than by `ts` - 31 of 62 sampled real transcripts carry a
-/// record whose timestamp runs backwards.
+/// now. Ordered by `stream_offset`, which is byte order within the session
+/// stream and total, rather than by `ts` - 31 of 62 sampled real transcripts
+/// carry a record whose timestamp runs backwards.
 pub fn dropped(conn: &Connection, session_key: &str) -> Option<BTreeSet<i64>> {
-    let (turn_seq, metadata) = boundary(conn, session_key)?;
+    let (stream_offset, metadata) = boundary(conn, session_key)?;
     let preserved = preserved_uuids(metadata.as_deref());
     if preserved.is_empty() {
         // Not "everything before the boundary was dropped": an unreadable
@@ -67,7 +69,7 @@ pub fn dropped(conn: &Connection, session_key: &str) -> Option<BTreeSet<i64>> {
         return Some(BTreeSet::new());
     }
     Some(
-        turns_before(conn, session_key, turn_seq)
+        turns_before(conn, session_key, stream_offset)
             .into_iter()
             .filter(|(_, uuid)| match uuid {
                 Some(uuid) => !preserved.contains(uuid),
@@ -82,17 +84,17 @@ pub fn dropped(conn: &Connection, session_key: &str) -> Option<BTreeSet<i64>> {
     )
 }
 
-/// `(turn_seq, metadata)` of the session's most recent compaction boundary.
+/// `(stream_offset, metadata)` of the session's most recent compaction
+/// boundary.
 ///
-/// The join is the boundary's own turn: `compaction_boundaries.turn_id` is a
-/// `turns.id`, and `turns` is where the session and the ordinal live.
-/// `UNIQUE (session_key, turn_seq)` covers the lookup.
+/// No join: the row carries its own session and position, so a boundary with
+/// no turn behind it is found the same way as one that is a turn. The primary
+/// key `(session_key, stream_offset)` covers the lookup.
 fn boundary(conn: &Connection, session_key: &str) -> Option<(i64, Option<Vec<u8>>)> {
     conn.query_row(
-        "SELECT t.turn_seq, b.metadata FROM compaction_boundaries b \
-         JOIN turns t ON t.id = b.turn_id \
-         WHERE t.session_key = ?1 \
-         ORDER BY t.turn_seq DESC LIMIT 1",
+        "SELECT stream_offset, metadata FROM compactions \
+         WHERE session_key = ?1 \
+         ORDER BY stream_offset DESC LIMIT 1",
         [session_key],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )
@@ -129,18 +131,26 @@ fn preserved_uuids(metadata: Option<&[u8]>) -> BTreeSet<String> {
         .unwrap_or_default()
 }
 
-/// `(id, uuid)` of every turn of this session before `turn_seq`.
+/// `(id, uuid)` of every turn of this session whose `stream_offset` is lower
+/// than the boundary's.
 ///
-/// Strictly before, which is what keeps the boundary record itself out of the
-/// dropped set: it is a turn like any other (phase 2 D-21) and it is the one
-/// record of the compaction the model definitely still has.
-fn turns_before(conn: &Connection, session_key: &str, turn_seq: i64) -> Vec<(i64, Option<String>)> {
+/// Strictly lower, which is what keeps the boundary record itself out of the
+/// dropped set when it is a turn (phase 2 D-21): it is the one record of the
+/// compaction the model definitely still has. Turns are written in stream
+/// order, so for a boundary that is a turn this is the same set a `turn_seq`
+/// comparison gives.
+fn turns_before(
+    conn: &Connection,
+    session_key: &str,
+    stream_offset: i64,
+) -> Vec<(i64, Option<String>)> {
     let Ok(mut statement) = conn.prepare(
-        "SELECT id, uuid FROM turns WHERE session_key = ?1 AND turn_seq < ?2 ORDER BY turn_seq",
+        "SELECT id, uuid FROM turns WHERE session_key = ?1 AND stream_offset < ?2 \
+         ORDER BY stream_offset",
     ) else {
         return Vec::new();
     };
-    let Ok(rows) = statement.query_map(rusqlite::params![session_key, turn_seq], |r| {
+    let Ok(rows) = statement.query_map(rusqlite::params![session_key, stream_offset], |r| {
         Ok((r.get(0)?, r.get(1)?))
     }) else {
         return Vec::new();

@@ -40,9 +40,15 @@ fn populate(project: &Path) {
     touch(&deep.join("journal.jsonl"));
 }
 
+/// A temp dir under the resolved temp root, for the reason `testkit::temp_root`
+/// gives. This file is built without testkit.
+fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+}
+
 /// A transcript root - a `projects` directory - holding one populated project.
 fn tree() -> (tempfile::TempDir, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let root = dir.path().join("claude").join("projects");
     populate(&root.join(PROJECT));
     (dir, root)
@@ -162,7 +168,7 @@ fn every_path_begins_with_the_canonical_root_even_through_a_symlink() {
 /// `an_unresolvable_exclusion_still_excludes` in the config tests pins.
 #[test]
 fn an_excluded_project_yields_nothing_while_its_hyphenated_sibling_is_walked() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let root = dir.path().join("claude").join("projects");
 
     // The real tree the encoded names above describe.
@@ -231,7 +237,7 @@ fn an_excluded_project_yields_nothing_while_its_hyphenated_sibling_is_walked() {
 /// Claude Code. It yields nothing and reports nothing.
 #[test]
 fn a_missing_root_is_empty_rather_than_an_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let found = discover::discover_root(&dir.path().join("nope"), &no_exclusions());
     assert_eq!(found, discover::Discovered::default());
 }
@@ -296,7 +302,7 @@ fn opening_a_transcript_records_its_path() {
 /// follows it into one the config forbids.
 #[test]
 fn a_symlinked_transcript_reaching_into_an_excluded_project_is_not_yielded() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let root = dir.path().join("claude").join("projects");
     let repo = dir.path().join("data").join("projects").join("cadence");
     std::fs::create_dir_all(&repo).unwrap();
@@ -378,7 +384,7 @@ fn a_transcript_directly_in_an_excluded_root_is_still_refused() {
 /// (D-23), which is exactly the situation a resolved link is in.
 #[test]
 fn a_symlink_into_the_excluded_projects_own_directory_is_not_yielded() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let root = dir.path().join("claude").join("projects");
     let repo = dir.path().join("data").join("projects").join("cadence");
     let target = repo.join("archive").join("keep.jsonl");

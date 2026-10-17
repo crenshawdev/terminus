@@ -37,8 +37,9 @@
 //! nothing. A record that cannot land must never become a prompt that cannot be
 //! answered.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +68,11 @@ const MAX_NAME: usize = 64;
 /// Enough to step over a name a same-millisecond sibling already took. Past
 /// that, something is wrong with the directory rather than with the name.
 const ATTEMPTS: u32 = 64;
+
+/// How a write's temporary is named. The drain's sweep matches on these same
+/// two, so a change here changes what it deletes.
+pub(crate) const TEMPORARY_PREFIX: &str = ".decision-";
+pub(crate) const TEMPORARY_SUFFIX: &str = ".tmp";
 
 /// One turn the index offered, with everything the threshold judged it on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -204,17 +210,30 @@ impl Decision {
 /// The path travels even when the parse failed, because the caller's job is to
 /// empty this directory: a file nobody can read is a file to delete, and a
 /// reader that returned only the good records would leave it there forever.
+///
+/// One exception, and `empty` and `modified` are there for it. An empty file
+/// may be the reservation `write_file` makes before it renames the record
+/// over it, so a young one is a write still in flight and the drain leaves it
+/// for the next pass. Both come from the handle the bytes were read through,
+/// never from a second lookup of the path: the rename can land between the two,
+/// and the path would then look like a record that did not parse.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Found {
     pub path: PathBuf,
     pub decision: Option<Decision>,
+    /// The file held no bytes. False when it could not be read at all.
+    pub empty: bool,
+    /// Its mtime, or `None` when it could not be read.
+    pub modified: Option<SystemTime>,
 }
 
 /// Every decision file under `data_dir`, in a stable order.
 ///
 /// An empty vector for a directory that is not there, which is every machine
 /// before its first prompt. Only files are yielded: a subdirectory somebody
-/// dropped in here is left alone rather than deleted by the drain.
+/// dropped in here is left alone rather than deleted by the drain. Each file is
+/// read and stat'd through one handle, so what [`Found`] says about its length
+/// and age is about the bytes that were read.
 pub fn read_all(data_dir: &Path) -> Vec<Found> {
     let dir = data_dir.join(DIR_NAME);
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -227,24 +246,43 @@ pub fn read_all(data_dir: &Path) -> Vec<Found> {
             continue;
         }
         let path = entry.path();
-        // A `.tmp` left by a write that was cut off at the hook's deadline is
-        // not a record and never will be: skipping it here and deleting it in
-        // the drain are two different answers, and this is the one that cannot
-        // race a write still in flight.
+        // A `.tmp` is a write's temporary and never a record, so it is skipped
+        // here. One left by a write cut off at the hook's deadline is deleted
+        // by the drain's sweep once it is older than the age limit.
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let decision = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Decision>(&bytes).ok())
-            .filter(|decision| decision.format == FORMAT);
-        found.push(Found { path, decision });
+        let (decision, empty, modified) = match read(&path) {
+            Some((bytes, meta)) => (
+                serde_json::from_slice::<Decision>(&bytes)
+                    .ok()
+                    .filter(|decision| decision.format == FORMAT),
+                meta.len() == 0,
+                meta.modified().ok(),
+            ),
+            None => (None, false, None),
+        };
+        found.push(Found {
+            path,
+            decision,
+            empty,
+            modified,
+        });
     }
     // Ingest order rather than directory order: the file names carry the clock,
     // so this is the order the prompts happened in, and `read_dir` guarantees no
     // order at all.
     found.sort_by(|a, b| a.path.cmp(&b.path));
     found
+}
+
+/// One file's bytes and the metadata of the handle they were read through.
+fn read(path: &Path) -> Option<(Vec<u8>, std::fs::Metadata)> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let meta = file.metadata().ok()?;
+    Some((bytes, meta))
 }
 
 /// Wall clock as unix milliseconds, or 0 for a clock set before the epoch.
@@ -264,7 +302,8 @@ fn now_ms() -> i64 {
 /// The same tmp+rename shape [`super::state`] uses and for the same reason: this
 /// runs on a thread the binary never joins, so process exit takes it wherever it
 /// got to, and a rename within a directory is atomic - the drain sees a whole
-/// document or no file at all, never a prefix.
+/// document, the empty reservation made below, or no file at all, never a
+/// prefix.
 ///
 /// No `fsync`. The rename buys the atomicity a reader cares about; durability
 /// across a power cut would cost a disk flush on the path where the user is
@@ -357,7 +396,9 @@ fn file_stem(session_id: &str) -> Option<String> {
 fn create_temporary(dir: &Path) -> Option<(PathBuf, std::fs::File)> {
     let pid = std::process::id();
     for attempt in 0..ATTEMPTS {
-        let path = dir.join(format!(".decision-{pid}-{attempt}.tmp"));
+        let path = dir.join(format!(
+            "{TEMPORARY_PREFIX}{pid}-{attempt}{TEMPORARY_SUFFIX}"
+        ));
         match crate::owner_only::options()
             .write(true)
             .create_new(true)

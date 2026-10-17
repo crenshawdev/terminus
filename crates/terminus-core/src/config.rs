@@ -28,10 +28,11 @@
 //! which is unambiguous. That is the read-side predicate (D-23).
 //!
 //! Both read the same configured strings, so those strings are normalized once
-//! ([`normalize`]) before either sees them. The component test is indifferent
-//! to a trailing separator and the encoded test is not, and two predicates that
-//! disagree about which projects are excluded is precisely the read-then-filter
-//! ING-08 forbids.
+//! ([`normalize`]) before either sees them, and both match each one as written
+//! and as resolved through any symlink ([`resolved`]). The component test is
+//! indifferent to a trailing separator and the encoded test is not, and two
+//! predicates that disagree about which projects are excluded is precisely the
+//! read-then-filter ING-08 forbids.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -416,7 +417,10 @@ pub struct Config {
     source: Option<PathBuf>,
     roots: Vec<PathBuf>,
     exclusions: Vec<String>,
-    /// D-07's encoding of each exclusion, case-folded where the platform is,
+    /// Every spelling the exclusions match: each one as configured, plus the
+    /// path it resolves to where that differs ([`resolved`]).
+    exclusion_spellings: Vec<String>,
+    /// D-07's encoding of each spelling, case-folded where the platform is,
     /// computed once so the pre-open test costs a comparison per project
     /// directory rather than a re-encode.
     encoded_exclusions: Vec<String>,
@@ -439,6 +443,7 @@ impl Default for Config {
             source: None,
             roots: Vec::new(),
             exclusions: Vec::new(),
+            exclusion_spellings: Vec::new(),
             encoded_exclusions: Vec::new(),
             brief_chars: DEFAULT_BRIEF_CHARS,
             prompt_chars: DEFAULT_PROMPT_CHARS,
@@ -515,10 +520,21 @@ impl Config {
     /// would be an edit to every test in the workspace that builds a config.
     pub fn from_parts(roots: Vec<PathBuf>, exclusions: Vec<String>) -> Config {
         let exclusions: Vec<String> = exclusions.iter().filter_map(|e| normalize(e)).collect();
-        let encoded_exclusions = exclusions.iter().map(|e| fold(&encode(e))).collect();
+        let mut exclusion_spellings = Vec::new();
+        for exclusion in &exclusions {
+            exclusion_spellings.push(exclusion.clone());
+            if let Some(resolved) = resolved(exclusion).filter(|r| r != exclusion) {
+                exclusion_spellings.push(resolved);
+            }
+        }
+        let encoded_exclusions = exclusion_spellings
+            .iter()
+            .map(|e| fold(&encode(e)))
+            .collect();
         Config {
             roots,
             exclusions,
+            exclusion_spellings,
             encoded_exclusions,
             ..Config::default()
         }
@@ -771,7 +787,7 @@ impl Config {
     /// exact test, and it is what decides whether anything is hidden.
     pub fn excludes_encoded_dir(&self, dir_name: &str) -> bool {
         let name = fold(dir_name);
-        self.exclusions
+        self.exclusion_spellings
             .iter()
             .zip(&self.encoded_exclusions)
             .any(|(excluded, encoded)| {
@@ -797,9 +813,11 @@ impl Config {
     /// `/data/projects/cadence/sub` and does not cover
     /// `/data/projects/cadence-research`. Components rather than string
     /// prefixes, because that is what makes the separator boundary exact and
-    /// what makes a trailing slash in the config irrelevant.
+    /// what makes a trailing slash in the config irrelevant. Each exclusion is
+    /// matched as written and as resolved, because a git project's key is its
+    /// resolved toplevel.
     pub fn excludes_path(&self, path: &Path) -> bool {
-        self.exclusions
+        self.exclusion_spellings
             .iter()
             .any(|excluded| covers(Path::new(excluded), path).is_some())
     }
@@ -899,6 +917,33 @@ fn normalize(raw: &str) -> Option<String> {
 
     let text = normalized.into_os_string().into_string().ok()?;
     (!text.is_empty()).then_some(text)
+}
+
+/// The path a normalized exclusion resolves to, or `None` when nothing of it
+/// resolves.
+///
+/// A git project's key is stored as its resolved toplevel and a linked
+/// transcript is judged by its resolved target, so an exclusion written through
+/// a symlink - any linked folder, or `/var` on macOS, which is `/private/var` -
+/// matches neither as written. The deepest part of the path that exists is
+/// resolved and the rest put back on, because an excluded directory is often
+/// gone (D-06) and the written spelling is kept beside this one, not replaced.
+fn resolved(exclusion: &str) -> Option<String> {
+    let mut existing = PathBuf::from(exclusion);
+    let mut rest = Vec::new();
+    let mut path = loop {
+        match existing.canonicalize() {
+            Ok(path) => break path,
+            Err(_) => {
+                rest.push(existing.file_name()?.to_owned());
+                existing.pop();
+            }
+        }
+    };
+    for name in rest.into_iter().rev() {
+        path.push(name);
+    }
+    path.into_os_string().into_string().ok()
 }
 
 /// Is this exclusion the filesystem root - the one that means "read nothing"?

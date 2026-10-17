@@ -14,7 +14,8 @@
 
 #![cfg(feature = "testkit")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use rusqlite::types::Value;
 use rusqlite::Connection;
@@ -24,7 +25,7 @@ use terminus_core::feedback::stats;
 use terminus_core::ingest::pass::{self, PassOutcome, Summary};
 use terminus_core::inject::decision::{self, Decision};
 use terminus_core::inject::prompt::Thresholds;
-use terminus_core::inject::state::Reason;
+use terminus_core::inject::state::{self, Reason};
 use terminus_core::inject::{prompt, Payload};
 use terminus_core::recall::{search, Query, Request, Scope};
 use terminus_core::store::{schema, Store, DB_FILE_NAME};
@@ -434,8 +435,9 @@ fn insert_decision(conn: &Connection) {
     conn.execute(
         "INSERT INTO decisions (
             session_id, ts, cwd, prompt, watermark_session_no, chars_injected,
-            spellings, candidates, injected, suppressed, thresholds
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            spellings, candidates, injected, suppressed, thresholds,
+            compacted, dropped
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             "0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55",
             "2026-08-20T09:14:21.000Z",
@@ -448,6 +450,8 @@ fn insert_decision(conn: &Connection) {
             r#"[{"turn_id":117440514,"chars":412}]"#,
             r#"[{"turn_id":117440515,"reason":"already_injected"}]"#,
             r#"{"ranked":10,"entity_rank":3,"co_occurring":2,"max_turns":3}"#,
+            1_i64,
+            "[117440510,117440511]",
         ],
     )
     .unwrap();
@@ -596,6 +600,247 @@ fn a_file_that_is_not_a_record_is_removed_and_named() {
     assert!(
         error.contains(&garbage.display().to_string()),
         "the note does not name the file: {error}"
+    );
+}
+
+/// Far enough back that the drain treats a writer's leftover as abandoned.
+const ELEVEN_MINUTES: Duration = Duration::from_secs(11 * 60);
+
+/// Move a file's or a directory's mtime back by `by`.
+fn age(path: &Path, by: Duration) {
+    std::fs::File::open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - by)
+        .unwrap();
+}
+
+/// The `error` of the last `runs` row.
+fn last_error(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT error FROM runs ORDER BY id DESC LIMIT 1", [], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+/// #38: a pass deletes the writers' own `.tmp` files once they are old, and
+/// nothing else in either directory, and says nothing about it.
+///
+/// `decisions/` holds no `.json` here, so this is also the drain that finds no
+/// record and used to return before doing anything.
+#[test]
+fn a_pass_sweeps_the_writers_old_temporaries_and_nothing_else() {
+    let bench = bench();
+    let outside = bench._dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let mut swept = Vec::new();
+    let mut kept = Vec::new();
+    for (dir, writer) in [
+        (decision::DIR_NAME, "decision"),
+        (state::DIR_NAME, "inject"),
+    ] {
+        let dir = bench.data_dir.join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let abandoned = dir.join(format!(".{writer}-4242-0.tmp"));
+        std::fs::write(&abandoned, b"{\"prompt\": \"cut off").unwrap();
+        age(&abandoned, ELEVEN_MINUTES);
+        swept.push(abandoned);
+
+        let writing = dir.join(format!(".{writer}-4242-1.tmp"));
+        std::fs::write(&writing, b"{").unwrap();
+
+        // Old enough to go if the sweep followed the link.
+        let target = outside.join(format!("{writer}-target"));
+        std::fs::write(&target, b"not ours").unwrap();
+        age(&target, ELEVEN_MINUTES);
+        let link = dir.join(format!(".{writer}-4242-2.tmp"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let directory = dir.join(format!(".{writer}-4242-3.tmp"));
+        std::fs::create_dir(&directory).unwrap();
+        age(&directory, ELEVEN_MINUTES);
+
+        let other = dir.join(format!("{writer}-4242-0.tmp"));
+        std::fs::write(&other, b"not ours either").unwrap();
+        age(&other, ELEVEN_MINUTES);
+
+        kept.extend([writing, target, link, directory, other]);
+    }
+    assert!(bench.files().is_empty(), "the premise: no record on disk");
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 0, "{summary:?}");
+    assert!(summary.feedback.discarded.is_empty(), "{summary:?}");
+    for path in &swept {
+        assert!(
+            std::fs::symlink_metadata(path).is_err(),
+            "{} was not swept",
+            path.display()
+        );
+    }
+    for path in &kept {
+        assert!(
+            std::fs::symlink_metadata(path).is_ok(),
+            "{} was swept",
+            path.display()
+        );
+    }
+    assert_eq!(last_error(&bench.conn()), None);
+}
+
+/// An empty decision file named like a record, as `write_file` reserves one
+/// before renaming the record over it.
+fn reserve(bench: &Bench) -> PathBuf {
+    let dir = bench.data_dir.join(decision::DIR_NAME);
+    std::fs::create_dir_all(&dir).unwrap();
+    let reserved = dir.join(format!("{SESSION}-4242-1760000000000-0.json"));
+    std::fs::File::create(&reserved).unwrap();
+    reserved
+}
+
+/// The drain race: a pass that finds the empty reservation of a write still in
+/// flight leaves it alone, and the next pass inserts the record renamed over
+/// it.
+#[test]
+fn a_young_empty_reservation_is_left_for_the_next_pass() {
+    let bench = bench();
+    let cwd = bench.project();
+    let reserved = reserve(&bench);
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 0, "{summary:?}");
+    assert!(summary.feedback.discarded.is_empty(), "{summary:?}");
+    assert!(reserved.exists(), "the reservation was deleted");
+    let rows: i64 = bench
+        .conn()
+        .query_row("SELECT count(*) FROM decisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+
+    // The writer's rename lands.
+    let prompt = "written while a pass was draining";
+    let record = Decision::opened(Some(SESSION), Some(&cwd), prompt);
+    let temporary = reserved.with_file_name(".decision-4242-0.tmp");
+    std::fs::write(&temporary, serde_json::to_vec(&record).unwrap()).unwrap();
+    std::fs::rename(&temporary, &reserved).unwrap();
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 1, "{summary:?}");
+    assert!(summary.feedback.discarded.is_empty(), "{summary:?}");
+    assert!(!reserved.exists(), "the drained record is still there");
+    row_of(&bench.conn(), prompt);
+}
+
+/// An empty reservation older than any hook's life is not a write in flight,
+/// and goes the way of any other file that is not a record.
+#[test]
+fn an_old_empty_reservation_is_removed_and_named() {
+    let bench = bench();
+    let reserved = reserve(&bench);
+    age(&reserved, ELEVEN_MINUTES);
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 0, "{summary:?}");
+    assert_eq!(summary.feedback.discarded.len(), 1, "{summary:?}");
+    assert_eq!(summary.feedback.discarded[0].0, reserved);
+    assert!(!reserved.exists(), "the old reservation is still there");
+}
+
+/// The `compacted` flag and the dropped turns of each record, read off its
+/// row by prompt.
+fn compaction_of(conn: &Connection, prompt: &str) -> (Option<i64>, Option<String>) {
+    conn.query_row(
+        "SELECT compacted, dropped FROM decisions WHERE prompt = ?1",
+        [prompt],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap_or_else(|e| panic!("no decisions row for {prompt:?}: {e}"))
+}
+
+/// #40: a decision made under the compacted pool keeps that fact and its
+/// dropped turns through the drain, and an ordinary one is stored as ordinary
+/// rather than as unknown.
+#[test]
+fn a_drained_decision_keeps_its_compaction() {
+    let bench = bench();
+    let cwd = bench.project();
+
+    let mut compacted = Decision::opened(Some(SESSION), Some(&cwd), "after the compaction");
+    compacted.compacted = true;
+    compacted.dropped = vec![41, 42];
+    assert!(compacted.save(&bench.data_dir), "the record did not land");
+    let ordinary = Decision::opened(Some(SESSION), Some(&cwd), "before any compaction");
+    assert!(ordinary.save(&bench.data_dir), "the record did not land");
+
+    let summary = bench.pass();
+    assert_eq!(summary.feedback.decisions, 2, "{summary:?}");
+
+    let conn = bench.conn();
+    assert_eq!(
+        compaction_of(&conn, "after the compaction"),
+        (Some(1), Some("[41,42]".to_owned()))
+    );
+    assert_eq!(
+        compaction_of(&conn, "before any compaction"),
+        (Some(0), Some("[]".to_owned()))
+    );
+}
+
+/// The columns of one table, in declaration order, with their types.
+fn table_info(conn: &Connection, table: &str) -> Vec<(String, String)> {
+    conn.prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// #40, D-11: a store made before the columns existed gains them on its first
+/// writable open, in a fresh store's order, and the rows it already held read
+/// null in both - their values are unknown, not ordinary.
+#[test]
+fn a_store_without_the_compaction_columns_gains_them_and_its_rows_read_unknown() {
+    let bench = bench();
+    {
+        let conn = bench.conn();
+        insert_decision(&conn);
+        conn.execute_batch(
+            "ALTER TABLE decisions DROP COLUMN dropped;
+             ALTER TABLE decisions DROP COLUMN compacted;",
+        )
+        .unwrap();
+        let names: Vec<String> = table_info(&conn, "decisions")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            !names.iter().any(|n| n == "compacted" || n == "dropped"),
+            "the premise: an aged table: {names:?}"
+        );
+    }
+
+    bench.pass();
+
+    let conn = bench.conn();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM decisions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+    let (compacted, dropped): (Option<i64>, Option<String>) = conn
+        .query_row("SELECT compacted, dropped FROM decisions", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((compacted, dropped), (None, None));
+
+    let fresh = tempfile::tempdir().unwrap();
+    let store = Store::open(fresh.path()).unwrap();
+    assert_eq!(
+        table_info(&conn, "decisions"),
+        table_info(store.conn(), "decisions"),
+        "an upgraded store and a fresh one disagree on the column order"
     );
 }
 
@@ -1026,6 +1271,144 @@ fn a_decision_is_never_scored_against_a_session_archived_after_it() {
     );
 }
 
+/// How many turns a replay injected across every decision: each one earns
+/// exactly one `hit` or one `false positive`.
+fn injected_total(replayed: &Replayed) -> (usize, usize) {
+    let (hit_old, hit_new) = movement(replayed, "hit");
+    let (fp_old, fp_new) = movement(replayed, "false positive");
+    (hit_old + fp_old, hit_new + fp_new)
+}
+
+/// #40, D-13: a decision made under the compacted pool replays through the
+/// compacted window and its own dropped set, so `compacted_ranked` moves it,
+/// and decisions recorded as ordinary or of unknown kind replay as they always
+/// have.
+///
+/// Three decisions alike in everything but `compacted`. Each one's stored
+/// `injected` is what the live arm gave it, so the shipped thresholds reproduce
+/// every label and any movement is the change under test.
+#[test]
+fn a_compacted_decision_replays_through_the_compacted_pool() {
+    let bench = bench();
+    let session = "88888888-8888-4888-8888-888888888888";
+    let project = "project-delta";
+    let file = "/code/delta/src/anchor.rs";
+    let cwd = bench.root.join(project).to_string_lossy().into_owned();
+
+    archive_at(
+        &bench,
+        "delta.jsonl",
+        project,
+        session,
+        &[
+            ("2026-08-14T10:00:00.000Z", read_call(file)),
+            ("2026-08-14T10:01:00.000Z", read_call(file)),
+            ("2026-08-14T10:02:00.000Z", read_call(file)),
+            ("2026-08-14T10:03:00.000Z", read_call(file)),
+            ("2026-08-14T12:00:00.000Z", read_call(file)),
+        ],
+    );
+    bench.pass();
+
+    // The ranked order this store produces, read the way the injector reads it.
+    let raw = format!("what happened in {file}");
+    let (_, candidates) = prompt::candidates(&raw, Some(&cwd), prompt::MAX_CANDIDATES);
+    let request = Request::new(
+        prompt::query_of(&raw, Some(&cwd)),
+        Scope::Directory(bench.root.join(project)),
+    )
+    .candidates(candidates)
+    .excerpts(false)
+    .limit(prompt::RANKED);
+    let hits = search::run(&bench.conn(), &Config::default(), &request)
+        .unwrap()
+        .hits;
+    let ranked: Vec<i64> = hits.iter().map(|hit| hit.turn_id).collect();
+    assert!(ranked.len() >= 4, "{hits:?}");
+    // The ordinary arm gives the top three. The compacted one is given only
+    // the third, the one turn of the three the compaction dropped.
+    let ordinary: Vec<(i64, usize)> = ranked[..prompt::MAX_TURNS]
+        .iter()
+        .map(|turn_id| (*turn_id, 100))
+        .collect();
+    let dropped = ranked[2];
+
+    let watermark = bench.watermark();
+    let at = "2026-08-14T11:00:00.000Z";
+    let compacted = decide(
+        &bench,
+        session,
+        at,
+        &cwd,
+        &raw,
+        watermark,
+        &[(dropped, 100)],
+        100,
+        &[],
+    );
+    let plain = decide(
+        &bench,
+        session,
+        at,
+        &cwd,
+        &raw,
+        watermark,
+        &ordinary,
+        300,
+        &[],
+    );
+    let unknown = decide(
+        &bench,
+        session,
+        at,
+        &cwd,
+        &raw,
+        watermark,
+        &ordinary,
+        300,
+        &[],
+    );
+    let conn = bench.conn();
+    conn.execute(
+        "UPDATE decisions SET compacted = 1, dropped = ?1 WHERE id = ?2",
+        rusqlite::params![format!("[{dropped}]"), compacted],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE decisions SET compacted = 0, dropped = '[]' WHERE id = ?1",
+        [plain],
+    )
+    .unwrap();
+    let kinds: Vec<Option<i64>> = [compacted, plain, unknown]
+        .iter()
+        .map(|id| {
+            conn.query_row("SELECT compacted FROM decisions WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        })
+        .collect();
+    assert_eq!(kinds, vec![Some(1), Some(0), None], "the premise");
+    bench.pass();
+
+    // The shipped numbers reproduce all three. For the compacted decision that
+    // is one injected turn, not three: nothing outside its dropped set got in.
+    let shipped = replayed(&bench, &Thresholds::default());
+    assert_eq!(shipped.decisions, 3, "{shipped:?}");
+    assert_eq!(shipped.changed, Vec::<i64>::new(), "{shipped:?}");
+    assert_eq!(injected_total(&shipped), (7, 7), "{shipped:?}");
+
+    // No compacted window at all: the compacted decision is given nothing, and
+    // the other two do not notice.
+    let closed = Thresholds {
+        compacted_ranked: 0,
+        ..Thresholds::default()
+    };
+    let diff = replayed(&bench, &closed);
+    assert_eq!(diff.changed, vec![compacted], "{diff:?}");
+    assert_eq!(injected_total(&diff), (7, 6), "{diff:?}");
+}
+
 // ---------------------------------------------------------------------------
 // FEED-04: what the log adds up to
 // ---------------------------------------------------------------------------
@@ -1106,7 +1489,7 @@ fn the_report_adds_up_the_known_mix() {
     let bench = bench();
     known_mix(&bench);
 
-    let counted = stats::stats(&bench.conn()).unwrap();
+    let counted = stats::stats(&Store::open_read_only(&bench.data_dir).unwrap()).unwrap();
 
     // Three prompts, including the one that injected nothing (D-11).
     assert_eq!(counted.decisions, 3, "{counted:?}");
@@ -1123,6 +1506,39 @@ fn the_report_adds_up_the_known_mix() {
     assert_eq!(counted.chars_referenced, 60, "{counted:?}");
 }
 
+/// #40, D-12: compacted decisions are counted apart from ordinary ones, and a
+/// decision whose kind was never recorded is in neither count while still being
+/// one of `decisions`.
+#[test]
+fn the_report_counts_compacted_decisions_apart_from_ordinary_ones() {
+    let bench = bench();
+    known_mix(&bench);
+    logged(&bench, "after a compaction", 0, &[], &[]);
+    logged(&bench, "logged before the split", 0, &[], &[]);
+    let conn = bench.conn();
+    for (prompt, compacted) in [
+        ("the mixed one", Some(1)),
+        ("after a compaction", Some(1)),
+        ("the wasteful one", Some(0)),
+        ("the non-fire", Some(0)),
+        ("logged before the split", None),
+    ] {
+        conn.execute(
+            "UPDATE decisions SET compacted = ?1 WHERE prompt = ?2",
+            rusqlite::params![compacted, prompt],
+        )
+        .unwrap();
+    }
+
+    let counted = stats::stats(&Store::open_read_only(&bench.data_dir).unwrap()).unwrap();
+    assert_eq!(counted.decisions, 5, "{counted:?}");
+    assert_eq!(counted.compacted_decisions, 2, "{counted:?}");
+    assert_eq!(counted.ordinary_decisions, 2, "{counted:?}");
+    // The rest of the report is the known mix's, untouched by the split.
+    assert_eq!(counted.hits, 1, "{counted:?}");
+    assert_eq!(counted.chars_injected, 150, "{counted:?}");
+}
+
 /// An archive with no labels yet has no precision, and says so rather than
 /// reporting zero.
 ///
@@ -1131,7 +1547,7 @@ fn the_report_adds_up_the_known_mix() {
 #[test]
 fn an_unlabelled_archive_has_no_precision_rather_than_a_precision_of_zero() {
     let bench = bench();
-    let counted = stats::stats(&bench.conn()).unwrap();
+    let counted = stats::stats(&Store::open_read_only(&bench.data_dir).unwrap()).unwrap();
 
     assert_eq!(counted.decisions, 0, "{counted:?}");
     assert_eq!(counted.precision, None, "{counted:?}");
@@ -1140,7 +1556,7 @@ fn an_unlabelled_archive_has_no_precision_rather_than_a_precision_of_zero() {
 
     // One decision, no label: still nothing to be precise about.
     logged(&bench, "not judged yet", 40, &[(10, 40)], &[]);
-    let counted = stats::stats(&bench.conn()).unwrap();
+    let counted = stats::stats(&Store::open_read_only(&bench.data_dir).unwrap()).unwrap();
     assert_eq!(counted.decisions, 1, "{counted:?}");
     assert_eq!(counted.injected_turns, 1, "{counted:?}");
     assert_eq!(counted.precision, None, "{counted:?}");

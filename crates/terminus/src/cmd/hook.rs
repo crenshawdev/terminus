@@ -94,6 +94,23 @@ const MAX_PAYLOAD: u64 = 1 << 20;
 /// killing the hook.
 const DRAIN_DEADLINE: Duration = Duration::from_millis(500);
 
+/// [`DRAIN_DEADLINE`], or in a testkit build the milliseconds in
+/// `testkit::DRAIN_DEADLINE_ENV` when it is set. The hook kill test sets it, so
+/// a slow CI machine cannot let the hook exit before the kill lands. The
+/// shipped binary is built without testkit and reads no variable.
+#[cfg(feature = "testkit")]
+fn drain_deadline() -> Duration {
+    std::env::var(terminus_core::testkit::DRAIN_DEADLINE_ENV)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(DRAIN_DEADLINE, Duration::from_millis)
+}
+
+#[cfg(not(feature = "testkit"))]
+fn drain_deadline() -> Duration {
+    DRAIN_DEADLINE
+}
+
 /// The longest the hook waits on its own injection before abandoning it and
 /// writing nothing (INJ-06, D-03).
 ///
@@ -106,6 +123,23 @@ const DRAIN_DEADLINE: Duration = Duration::from_millis(500);
 /// waiting on this, and a memory system that costs a visible pause on every
 /// prompt has already lost the argument for existing.
 const INJECT_DEADLINE: Duration = Duration::from_millis(50);
+
+/// [`INJECT_DEADLINE`], or in a testkit build the milliseconds in
+/// `testkit::INJECT_DEADLINE_ENV` when it is set. The tests that check what a
+/// hook injects set it, so a slow CI machine cannot fail them on time. The
+/// shipped binary is built without testkit and reads no variable.
+#[cfg(feature = "testkit")]
+fn inject_deadline() -> Duration {
+    std::env::var(terminus_core::testkit::INJECT_DEADLINE_ENV)
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(INJECT_DEADLINE, Duration::from_millis)
+}
+
+#[cfg(not(feature = "testkit"))]
+fn inject_deadline() -> Duration {
+    INJECT_DEADLINE
+}
 
 /// The five fields of the hook payload injection reads.
 ///
@@ -232,9 +266,15 @@ pub(crate) fn arm(event: &str) -> Option<Arm> {
 /// **The work runs on a thread this command starts and never joins**, the same
 /// shape and the same reason as [`drain`]: a blocking SQLite call cannot be
 /// cancelled with `std` alone, so the only way to stop waiting is to stop
-/// waiting and let process exit take the thread with it. Abandoning it is safe
-/// because nothing on that thread writes, creates a directory or takes the
-/// ingest lock (INJ-06). This is the second of D-03's two mechanisms: the busy
+/// waiting and let process exit take the thread with it. The thread does write
+/// files: both arms save the session's state file (`State::save`), and the
+/// prompt arm saves a decision file (`Decision::save`), each creating its
+/// directory if it has to. Abandoning it is still safe because both writes go
+/// through a temp file and a rename. A write cut off here leaves a `.tmp`, and a
+/// decision write cut off after it reserves its `.json` also leaves that empty
+/// `.json`. The ingest's drain deletes both once they are old. The thread never
+/// writes SQLite and never takes the ingest lock (INJ-06). This is the second
+/// of D-03's two mechanisms: the busy
 /// timeout `terminus_core::inject` sets turns lock contention into an immediate
 /// `SQLITE_BUSY`, and this catches what a busy timeout cannot see - a slow
 /// query, a large blob, a `terminus.toml` on a filesystem that has stopped
@@ -272,12 +312,13 @@ fn inject(event: &str, payload: Payload) -> Option<String> {
         return None;
     }
 
-    match injected.recv_timeout(INJECT_DEADLINE) {
+    let deadline = inject_deadline();
+    match injected.recv_timeout(deadline) {
         Ok(text) => text,
         Err(RecvTimeoutError::Timeout) => {
             eprintln!(
                 "terminus: {event} abandoned its injection after {} ms",
-                INJECT_DEADLINE.as_millis()
+                deadline.as_millis()
             );
             None
         }
@@ -337,7 +378,8 @@ fn drain(event: &str) -> Payload {
         return Payload::default();
     }
 
-    match drained.recv_timeout(DRAIN_DEADLINE) {
+    let deadline = drain_deadline();
+    match drained.recv_timeout(deadline) {
         Ok((payload, None)) => payload,
         // A read that failed part way still parses what arrived, which is
         // almost always nothing. The line on stderr is the same one it was.
@@ -348,7 +390,7 @@ fn drain(event: &str) -> Payload {
         Err(RecvTimeoutError::Timeout) => {
             eprintln!(
                 "terminus: {event} stopped waiting on a stdin that stayed open for {} ms",
-                DRAIN_DEADLINE.as_millis()
+                deadline.as_millis()
             );
             Payload::default()
         }

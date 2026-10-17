@@ -197,6 +197,22 @@ pub const UNIQUE_TOKEN: &str = "brillig";
 /// pointed at a real tree by copying one value between them.
 pub const CORPUS_DIR_ENV: &str = "TERMINUS_TEST_CORPUS";
 
+/// The variable a testkit build's hook reads its injection deadline from, in
+/// milliseconds, in place of the shipped 50 ms (`cmd/hook.rs` in the binary).
+pub const INJECT_DEADLINE_ENV: &str = "TERMINUS_TEST_INJECT_DEADLINE_MS";
+
+/// What the tests that check injected content set [`INJECT_DEADLINE_ENV`] to:
+/// ten seconds, so only a hang reaches it. The tests about time leave it unset.
+pub const CONTENT_INJECT_DEADLINE_MS: &str = "10000";
+
+/// The variable a testkit build's hook reads its stdin deadline from, in
+/// milliseconds, in place of the shipped 500 ms (`cmd/hook.rs` in the binary).
+pub const DRAIN_DEADLINE_ENV: &str = "TERMINUS_TEST_DRAIN_DEADLINE_MS";
+
+/// What the hook kill test sets [`DRAIN_DEADLINE_ENV`] to: ten seconds, so the
+/// hook is still waiting on stdin when the kill lands, however slow the machine.
+pub const KILL_TEST_DRAIN_DEADLINE_MS: &str = "10000";
+
 /// The corpus directory, or `None` with the reason already printed.
 ///
 /// Printed rather than silent: a test that skips without saying so is a test
@@ -293,6 +309,21 @@ pub fn fixture_path(name: &str) -> PathBuf {
 pub fn fixture_bytes(name: &str) -> Vec<u8> {
     let path = fixture_path(name);
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The system temp directory with symlinks resolved. Terminus reports resolved
+/// paths, and on macOS `/var` links to `/private/var`, so a test expecting paths
+/// under the unresolved temp dir fails there. Make test dirs with
+/// `tempfile::tempdir_in(testkit::temp_root())`.
+pub fn temp_root() -> PathBuf {
+    // This creates nothing in the shared temp directory: it resolves the path,
+    // and callers make uniquely named directories under it with
+    // `tempfile::tempdir_in`. That is why semgrep's temp-dir rule is silenced
+    // on this line.
+    // nosemgrep: rust.lang.security.temp-dir.temp-dir
+    let dir = std::env::temp_dir();
+    dir.canonicalize()
+        .unwrap_or_else(|e| panic!("resolve the temp directory {}: {e}", dir.display()))
 }
 
 /// The fixed query set AC4 compares before and after a rebuild.

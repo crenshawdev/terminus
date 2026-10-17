@@ -67,6 +67,11 @@ const MAX_NAME: usize = 64;
 /// grow by ten a prompt for as long as a session lasts.
 const MAX_SUPPRESSED: usize = 100;
 
+/// How a write's temporary is named. The drain's sweep matches on these same
+/// two, so a change here changes what it deletes.
+pub(crate) const TEMPORARY_PREFIX: &str = ".inject-";
+pub(crate) const TEMPORARY_SUFFIX: &str = ".tmp";
+
 /// Why a candidate turn was not injected (INJ-04).
 ///
 /// Exactly the three distinctions INJ-04 draws and no more. Entities,
@@ -308,10 +313,11 @@ fn write_atomically(path: &Path, state: &State) -> Option<()> {
 /// The name can never collide with a session's own file: it starts with a dot
 /// and ends in `.tmp`, and [`file_name`] admits neither.
 ///
-/// Owner-only from the moment it exists. The temporary holds the same quoted
-/// prompt text the target does, and it is on disk under its own name for the
-/// length of the write, so a mode applied after the fact would cover the target
-/// and miss the bytes.
+/// Owner-only from the moment it exists. The temporary holds the same document
+/// the target does: the turn ids injected and briefed, the suppressions and the
+/// compaction flag, a record of what this person's sessions were given. It is
+/// on disk under its own name for the length of the write, so a mode applied
+/// after the fact would cover the target and miss the bytes.
 fn create_temporary(dir: &Path) -> Option<(PathBuf, std::fs::File)> {
     /// Enough to step over a stale name or two. Past that, something is wrong
     /// with the directory rather than with the name.
@@ -319,7 +325,9 @@ fn create_temporary(dir: &Path) -> Option<(PathBuf, std::fs::File)> {
 
     let pid = std::process::id();
     for attempt in 0..ATTEMPTS {
-        let path = dir.join(format!(".inject-{pid}-{attempt}.tmp"));
+        let path = dir.join(format!(
+            "{TEMPORARY_PREFIX}{pid}-{attempt}{TEMPORARY_SUFFIX}"
+        ));
         match crate::owner_only::options()
             .write(true)
             .create_new(true)

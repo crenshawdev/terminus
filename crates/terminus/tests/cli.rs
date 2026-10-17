@@ -891,11 +891,20 @@ fn stats_reports_the_hand_computed_numbers_in_both_modes() {
         &[("false positive", Some(12)), ("wasted budget", None)],
     );
     place("the non-fire", 0, "[]", &[("miss", None)]);
+    // One of each kind, and the third left unknown, as a decision logged
+    // before the split was recorded is.
+    conn.execute_batch(
+        "UPDATE decisions SET compacted = 1 WHERE prompt = 'the mixed one';
+         UPDATE decisions SET compacted = 0 WHERE prompt = 'the wasteful one';",
+    )
+    .unwrap();
 
     let out = bench.run(&["stats", "--json"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let data = &document(&out)["data"];
     assert_eq!(data["decisions"], 3, "{data}");
+    assert_eq!(data["compacted_decisions"], 1, "{data}");
+    assert_eq!(data["ordinary_decisions"], 1, "{data}");
     assert_eq!(data["injected_turns"], 3, "{data}");
     assert_eq!(data["hits"], 1, "{data}");
     assert_eq!(data["false_positives"], 2, "{data}");
@@ -912,6 +921,8 @@ fn stats_reports_the_hand_computed_numbers_in_both_modes() {
     let text = stdout(&out);
     for line in [
         "decisions         3",
+        "  compacted       1",
+        "  ordinary        1",
         "injected turns    3",
         "hits              1",
         "false positives   2",
@@ -1010,6 +1021,8 @@ const DATA_COMMANDS: &[(&str, &[&str], &[&str])] = &[
         &[],
         &[
             "decisions",
+            "compacted_decisions",
+            "ordinary_decisions",
             "injected_turns",
             "hits",
             "false_positives",

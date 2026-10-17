@@ -258,38 +258,30 @@ pub(crate) fn prepare(
         });
     }
 
-    let tail = read_tail(path, existing.watermark)?;
-
     // A flagged session stops being flagged only when the file is provably the
-    // one that was archived (D-13). `read_tail` returning proves the file is no
-    // shorter than the watermark and NOTHING about its contents: a transcript
-    // truncated to half its length and then written back past the old watermark
-    // passes that length test while every byte between the truncation point and
-    // the watermark is different. Clearing on length alone would then append at
-    // the stale offset - splicing a record fragment onto a session whose middle
-    // no longer exists anywhere, permanently, with `verify` reporting it clean
-    // because the session's own checksum still matches itself.
+    // one that was archived (D-13). A length test proves the file is no shorter
+    // than the watermark and NOTHING about its contents: a transcript truncated
+    // to half its length and then written back past the old watermark passes it
+    // while every byte between the truncation point and the watermark is
+    // different. Clearing on length alone would then append at the stale offset
+    // - splicing a record fragment onto a session whose middle no longer exists
+    // anywhere, permanently, with `verify` reporting it clean because the
+    // session's own checksum still matches itself.
     //
     // So the archived prefix is compared against the file's. This costs every
-    // block row and a re-read of the session, and it is paid only by a session
+    // block row and a read of the whole file, and it is paid only by a session
     // that is actually flagged - the steady state reads the flag, finds it
     // clear, and fetches at most the tail row (D-13).
-    let mut clear_divergence = false;
-    if existing.diverged {
-        if !prefix_matches(path, existing, existing.watermark)? {
-            // Still divergent, and now for a reason a length test cannot see.
-            // Skipped exactly like the shortened case, flag left set.
-            return Err(Error::TranscriptRewritten {
-                path: path.to_path_buf(),
-                watermark: existing.watermark,
-            });
-        }
-        clear_divergence = true;
-    }
+    let tail = if existing.diverged {
+        read_flagged(path, existing)?
+    } else {
+        read_tail(path, existing.watermark)?
+    };
+    let clear_divergence = existing.diverged;
 
     // The FIRST scan, over the raw tail, and its only job is to say where this
-    // pass stops in the FILE. The watermark is a file offset - `read_tail` seeks
-    // by it and `read_tail` refuses a file shorter than it - so it has to keep
+    // pass stops in the FILE. The watermark is a file offset - the tail read seeks
+    // by it and `open_at_least` refuses a file shorter than it - so it has to keep
     // being measured against the file, whatever the capture mode does to the
     // bytes afterwards. `consumed` is likewise file bytes, and is what
     // `runs.bytes_read` and `status` report.
@@ -541,6 +533,12 @@ pub(crate) fn apply(
             },
         )?;
     }
+    // A boundary with no `uuid` or `timestamp` is not a turn, so the loop above
+    // never sees it. Its row goes in this same transaction (STOR-02), at its
+    // offset in the stored stream, which is the coordinate `derive_turn` got.
+    for record in &scan.records {
+        derive::derive_boundary(&tx, &session_key, record)?;
+    }
     fault::stall(fault::IN_TX_AFTER_TURNS);
     write_watermark(&tx, &session_key, pass.watermark)?;
     if run_row == RunRow::PerFile {
@@ -598,7 +596,7 @@ fn read_agent_meta(transcript: &Path) -> Option<Vec<u8>> {
 /// has already rolled back by then, and this records a fact about the file on
 /// disk rather than about the archive - which is untouched, and is the point.
 ///
-/// The path is the one `read_tail` refused, so it has already been through
+/// The path is the one `open_at_least` refused, so it has already been through
 /// [`path_key`] and is UTF-8 by construction; deriving the key here rather than
 /// taking it keeps one definition of what keys a session (D-01).
 pub(crate) fn flag_divergence(conn: &Connection, path: &Path) -> Result<()> {
@@ -988,12 +986,40 @@ pub(crate) fn path_key(path: &Path) -> Result<String> {
     })
 }
 
+/// A flagged session's tail, read only once its prefix proves the file is the
+/// one that was archived.
+///
+/// One open does all three reads, in this order: the length check
+/// ([`Error::TranscriptDiverged`] for a file shorter than the watermark), the
+/// prefix comparison ([`Error::TranscriptRewritten`] when it fails, flag left
+/// set), and the tail from the watermark to EOF (#15). A file replaced at this
+/// path between the prefix read and the tail read, by rename or by unlink and
+/// recreate, cannot put its tail after the other file's prefix, because both
+/// come from the same handle.
+///
+/// It does not protect against the same file being rewritten in place while it
+/// is read, and adds no identity or length re-check for it (D-09).
+fn read_flagged(path: &Path, existing: &Existing) -> Result<Vec<u8>> {
+    let watermark = existing.watermark;
+    let (mut file, len) = open_at_least(path, watermark)?;
+    if !prefix_matches(&mut file, path, existing, watermark)? {
+        // Still divergent, and now for a reason a length test cannot see.
+        // Skipped exactly like the shortened case, flag left set.
+        return Err(Error::TranscriptRewritten {
+            path: path.to_path_buf(),
+            watermark,
+        });
+    }
+    rest_of(&mut file, path, watermark, len)
+}
+
 /// Are the file's first `watermark` bytes the ones already archived?
 ///
 /// The question a length test cannot answer, asked only of a session that is
-/// already flagged. `false` means the file at this path is a different file
-/// that happens to be long enough - truncated and rewritten, or replaced
-/// outright - and the archive must not be appended to at the stale offset.
+/// already flagged, and read from the handle [`read_flagged`] opened. `false`
+/// means the file at this path is a different file that happens to be long
+/// enough - truncated and rewritten, or replaced outright - and the archive
+/// must not be appended to at the stale offset.
 ///
 /// A session with nothing archived cannot disagree with the file, so it is
 /// treated as matching: the flag was set for a session whose bytes are gone,
@@ -1008,9 +1034,17 @@ pub(crate) fn path_key(path: &Path) -> Result<String> {
 /// stale offset onto a session whose middle no longer exists anywhere, with
 /// `verify` reporting it clean because its checksum still matches itself.
 ///
+/// Those two answers, and an archive shorter than the watermark, read no byte
+/// of the file.
+///
 /// The one reader on the ingest path that decodes every block, from the rows
 /// [`Existing::read`] fetched for a flagged session (D-13).
-fn prefix_matches(path: &Path, existing: &Existing, watermark: u64) -> Result<bool> {
+fn prefix_matches(
+    file: &mut std::fs::File,
+    path: &Path,
+    existing: &Existing,
+    watermark: u64,
+) -> Result<bool> {
     let Some(session) = existing.session.as_ref() else {
         return Ok(true);
     };
@@ -1028,19 +1062,27 @@ fn prefix_matches(path: &Path, existing: &Existing, watermark: u64) -> Result<bo
         return Ok(false);
     }
 
-    let mut file = crate::discover::open_transcript(path).map_err(|e| Error::io(path, e))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| Error::io(path, e))?;
     let mut head = vec![0u8; watermark as usize];
     file.read_exact(&mut head).map_err(|e| Error::io(path, e))?;
     Ok(head == archived[..watermark as usize])
 }
 
-/// Read from the stored watermark to the end of the file.
+/// Read from the stored watermark to the end of the file, for a session that
+/// is not flagged. It seeks past the prefix and never reads it.
+fn read_tail(path: &Path, watermark: u64) -> Result<Vec<u8>> {
+    let (mut file, len) = open_at_least(path, watermark)?;
+    rest_of(&mut file, path, watermark, len)
+}
+
+/// Open the transcript and refuse one shorter than the watermark.
 ///
 /// Through `discover::open_transcript` and not `File::open`, so the pass's
 /// opens are the number AC5 measures: "zero opens of any file under an excluded
 /// directory" has to be a fact a test can read off a log.
-fn read_tail(path: &Path, watermark: u64) -> Result<Vec<u8>> {
-    let mut file = crate::discover::open_transcript(path).map_err(|e| Error::io(path, e))?;
+fn open_at_least(path: &Path, watermark: u64) -> Result<(std::fs::File, u64)> {
+    let file = crate::discover::open_transcript(path).map_err(|e| Error::io(path, e))?;
     let len = file.metadata().map_err(|e| Error::io(path, e))?.len();
     if len < watermark {
         // A transcript never shrinks: compaction appends to the same file
@@ -1060,6 +1102,11 @@ fn read_tail(path: &Path, watermark: u64) -> Result<Vec<u8>> {
             watermark,
         });
     }
+    Ok((file, len))
+}
+
+/// The bytes from the watermark to EOF, from a handle [`open_at_least`] gave.
+fn rest_of(file: &mut std::fs::File, path: &Path, watermark: u64, len: u64) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(watermark))
         .map_err(|e| Error::io(path, e))?;
     let mut buffer = Vec::with_capacity((len - watermark) as usize);

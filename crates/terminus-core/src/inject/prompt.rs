@@ -569,7 +569,11 @@ fn owed(conn: &Connection, state: &mut State, current: Option<&str>) -> Option<B
 /// twentieth overall would arrive at the threshold looking like a rank-1 hit.
 /// One definition of relevance for both paths (INJ-03), and "never on a
 /// free-text-only match" is not conditioned on a compaction having happened.
-fn within(hits: Vec<Hit>, dropped: Option<&BTreeSet<i64>>) -> Vec<Hit> {
+///
+/// Public for the reason [`eligible`] is: `terminus replay` filters a
+/// compacted decision's hits to its stored dropped set through this, rather
+/// than through a second copy that could drift from what the prompt did.
+pub fn within(hits: Vec<Hit>, dropped: Option<&BTreeSet<i64>>) -> Vec<Hit> {
     let Some(dropped) = dropped else {
         return hits;
     };

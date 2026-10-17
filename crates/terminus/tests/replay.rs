@@ -416,3 +416,121 @@ fn stats_and_replay_call_half_a_decision_log_a_failure() {
         }
     }
 }
+
+/// #40, D-13: a labelled decision made under the compacted pool replays
+/// through the compacted window, so `--compacted-ranked` moves it.
+///
+/// The decision's dropped set is the one turn it was given, which is what the
+/// live arm would have offered it. Closing the window to zero leaves it nothing
+/// to inject, and the false positive it earned is gone from the replay.
+#[test]
+fn compacted_ranked_moves_a_compacted_decision() {
+    let bench = bench();
+    let cwd = bench.ingest_fixture();
+    let turn = bench.stored_turn();
+    bench.decide(&cwd, "what changed in crates/gizmo/lantern.rs", turn);
+    bench
+        .conn()
+        .execute(
+            "UPDATE decisions SET compacted = 1, dropped = ?1",
+            [format!("[{turn}]")],
+        )
+        .unwrap();
+    let out = bench.run(&["ingest"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    let shipped = bench.run(&["replay", "--json"]);
+    assert_eq!(shipped.status.code(), Some(0), "{}", stderr(&shipped));
+    let shipped = document(&shipped);
+    assert_eq!(shipped["data"]["decisions"], 1, "{shipped}");
+    assert_eq!(
+        shipped["data"]["changed"].as_array().unwrap().len(),
+        0,
+        "the build does not reproduce a compacted decision's labels: {shipped}"
+    );
+
+    let closed = bench.run(&["replay", "--json", "--compacted-ranked", "0"]);
+    assert_eq!(closed.status.code(), Some(0), "{}", stderr(&closed));
+    let closed = document(&closed);
+    assert_eq!(
+        closed["data"]["thresholds"]["compacted_ranked"], 0,
+        "{closed}"
+    );
+    assert!(
+        closed["data"]["labels"] != shipped["data"]["labels"]
+            || closed["data"]["changed"] != shipped["data"]["changed"],
+        "--compacted-ranked did not move a compacted decision: {closed}"
+    );
+}
+
+/// D-15: replay still answers on a store whose `decisions` table predates the
+/// `compacted` and `dropped` columns. It opens read-only and cannot add them,
+/// so its query must not name them.
+#[test]
+fn replay_on_a_store_without_the_compaction_columns_still_answers() {
+    let bench = bench();
+    let cwd = bench.ingest_fixture();
+    let turn = bench.stored_turn();
+    bench.decide(&cwd, "what changed in crates/gizmo/lantern.rs", turn);
+    let out = bench.run(&["ingest"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // After the ingest, which would have added them back.
+    bench
+        .conn()
+        .execute_batch(
+            "ALTER TABLE decisions DROP COLUMN dropped;
+             ALTER TABLE decisions DROP COLUMN compacted;",
+        )
+        .unwrap();
+
+    let out = bench.run(&["replay", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let value = document(&out);
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["data"]["decisions"], 1, "{value}");
+    assert!(
+        !stderr(&out).contains("no such column"),
+        "replay named a column the store does not have: {}",
+        stderr(&out)
+    );
+}
+
+/// D-15: stats still answers on a store whose `decisions` table predates the
+/// `compacted` and `dropped` columns. Every row is of unknown kind, so both
+/// split counts are 0 while `decisions` still counts every row.
+#[test]
+fn stats_on_a_store_without_the_compaction_columns_still_answers() {
+    let bench = bench();
+    let cwd = bench.ingest_fixture();
+    let turn = bench.stored_turn();
+    bench.decide(&cwd, "what changed in crates/gizmo/lantern.rs", turn);
+    bench.decide(&cwd, "and in the other file", turn);
+    let out = bench.run(&["ingest"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+
+    // After the ingest, which would have added them back.
+    let conn = bench.conn();
+    conn.execute_batch(
+        "ALTER TABLE decisions DROP COLUMN dropped;
+         ALTER TABLE decisions DROP COLUMN compacted;",
+    )
+    .unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM decisions", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+
+    let out = bench.run(&["stats", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let value = document(&out);
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["data"]["decisions"], rows, "{value}");
+    assert_eq!(value["data"]["compacted_decisions"], 0, "{value}");
+    assert_eq!(value["data"]["ordinary_decisions"], 0, "{value}");
+    assert!(
+        !stderr(&out).contains("no such column"),
+        "stats named a column the store does not have: {}",
+        stderr(&out)
+    );
+}

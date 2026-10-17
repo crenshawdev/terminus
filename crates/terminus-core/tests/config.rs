@@ -393,6 +393,51 @@ fn a_differently_spelled_exclusion_is_the_same_exclusion_to_both_tests() {
     }
 }
 
+/// An exclusion written through a symlink also matches the path it resolves to.
+///
+/// A git project's key is stored as its resolved toplevel, and a linked
+/// transcript is judged by its resolved target, so an exclusion matched only as
+/// written misses both, and the project's archived sessions stay visible. The
+/// link is made here, so this holds on Linux as well as on macOS, where every
+/// temporary path is one (`/var` is `/private/var`).
+#[test]
+fn an_exclusion_written_through_a_symlink_also_matches_the_resolved_path() {
+    let tree = tempfile::tempdir().unwrap();
+    let real = tree.path().join("data").join("projects");
+    std::fs::create_dir_all(real.join("cadence")).unwrap();
+    std::os::unix::fs::symlink(&real, tree.path().join("projects")).unwrap();
+    let written = tree.path().join("projects").join("cadence");
+    let resolved = real.join("cadence").canonicalize().unwrap();
+    let encoded = |path: &Path| terminus_core::config::encode(path.to_str().unwrap());
+
+    let config = excluding(&[written.to_str().unwrap()]);
+
+    assert!(
+        config.excludes_path(&resolved.join("sub")),
+        "a project key stored resolved stays visible"
+    );
+    assert!(
+        config.excludes_encoded_dir(&encoded(&resolved)),
+        "a project directory named for the resolved cwd would be opened"
+    );
+    assert!(config.excludes_path(&written.join("sub")));
+    assert!(config.excludes_encoded_dir(&encoded(&written)));
+    assert!(
+        !config.excludes_path(&resolved.with_file_name("cadence-research")),
+        "the resolved spelling keeps the segment boundary"
+    );
+    assert_eq!(
+        config.exclusions(),
+        [written.to_str().unwrap()],
+        "the exclusion is reported as written"
+    );
+
+    // A deleted leaf below the link resolves through its deepest live ancestor.
+    let worktree = Path::new(".claude").join("worktrees").join("wt-a");
+    let config = excluding(&[written.join(&worktree).to_str().unwrap()]);
+    assert!(config.excludes_path(&resolved.join(&worktree).join("sub")));
+}
+
 /// An exclusion naming nothing is dropped rather than kept as an empty string,
 /// which every encoded name has as a prefix.
 #[test]

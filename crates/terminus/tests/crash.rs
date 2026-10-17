@@ -422,9 +422,9 @@ fn check_invariants(data_dir: &Path) -> Result<(), String> {
             "SELECT count(*) FROM paths WHERE turn_id NOT IN (SELECT id FROM turns)",
         ),
         (
-            "compaction_boundaries",
-            "SELECT count(*) FROM compaction_boundaries
-             WHERE turn_id NOT IN (SELECT id FROM turns)",
+            "compactions",
+            "SELECT count(*) FROM compactions
+             WHERE session_key NOT IN (SELECT session_key FROM sessions)",
         ),
     ] {
         let orphans: i64 = conn.query_row(sql, [], |r| r.get(0)).unwrap();

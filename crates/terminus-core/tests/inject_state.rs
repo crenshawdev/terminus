@@ -264,10 +264,10 @@ fn a_write_replaces_the_target_rather_than_rewriting_it_in_place() {
     );
 }
 
-/// PRIV-02, PRIV-04: the injection scratch is quoted prompt text keyed by
-/// session id, and none of it - nor the directory holding it, nor the data
-/// directory the hook had to create to get there - is readable by group or
-/// world.
+/// PRIV-02, PRIV-04: the injection scratch holds the turn ids each session was
+/// given, its suppressions and its compaction flag, keyed by session id, and
+/// none of it - nor the directory holding it, nor the data directory the hook
+/// had to create to get there - is readable by group or world.
 ///
 /// The data directory does not exist when this starts, which is the case that
 /// matters: a `SessionStart` hook on a machine that has installed terminus and

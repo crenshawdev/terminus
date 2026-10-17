@@ -352,12 +352,20 @@ fn the_seam_owns_the_boundary_row_and_clears_it_when_the_turn_is_not_one() {
         ..turn.clone()
     };
     let id = schema::turn_id(bench.session_no, seq);
+    // Past the session's stream too, so the row's key is no other turn's.
+    let offset: i64 = conn
+        .query_row(
+            "SELECT max(stream_offset + byte_len) + 1 FROM turns WHERE session_key = ?1",
+            [&bench.session_key],
+            |r| r.get(0),
+        )
+        .unwrap();
 
     let row = TurnRow {
         session_key: &bench.session_key,
         session_no: bench.session_no,
         turn: &turn,
-        stream_offset: 0,
+        stream_offset: offset as u64,
         byte_len: line.len() as u64,
         record: &line,
         subtype: record.subtype.as_deref(),
@@ -367,12 +375,12 @@ fn the_seam_owns_the_boundary_row_and_clears_it_when_the_turn_is_not_one() {
 
     let stored: Vec<u8> = conn
         .query_row(
-            "SELECT metadata FROM compaction_boundaries WHERE turn_id = ?1",
-            [id],
+            "SELECT metadata FROM compactions WHERE session_key = ?1 AND stream_offset = ?2",
+            rusqlite::params![bench.session_key, offset],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count(&conn, "compaction_boundaries"), 1);
+    assert_eq!(count(&conn, "compactions"), 1);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&stored).unwrap(),
         serde_json::from_slice::<serde_json::Value>(&line).unwrap()["compactMetadata"]
@@ -389,7 +397,7 @@ fn the_seam_owns_the_boundary_row_and_clears_it_when_the_turn_is_not_one() {
     )
     .unwrap();
     assert_eq!(
-        count(&conn, "compaction_boundaries"),
+        count(&conn, "compactions"),
         0,
         "the boundary row outlived the turn being one"
     );

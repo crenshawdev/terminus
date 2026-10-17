@@ -1,0 +1,293 @@
+name: test
+
+# The whole suite on every push and pull request, on the four runners the
+# release builds on. It reads no secret, so corpus.rs skips the private corpus
+# here as it does on any machine without it.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.97.1"
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+        build: [debug, release]
+    runs-on: ${{ matrix.runner }}
+    # The backstop behind the Test step's own 15-minute limit, instead of
+    # GitHub's default of six hours. Hung Linux jobs have run past it and lost
+    # their whole log.
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the named Rust version
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustc --version
+
+      # Compiled dependencies from an earlier run on the same runner and build,
+      # keyed by the toolchain and Cargo.lock. An older Cargo.lock's cache is
+      # restored when there is no exact match, and cargo rebuilds what changed.
+      # Only dependencies are saved: Terminus's own crates are removed first,
+      # because their test binaries are most of target/ and change every push.
+      - name: Restore the dependency cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            target/
+          key: deps-${{ matrix.runner }}-${{ matrix.build }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            deps-${{ matrix.runner }}-${{ matrix.build }}-${{ env.RUST_VERSION }}-
+
+      # macOS ships LibreSSL as openssl, no dash, and may lack sha256sum. The
+      # sha256sum link goes in a folder of its own, so the rest of the BSD
+      # tools install.sh meets on a Mac stay first on PATH. The runner images
+      # put OpenSSL 1.1.1 first, whose s_server -WWW closes without a TLS
+      # close_notify, and the Intel image's curl on OpenSSL 3 fails on that.
+      - name: Install the shell-test tools macOS lacks
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          on_path() {
+            local dir
+            IFS=: read -ra dirs <<< "$PATH"
+            for dir in "${dirs[@]}"; do
+              [ -f "$dir/$1" ] && return 0
+            done
+            return 1
+          }
+          if ! on_path dash; then
+            brew install dash
+          fi
+          if ! on_path sha256sum; then
+            brew install coreutils
+            mkdir -p "$RUNNER_TEMP/tools"
+            ln -s "$(brew --prefix coreutils)/bin/gsha256sum" "$RUNNER_TEMP/tools/sha256sum"
+            echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          fi
+          version="$(openssl version 2>&1 || true)"
+          if [[ $version != "OpenSSL "[3-9]* ]]; then
+            brew install openssl@3
+            echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+          fi
+
+      # install_script.rs and sign_release.rs fail rather than skip when a
+      # tool is missing, and they find tools by scanning PATH for the exact
+      # name, so this does too. Bash builtins only, so it runs on any PATH.
+      - name: Check the shell-test tools
+        run: |
+          set -euo pipefail
+          tools=(od uname mktemp rm curl sha256sum mkdir chmod mv ln readlink grep ssh-keygen dash shasum openssl cp)
+          IFS=: read -ra dirs <<< "$PATH"
+          missing=()
+          for tool in "${tools[@]}"; do
+            found=
+            for dir in "${dirs[@]}"; do
+              if [ -f "$dir/$tool" ]; then
+                found=1
+                break
+              fi
+            done
+            [ -n "$found" ] || missing+=("$tool")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::not on PATH: ${missing[*]}"
+            exit 1
+          fi
+          version="$(openssl version 2>&1 || true)"
+          if [[ $version != "OpenSSL "[3-9]* ]]; then
+            echo "::error::openssl is $version; the test server needs OpenSSL 3 or later"
+            exit 1
+          fi
+          server="$(openssl s_server -help 2>&1 || true)"
+          if [[ $server != *-WWW* ]]; then
+            echo "::error::openssl s_server has no -WWW"
+            exit 1
+          fi
+          req="$(openssl req -help 2>&1 || true)"
+          if [[ $req != *-addext* ]]; then
+            echo "::error::openssl req has no -addext"
+            exit 1
+          fi
+
+      # Every runner tests two builds, as two jobs: debug, with debug assertions
+      # and overflow checks on, as the suite runs locally, and release, the
+      # profile users get. Both take --all-features, because the crash and fault
+      # tests need testkit's points compiled in; the shipped binary has none.
+      #
+      # The tests are built in a step of their own, so the Test step's 15-minute
+      # limit times the tests and not a release link.
+      - name: Build the tests
+        env:
+          BUILD: ${{ matrix.build }}
+        run: |
+          set -euo pipefail
+          flag=
+          if [ "$BUILD" = release ]; then
+            flag=--release
+          fi
+          cargo test --workspace --all-features --locked $flag --no-run
+
+      # The timing budgets in hook.rs, backfill.rs, lock_race.rs and corpus.rs
+      # are not loosened here. --no-fail-fast runs every test file after one
+      # fails, so a run shows every failure.
+      #
+      # The three tests that hold a hook spawn's p99 under 10 ms, two in
+      # hook.rs and one in brief.rs, are skipped here and run everywhere else.
+      # On a hosted runner the p99 came out two to six times the p50, which
+      # measures the shared VM, not the hook.
+      #
+      # The three budgets on a single spawn, two in backfill.rs and one in
+      # lock_race.rs, are skipped on the two macOS runners only. Measured there,
+      # starting /usr/bin/true once took up to 150 ms and a release
+      # `terminus --version` up to 115 ms, against budgets of 50 and 100 ms.
+      # On the Linux runners the same measurements stayed under 4.2 ms.
+      #
+      # A run still going at 15 minutes is stopped here, not by timeout-minutes,
+      # so the log survives. Before the kill it prints the log tail, every
+      # process with its state and group, and the open files of every process
+      # it can read. The first process listing uses the short name, which
+      # reads nothing a stuck process could hold. Processes still there 5 s
+      # after SIGKILL are listed again.
+      - name: Test
+        env:
+          BUILD: ${{ matrix.build }}
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/cargo-test.log"
+          limit=$((15 * 60))
+          flag=
+          if [ "$BUILD" = release ]; then
+            flag=--release
+          fi
+          skips=(
+            --skip every_event_exits_zero_with_an_empty_stdout_inside_the_budget
+            --skip every_event_stays_inside_the_budget_with_the_redaction_knob_on
+            --skip a_hundred_session_starts_stay_inside_the_budget_and_the_wall_clock
+          )
+          if [ "$RUNNER_OS" = macOS ]; then
+            skips+=(
+              --skip backfill_returns_inside_the_budget_with_the_store_still_empty
+              --skip an_ingest_during_a_backfill_exits_inside_the_budget
+              --skip a_contended_ingest_exits_inside_the_budget
+            )
+          fi
+          ( cargo test --workspace --all-features --locked $flag --no-fail-fast -- "${skips[@]}" \
+              2>&1 | tee "$log" ) &
+          run=$!
+          while kill -0 "$run" 2>/dev/null && [ "$SECONDS" -lt "$limit" ]; do
+            sleep 5
+          done
+          if ! kill -0 "$run" 2>/dev/null; then
+            wait "$run"
+            exit 0
+          fi
+
+          if [ "$(uname -s)" = Linux ]; then
+            columns=pid,ppid,pgid,sid,stat,wchan:32,etime
+            bounded() { timeout -k 5 30 "$@"; }
+          else
+            columns=pid,ppid,pgid,stat,wchan,etime
+            bounded() { "$@"; }
+          fi
+
+          echo "::error::cargo test was still running after 15 minutes"
+          echo "== last 200 lines of the test log"
+          tail -n 200 "$log"
+          echo "== every process, short names"
+          ps -e -o "$columns,comm"
+          echo "== every process, full command lines"
+          bounded ps -e -ww -o "$columns,args" || echo "ps with command lines did not finish"
+          echo "== open files of every process this user can read"
+          if [ "$(uname -s)" = Linux ]; then
+            for dir in /proc/[0-9]*; do
+              files="$(ls -l "$dir/fd" 2>/dev/null)" || continue
+              echo "-- ${dir#/proc/} $(cat "$dir/comm" 2>/dev/null)"
+              printf '%s\n' "$files"
+            done
+          else
+            lsof -nP -u "$(id -u)" || true
+          fi
+
+          # The run's descendants, plus the terminus processes whose binary is
+          # in this build or the temp directory: the ingests a hook starts leave
+          # the run's tree on purpose. An installed terminus is left alone. On
+          # macOS the short name is the full path, and /private is dropped so
+          # /var and /private/var compare equal.
+          target="${GITHUB_WORKSPACE#/private}/target/"
+          tmp="${TMPDIR:-/tmp}"
+          tmp="${tmp#/private}"
+          tmp="${tmp%/}/"
+          seeds="$run"
+          while read -r pid name; do
+            [ "${name##*/}" = terminus ] || continue
+            if [ "$(uname -s)" = Linux ]; then
+              path="$(readlink "/proc/$pid/exe" 2>/dev/null)" || continue
+            else
+              path="$name"
+            fi
+            case "${path#/private}" in
+              "$target"* | "$tmp"*) seeds="$seeds $pid" ;;
+            esac
+          done < <(ps -e -o pid=,comm=)
+          victims="$(ps -e -o pid=,ppid= | awk -v seeds="$seeds" '
+            BEGIN { n = split(seeds, s, " "); for (i = 1; i <= n; i++) hit[s[i]] = 1 }
+            { pid[NR] = $1; parent[NR] = $2 }
+            END {
+              do {
+                grew = 0
+                for (i = 1; i <= NR; i++)
+                  if ((parent[i] in hit) && !(pid[i] in hit)) { hit[pid[i]] = 1; grew = 1 }
+              } while (grew)
+              for (p in hit) print p
+            }')"
+          echo "== killing: $(echo $victims)"
+          kill -KILL $victims 2>/dev/null || true
+          sleep 5
+          echo "== still there 5 s after SIGKILL"
+          ps -o "$columns,comm" -p "$(echo $victims | tr ' ' ',')" || echo "none"
+          exit 1
+
+      # After the tests, whether they passed or not, and only when the cache
+      # missed: a key that already has a cache cannot be saved again.
+      - name: Keep only the dependencies in target/
+        if: ${{ !cancelled() && steps.cache.outputs.cache-hit != 'true' }}
+        env:
+          BUILD: ${{ matrix.build }}
+        run: |
+          set -euo pipefail
+          flag=
+          if [ "$BUILD" = release ]; then
+            flag=--release
+          fi
+          cargo clean $flag -p terminus -p terminus-core
+          rm -rf "target/${BUILD:?}/incremental"
+          du -sh target/
+
+      - name: Save the dependency cache
+        if: ${{ !cancelled() && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            target/
+          key: ${{ steps.cache.outputs.cache-primary-key }}

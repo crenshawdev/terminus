@@ -48,8 +48,7 @@ pub fn run(json: bool) -> Result<(), Failure> {
         }
     }
 
-    let stats =
-        stats::stats(reader.store().conn()).map_err(|e| Failure::Operational(e.to_string()))?;
+    let stats = stats::stats(reader.store()).map_err(|e| Failure::Operational(e.to_string()))?;
 
     if json {
         // The same numbers the human output prints, and no others.
@@ -58,6 +57,10 @@ pub fn run(json: bool) -> Result<(), Failure> {
     }
 
     outln!("decisions         {}", stats.decisions);
+    // Indented as a split of the line above. Decisions logged before the split
+    // was recorded are in neither, so the two need not add up to it.
+    outln!("  compacted       {}", stats.compacted_decisions);
+    outln!("  ordinary        {}", stats.ordinary_decisions);
     outln!("injected turns    {}", stats.injected_turns);
     outln!("hits              {}", stats.hits);
     outln!("false positives   {}", stats.false_positives);
@@ -78,6 +81,8 @@ pub fn run(json: bool) -> Result<(), Failure> {
 fn document(stats: &Stats) -> Document {
     Document::new(COMMAND)
         .field("decisions", stats.decisions)
+        .field("compacted_decisions", stats.compacted_decisions)
+        .field("ordinary_decisions", stats.ordinary_decisions)
         .field("injected_turns", stats.injected_turns)
         .field("hits", stats.hits)
         .field("false_positives", stats.false_positives)

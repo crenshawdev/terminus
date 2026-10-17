@@ -1,0 +1,11 @@
+PLAN COMPLETE
+Plan: .planning/phases/13/PLAN-3.md
+Tasks: 3 of 3
+| Task | Commit | Note |
+|---|---|---|
+| 1 - Sweep the writers' abandoned temp files on every drain | 203c29e | `feedback::sweep` runs first in `drain`, before the empty-`found` return and before the insert; `ABANDONED_AFTER` = 10 min in feedback/mod.rs; name prefix/suffix consts beside each writer's `create_temporary`. New test `a_pass_sweeps_the_writers_old_temporaries_and_nothing_else` (also plants an aged directory with a writer name); fails with the sweep call removed. feedback 17/17, inject::decision 8/8, clippy clean. |
+| 2 - Leave a decision reservation that is still in flight for the next pass | 7e3415d | `Found` gains `empty` and `modified`, both from the metadata of the handle `read_all` read the bytes through; `drain` filters out `in_flight` entries before the insert loop and the delete loop. New tests `a_young_empty_reservation_is_left_for_the_next_pass` (fails with the filter disabled) and `an_old_empty_reservation_is_removed_and_named`. feedback 19/19, inject::decision 8/8, clippy clean. |
+| 3 - Correct the comments that #38 and the drain change make false | 718341d | hook.rs `inject` doc, state.rs `create_temporary` doc, decision.rs `read_all` `.tmp` comment; also decision.rs `write_file` doc, which said the drain sees a whole document or no file, now names the empty reservation. Both Verify greps print nothing, build and `--lib inject` (14/14) pass, diff is the three files and comment lines only. |
+Suite: `cargo test --workspace --all-features --locked` (CI's command; workflow.test_command is null), exit 0, 67 test binaries ok.
+Deviations: none
+Open items: crates/terminus-core/tests/inject_state.rs:267 says "the injection scratch is quoted prompt text", which is false (state holds turn ids, suppressions and the compaction flag); outside this plan's lease, so reported and not edited. `cargo fmt --all -- --check` reports pre-existing diffs in crates/terminus/src/cmd/hook.rs:210 and crates/terminus/tests/release_workflows.rs, not touched by this plan's edits. The race test proves the drain-side rule (young empty file left, record inserted after the rename); it does not time a real rename between the read and the stat, the same call D-10 made for #15.
