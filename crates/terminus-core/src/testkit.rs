@@ -316,6 +316,11 @@ pub fn fixture_bytes(name: &str) -> Vec<u8> {
 /// under the unresolved temp dir fails there. Make test dirs with
 /// `tempfile::tempdir_in(testkit::temp_root())`.
 pub fn temp_root() -> PathBuf {
+    // This creates nothing in the shared temp directory: it resolves the path,
+    // and callers make uniquely named directories under it with
+    // `tempfile::tempdir_in`. That is why semgrep's temp-dir rule is silenced
+    // on this line.
+    // nosemgrep: rust.lang.security.temp-dir.temp-dir
     let dir = std::env::temp_dir();
     dir.canonicalize()
         .unwrap_or_else(|e| panic!("resolve the temp directory {}: {e}", dir.display()))
