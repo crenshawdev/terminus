@@ -37,7 +37,7 @@ jobs:
           echo "$dir" >> "$GITHUB_PATH"
 
       - name: Install with the one-line command
-        run: curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh
+        run: curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install.sh | sh
 
       - name: Check the installed version
         env:

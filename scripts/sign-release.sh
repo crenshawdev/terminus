@@ -11,7 +11,7 @@ set -eu
 LC_ALL=C
 export LC_ALL
 
-repo=crenshawdev/terminus
+repo=jcrenshaw-dev/terminus
 platforms='linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64'
 usage='usage: sh scripts/sign-release.sh v<X.Y.Z>'
 

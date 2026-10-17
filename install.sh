@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install Terminus.
-# With no argument it downloads from the GitHub releases on crenshawdev/terminus;
+# With no argument it downloads from the GitHub releases on jcrenshaw-dev/terminus;
 # one https:// argument names another source.
 # Before it reads the manifest, it checks terminus-<os>-<arch>.manifest.sig with
 # ssh-keygen against the crenshawdev release key pinned below, under the namespace
@@ -129,7 +129,7 @@ stage() {
 
 {
     case $# in
-        0) source=https://github.com/crenshawdev/terminus/releases/latest/download ;;
+        0) source=https://github.com/jcrenshaw-dev/terminus/releases/latest/download ;;
         1) case $1 in https://*) source=$1 ;; *) fail 'the source must start with https://' ;; esac ;;
         *) fail 'usage: sh install.sh [https://<source>]' ;;
     esac

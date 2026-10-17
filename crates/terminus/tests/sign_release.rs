@@ -35,7 +35,7 @@ const PLATFORMS: [&str; 4] = [
 
 const TAG: &str = "v0.1.0";
 
-const REPO: [&str; 2] = ["--repo", "crenshawdev/terminus"];
+const REPO: [&str; 2] = ["--repo", "jcrenshaw-dev/terminus"];
 
 /// The call that asks whether the release is still a draft.
 const VIEW: [&str; 9] = [
@@ -43,7 +43,7 @@ const VIEW: [&str; 9] = [
     "view",
     TAG,
     "--repo",
-    "crenshawdev/terminus",
+    "jcrenshaw-dev/terminus",
     "--json",
     "isDraft",
     "--jq",
@@ -388,7 +388,7 @@ fn a_good_draft_is_signed_and_published(shell: Shell) {
         .map(|platform| format!("terminus-{platform}.manifest.sig"))
         .collect();
     assert_eq!(named, sigs);
-    assert_eq!(gh[1][7..], ["--repo", "crenshawdev/terminus", "--clobber"]);
+    assert_eq!(gh[1][7..], ["--repo", "jcrenshaw-dev/terminus", "--clobber"]);
     assert_eq!(
         gh[2],
         [
@@ -396,7 +396,7 @@ fn a_good_draft_is_signed_and_published(shell: Shell) {
             "edit",
             TAG,
             "--repo",
-            "crenshawdev/terminus",
+            "jcrenshaw-dev/terminus",
             "--draft=false",
             "--prerelease=false",
             "--latest"
