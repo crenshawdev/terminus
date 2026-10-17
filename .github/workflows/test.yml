@@ -40,6 +40,23 @@ jobs:
           rustup default "$RUST_VERSION"
           rustc --version
 
+      # Compiled dependencies from an earlier run on the same runner and build,
+      # keyed by the toolchain and Cargo.lock. An older Cargo.lock's cache is
+      # restored when there is no exact match, and cargo rebuilds what changed.
+      # Only dependencies are saved: Terminus's own crates are removed first,
+      # because their test binaries are most of target/ and change every push.
+      - name: Restore the dependency cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            target/
+          key: deps-${{ matrix.runner }}-${{ matrix.build }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            deps-${{ matrix.runner }}-${{ matrix.build }}-${{ env.RUST_VERSION }}-
+
       # macOS ships LibreSSL as openssl, no dash, and may lack sha256sum. The
       # sha256sum link goes in a folder of its own, so the rest of the BSD
       # tools install.sh meets on a Mac stay first on PATH. The runner images
@@ -248,3 +265,29 @@ jobs:
           echo "== still there 5 s after SIGKILL"
           ps -o "$columns,comm" -p "$(echo $victims | tr ' ' ',')" || echo "none"
           exit 1
+
+      # After the tests, whether they passed or not, and only when the cache
+      # missed: a key that already has a cache cannot be saved again.
+      - name: Keep only the dependencies in target/
+        if: ${{ !cancelled() && steps.cache.outputs.cache-hit != 'true' }}
+        env:
+          BUILD: ${{ matrix.build }}
+        run: |
+          set -euo pipefail
+          flag=
+          if [ "$BUILD" = release ]; then
+            flag=--release
+          fi
+          cargo clean $flag -p terminus -p terminus-core
+          rm -rf "target/${BUILD:?}/incremental"
+          du -sh target/
+
+      - name: Save the dependency cache
+        if: ${{ !cancelled() && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            target/
+          key: ${{ steps.cache.outputs.cache-primary-key }}
