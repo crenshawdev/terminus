@@ -796,9 +796,9 @@ fn no_claude_exits_non_zero_after_the_link_is_placed(shell: Shell) {
     fx.assert_linked("1.0.0", &bytes);
 }
 
-/// The release URLs on crenshawdev/terminus, as the fake `curl` logs them.
+/// The release URLs on jcrenshaw-dev/terminus, as the fake `curl` logs them.
 fn default_urls() -> Vec<String> {
-    let base = "https://github.com/crenshawdev/terminus/releases/latest/download";
+    let base = "https://github.com/jcrenshaw-dev/terminus/releases/latest/download";
     vec![
         format!("{base}/terminus-{}.manifest", platform()),
         format!("{base}/terminus-{}.manifest.sig", platform()),

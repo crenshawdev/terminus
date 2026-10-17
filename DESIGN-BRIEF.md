@@ -379,7 +379,7 @@ Prefix match on canonicalized paths, case-insensitive on macOS. A repo-local mar
 
 ## 13. Install and packaging
 
-**There is no npm channel.** The npm package was removed. `install.sh` is the one-command installer, run as `curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh`. It downloads from the GitHub releases on crenshawdev/terminus, and one `https://` source replaces them when the line ends in `sh -s -- https://<source>` instead of `sh`. It refuses any release whose signature does not verify against the crenshawdev release key pinned in the script.
+**There is no npm channel.** The npm package was removed. `install.sh` is the one-command installer, run as `curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install.sh | sh`. It downloads from the GitHub releases on jcrenshaw-dev/terminus, and one `https://` source replaces them when the line ends in `sh -s -- https://<source>` instead of `sh`. It refuses any release whose signature does not verify against the crenshawdev release key pinned in the script.
 
 Secondary: Homebrew, deb/rpm.
 
@@ -499,7 +499,7 @@ No mocking SQLite — real temp databases throughout.
 - **Store format version is a separate integer** in `meta`. The binary refuses a store whose archive format differs from its own, newer or older, and a derived schema that differs from its own rebuilds the derived tables. A product bump never implies a store rebuild.
 - **MIT.** Source must be public — nobody installs a closed binary that reads every keystroke of their work. AGPL is a documented negative signal in this category and its network clause protects nothing here. All dependencies are permissive (SQLite public domain, rusqlite MIT, zstd BSD, rayon MIT/Apache).
 - **Public OSS** — an explicit override of the private-by-default rule, scoped to this project.
-- `origin` is github.com/crenshawdev/terminus, where releases are published. Publishing elsewhere is handled outside this project.
+- `origin` is github.com/jcrenshaw-dev/terminus, where releases are published. Publishing elsewhere is handled outside this project.
 - crates.io `terminus` is taken. Skip crates.io; Terminus is delivered by `install.sh` from the GitHub releases.
 
 ---

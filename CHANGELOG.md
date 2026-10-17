@@ -139,12 +139,12 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `install.sh` installs Terminus with one command:
 
   ```sh
-  curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install.sh | sh
   ```
 
   It downloads `terminus-<os>-<arch>.manifest`,
   `terminus-<os>-<arch>.manifest.sig` and `terminus-<os>-<arch>` from
-  `https://github.com/crenshawdev/terminus/releases/latest/download`, where
+  `https://github.com/jcrenshaw-dev/terminus/releases/latest/download`, where
   `<os>` is `linux` or `macos` and `<arch>` is `x86_64` or `aarch64`. One
   `https://` source, passed by ending the line with
   `sh -s -- https://<source>` instead of `sh`, replaces that default, and the
@@ -367,8 +367,8 @@ granularity, and gives the model recall over its own history through three MCP
 tools and hook-driven context injection. Local only, no daemon, no port, no
 telemetry.
 
-[Unreleased]: https://github.com/crenshawdev/terminus/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/crenshawdev/terminus/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/crenshawdev/terminus/compare/verbatim-v0.1.1...v0.1.0
-[Verbatim 0.1.1]: https://github.com/crenshawdev/terminus/compare/verbatim-v0.1.0...verbatim-v0.1.1
-[Verbatim 0.1.0]: https://github.com/crenshawdev/terminus/tree/verbatim-v0.1.0
+[Unreleased]: https://github.com/jcrenshaw-dev/terminus/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/jcrenshaw-dev/terminus/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/jcrenshaw-dev/terminus/compare/verbatim-v0.1.1...v0.1.0
+[Verbatim 0.1.1]: https://github.com/jcrenshaw-dev/terminus/compare/verbatim-v0.1.0...verbatim-v0.1.1
+[Verbatim 0.1.0]: https://github.com/jcrenshaw-dev/terminus/tree/verbatim-v0.1.0

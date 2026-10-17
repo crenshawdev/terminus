@@ -6,7 +6,7 @@ members = ["crates/terminus-core", "crates/terminus"]
 version = "0.1.1"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/crenshawdev/terminus"
+repository = "https://github.com/jcrenshaw-dev/terminus"
 authors = ["John Crenshaw <john@jcrenshaw.dev>"]
 # Neither crate is a registry artifact. terminus is a binary application
 # distributed as a prebuilt binary, and terminus-core exists to be linked

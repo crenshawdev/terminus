@@ -18,7 +18,7 @@ Reports about Terminus on the `main` branch and about any published release are 
 
 ## How Terminus is checked
 
-Terminus is audited with [sentinel](https://github.com/crenshawdev/sentinel), which this repo carries as a git submodule at `.sentinel`. The audit works from [THREAT-MODEL.md](THREAT-MODEL.md), which lists what Terminus reads, writes and runs, and where untrusted data enters.
+Terminus is audited with [sentinel](https://github.com/jcrenshaw-dev/sentinel), which this repo carries as a git submodule at `.sentinel`. The audit works from [THREAT-MODEL.md](THREAT-MODEL.md), which lists what Terminus reads, writes and runs, and where untrusted data enters.
 
 - **Every pull request** runs sentinel's mechanical checks through `.github/workflows/fast.yml`: `cargo audit`, `cargo deny` against this repo's `deny.toml`, `cargo clippy` and `semgrep`. If any of them fails, the pull request fails. When they pass, a second job, on GitHub only, has Claude Code review the pull request's diff against THREAT-MODEL.md, reading only the repository's files, and posts the review as a comment on the pull request. The job fails if the review did not run. Findings don't fail it; they are posted for the author to read. It reads the `ANTHROPIC_API_KEY` secret, which GitHub does not pass to workflows run from a fork.
 - **Every push and pull request** runs the whole test suite through `.github/workflows/test.yml`: `cargo test --workspace --all-features --locked`, on Linux and macOS, on x86_64 and aarch64. If any test fails on any of the four, the run fails. It reads no secret.
