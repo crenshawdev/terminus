@@ -19,6 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+        build: [debug, release]
     runs-on: ${{ matrix.runner }}
     # The backstop behind the Test step's own 15-minute limit, instead of
     # GitHub's default of six hours. Hung Linux jobs have run past it and lost
@@ -110,15 +111,38 @@ jobs:
             exit 1
           fi
 
-      # The debug build, as the suite runs locally. The timing budgets in
-      # hook.rs, backfill.rs, lock_race.rs and corpus.rs are not loosened here.
-      # --no-fail-fast runs every test file after one fails, so a run shows
-      # every failure.
+      # Every runner tests two builds, as two jobs: debug, with debug assertions
+      # and overflow checks on, as the suite runs locally, and release, the
+      # profile users get. Both take --all-features, because the crash and fault
+      # tests need testkit's points compiled in; the shipped binary has none.
+      #
+      # The tests are built in a step of their own, so the Test step's 15-minute
+      # limit times the tests and not a release link.
+      - name: Build the tests
+        env:
+          BUILD: ${{ matrix.build }}
+        run: |
+          set -euo pipefail
+          flag=
+          if [ "$BUILD" = release ]; then
+            flag=--release
+          fi
+          cargo test --workspace --all-features --locked $flag --no-run
+
+      # The timing budgets in hook.rs, backfill.rs, lock_race.rs and corpus.rs
+      # are not loosened here. --no-fail-fast runs every test file after one
+      # fails, so a run shows every failure.
       #
       # The three tests that hold a hook spawn's p99 under 10 ms, two in
       # hook.rs and one in brief.rs, are skipped here and run everywhere else.
       # On a hosted runner the p99 came out two to six times the p50, which
       # measures the shared VM, not the hook.
+      #
+      # The three budgets on a single spawn, two in backfill.rs and one in
+      # lock_race.rs, are skipped on the two macOS runners only. Measured there,
+      # starting /usr/bin/true once took up to 150 ms and a release
+      # `terminus --version` up to 115 ms, against budgets of 50 and 100 ms.
+      # On the Linux runners the same measurements stayed under 4.2 ms.
       #
       # A run still going at 15 minutes is stopped here, not by timeout-minutes,
       # so the log survives. Before the kill it prints the log tail, every
@@ -127,14 +151,29 @@ jobs:
       # reads nothing a stuck process could hold. Processes still there 5 s
       # after SIGKILL are listed again.
       - name: Test
+        env:
+          BUILD: ${{ matrix.build }}
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/cargo-test.log"
           limit=$((15 * 60))
-          ( cargo test --workspace --all-features --locked --no-fail-fast -- \
-              --skip every_event_exits_zero_with_an_empty_stdout_inside_the_budget \
-              --skip every_event_stays_inside_the_budget_with_the_redaction_knob_on \
-              --skip a_hundred_session_starts_stay_inside_the_budget_and_the_wall_clock \
+          flag=
+          if [ "$BUILD" = release ]; then
+            flag=--release
+          fi
+          skips=(
+            --skip every_event_exits_zero_with_an_empty_stdout_inside_the_budget
+            --skip every_event_stays_inside_the_budget_with_the_redaction_knob_on
+            --skip a_hundred_session_starts_stay_inside_the_budget_and_the_wall_clock
+          )
+          if [ "$RUNNER_OS" = macOS ]; then
+            skips+=(
+              --skip backfill_returns_inside_the_budget_with_the_store_still_empty
+              --skip an_ingest_during_a_backfill_exits_inside_the_budget
+              --skip a_contended_ingest_exits_inside_the_budget
+            )
+          fi
+          ( cargo test --workspace --all-features --locked $flag --no-fail-fast -- "${skips[@]}" \
               2>&1 | tee "$log" ) &
           run=$!
           while kill -0 "$run" 2>/dev/null && [ "$SECONDS" -lt "$limit" ]; do
