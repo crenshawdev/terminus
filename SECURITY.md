@@ -33,7 +33,7 @@ Terminus is audited with [sentinel](https://github.com/jcrenshaw-dev/sentinel), 
 
 ## The full audit
 
-The full audit runs [sentinel](https://github.com/crenshawdev/sentinel)'s pipeline in eight steps. The run counts are sentinel's defaults.
+The full audit runs [sentinel](https://github.com/jcrenshaw-dev/sentinel)'s pipeline in eight steps. The run counts are sentinel's defaults.
 
 1. **Mechanical checks.** The same checks every pull request runs.
 2. **Context map.** Trail of Bits' `audit-context-building` skill maps the code. The map goes at the top of every review prompt in step 4.
