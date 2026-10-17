@@ -20,9 +20,10 @@ and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   up to less than `decisions`.
 - The test suite runs on GitHub for every push and pull request, on the four
   runners the release builds on: `ubuntu-24.04`, `ubuntu-24.04-arm`,
-  `macos-15-intel` and `macos-15`. Each job checks that every tool the shell
-  tests need is on PATH before `cargo test --workspace --all-features --locked`
-  starts, and fails naming the one that is missing (#47).
+  `macos-15-intel` and `macos-15`, once on the debug build and once on the
+  release build. Each job checks that every tool the shell tests need is on
+  PATH before `cargo test --workspace --all-features --locked` starts, and
+  fails naming the one that is missing (#47).
 
 ### Fixed
 

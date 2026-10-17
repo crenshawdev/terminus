@@ -145,7 +145,7 @@ Each key's full effect, and the environment variables Terminus reads, are in [do
 ## How it is designed and built
 
 - **How it is designed:** the design decisions are in [DESIGN-BRIEF.md](DESIGN-BRIEF.md) and in [.planning/](.planning/).
-- **How it is built:** `main` is protected, and every change reaches it through a pull request. The test workflow, `.github/workflows/test.yml`, runs the whole suite on every push and pull request, on Linux and macOS, on x86_64 and aarch64. No status check is required. To run the tests locally, use `cargo test --workspace --all-features`.
+- **How it is built:** `main` is protected, and every change reaches it through a pull request. The test workflow, `.github/workflows/test.yml`, runs the whole suite on every push and pull request, on the debug and the release build, on Linux and macOS, on x86_64 and aarch64. No status check is required. To run the tests locally, use `cargo test --workspace --all-features`.
 - **The issues:** bugs and known gaps are tracked at [github.com/jcrenshaw-dev/terminus/issues](https://github.com/jcrenshaw-dev/terminus/issues).
 
 ## Issues and contributions
