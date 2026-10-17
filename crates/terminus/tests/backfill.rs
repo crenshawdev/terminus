@@ -22,6 +22,12 @@
 //! 5. over the real corpus, a backfill and a `terminus ingest` tree pass archive
 //!    the same sessions and the same turns.
 //!
+//! The 100 ms and 50 ms budgets in 1 and 3 are tests of their own, so CI can
+//! skip them on the macOS runners, where starting any process at all has taken
+//! longer than either budget (`.github/workflows/test.yml`). "Still empty" goes
+//! with the 100 ms one: on a machine that slow to start a process, the work can
+//! commit before the shell comes back.
+//!
 //! The tree is deliberately larger than the fixture set: a backfill over three
 //! small transcripts finishes inside the 100 ms budget, and every assertion
 //! about "still empty at that instant" would then be a coin flip. A megabyte of
@@ -217,7 +223,41 @@ fn place(project: &Path, name: &str, fixture: &str) -> PathBuf {
 
 /// AC8's first half: the estimate, then the shell, then the work.
 #[test]
-fn backfill_prints_an_estimate_returns_at_once_and_finishes_behind_the_shell() {
+fn backfill_prints_an_estimate_and_finishes_behind_the_shell() {
+    let dirs = Dirs::new();
+    let sessions = build_tree(&dirs.claude);
+
+    let output = dirs.command(&["backfill"]).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "backfill exited {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!("{sessions} transcript(s)")),
+        "the estimate must name how many transcripts there are: {stdout}"
+    );
+    assert!(
+        stdout.contains("not yet archived"),
+        "the estimate must name a byte total: {stdout}"
+    );
+    assert!(
+        stdout.contains("an estimate from a measured rate"),
+        "the estimate must say it is an estimate from a measured rate: {stdout}"
+    );
+
+    // The control. Without it, everything above is satisfied by a command that
+    // printed two lines and archived nothing.
+    dirs.wait_for_sessions(sessions);
+}
+
+/// AC8's 100 ms, and the store still empty when the shell comes back.
+#[test]
+fn backfill_returns_inside_the_budget_with_the_store_still_empty() {
     let dirs = Dirs::new();
     let sessions = build_tree(&dirs.claude);
 
@@ -238,47 +278,26 @@ fn backfill_prints_an_estimate_returns_at_once_and_finishes_behind_the_shell() {
         elapsed < RETURN_BUDGET,
         "backfill took {elapsed:?} to return, over the {RETURN_BUDGET:?} budget"
     );
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        stdout.contains(&format!("{sessions} transcript(s)")),
-        "the estimate must name how many transcripts there are: {stdout}"
-    );
-    assert!(
-        stdout.contains("not yet archived"),
-        "the estimate must name a byte total: {stdout}"
-    );
-    assert!(
-        stdout.contains("an estimate from a measured rate"),
-        "the estimate must say it is an estimate from a measured rate: {stdout}"
-    );
-
     assert_eq!(
         archived_on_return, 0,
         "the shell came back with the work already done, so it never proved it was detached"
     );
 
-    // The control. Without it, everything above is satisfied by a command that
-    // printed two lines and archived nothing.
+    // The control. Without it, an empty store is what a command that archived
+    // nothing leaves too.
     dirs.wait_for_sessions(sessions);
 }
 
-/// D-18: a hook firing during a backfill costs the hook nothing.
+/// The backfill and the contended ingest the two tests below race.
 ///
-/// The same property `tests/lock_race.rs` asserts for two ingests, against the
-/// process the user actually has running for minutes.
-#[test]
-fn an_ingest_during_a_backfill_loses_the_race_and_exits_at_once() {
-    let dirs = Dirs::new();
-    let sessions = build_tree(&dirs.claude);
-
+/// The race starts only once the backfill is provably mid-pass. Polling for
+/// the lock is what makes this a contended run rather than a hope: an ingest
+/// that arrived first would take the lock, walk the whole tree and blow the
+/// budget for a reason that is not the one under test.
+fn race_a_backfill(dirs: &Dirs) -> (std::process::Output, Duration) {
     let output = dirs.command(&["backfill"]).output().unwrap();
     assert!(output.status.success());
 
-    // Race the backfill only once it is provably mid-pass. Polling for the
-    // lock is what makes this a contended run rather than a hope: an ingest
-    // that arrived first would take the lock, walk the whole tree and blow the
-    // budget for a reason that is not the one under test.
     dirs.wait_for_the_lock();
 
     let started = Instant::now();
@@ -291,10 +310,19 @@ fn an_ingest_during_a_backfill_loses_the_race_and_exits_at_once() {
         contended.status.code(),
         String::from_utf8_lossy(&contended.stderr)
     );
-    assert!(
-        elapsed < CONTENDED_BUDGET,
-        "the contended ingest took {elapsed:?}, over the {CONTENDED_BUDGET:?} budget"
-    );
+    (contended, elapsed)
+}
+
+/// D-18: a hook firing during a backfill costs the hook nothing.
+///
+/// The same property `tests/lock_race.rs` asserts for two ingests, against the
+/// process the user actually has running for minutes.
+#[test]
+fn an_ingest_during_a_backfill_loses_the_race_and_exits_zero() {
+    let dirs = Dirs::new();
+    let sessions = build_tree(&dirs.claude);
+
+    let (contended, _) = race_a_backfill(&dirs);
     assert!(
         contended.stdout.is_empty(),
         "the contended ingest wrote to stdout: {:?}",
@@ -302,6 +330,21 @@ fn an_ingest_during_a_backfill_loses_the_race_and_exits_at_once() {
     );
 
     // And the backfill it lost to still finishes.
+    dirs.wait_for_sessions(sessions);
+}
+
+/// ING-02's 50 ms, for an ingest that lost to a backfill.
+#[test]
+fn an_ingest_during_a_backfill_exits_inside_the_budget() {
+    let dirs = Dirs::new();
+    let sessions = build_tree(&dirs.claude);
+
+    let (_, elapsed) = race_a_backfill(&dirs);
+    assert!(
+        elapsed < CONTENDED_BUDGET,
+        "the contended ingest took {elapsed:?}, over the {CONTENDED_BUDGET:?} budget"
+    );
+
     dirs.wait_for_sessions(sessions);
 }
 
