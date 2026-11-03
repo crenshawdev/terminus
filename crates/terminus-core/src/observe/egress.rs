@@ -44,8 +44,8 @@
 //!    Marker: [`REDACTED`].
 //! 4. **JSON string pairs** whose name matches [`SECRET_NAMES`].
 //!    Marker: [`REDACTED`].
-//! 5. **Assignment-shaped text** - `NAME=value` whose name matches
-//!    [`SECRET_NAMES`]. Marker: [`REDACTED`].
+//! 5. **Assignment-shaped text** - `NAME=value` or `name = value` whose name
+//!    matches [`SECRET_NAMES`]. Marker: [`REDACTED`].
 //! 6. **Space-separated secret flags** - `--name value`, quoted or bare, which
 //!    rule 5 cannot see because it scans for `=`.
 //!    Marker: [`REDACTED_FLAG_VALUE`].
@@ -634,20 +634,37 @@ fn skip_blanks(bytes: &[u8], from: usize) -> usize {
 
 /// The end of an unquoted value run starting at `from`.
 ///
-/// It stops at whitespace, at a quote and at a backslash for rule 5's reason:
-/// this filter runs over text that may sit INSIDE a JSON string, where the byte
+/// It stops at whitespace, at a quote and at a backslash because this filter
+/// runs over text that may sit INSIDE a JSON string, where the byte
 /// after the value is the string's closing quote, and running past it would
 /// hand the endpoint a document that is not JSON.
+///
+/// A backslash in front of a byte that cannot follow one in JSON is part of the
+/// value, as in a shell's `\!` or `\$`, so the run goes on past both (#131).
+/// Valid JSON never holds that pair, so the stop still holds inside a JSON
+/// string.
 fn value_run_end(bytes: &[u8], from: usize) -> usize {
     let mut at = from;
     while at < bytes.len() {
         let b = bytes[at];
+        if b == b'\\' && bytes.get(at + 1).is_some_and(|&next| !stops_after_backslash(next)) {
+            at += 2;
+            continue;
+        }
         if b.is_ascii_whitespace() || b == b'"' || b == b'\'' || b == b'\\' {
             break;
         }
         at += 1;
     }
     at
+}
+
+/// Does a backslash in front of this byte end an unquoted value?
+///
+/// Yes for every byte a JSON escape can open with, and for whitespace, so a
+/// trailing `\` never carries the value onto the next line.
+fn stops_after_backslash(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' | b'u')
 }
 
 /// Is this word an auth scheme, and therefore part of the value that follows?
@@ -723,11 +740,19 @@ fn quoted_end(bytes: &[u8], open: usize) -> Option<usize> {
     None
 }
 
-/// Rule 5: `NAME=value` where the name is a secret name.
+/// Rule 5: `NAME=value` where the name is a secret name, with or without
+/// blanks around the `=`.
 ///
-/// The value runs to the closing quote when it is quoted and to the next
-/// whitespace when it is not - which is how a shell export, a `.env` line and a
-/// process command line all spell it.
+/// A shell export, a `.env` line and a process command line spell it
+/// `NAME=value`. An INI, TOML, HCL or Python file and `~/.aws/credentials`
+/// spell it `name = value`, and a rule that read only the first spelling let
+/// all of those through whole (#131).
+///
+/// The value is read with [`flag_value_span`], the way rules 3 and 6 read
+/// theirs, so a quoted value ends at its real closing quote rather than at an
+/// escaped one inside it, and its quotes stay. A `=` or `>` right after the `=`
+/// belongs to the operator, so `key == "v"` and `key => "v"` lose `v` rather
+/// than the operator's second byte.
 ///
 /// The name is read back from the `=` a byte at a time, over ASCII bytes only,
 /// the way rule 3 reads a header name. It used to be found with `rfind` over
@@ -746,36 +771,26 @@ fn redact_assignments(text: &str) -> String {
             at += 1;
             continue;
         }
-        let mut name_start = at;
+        let mut name_end = at;
+        while name_end > copied && matches!(bytes[name_end - 1], b' ' | b'\t') {
+            name_end -= 1;
+        }
+        let mut name_start = name_end;
         while name_start > copied && is_flag_name_byte(bytes[name_start - 1]) {
             name_start -= 1;
         }
-        if name_start == at || !is_secret_name(&text[name_start..at]) {
+        if name_start == name_end || !is_secret_name(&text[name_start..name_end]) {
             at += 1;
             continue;
         }
-        let value_start = at + 1;
-        let value_end = match bytes.get(value_start) {
-            Some(&quote @ (b'"' | b'\'')) => {
-                match text[value_start + 1..].find(quote as char) {
-                    Some(offset) => value_start + 1 + offset + 1,
-                    // Unterminated: to the end, because half a quoted secret is
-                    // still a secret.
-                    None => bytes.len(),
-                }
-            }
-            // Whitespace ends an unquoted value, and so does a quote or a
-            // backslash. That second half is load-bearing rather than tidy:
-            // this filter MAY be handed text that sits inside a JSON string,
-            // where the character after the value is the string's closing
-            // quote. Running to the next space there would swallow the quote
-            // and the comma after it and hand the endpoint a document that is
-            // not JSON.
-            _ => text[value_start..]
-                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '\\')
-                .map(|offset| value_start + offset)
-                .unwrap_or(bytes.len()),
-        };
+        let mut value_from = at + 1;
+        while bytes.get(value_from) == Some(&b'=') {
+            value_from += 1;
+        }
+        if bytes.get(value_from) == Some(&b'>') {
+            value_from += 1;
+        }
+        let (value_start, value_end) = flag_value_span(bytes, skip_blanks(bytes, value_from));
         if value_end == value_start {
             at += 1;
             continue;
@@ -794,9 +809,10 @@ fn redact_assignments(text: &str) -> String {
 /// Rule 5 scans for `=` and its name run admits `-`, so `--token=x` is already
 /// its case; the space-separated spelling is not, and it was measured 5 times
 /// over the 60 most recent real transcripts, 21 MB. An unquoted value stops at
-/// the same quote and backslash bytes rule 5 stops at, for the reason stated
-/// there: this text may sit inside a JSON string, and running to the next space
-/// would swallow the string's closing quote and the comma after it. A QUOTED
+/// the same quote and backslash bytes rule 5 stops at, for the reason
+/// [`value_run_end`] gives: this text may sit inside a JSON string, and running
+/// to the next space would swallow the string's closing quote and the comma
+/// after it. A QUOTED
 /// value is [`flag_value_span`]'s case, because those same stop bytes are what
 /// made `--token "x"` read as an empty value and pass through untouched.
 fn redact_flag_values(text: &str) -> String {
@@ -1558,5 +1574,94 @@ mod tests {
             "the key survived: {assignment}"
         );
         assert_eq!(for_model_context(&assignment), assignment);
+    }
+
+    /// An INI, TOML, HCL or Python file and `~/.aws/credentials` put blanks
+    /// around the `=`, and rule 5 read only a name that touched it (#131).
+    #[test]
+    fn a_spaced_assignment_loses_its_value() {
+        for (line, want) in [
+            (
+                "aws_secret_access_key = PLANTED-131-aws",
+                "aws_secret_access_key = [redacted]",
+            ),
+            (
+                "aws_secret_access_key\t=\tPLANTED-131-tab",
+                "aws_secret_access_key\t=\t[redacted]",
+            ),
+            (
+                "SECRET_KEY = 'PLANTED-131-django'",
+                "SECRET_KEY = '[redacted]'",
+            ),
+            (
+                "password = \"PLANTED-131-toml\"",
+                "password = \"[redacted]\"",
+            ),
+            (
+                "[default]\naws_secret_access_key = PLANTED-131-ini\nregion = us-east-1",
+                "[default]\naws_secret_access_key = [redacted]\nregion = us-east-1",
+            ),
+            // The operator's second byte stays and the value after it goes.
+            (
+                "if api_key == \"PLANTED-131-cmp\":",
+                "if api_key == \"[redacted]\":",
+            ),
+            (
+                "password => 'PLANTED-131-arrow',",
+                "password => '[redacted]',",
+            ),
+        ] {
+            let scrubbed = for_model_context(line);
+            assert_eq!(scrubbed, want, "from {line:?}");
+            assert_eq!(for_model_context(&scrubbed), scrubbed);
+        }
+    }
+
+    /// A quote the value escapes is not its end, and a backslash the value
+    /// opens with is part of it. Both left the secret, or its tail, on the
+    /// wire (#131).
+    #[test]
+    fn an_escaped_quote_or_a_shell_backslash_keeps_the_whole_value() {
+        for (line, want) in [
+            (
+                r#"PASSWORD="ab\"PLANTED-131-esc" then"#,
+                r#"PASSWORD="[redacted]" then"#,
+            ),
+            (
+                r"--password=\!PLANTED-131-bang then",
+                "--password=[redacted] then",
+            ),
+            (r"TOKEN=ab\$PLANTED-131-dollar then", "TOKEN=[redacted] then"),
+        ] {
+            let scrubbed = for_model_context(line);
+            assert_eq!(scrubbed, want, "from {line:?}");
+            assert_eq!(for_model_context(&scrubbed), scrubbed);
+        }
+    }
+
+    /// Inside an archived JSON line the spaced form and the shell backslash
+    /// still go, and the line still parses.
+    #[test]
+    fn a_json_line_loses_a_spaced_assignment_and_stays_json() {
+        let line = r#"{"content":"aws_secret_access_key = PLANTED-131-json\nexport TOKEN=\\!PLANTED-131-sh ok"}"#;
+
+        let scrubbed = Redaction { on: true }.apply_json_line(line);
+
+        assert!(!scrubbed.contains("PLANTED-131"), "survived: {scrubbed}");
+        serde_json::from_str::<serde_json::Value>(&scrubbed)
+            .unwrap_or_else(|e| panic!("no longer JSON ({e}): {scrubbed}"));
+    }
+
+    /// Blanks around an `=` do not make a name secret, and an operator whose
+    /// `=` follows something other than a name is not an assignment.
+    #[test]
+    fn a_spaced_assignment_or_comparison_that_names_no_secret_comes_back_unchanged() {
+        for plain in [
+            "region = us-east-1",
+            "count = 3 and total == 4",
+            "if key >= 5 or key <= 2 or key != 3 or key += 1",
+        ] {
+            assert_eq!(for_model_context(plain), plain, "changed: {plain}");
+        }
     }
 }
