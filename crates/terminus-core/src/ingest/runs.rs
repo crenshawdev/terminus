@@ -87,6 +87,7 @@ pub(crate) fn insert(
     errors.extend(summary.retention.errors());
     errors.extend(fatal);
     let mut notes = summary.recovery.lines();
+    notes.extend(summary.feedback.notes());
     notes.extend(summary.outcomes.notes());
     notes.extend(summary.observations.notes());
     notes.extend(summary.retention.notes());

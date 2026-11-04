@@ -204,16 +204,21 @@ pub struct Fired {
 /// hook then writes nothing at all and exits 0, which is what every prompt that
 /// names something the archive has not seen gets.
 ///
-/// **Every call leaves a decision record.** Including the ones
-/// that inject nothing, and including the ones that return before the store is
-/// opened at all: non-fires are where the miss data lives, and a precision
-/// computed only over the prompts that fired has no denominator. The record is
+/// **Every call leaves a decision record, unless the project is excluded.**
+/// Including the ones that inject nothing, and including the ones that return
+/// before the store is opened at all: non-fires are where the miss data lives,
+/// and a precision computed only over the prompts that fired has no
+/// denominator. A record holds the whole prompt, so an excluded project gets
+/// none: exclusion means never read, and that covers the prompt too. The record is
 /// completed HERE rather than inside [`selected`] because what one injection
 /// cost is known only after [`render`] has clipped it, and it is written after
 /// the state save, on the same thread the hook abandons - a write that fails
 /// changes nothing about what is emitted. [`selected`] renders too, because
 /// what the state remembers as injected is what the render showed.
 pub fn user_prompt_submit(data_dir: &Path, config: &Config, payload: &Payload) -> Option<String> {
+    if excluded(config, payload) {
+        return None;
+    }
     let mut decision = Decision::opened(
         payload.session_id,
         payload.cwd,
@@ -229,6 +234,37 @@ pub fn user_prompt_submit(data_dir: &Path, config: &Config, payload: &Payload) -
 
     decision.save(data_dir);
     text
+}
+
+/// Is this prompt in a project the config excludes?
+///
+/// Both coordinates, because they can disagree. The payload's `cwd` follows
+/// Claude through a `cd`, while the transcript stays in the project directory
+/// the session started in, which is what ingest goes by. So a session that
+/// started in an excluded project and moved out of it still counts.
+///
+/// The transcript's folder is what gets resolved, because a session's first
+/// prompt can arrive before its transcript exists. A folder that does not exist
+/// yet says nothing, and `cwd` has already answered for that session.
+fn excluded(config: &Config, payload: &Payload) -> bool {
+    if config.exclusions().is_empty() {
+        return false;
+    }
+    if payload
+        .cwd
+        .is_some_and(|cwd| config.excludes_path(Path::new(cwd)))
+    {
+        return true;
+    }
+    let Some(transcript) = payload.transcript_path.map(Path::new) else {
+        return false;
+    };
+    let (Some(folder), Some(name)) = (transcript.parent(), transcript.file_name()) else {
+        return false;
+    };
+    folder.canonicalize().is_ok_and(|folder| {
+        crate::discover::excluded_project_of(config, &folder.join(name)).is_some()
+    })
 }
 
 /// The character budget one injection actually gets: what `terminus.toml`

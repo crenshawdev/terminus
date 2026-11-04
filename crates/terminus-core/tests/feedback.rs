@@ -174,9 +174,14 @@ impl Bench {
     /// nothing to do and every row this pass writes came out of the decision
     /// log - which is what the assertions are about.
     fn pass(&self) -> Summary {
+        self.pass_excluding(Vec::new())
+    }
+
+    /// The same pass, under these exclusions.
+    fn pass_excluding(&self, exclusions: Vec<String>) -> Summary {
         let claude = self._dir.path().join("claude");
         std::fs::create_dir_all(claude.join("projects")).unwrap();
-        let config = Config::from_parts(vec![claude], Vec::new());
+        let config = Config::from_parts(vec![claude], exclusions);
         match pass::run_with(&self.data_dir, &config).unwrap() {
             PassOutcome::Ran(summary) => summary,
             PassOutcome::LockHeld => panic!("nothing else holds the lock"),
@@ -228,6 +233,82 @@ impl Bench {
             other => panic!("{name}: {other:?}"),
         }
     }
+}
+
+/// A record holds the whole prompt, so an excluded project gets none, whether
+/// the session is still in it or has moved out of it with a `cd`.
+#[test]
+fn a_prompt_in_an_excluded_project_leaves_no_record() {
+    let bench = bench();
+    let project = bench.root.join("client-work");
+    let excluded = project.to_string_lossy().into_owned();
+    let config = Config::from_parts(Vec::new(), vec![excluded.clone()]);
+
+    let inside = project.join("sub");
+    let in_the_project = Payload {
+        session_id: Some(SESSION),
+        transcript_path: None,
+        cwd: inside.to_str(),
+        prompt: Some("a private prompt"),
+        source: None,
+    };
+    assert_eq!(
+        prompt::user_prompt_submit(&bench.data_dir, &config, &in_the_project),
+        None
+    );
+
+    let folder = bench.work.join(terminus_core::config::encode(&excluded));
+    std::fs::create_dir_all(&folder).unwrap();
+    let transcript = folder.join(format!("{SESSION}.jsonl"));
+    let moved_out = Payload {
+        transcript_path: transcript.to_str(),
+        cwd: Some("/elsewhere"),
+        ..in_the_project
+    };
+    assert_eq!(
+        prompt::user_prompt_submit(&bench.data_dir, &config, &moved_out),
+        None
+    );
+
+    assert!(bench.files().is_empty(), "{:?}", bench.files());
+}
+
+/// A record queued before its project was excluded is removed without becoming
+/// a row, and the pass says so. A row already in the store stays, and so does a
+/// record from any other project.
+#[test]
+fn a_record_queued_before_its_project_was_excluded_never_becomes_a_row() {
+    let bench = bench();
+    let cwd = bench.project();
+    bench.submit(&cwd, "logged before the exclusion");
+    assert_eq!(bench.pass().feedback.decisions, 1);
+
+    bench.submit(&cwd, "queued before the exclusion");
+    bench.submit("/elsewhere", "from another project");
+    let summary = bench.pass_excluding(vec![cwd]);
+    assert_eq!(summary.feedback.decisions, 1, "{summary:?}");
+    assert_eq!(summary.feedback.excluded, 1, "{summary:?}");
+    assert!(summary.feedback.discarded.is_empty(), "{summary:?}");
+    assert!(bench.files().is_empty(), "{:?}", bench.files());
+
+    let conn = bench.conn();
+    let prompts: Vec<String> = conn
+        .prepare("SELECT prompt FROM decisions ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        prompts,
+        ["logged before the exclusion", "from another project"]
+    );
+    let notes: String = conn
+        .query_row("SELECT notes FROM runs ORDER BY id DESC LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(notes.contains("1 queued prompt record(s)"), "{notes}");
 }
 
 /// A prompt that injected something says what it injected, what the

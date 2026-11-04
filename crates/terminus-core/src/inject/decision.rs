@@ -18,7 +18,8 @@
 //! store at all, and it still leaves a record: non-fires are where the miss data
 //! lives, and precision computed only over the prompts that fired has no
 //! denominator. Measured growth is bounded - median 2 user prompts per session,
-//! p90 10, max 50 over 150 sampled transcripts.
+//! p90 10, max 50 over 150 sampled transcripts. The one exception is a prompt in
+//! an excluded project, which writes nothing, because a record holds the prompt.
 //!
 //! **Not [`super::state`].** That file is one session's disposable scratch,
 //! capped, overwritten every prompt and thrown away; this one is durable, one

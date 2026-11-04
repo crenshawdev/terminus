@@ -29,6 +29,7 @@ use std::time::{Duration, SystemTime};
 
 use rusqlite::Connection;
 
+use crate::config::Config;
 use crate::error::Result;
 use crate::inject::decision::{self, Decision};
 use crate::inject::state;
@@ -49,6 +50,9 @@ const ABANDONED_AFTER: Duration = Duration::from_secs(10 * 60);
 pub struct Drained {
     /// Records that became rows.
     pub decisions: usize,
+    /// Records removed without becoming rows, because their project is excluded
+    /// now. They were queued before the exclusion was set.
+    pub excluded: usize,
     /// Files that were removed without becoming rows, and why. There is no log
     /// file, so these travel into `runs.error` with the pass's other notes.
     pub discarded: Vec<(PathBuf, String)>,
@@ -62,6 +66,18 @@ impl Drained {
             .iter()
             .map(|(path, reason)| crate::ingest::pass::note(path, reason))
             .collect()
+    }
+
+    /// What this drain removed on purpose, for `runs.notes`. A record holds a
+    /// whole prompt, so removing one is worth saying even though it is correct.
+    pub fn notes(&self) -> Vec<String> {
+        if self.excluded == 0 {
+            return Vec::new();
+        }
+        vec![format!(
+            "removed {} queued prompt record(s) from excluded projects without logging them",
+            self.excluded
+        )]
     }
 }
 
@@ -153,9 +169,13 @@ pub fn outcomes(conn: &mut Connection) -> Labeled {
 /// empty one is no write still running, and is deleted and named like any other
 /// file that does not parse.
 ///
+/// A record whose `cwd` is excluded now is deleted and counted, and never
+/// becomes a row. The prompt arm no longer writes one, so this is a record
+/// queued before the exclusion was set.
+///
 /// Every drain first sweeps the writers' abandoned `.tmp` files (see
 /// [`sweep`]), including one that finds no record or whose insert fails.
-pub fn drain(conn: &mut Connection, data_dir: &Path) -> Result<Drained> {
+pub fn drain(conn: &mut Connection, data_dir: &Path, config: &Config) -> Result<Drained> {
     sweep(data_dir);
     let found: Vec<decision::Found> = decision::read_all(data_dir)
         .into_iter()
@@ -175,6 +195,7 @@ pub fn drain(conn: &mut Connection, data_dir: &Path) -> Result<Drained> {
     let tx = conn.transaction()?;
     for entry in &found {
         match &entry.decision {
+            Some(decision) if excluded(config, decision) => drained.excluded += 1,
             Some(decision) => {
                 insert(&tx, decision, watermark)?;
                 drained.decisions += 1;
@@ -197,6 +218,14 @@ pub fn drain(conn: &mut Connection, data_dir: &Path) -> Result<Drained> {
         }
     }
     Ok(drained)
+}
+
+/// Is this record's working directory inside an excluded project?
+fn excluded(config: &Config, decision: &Decision) -> bool {
+    decision
+        .cwd
+        .as_deref()
+        .is_some_and(|cwd| config.excludes_path(Path::new(cwd)))
 }
 
 /// Delete the writers' temporaries once they are older than
