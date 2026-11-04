@@ -90,7 +90,7 @@ No value is ever rejected for being common, because what counts as common change
 
 ## 5. Commands and operations
 
-Options are in [commands.md](../commands.md#reading-the-archive), and the `--json` fields and exit codes are in [json-shapes.md](../json-shapes.md#search). All three commands open the store through `cmd/read.rs`, read-only, and never create one.
+Options are in [the command reference](../guide/reference/commands.md#reading-the-archive), and the `--json` fields and exit codes are in [JSON output and exit codes](../guide/reference/json-shapes.md#search). All three commands open the store through `cmd/read.rs`, read-only, and never create one.
 
 ### Scope
 
@@ -170,8 +170,8 @@ flowchart TD
 
 | Key | What it changes here |
 |---|---|
-| [`exclude`](../configuration.md#exclude) | Projects no search, show or listing returns, under every scope, `*` included, and including sessions archived before the project was excluded. |
-| [`[privacy] redact_recall`](../configuration.md#privacy) | Whether excerpts and shown records are filtered on their way out. Off by default. `--raw` on `search` or `show` turns it off for that one run, and no setting or variable turns it off for the hooks or the MCP server. |
-| [`[capture] mode`](../configuration.md#capture) | Under `lean` or `minimal`, text that was only in elided tool output is not in the body and is not found. |
+| [`exclude`](../guide/configuration/archiving.md#exclude) | Projects no search, show or listing returns, under every scope, `*` included, and including sessions archived before the project was excluded. |
+| [`[privacy] redact_recall`](../guide/configuration/recall.md#privacy) | Whether excerpts and shown records are filtered on their way out. Off by default. `--raw` on `search` or `show` turns it off for that one run, and no setting or variable turns it off for the hooks or the MCP server. |
+| [`[capture] mode`](../guide/configuration/archiving.md#capture) | Under `lean` or `minimal`, text that was only in elided tool output is not in the body and is not found. |
 
 The query limits, `MAX_QUERY_TOKENS`, `MAX_RESULTS`, the candidate pool and the entity weights, are constants, and no key changes them.

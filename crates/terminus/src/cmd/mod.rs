@@ -28,7 +28,7 @@
 //! that checks the code never disagree - `verify --json` on a damaged store
 //! writes its failures AND exits 1.
 //!
-//! The shapes are documented field for field in `docs/json-shapes.md` and
+//! The shapes are documented field for field in `docs/guide/reference/json-shapes.md` and
 //! `crates/terminus/tests/cli.rs` holds every command to them: one test per
 //! property across all commands, rather than one test per command, so a seventh
 //! command is one line rather than a new file.

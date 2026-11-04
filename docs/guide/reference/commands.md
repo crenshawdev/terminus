@@ -1,6 +1,6 @@
 # Commands
 
-Every command is `terminus <command>`. This page lists each one from the usage text the binary prints, with every argument and option it accepts. The `--json` document each data command writes, and the exit codes every command uses, are in [json-shapes.md](json-shapes.md).
+Every command is `terminus <command>`. This page lists each one from the usage text the binary prints, with every argument and option it accepts. The `--json` document each data command writes, and the exit codes every command uses, are in [JSON output and exit codes](json-shapes.md).
 
 Two commands, `hook` and `mcp`, are run by Claude Code and never typed. They are at the [end of this page](#run-by-claude-code).
 
@@ -15,12 +15,12 @@ Both options go before the command name. After it, they are an option that comma
 
 ### `terminus ingest`
 
-Archives every transcript under the configured [`roots`](configuration.md#roots), skipping every project in [`exclude`](configuration.md#exclude) before any of its files is opened. Each file is read from where the last pass stopped, so a pass reads only what is new. When the files are done, the same pass:
+Archives every transcript under the configured [`roots`](../configuration/archiving.md#roots), skipping every project in [`exclude`](../configuration/archiving.md#exclude) before any of its files is opened. Each file is read from where the last pass stopped, so a pass reads only what is new. When the files are done, the same pass:
 
 1. Closes every session whose last turn is more than 6 hours old, and labels that session's injections for `terminus stats`.
 2. Records the observations for the sessions it just closed.
-3. Applies the [`[retention]`](configuration.md#retention) rule.
-4. Takes a [snapshot](configuration.md#snapshot) when one is due.
+3. Applies the [`[retention]`](../configuration/retention.md#retention) rule.
+4. Takes a [snapshot](../configuration/retention.md#snapshot) when one is due.
 
 One pass runs at a time. When another Terminus process holds the ingest lock, `ingest` exits 0 having done nothing, because that pass reads the same files. A transcript that cannot be read is named on stderr, the rest are still archived, and the command exits 0. A pass that cannot run at all exits 1.
 
@@ -58,7 +58,7 @@ An excluded project is never shown, with `*` too, including sessions archived be
 
 ### `terminus search <words>`
 
-Finds past turns by text, a path, an error line or an identifier. The index holds what each turn said, up to 256 KiB of text per turn: prompts and replies, tool names and the text in tool inputs, tool results, and attachments. It leaves out text past that limit, thinking blocks, JSON keys, numbers, and records that are not turns. `terminus show` and `recall_get` read those from the archive, and search does not find them. Every word after `search` that is not an option is part of the query, so the words need no quotes, and a turn must match all of them. A word made only of letters the search index makes no token from, such as circled letters, is dropped and takes no place in the count. Only the first 32 distinct terms are used, and stderr says so when a query is cut. A query with nothing left to search, such as `///`, finds no turns, says so, and exits 0.
+Finds past turns by text, a path, an error line or an identifier. The index holds what each turn said, up to 256 KiB of text per turn: prompts and replies, tool names and the text in tool inputs, tool results, and attachments. It leaves out text past that limit, thinking blocks, JSON keys, JSON number and boolean values, and records that are not turns. `terminus show` and `recall_get` read those from the archive, and search does not find them. Every word after `search` that is not an option is part of the query, so the words need no quotes, and a turn must match all of them. A word made only of letters the search index makes no token from, such as circled letters, is dropped and takes no place in the count. Only the first 32 distinct terms are used, and stderr says so when a query is cut. A query with nothing left to search, such as `///`, finds no turns, says so, and exits 0.
 
 Each hit is two lines: the turn id, the day, the transcript's file name, the project, and `(subagent)` for a subagent's turn, then an excerpt around the match. The count of hits goes to stderr. The turn id is what `terminus show` takes. As in every command's human output, a control character in archived text other than tab and newline prints as a `\u00XX` escape, such as `\u001b` for ESC, with or without `--raw`.
 
@@ -68,7 +68,7 @@ Each hit is two lines: the turn id, the day, the transcript's file name, the pro
 - `--path <path>`: only turns whose tool call or tool result names this path in a structured field, such as a `Read`'s `file_path`. The match is exact, not a prefix, and a turn that only mentions the path in text does not match. Repeat it to match any of several paths.
 - `--since <time>`, `--until <time>`: only turns inside these [bounds](#time-bounds).
 - `--limit <n>`: how many hits, default 10. A number above 50 is treated as 50, and 0 exits 2.
-- `--raw`: with [`[privacy] redact_recall`](configuration.md#privacy) on, prints the excerpts unfiltered for this run only.
+- `--raw`: with [`[privacy] redact_recall`](../configuration/recall.md#privacy) on, prints the excerpts unfiltered for this run only.
 - `--json`
 
 ### `terminus show <id>...`
@@ -77,7 +77,7 @@ Prints the archived record behind each turn id, byte for byte as it was archived
 
 - `--project <path>`: which project the ids are looked up in, as [above](#which-project-a-read-command-sees). An id from another project needs that project or `*`.
 - `--before <n>`, `--after <n>`: also prints up to this many turns before and after each record, from the same session, at most 25 each. A larger number is treated as 25. The window stops at the session's first and last turn and says which end it reached. When the session continues from another, a line after the window names that session's id.
-- `--raw`: with [`[privacy] redact_recall`](configuration.md#privacy) on, prints the records unfiltered for this run only.
+- `--raw`: with [`[privacy] redact_recall`](../configuration/recall.md#privacy) on, prints the records unfiltered for this run only.
 - `--json`
 
 ### `terminus sessions`
@@ -151,7 +151,7 @@ The export is not filtered. `[privacy] redact_recall` applies to text on its way
 
 ### `terminus data move <path>`
 
-Moves the whole data directory to `<path>` and records the new location in the config directory ([the data directory](configuration.md#the-data-directory)). It prints where the data is now, where it is going and its size, warns that the store is not safe on a network filesystem, and asks once. The default answer is no.
+Moves the whole data directory to `<path>` and records the new location in the config directory ([the data directory](../configuration/paths.md#the-data-directory)). It prints where the data is now, where it is going and its size, warns that the store is not safe on a network filesystem, and asks once. The default answer is no.
 
 Trailing slashes and `.` parts are dropped from `<path>` before it is checked, and the location is recorded without them. It refuses a `<path>` that is the data directory itself or is inside it. A `<path>` that does not exist is created 0700. One that exists has to be an empty directory owned by the user running the command, with no group or world permission bits. It refuses a symlink, with or without a trailing slash, a file, a directory another user owns, a directory with any group or world bit, a directory it cannot list, and a directory that already holds files. A directory made with `mkdir` under the usual umask 022 is 0755, so it is refused until `chmod 700 <path>` narrows it, and the refusal prints that command. Terminus does not change the mode of a directory it did not create. After the answer, and under the ingest lock, it checks `<path>` again and refuses if it was created, removed, replaced or changed while the question waited. It copies under the ingest lock, and refuses while another process holds that lock, then records the new location, then deletes the old directory. A copy that fails deletes nothing, and the old location stays recorded. Nothing in Claude Code's settings changes, because the hook and MCP entries never name the data directory. `TERMINUS_DATA_DIR`, when set, still outranks the recorded location.
 
@@ -161,7 +161,7 @@ Trailing slashes and `.` parts are dropped from `<path>` before it is checked, a
 
 ### `terminus stats`
 
-Reports whether the text Terminus hands Claude Code on each prompt is helping: how many prompts were logged, how many turns were injected, the hits and false positives among them, the precision, the misses, the wasted budget, and the characters injected and the part of them the hits carried. The prompt count is split into compacted decisions, taken on the one prompt after a compaction, and ordinary ones, and a prompt logged by a build that did not record which it was is in neither. The counts are characters, not tokens. An injection is labelled only once its session is closed. A prompt in an [excluded](configuration.md#exclude) project is not logged. One logged before its project was excluded stays in these counts. What each number means is in [json-shapes.md](json-shapes.md#stats).
+Reports whether the text Terminus hands Claude Code on each prompt is helping: how many prompts were logged, how many turns were injected, the hits and false positives among them, the precision, the misses, the wasted budget, and the characters injected and the part of them the hits carried. The prompt count is split into compacted decisions, taken on the one prompt after a compaction, and ordinary ones, and a prompt logged by a build that did not record which it was is in neither. The counts are characters, not tokens. An injection is labelled only once its session is closed. A prompt in an [excluded](../configuration/archiving.md#exclude) project is not logged. One logged before its project was excluded stays in these counts. What each number means is in [JSON output](json-shapes.md#stats).
 
 - `--json`
 
@@ -183,7 +183,7 @@ Each option takes a whole number and defaults to the value Terminus injects with
 
 ### `terminus retention --dry-run`
 
-Prints what the next ingest pass would evict and what it would delete under the current [`[retention]`](configuration.md#retention) rule, and the time it measured every age from. Sessions over the per-pass limit, and sessions in excluded projects it passed over, are counted on stderr.
+Prints what the next ingest pass would evict and what it would delete under the current [`[retention]`](../configuration/retention.md#retention) rule, and the time it measured every age from. Sessions over the per-pass limit, and sessions in excluded projects it passed over, are counted on stderr.
 
 It changes nothing. Retention acts only inside the ingest pass, and this command only reports, so `--dry-run` is accepted and changes nothing. `terminus retention` without it prints the same report.
 
@@ -192,11 +192,11 @@ It changes nothing. Retention acts only inside the ingest pass, and this command
 
 ## Setup
 
-`~/.local/bin/terminus` below is the path when `TERMINUS_BIN_DIR` is unset. With it set, `doctor`, `install` and `uninstall` use `$TERMINUS_BIN_DIR/terminus` instead ([environment variables](configuration.md#environment-variables)).
+`~/.local/bin/terminus` below is the path when `TERMINUS_BIN_DIR` is unset. With it set, `doctor`, `install` and `uninstall` use `$TERMINUS_BIN_DIR/terminus` instead ([environment variables](../configuration/paths.md#environment-variables)).
 
 ### `terminus doctor`
 
-Reports what is wired into Claude Code and what is not. It checks the binary at `~/.local/bin/terminus` and its version, Claude Code's `settings.json`, each of the four hook entries, the MCP entry, the `claude` command, the transcript roots, the data directory, the store, the last ingest run, and the two Claude Code settings Terminus [reports and never changes](configuration.md#claude-code-settings-terminus-reports). Each check is `ok`, `note`, `unknown` or `problem`, and where there is something to run, it carries the command that fixes it. The last ingest run is a `problem` when it failed a file or recorded an error, including `terminus ingest <path.jsonl>` on a damaged file, and it stays one until a later run records no failure.
+Reports what is wired into Claude Code and what is not. It checks the binary at `~/.local/bin/terminus` and its version, Claude Code's `settings.json`, each of the four hook entries, the MCP entry, the `claude` command, the transcript roots, the data directory, the store, the last ingest run, and the two Claude Code settings Terminus [reports and never changes](../configuration/paths.md#claude-code-settings-terminus-reports). Each check is `ok`, `note`, `unknown` or `problem`, and where there is something to run, it carries the command that fixes it. The last ingest run is a `problem` when it failed a file or recorded an error, including `terminus ingest <path.jsonl>` on a damaged file, and it stays one until a later run records no failure.
 
 It writes nothing and repairs nothing. It reads `settings.json` only for the keys it checks and never prints the file. It exits 1 only when a check is a `problem`.
 
@@ -206,7 +206,7 @@ It writes nothing and repairs nothing. It reads `settings.json` only for the key
 
 Wires Terminus into Claude Code. It stores the running binary as `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus` and points the link at `~/.local/bin/terminus` to it, adds the four hook entries to Claude Code's `settings.json`, registers the MCP server through `claude mcp`, prints a receipt of every file it touched, and starts a backfill. `install.sh` runs it, and `target/release/terminus install` installs a local build the same way.
 
-An MCP entry already current runs no `claude`. A missing entry is added with `claude mcp add-json`, and an entry in any other shape is removed with `claude mcp remove` first ([when `claude` runs](install.md#when-claude-runs-and-when-install-exits-1)).
+An MCP entry already current runs no `claude`. A missing entry is added with `claude mcp add-json`, and an entry in any other shape is removed with `claude mcp remove` first ([when `claude` runs](../getting-started/install.md#when-claude-runs-and-when-install-exits-1)).
 
 Before it writes anything, it refuses when a file it did not put there sits at `~/.local/bin/terminus`. The first time it changes `settings.json` it keeps a copy of the file, and a later install never replaces that copy. It writes nothing to a file that is already current, so running it again is safe. It exits 1 when the MCP server could not be registered, after doing the rest and printing the command that finishes it, and when the store is in an older archive format than this build reads.
 
@@ -231,7 +231,7 @@ It keeps the versions folder, because a session already running may be using one
 - On `UserPromptSubmit` it may hand Claude Code up to three earlier turns that match what the prompt names.
 - On `SessionEnd` and `PostCompact` it hands over nothing.
 
-How much text each may carry is set by [`[injection]`](configuration.md#injection), and [`[privacy] redact_recall`](configuration.md#privacy) filters it. The injection has 50 ms. Past that, the hook hands over nothing for that event. It reads at most 1 MiB of stdin and waits at most 500 ms for it.
+How much text each may carry is set by [`[injection]`](../configuration/recall.md#injection), and [`[privacy] redact_recall`](../configuration/recall.md#privacy) filters it. The injection has 50 ms. Past that, the hook hands over nothing for that event. It reads at most 1 MiB of stdin and waits at most 500 ms for it.
 
 Once the event name is known it exits 0, whatever happens after, so it can never block a prompt. Anything that goes wrong is one line on stderr. A missing or unknown event exits 2.
 
@@ -245,10 +245,10 @@ It serves three tools. All three are read-only, answer about the session's proje
 - `recall_context`: the turns before and after one turn id, default 5 each side and at most 25, stopping at the session's ends.
 - `recall_get`: the full archived text of up to 25 turn ids.
 
-With [`[privacy] redact_recall`](configuration.md#privacy) on, every result is filtered. There is no unfiltered form, because the results go to Claude Code's model.
+With [`[privacy] redact_recall`](../configuration/recall.md#privacy) on, every result is filtered. There is no unfiltered form, because the results go to Claude Code's model.
 
 ## `--json`
 
-These commands accept `--json`: `search`, `show`, `sessions`, `observations`, `observations regenerate`, `verify`, `reindex`, `status`, `compact`, `usage`, `export`, `stats`, `replay`, `retention` and `doctor`. Each then writes one JSON document on stdout, described in [json-shapes.md](json-shapes.md).
+These commands accept `--json`: `search`, `show`, `sessions`, `observations`, `observations regenerate`, `verify`, `reindex`, `status`, `compact`, `usage`, `export`, `stats`, `replay`, `retention` and `doctor`. Each then writes one JSON document on stdout, described in [JSON output and exit codes](json-shapes.md).
 
 `ingest`, `backfill`, `install`, `uninstall` and `data move` print for a person, and `--json` exits 2. `hook` and `mcp` speak Claude Code's own formats.

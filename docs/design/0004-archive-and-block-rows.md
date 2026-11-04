@@ -245,7 +245,7 @@ An append, which is how every pass after a session's first adds to it, rewrites 
 
 ## 5. Commands and operations
 
-Options are in [commands.md](../commands.md#the-store), and the `--json` fields and exit codes are in [json-shapes.md](../json-shapes.md).
+Options are in [the command reference](../guide/reference/commands.md#the-store), and the `--json` fields and exit codes are in [JSON output and exit codes](../guide/reference/json-shapes.md).
 
 ### Opening the store
 
@@ -463,13 +463,13 @@ flowchart TD
 
 ## 7. Settings
 
-The archive reads no key in `terminus.toml` of its own. Where it lives is decided outside the file, as [configuration.md](../configuration.md#the-data-directory) gives in full:
+The archive reads no key in `terminus.toml` of its own. Where it lives is decided outside the file, as [the settings reference](../guide/configuration/paths.md#the-data-directory) gives in full:
 
 | Setting | What it changes here |
 |---|---|
 | `TERMINUS_DATA_DIR` | When set and not empty, the data directory, ahead of everything else. |
 | The `data-location` pointer | A plain text file in the config directory holding one absolute path, written by `terminus data move` and by nothing else. A pointer that cannot be read, or names a relative path, is an error rather than a fall back to the default. |
 | `$XDG_DATA_HOME`, `$HOME` | The platform default: `$XDG_DATA_HOME/terminus` or `~/.local/share/terminus` on Linux, and `~/Library/Application Support/terminus` on macOS. |
-| [`exclude`](../configuration.md#exclude) | Which sessions `usage` and `export` leave out. The rows stay in the store. |
+| [`exclude`](../guide/configuration/archiving.md#exclude) | Which sessions `usage` and `export` leave out. The rows stay in the store. |
 
 The block size, the zstd level and the two format versions are constants, and no key or variable changes them.

@@ -309,8 +309,7 @@ and unchanged.
   are all still open has no precision, and zero would read as "injection never
   helps".
 - `misses` counts decisions where the model went to recall for something the
-  prompt had named and the injector declined to hand over. It reads zero on real
-  history today: no `recall_search` call exists in any measured transcript.
+  prompt had named and the injector declined to hand over.
 - `chars_injected` is what was spent; `chars_referenced` is the part of it
   carried by turns that turned out to be hits. **Characters, never tokens** -
   the same proxy the injection budget is spent in.
@@ -531,15 +530,13 @@ other's total is the mistake it exists to prevent.
 - The ARCHIVE table is `by_project` and `by_month`. The bytes in each add up to
   `archive_bytes`, which is the sum of each session's block byte lengths
   (`length(bytes)` over its `blocks` rows) over the sessions a read path may
-  see - and **not** to `file_bytes`. On the live store measured 2026-08-22 the
-  file is 1,103,396,864 bytes against 465,985,120 of archive, 2.4x everything
-  the projects account for; the rest is the derived tables, and attributing them
-  to projects pro-rata would make every per-project number an estimate rather
-  than a measurement.
+  see - and **not** to `file_bytes`. The file is larger because it also holds the
+  derived tables, and attributing them to projects pro-rata would make every
+  per-project number an estimate rather than a measurement.
 - A session with no `project` and a session with no `first_turn_at` each get a
   bucket whose key is `null`. They are counted and their bytes are inside the
-  totals: a null quietly dropped is a total that no longer reconciles, and the
-  live store has exactly one of each. Buckets are biggest first, with the `null`
+  totals: a null quietly dropped is a total that no longer reconciles. Buckets
+  are biggest first, with the `null`
   one last whatever its size.
 - A session is filed under one month, by `substr(first_turn_at, 1, 7)`.
   `first_turn_at` is established by byte order and never revised by a tail pass,

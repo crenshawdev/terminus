@@ -35,11 +35,11 @@ Code is named by its full path from the repository root and linked relative to t
 
 What the user docs already pin down is linked from here and not restated, so there is one place to change it:
 
-- every command and option, in [commands.md](../commands.md);
-- every key in `terminus.toml` and its default, in [configuration.md](../configuration.md);
-- the `--json` fields and the exit codes, in [json-shapes.md](../json-shapes.md);
-- what the installer and `terminus install` do, in [install.md](../install.md);
-- how a release is built, signed and checked, in [release.md](../release.md).
+- every command and option, in [the command reference](../guide/reference/commands.md);
+- every key in `terminus.toml` and its default, in [the settings reference](../guide/configuration/index.md);
+- the `--json` fields and the exit codes, in [JSON output and exit codes](../guide/reference/json-shapes.md);
+- what the installer and `terminus install` do, in [the install page](../guide/getting-started/install.md);
+- how a release is built, signed and checked, in [the release page](../guide/reference/release.md).
 
 ## Index
 

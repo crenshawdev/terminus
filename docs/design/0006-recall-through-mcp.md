@@ -62,7 +62,7 @@ The server owns no table and writes no file. Its records are what crosses betwee
 
 ## 5. Commands and operations
 
-`terminus mcp`'s place among the commands is in [commands.md](../commands.md#terminus-mcp). The field names the tools share with `terminus search --json` and `terminus show --json` are given in [json-shapes.md](../json-shapes.md#search), and each subsection below says which ones they are.
+`terminus mcp`'s place among the commands is in [the command reference](../guide/reference/commands.md#terminus-mcp). The field names the tools share with `terminus search --json` and `terminus show --json` are given in [JSON output and exit codes](../guide/reference/json-shapes.md#search), and each subsection below says which ones they are.
 
 ### `terminus mcp`
 
@@ -162,7 +162,7 @@ The search `terminus search` runs, with the same ranking, in [0005: Search](0005
 
   `reason` is null, or one string, the first that applies: why the scope or the query gave nothing, such as a query with no searchable words; that the limit was lowered to 50; or that only the first 32 tokens of the query were used.
 
-  Every key of a hit has the same name and meaning as in the hits `terminus search --json` prints, in [json-shapes.md](../json-shapes.md#search). The terminal's hits also carry `matched_on`, and its document carries `query` and `truncated`; the tool returns none of the three, and says what `truncated` would have said in `reason`.
+  Every key of a hit has the same name and meaning as in the hits `terminus search --json` prints, in [JSON output and exit codes](../guide/reference/json-shapes.md#search). The terminal's hits also carry `matched_on`, and its document carries `query` and `truncated`; the tool returns none of the three, and says what `truncated` would have said in `reason`.
 - **Refusals:** as in `tools/call`. The empty document is `{"hits":[],"reason":"..."}`.
 
 ### `recall_context`
@@ -195,7 +195,7 @@ The conversation around one turn, in the order it happened. It reads `recall::co
   | `continues_from` | The session this one continues from, or null. It is handed back and not followed, because a session can be continued by many others, and a walk across sessions could join turns from conversations that never happened together. A caller that wants earlier turns makes a second call. |
   | `reason` | Null, why the window is empty, or that `before` or `after` was lowered to 25. |
 
-  The document has the same keys and meanings as the `context` object `terminus show --json` prints with `--before` or `--after`, in [json-shapes.md](../json-shapes.md#show).
+  The document has the same keys and meanings as the `context` object `terminus show --json` prints with `--before` or `--after`, in [JSON output and exit codes](../guide/reference/json-shapes.md#show).
 - **Refusals:** as in `tools/call`. An anchor that is not archived, is outside the scope, or is in an excluded project gives an empty window with the reason `no turn <id> is archived`, and `isError` false. The empty document is `{"turns":[],"at_session_start":false,"at_session_end":false,"continues_from":null,"reason":"..."}`.
 
 ### `recall_get`
@@ -226,7 +226,7 @@ The archived record behind each turn id. This is the one read that hands back th
   | `absent` | One `{"turn_id":...,"reason":...}` per id that gave no record. An id that is not archived, is outside the scope, or is in an excluded project is `no turn <id> is archived`, the same reason in all three cases. When the scope itself has nothing, every id is listed with the scope's reason. |
   | `reason` | Null, or the first that applies: why the scope gave nothing; that only the first 25 ids were read; or, when there are no records at all, the first `absent` reason. |
 
-  `records` and `absent` have the same keys and meanings as in the document `terminus show --json` prints, in [json-shapes.md](../json-shapes.md#show), where each record also carries `context`.
+  `records` and `absent` have the same keys and meanings as in the document `terminus show --json` prints, in [JSON output and exit codes](../guide/reference/json-shapes.md#show), where each record also carries `context`.
 - **Refusals:** as in `tools/call`. The empty document is `{"records":[],"absent":[],"reason":"..."}`.
 
 ### The egress filter
@@ -323,7 +323,7 @@ The split between `isError` true and false is the one a client acts on. True mea
 
 | Key | What it changes here |
 |---|---|
-| [`[privacy] redact_recall`](../configuration.md#privacy) | Off by default. When on, every excerpt, context text and `recall_get` body the server returns goes through the egress filter. No argument and no variable turns it off for the server, because the server's answers always go to the model. |
-| [`exclude`](../configuration.md#exclude) | Projects no tool returns, under every scope, `"*"` included. An id in an excluded project is answered as not archived. |
+| [`[privacy] redact_recall`](../guide/configuration/recall.md#privacy) | Off by default. When on, every excerpt, context text and `recall_get` body the server returns goes through the egress filter. No argument and no variable turns it off for the server, because the server's answers always go to the model. |
+| [`exclude`](../guide/configuration/archiving.md#exclude) | Projects no tool returns, under every scope, `"*"` included. An id in an excluded project is answered as not archived. |
 
-The tool limits, `MAX_HITS`, `DEFAULT_HITS`, `MAX_CONTEXT_SIDE`, `DEFAULT_CONTEXT_SIDE` and `MAX_IDS`, and the list of protocol revisions are constants, and no key changes them. The server finds the data directory and `terminus.toml` from the environment Claude Code starts it in, as in [the data directory](../configuration.md#the-data-directory) and [environment variables](../configuration.md#environment-variables).
+The tool limits, `MAX_HITS`, `DEFAULT_HITS`, `MAX_CONTEXT_SIDE`, `DEFAULT_CONTEXT_SIDE` and `MAX_IDS`, and the list of protocol revisions are constants, and no key changes them. The server finds the data directory and `terminus.toml` from the environment Claude Code starts it in, as in [the data directory](../guide/configuration/paths.md#the-data-directory) and [environment variables](../guide/configuration/paths.md#environment-variables).

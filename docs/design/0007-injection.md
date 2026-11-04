@@ -66,7 +66,7 @@ Both files take their name from the payload's `session_id`, which arrives untrus
 
 ## 5. Commands and operations
 
-`terminus stats` and `terminus replay` have their options in [commands.md](../commands.md#injection) and their `--json` fields in [json-shapes.md](../json-shapes.md#stats). The two arms take no options: the hook runs them.
+`terminus stats` and `terminus replay` have their options in [the command reference](../guide/reference/commands.md#injection) and their `--json` fields in [JSON output and exit codes](../guide/reference/json-shapes.md#stats). The two arms take no options: the hook runs them.
 
 ### The brief, at `SessionStart`
 
@@ -137,13 +137,13 @@ Run by the ingest pass, in `feedback::outcomes`, after its walk. What follows is
 ### `terminus stats`
 
 - **Inputs:** `--json`.
-- **Outputs:** the counts over every logged decision, the ones that injected nothing included, so precision has its true denominator: `decisions`, split into `compacted_decisions` and `ordinary_decisions`; `injected_turns`; `hits`; `false_positives`; `precision`, hits over hits plus false positives, null when nothing is labelled yet; `misses`; `wasted_budget`; `chars_injected`; and `chars_referenced`, the part of it carried by hits. Their meanings are in [json-shapes.md](../json-shapes.md#stats).
+- **Outputs:** the counts over every logged decision, the ones that injected nothing included, so precision has its true denominator: `decisions`, split into `compacted_decisions` and `ordinary_decisions`; `injected_turns`; `hits`; `false_positives`; `precision`, hits over hits plus false positives, null when nothing is labelled yet; `misses`; `wasted_budget`; `chars_injected`; and `chars_referenced`, the part of it carried by hits. Their meanings are in [JSON output and exit codes](../guide/reference/json-shapes.md#stats).
 - **Refusals:** no store is an empty report with a reason and exit 0. A store missing either decision-log table, or both, is damaged, and exits 1.
 
 ### `terminus replay`
 
 - **Inputs:** `--ranked`, `--compacted-ranked`, `--entity-rank`, `--co-occurring`, `--max-turns` and `--max-candidates`, each defaulting to the value the prompt arm uses, and `--json`.
-- **Outputs:** for every decision of a final session, the prompt arm's steps run again under the given thresholds against the store opened read-only, through the same `candidates`, `eligible`, `quotable`, `within` and `capped` functions the arm uses. A `prompt_chars` too small for the frame credits nothing, since the arm hands over nothing. Each search is bounded by the decision's watermark, so a turn archived after the prompt was submitted is never offered to it. The suppressions are the ones the decision recorded, re-applied rather than worked out again, because the session files they came from are scratch. A decision with `compacted` 1 replays through `--compacted-ranked` and its own `dropped` set. The turns it would hand over are judged through the same `label::referenced` and `label::sought` joins the ingest's `hit`, `false positive` and `miss` labels come from, and the report gives the old and new count of each of the four labels and the ids of the decisions whose labels moved. The fields are in [json-shapes.md](../json-shapes.md#replay).
+- **Outputs:** for every decision of a final session, the prompt arm's steps run again under the given thresholds against the store opened read-only, through the same `candidates`, `eligible`, `quotable`, `within` and `capped` functions the arm uses. A `prompt_chars` too small for the frame credits nothing, since the arm hands over nothing. Each search is bounded by the decision's watermark, so a turn archived after the prompt was submitted is never offered to it. The suppressions are the ones the decision recorded, re-applied rather than worked out again, because the session files they came from are scratch. A decision with `compacted` 1 replays through `--compacted-ranked` and its own `dropped` set. The turns it would hand over are judged through the same `label::referenced` and `label::sought` joins the ingest's `hit`, `false positive` and `miss` labels come from, and the report gives the old and new count of each of the four labels and the ids of the decisions whose labels moved. The fields are in [JSON output and exit codes](../guide/reference/json-shapes.md#replay).
 - **Refusals:** as for `terminus stats`. The options change this report and nothing else: no setting, variable or option changes the thresholds the hooks use.
 
 ## 6. States and workflows
@@ -235,9 +235,9 @@ A pass killed after the drain's commit and before the files are deleted drains t
 
 | Key | What it changes here |
 |---|---|
-| [`[injection] brief_chars`](../configuration.md#injection) | The brief's budget, default 6000 characters, clamped to `MAX_BRIEF_CHARS`, 10000. A smaller number shortens the quotations first. |
-| [`[injection] prompt_chars`](../configuration.md#injection) | One prompt's budget, default 4000 characters, clamped to `MAX_PROMPT_CHARS`, 10000. The value applied is recorded in each decision. |
-| [`[privacy] redact_recall`](../configuration.md#privacy) | When on, every quotation in the brief and every excerpt the prompt arm hands over goes through the egress filter that [0006: Recall through MCP](0006-recall-through-mcp.md) describes, before the budget is spent. Off by default. Nothing turns it off for the hooks. |
-| [`exclude`](../configuration.md#exclude) | An arm run in an excluded project hands over nothing, and no excluded session is quoted, counted or offered. |
+| [`[injection] brief_chars`](../guide/configuration/recall.md#injection) | The brief's budget, default 6000 characters, clamped to `MAX_BRIEF_CHARS`, 10000. A smaller number shortens the quotations first. |
+| [`[injection] prompt_chars`](../guide/configuration/recall.md#injection) | One prompt's budget, default 4000 characters, clamped to `MAX_PROMPT_CHARS`, 10000. The value applied is recorded in each decision. |
+| [`[privacy] redact_recall`](../guide/configuration/recall.md#privacy) | When on, every quotation in the brief and every excerpt the prompt arm hands over goes through the egress filter that [0006: Recall through MCP](0006-recall-through-mcp.md) describes, before the budget is spent. Off by default. Nothing turns it off for the hooks. |
+| [`exclude`](../guide/configuration/archiving.md#exclude) | An arm run in an excluded project hands over nothing, and no excluded session is quoted, counted or offered. |
 
 The thresholds, `RANKED`, `COMPACTED_RANKED`, `ENTITY_RANK`, `CO_OCCURRING`, `MAX_TURNS` and `MAX_CANDIDATES`, are constants. No key, variable or option changes them on the hooks' path, and `terminus replay`'s options change only its own report. The 6-hour idle rule and the 10-minute age for abandoned files are constants too.

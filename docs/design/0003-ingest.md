@@ -80,7 +80,7 @@ What the pass writes, and where. The columns of every table are in [0004: The ar
 
 ## 5. Commands and operations
 
-Options are in [commands.md](../commands.md#archiving), and the `--json` fields and exit codes are in [json-shapes.md](../json-shapes.md).
+Options are in [the command reference](../guide/reference/commands.md#archiving), and the `--json` fields and exit codes are in [JSON output and exit codes](../guide/reference/json-shapes.md).
 
 ### `terminus ingest`
 
@@ -254,14 +254,14 @@ The sweep that finds a watermark behind applies only to sessions captured under 
 
 ## 7. Settings
 
-Each key below is read once per pass. Its default and full effect are in [configuration.md](../configuration.md).
+Each key below is read once per pass. Its default and full effect are in [the settings reference](../guide/configuration/index.md).
 
 | Key | What it changes here |
 |---|---|
-| [`roots`](../configuration.md#roots) | Which Claude Code config directories' `projects` folders discovery walks. Empty by default, which means `$CLAUDE_CONFIG_DIR`, then `~/.claude`. |
-| [`exclude`](../configuration.md#exclude) | Project directories discovery never lists, and `terminus ingest <path.jsonl>` refuses. The observation and retention steps pass over excluded sessions too, and the drain removes a queued decision whose `cwd` is excluded. |
-| [`[capture] mode`](../configuration.md#capture) | `full` by default. `lean` and `minimal` elide as records are archived, and records already stored keep what they have. |
-| [`[retention]`](../configuration.md#retention) and [`[retention.project."<path>"]`](../configuration.md#retentionprojectpath) | What step 9 evicts or deletes. Off by default: nothing happens unless `action` is not `keep` and `age_days` is above 0. |
-| [`[snapshot]`](../configuration.md#snapshot) | Whether step 11 runs, and when: `enabled` defaults to `true`, `interval_hours` to 24, and `keep` to 3. |
+| [`roots`](../guide/configuration/archiving.md#roots) | Which Claude Code config directories' `projects` folders discovery walks. Empty by default, which means `$CLAUDE_CONFIG_DIR`, then `~/.claude`. |
+| [`exclude`](../guide/configuration/archiving.md#exclude) | Project directories discovery never lists, and `terminus ingest <path.jsonl>` refuses. The observation and retention steps pass over excluded sessions too, and the drain removes a queued decision whose `cwd` is excluded. |
+| [`[capture] mode`](../guide/configuration/archiving.md#capture) | `full` by default. `lean` and `minimal` elide as records are archived, and records already stored keep what they have. |
+| [`[retention]`](../guide/configuration/retention.md#retention) and [`[retention.project."<path>"]`](../guide/configuration/retention.md#retentionprojectpath) | What step 9 evicts or deletes. Off by default: nothing happens unless `action` is not `keep` and `age_days` is above 0. |
+| [`[snapshot]`](../guide/configuration/retention.md#snapshot) | Whether step 11 runs, and when: `enabled` defaults to `true`, `interval_hours` to 24, and `keep` to 3. |
 
 No key changes the order of the steps, the per-pass limits of 100, the 6-hour idle rule or the worker count.

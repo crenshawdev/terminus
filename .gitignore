@@ -10,3 +10,4 @@
 .planning/reads.1.jsonl.claim.*
 .planning/reads.jsonl.rotate.*
 .planning/reads.1.jsonl.evict.*
+/docs/book/

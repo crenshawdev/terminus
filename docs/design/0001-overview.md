@@ -36,7 +36,7 @@ Terminus is one Rust workspace with two crates, built into one binary, `terminus
 
 - **The hook.** Claude Code runs `terminus hook <event>` on `SessionStart`, `UserPromptSubmit`, `SessionEnd` and `PostCompact`. The hook starts `terminus ingest` in the background, reads the event's payload, and on the first two events may hand text back. It never writes the database.
 - **The MCP server.** Claude Code starts `terminus mcp` and talks to it over stdin and stdout until stdin closes. It serves exactly three tools, `recall_search`, `recall_context` and `recall_get`, and opens the store read-only for each call.
-- **The CLI.** Every other command: `ingest`, `backfill`, `search`, `show`, `sessions`, `verify`, `reindex`, `status`, `compact`, `usage`, `export`, `stats`, `observations`, `replay`, `retention`, `doctor`, `install`, `uninstall` and `data move`. Every option is in [commands.md](../commands.md).
+- **The CLI.** Every other command: `ingest`, `backfill`, `search`, `show`, `sessions`, `verify`, `reindex`, `status`, `compact`, `usage`, `export`, `stats`, `observations`, `replay`, `retention`, `doctor`, `install`, `uninstall` and `data move`. Every option is in [the command reference](../guide/reference/commands.md).
 
 The archived session is the record. Each session's transcript is stored as compressed block rows, byte for byte under the default `[capture] mode` of `full`, and everything else in the store, the turns, the full-text index, the entities and paths, is derived from those rows and can be rebuilt from them.
 
@@ -47,7 +47,7 @@ The archived session is the record. Each session's transcript is stored as compr
 | [`crates/terminus/src/lib.rs`](../../crates/terminus/src/lib.rs) | Parses the command line with `lexopt` and holds `USAGE`, the command list `terminus` prints. Maps each failure to its exit code: 1 for an operational failure, 2 for misuse. |
 | [`crates/terminus/src/main.rs`](../../crates/terminus/src/main.rs) | The entry point, which calls into `lib.rs`. |
 | [`crates/terminus/src/cmd/`](../../crates/terminus/src/cmd/) | One module per command, plus `spawn.rs`, which starts the detached ingest, and `read.rs`, the read-only open every read command shares. |
-| [`crates/terminus/src/cmd/json.rs`](../../crates/terminus/src/cmd/json.rs) | The one `--json` envelope, `{command, ok, reason, data}`, built with `serde_json` and never by hand. Its fields and the exit codes are in [json-shapes.md](../json-shapes.md). |
+| [`crates/terminus/src/cmd/json.rs`](../../crates/terminus/src/cmd/json.rs) | The one `--json` envelope, `{command, ok, reason, data}`, built with `serde_json` and never by hand. Its fields and the exit codes are in [JSON output and exit codes](../guide/reference/json-shapes.md). |
 | [`crates/terminus/src/out.rs`](../../crates/terminus/src/out.rs) | Every write to stdout and stderr, through `outln!`, `out!` and `errln!`, so a reader that closes either stream early does not make the binary panic. Each of those writes is escaped through `escape.rs` by default. `write_raw` and `try_write_raw` write their bytes unchanged, and only the sites that must stay byte for byte call them: `Document::emit` and `try_emit`, the hook's `hookSpecificOutput` object, and the record body `show` prints. |
 | [`crates/terminus/src/escape.rs`](../../crates/terminus/src/escape.rs) | Spells every control character other than tab and newline as `\u00XX` in every command's human output, on stdout and on stderr, so archived text cannot drive the reader's terminal. The store, `--json`, the hook's `hookSpecificOutput` object and the record body `show` prints are left as they are. |
 
@@ -99,7 +99,7 @@ Everything Terminus creates there is readable only by the user who runs it: [`cr
 
 ## The config file
 
-`terminus.toml` sits in the config directory, which is `TERMINUS_CONFIG_DIR` when that is set and not empty, then `$XDG_CONFIG_HOME/terminus`, then `~/.config/terminus`, on Linux and macOS alike. A missing file gives the defaults. [`crates/terminus-core/src/config.rs`](../../crates/terminus-core/src/config.rs) loads it, and every key and its default is in [configuration.md](../configuration.md).
+`terminus.toml` sits in the config directory, which is `TERMINUS_CONFIG_DIR` when that is set and not empty, then `$XDG_CONFIG_HOME/terminus`, then `~/.config/terminus`, on Linux and macOS alike. A missing file gives the defaults. [`crates/terminus-core/src/config.rs`](../../crates/terminus-core/src/config.rs) loads it, and every key and its default is in [the settings reference](../guide/configuration/index.md).
 
 The transcripts Terminus reads are the `projects` folder of each Claude Code config directory. The `roots` key lists those directories; with no `roots`, it is `$CLAUDE_CONFIG_DIR`, and without that, `~/.claude`.
 

@@ -55,7 +55,7 @@ The files the injection thread writes, the session's state under `injection/` an
 
 ### `terminus hook <event>`
 
-Claude Code runs this. No one types it. Its options and exit codes are in [commands.md](../commands.md#terminus-hook-event) and [json-shapes.md](../json-shapes.md#exit-codes).
+Claude Code runs this. No one types it. Its options and exit codes are in [the command reference](../guide/reference/commands.md#terminus-hook-event) and [JSON output and exit codes](../guide/reference/json-shapes.md#exit-codes).
 
 - **Inputs:** one event name from `EVENTS` as the only argument, and the payload on stdin.
 - **Outputs:**
@@ -138,8 +138,8 @@ The injection arms the hook runs read these keys, and [0007: Injection](0007-inj
 
 | Key | What it changes here |
 |---|---|
-| [`exclude`](../configuration.md#exclude) | An arm run in an excluded project hands back nothing. |
-| [`[injection]`](../configuration.md#injection) `brief_chars` and `prompt_chars` | How much text the `SessionStart` and `UserPromptSubmit` objects may carry. |
-| [`[privacy] redact_recall`](../configuration.md#privacy) | Whether the text is filtered before the hook writes it. |
+| [`exclude`](../guide/configuration/archiving.md#exclude) | An arm run in an excluded project hands back nothing. |
+| [`[injection]`](../guide/configuration/recall.md#injection) `brief_chars` and `prompt_chars` | How much text the `SessionStart` and `UserPromptSubmit` objects may carry. |
+| [`[privacy] redact_recall`](../guide/configuration/recall.md#privacy) | Whether the text is filtered before the hook writes it. |
 
-The hook and the ingest it starts resolve the data directory and the config directory from the environment Claude Code runs them in, as in [the data directory](../configuration.md#the-data-directory) and [environment variables](../configuration.md#environment-variables).
+The hook and the ingest it starts resolve the data directory and the config directory from the environment Claude Code runs them in, as in [the data directory](../guide/configuration/paths.md#the-data-directory) and [environment variables](../guide/configuration/paths.md#environment-variables).
