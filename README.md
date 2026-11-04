@@ -1,19 +1,19 @@
 # Terminus
 
-Claude Code forgets. A new session starts blank, a long session that compacts loses its earlier part, and the transcripts that hold all of it are deleted after 30 days.
+Claude Code forgets. A new session starts blank, a long session that compacts loses its earlier part, and by default Claude Code deletes transcripts older than 30 days.
 
-Terminus keeps every session and gives it back to Claude:
+Terminus keeps every session and offers it back to Claude:
 
 * A new session starts knowing where the last one in the project left off.
-* When a prompt names a file or a function from earlier work, Claude is handed the turns where it came up.
-* After a compaction, the next prompt gets back what dropped out.
+* When a prompt names a file or a function from earlier work, Claude can be handed up to three of the turns where it came up.
+* After a compaction, the next prompt that names a file or a function can get back up to three of the turns that dropped out. Claude can search for the rest.
 * Claude can search the whole history itself, by text, path, error or identifier. "Where did the retry budget come from?" still has an answer three weeks later.
 * You can search it too, from the command line.
 * Every subagent's transcript is kept as well, so you can see what each agent was asked, what it ran and what it reported.
 
-Other memory tools for Claude Code send your sessions to a model, on your account, and keep what it chose to write down. Terminus keeps the session: every prompt, every reply, every tool call and its output, with nothing summarized. All of it stays searchable, whether it happened a few minutes ago or in the first session Terminus archived, unless you set a retention rule.
+Other memory tools for Claude Code send your sessions to a model, on your account, and keep what it chose to write down. Terminus keeps the session: every prompt, every reply, every tool call and its output, with nothing summarized. Search covers what each turn said, up to 256 KiB of text per turn, whether it happened a few minutes ago or in the first session Terminus archived. Text past that limit stays in the archive, where `recall_get` and `terminus show` read it and search does not find it. [`terminus search`](docs/commands.md#terminus-search-words) lists what is indexed, and [`[capture]`](docs/configuration.md#capture) and [`[retention]`](docs/configuration.md#retention) can keep less.
 
-It is one local binary. It makes no model call of its own, so nothing runs up your bill or your usage limit in the background. It runs no daemon and opens no network connection. What it hands Claude goes into the session like anything else you type, capped at 6,000 characters when a session starts and 4,000 on a prompt.
+It is one local binary. It makes no model call of its own, so nothing runs up your bill or your usage limit in the background. It runs no daemon and opens no network connection. What it hands Claude goes into the session like anything else you type, by default at most 6,000 characters when a session starts and 4,000 on a prompt. [`[injection]`](docs/configuration.md#injection) can set either one up to 10,000.
 
 ## Install
 
@@ -48,9 +48,9 @@ A local build is not checked against any signature.
 
 Terminus offers Claude earlier work at three points. Each is an offer, not a guarantee: it depends on what the archive holds, and a hook that misses its deadline hands over nothing.
 
-* **When a session starts:** a brief of where the last session in the project left off: its date, its branch, and the last thing said each way.
+* **When a session starts:** a brief of where the last session in the project left off: its date, the branch it ended on, and the last thing said each way.
 * **On a prompt:** up to three earlier turns that named the same paths or identifiers, when they clear the match threshold. Most prompts get nothing.
-* **After a compaction:** the next prompt is offered only the turns the compaction dropped.
+* **After a compaction:** the next prompt that names a path or identifier looks only at the turns the compaction dropped, under the same match threshold and character budget. It gets at most three of them and often none, and `recall_search` is how Claude reaches the rest.
 
 `[injection]` caps each in characters, and `[privacy] redact_recall` filters text shaped like a secret out of what is handed over.
 
@@ -100,7 +100,7 @@ Every command and option is in [docs/commands.md](docs/commands.md).
 
 * `terminus doctor` reports what is and is not wired into Claude Code: the hook entries, the MCP entry, the store and the last ingest pass. Where there is a fix to run, it prints the command.
 * `terminus verify` checks every archived block against its hash.
-* `terminus reindex` drops everything derived from the archive and rebuilds it from the blocks alone, with the same turn ids.
+* `terminus reindex` rebuilds the search index and the other tables derived from the archived blocks, with the same turn ids. It does not touch the archive, the observations or the injection log, and it keeps an evicted session's rows as they are, because its blocks are gone.
 * `[snapshot]` keeps rolling copies of the archive: by default the last three, taken at most once every 24 hours.
 
 ## Design principles
@@ -108,7 +108,7 @@ Every command and option is in [docs/commands.md](docs/commands.md).
 * **Lossless.** Each session is stored as numbered blocks of its transcript, compressed with zstd. Under the default capture mode the archived bytes are the transcript exactly.
 * **Verifiable.** Each block carries a BLAKE3 hash of its bytes, and each session a hash over its block hashes.
 * **No model.** Search is SQLite FTS5 with no model and no embeddings, and an identifier is indexed by its parts, so `manager` finds `SearchManager`. What Terminus records about a session comes from the transcript's own records.
-* **Rebuildable.** Search, recall and the rest are derived from the blocks and can be rebuilt from them. A pass killed partway leaves each transcript as its last commit left it, and recovery loses no archived byte.
+* **Rebuildable.** The search tables are derived from the blocks and can be rebuilt from them, except an evicted session's, whose blocks are gone. Observations have their own rebuild, `terminus observations regenerate`, and the injection log has none. A pass killed partway leaves each transcript as its last commit left it, and recovery loses no archived byte.
 * **Local.** One SQLite file in your data directory, with its snapshots beside it, readable only by your user. The binary opens no network connection, and a test fails if any source file names a socket type.
 * **Out of the way.** No daemon: each hook starts a detached pass and exits. A hook exits 0 whatever goes wrong, so it never blocks a prompt.
 
@@ -136,7 +136,7 @@ Every open bug is in the [issues](https://github.com/jcrenshaw-dev/terminus/issu
 
 Issues are welcome: bugs, questions, and reports of anything in the docs that is wrong. Pull requests are by invitation only; open an issue first. Security problems go through [SECURITY.md](SECURITY.md), not a public issue.
 
-The tests run with `cargo test --workspace --all-features`. CI runs them on every pull request and every push to `main`, on the debug and the release build, on Linux and macOS, on x86_64 and aarch64. `main` takes changes only through pull requests with signed commits, and only once the tests pass.
+The tests run with `cargo test --workspace --all-features`. CI runs them on every pull request and every push to `main`, on the debug and the release build, on Linux and macOS, on x86_64 and aarch64. CI skips three tests of a hook spawn's p99 on every runner and three time budgets on a single spawn on the macOS runners, because a hosted VM's timing measures the VM. The tests over a real transcript corpus need `TERMINUS_TEST_CORPUS` and that private data, so they skip themselves in CI and on any machine without it. `main` takes changes only through pull requests with signed commits, and only once the tests pass.
 
 ## Sponsoring
 

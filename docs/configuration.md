@@ -57,18 +57,24 @@ The Claude Code config directories whose transcripts Terminus archives. Each roo
 
 Default: none.
 
-Project paths Terminus never reads and never returns. A project listed here is skipped before any of its transcript files is opened, and anything already archived from it is left out of every search, recall, brief and injection. Retention passes over its sessions too. A path covers its subfolders, so `/data/code/demo` covers `/data/code/demo/sub` and does not cover `/data/code/demo-other`. A leading `~` is expanded, `..` is resolved, and a trailing `/` makes no difference. An entry that is not an absolute path once `~` is expanded is dropped without a message.
+Project paths Terminus never reads and never returns. A project listed here is skipped before any of its transcript files is opened, and anything already archived from it is left out of every search, recall, brief and injection. Its prompts are not written to the injection log, including those of a session that started in it and moved elsewhere with `cd`. Retention passes over its sessions too. A path covers its subfolders, so `/data/code/demo` covers `/data/code/demo/sub` and does not cover `/data/code/demo-other`. A leading `~` is expanded, `..` is resolved, and a trailing `/` makes no difference. An entry that is not an absolute path once `~` is expanded is dropped without a message.
 
 ```toml
 exclude = ["/data/code/client-work", "~/scratch"]
 ```
+
+Adding an entry deletes nothing that is already stored:
+
+- A prompt still queued for the injection log is removed at the next ingest pass without being logged, and `terminus status` shows how many under that pass's notes.
+- A prompt already in the injection log stays there. No command prints it, `terminus stats` still counts it and `terminus replay` scores it as injecting nothing. `terminus uninstall --purge` is the only command that removes it.
+- [Snapshots](#snapshot) keep what they already hold.
 
 ### `[injection]`
 
 How much text Terminus hands Claude Code when a hook fires. Both counts are characters, not tokens, and each is capped at 10,000 whatever the file says, because Claude Code writes a hook's output longer than 10,000 characters to a file and gives the model the file's path instead of the text.
 
 - `brief_chars`, default 6000. The most the brief at the start of a session may carry. The brief says where the last session in the project left off: its date, the branch it ended on, the last thing said in each direction, and how much of the project is archived. A smaller number shortens the quotes first.
-- `prompt_chars`, default 4000. The most one prompt's injection may carry. An injection quotes at most three earlier turns that match the paths and identifiers the prompt names, and most prompts get none.
+- `prompt_chars`, default 4000. The most one prompt's injection may carry. An injection quotes at most three earlier turns that match the paths and identifiers the prompt names, and most prompts get none. After a compaction, the next such prompt looks only at the turns the compaction dropped, under the same limits, so it does not restore everything that dropped.
 
 ### `[retention]`
 
@@ -76,11 +82,13 @@ How much of each project's history the archive keeps. The default keeps everythi
 
 - `action`, default `keep`. One of `keep`, `evict` or `delete`. Any other value means `keep`.
   - `keep` does nothing.
-  - `evict` removes a session's archived text and keeps the session's record and everything derived from it.
-  - `delete` removes the session and everything derived from it, its observations included, which `terminus reindex` cannot rebuild. It acts only once Claude Code has already deleted the session's transcript, because a transcript still on disk would be archived again on the next pass.
+  - `evict` removes a session's archived text and keeps the session's record and everything derived from it, its search rows and observations included. The injection log keeps its copies of the session's prompts.
+  - `delete` removes the session, everything derived from it, its observations, and the prompts and labels the injection log holds for it. `terminus reindex` cannot rebuild the observations or the log, and `terminus stats` and `terminus replay` stop counting those prompts. A subagent's session reports its parent's session id, so deleting one removes no prompts, and deleting the parent removes them. It acts only once the session's transcript is gone, which is usually Claude Code's cleanup, because a transcript still on disk would be archived again on the next pass.
 - `age_days`, default 0. How many days old a session's last turn must be before `action` applies. 0 is off, and a negative number counts as 0.
 
 Retention does nothing unless both keys are set: an `action` other than `keep` and an `age_days` above 0. It acts only on sessions Terminus has already closed, during the ingest pass each hook starts, at most 100 sessions per action per pass. The rest are counted and taken on the next pass. `terminus retention --dry-run` lists what the current rule would act on and changes nothing.
+
+A deleted row's bytes can stay in the store file's free pages until [`terminus compact`](commands.md#terminus-compact) rebuilds the file. Prompts left behind by deletions under a version before this rule stay in the injection log. [Snapshots](#snapshot) are separate copies, and neither action reaches them.
 
 ### `[retention.project."<path>"]`
 
@@ -103,6 +111,8 @@ Rolling copies of the archive, kept in the `snapshots` folder of the data direct
 - `enabled`, default `true`. `false` stops new snapshots. Snapshots already taken stay.
 - `interval_hours`, default 24. How long after the last snapshot the next one is taken, checked on each ingest pass. 0 counts as 24, because a snapshot on every pass would write a full copy of the archive on every prompt.
 - `keep`, default 3. How many snapshots are kept. After each new one, the oldest past this number are deleted. The lowest value is 1; to keep none, set `enabled = false`.
+
+A snapshot is a copy of the store as it stood when it was taken. `exclude` and `[retention]` change the store and never a snapshot, so a snapshot keeps what was excluded or deleted after it was taken, prompts included, until the next snapshots push it past `keep`. With `enabled = false` no new snapshot pushes them out, so they stay until you delete them. To remove that data sooner, delete the files in the `snapshots` folder.
 
 ### `[capture]`
 
@@ -148,5 +158,5 @@ The hooks and the MCP server are started by Claude Code, so they see the environ
 
 `terminus doctor` reports two Claude Code settings and never changes either. It reads them from `settings.json` in Claude Code's config directory, then `.claude/settings.json` in the current directory, then `.claude/settings.local.json` in the current directory, the last one holding the key winning. It does not look for the project root, so run from a subfolder of a project, it does not read that project's settings.
 
-- `cleanupPeriodDays`. Claude Code deletes its transcripts this many days after they are written, 30 when unset. What Terminus has archived stays, and a session it never read is lost with its transcript. Below 90, `doctor` prints the edit that sets it to 3650.
-- `autoCompactEnabled`. On when unset. `doctor` recommends off, because compaction spends tokens summarizing context the archive already holds, and prints the edit that sets it to `false`. A `DISABLE_AUTO_COMPACT` environment variable set to anything other than `0` or `false` counts as off.
+- `cleanupPeriodDays`. How many days Claude Code keeps its transcripts, 30 when unset, and at least 1. A sweep after a session starts deletes the ones older than that. Claude Code pauses the sweep when it cannot determine the period, such as when a settings file will not parse, `claude -p --bare` does not run it, and Claude Desktop and Cowork transcripts follow their own rule. What Terminus has archived stays, and a session it never read is lost with its transcript. Below 90, `doctor` prints the edit that sets it to 3650.
+- `autoCompactEnabled`. On when unset. `doctor` reports the trade-off and recommends neither value. On, Claude Code summarizes older history as context fills, which spends tokens and loses detail, and the session keeps going. Off, a session that reaches the context limit stops with `Context limit reached · /compact or /clear to continue` until you run one of them. The archive keeps the full history either way but does not manage active context: recall offers at most three matching turns on a prompt, and no measurement shows that replaces compaction. A `DISABLE_AUTO_COMPACT` environment variable set to anything other than `0` or `false` counts as off.

@@ -58,7 +58,7 @@ An excluded project is never shown, with `*` too, including sessions archived be
 
 ### `terminus search <words>`
 
-Finds past turns by text, a path, an error line or an identifier. Every word after `search` that is not an option is part of the query, so the words need no quotes, and a turn must match all of them. A word made only of letters the search index makes no token from, such as circled letters, is dropped and takes no place in the count. Only the first 32 distinct terms are used, and stderr says so when a query is cut. A query with nothing left to search, such as `///`, finds no turns, says so, and exits 0.
+Finds past turns by text, a path, an error line or an identifier. The index holds what each turn said, up to 256 KiB of text per turn: prompts and replies, tool names and the text in tool inputs, tool results, and attachments. It leaves out text past that limit, thinking blocks, JSON keys, numbers, and records that are not turns. `terminus show` and `recall_get` read those from the archive, and search does not find them. Every word after `search` that is not an option is part of the query, so the words need no quotes, and a turn must match all of them. A word made only of letters the search index makes no token from, such as circled letters, is dropped and takes no place in the count. Only the first 32 distinct terms are used, and stderr says so when a query is cut. A query with nothing left to search, such as `///`, finds no turns, says so, and exits 0.
 
 Each hit is two lines: the turn id, the day, the transcript's file name, the project, and `(subagent)` for a subagent's turn, then an excerpt around the match. The count of hits goes to stderr. The turn id is what `terminus show` takes. As in every command's human output, a control character in archived text other than tab and newline prints as a `\u00XX` escape, such as `\u001b` for ESC, with or without `--raw`.
 
@@ -82,7 +82,7 @@ Prints the archived record behind each turn id, byte for byte as it was archived
 
 ### `terminus sessions`
 
-Lists every archived session in the project, one line each: the day of its first turn, the transcript's file name, the number of turns, the project, the branch, `(subagent)` for a subagent's session, and `(evicted)` when retention has evicted its text. The count goes to stderr.
+Lists every archived session in the project, one line each: the day of its first turn, the transcript's file name, the number of turns, the project, the branch its last record named, `(subagent)` for a subagent's session, and `(evicted)` when retention has evicted its text. The count goes to stderr.
 
 - `--project <path>`: which project to list, as [above](#which-project-a-read-command-sees).
 - `--since <time>`, `--until <time>`: only sessions that overlap these [bounds](#time-bounds), meaning still going at `--since` and started by `--until`.
@@ -115,7 +115,9 @@ Checks every session's archived blocks against the hash recorded for each. The s
 
 ### `terminus reindex`
 
-Rebuilds every table derived from the archive, the search index among them. Turn ids stay the same. It does not rebuild observations. It prints how many evicted sessions it carried across without rebuilding them, on stderr when there are any. It takes the ingest lock and exits 1 when another process holds it. A session that cannot be rebuilt is skipped and named on stderr, every other session is still rebuilt, and the command exits 1.
+Rebuilds the tables derived from the archived blocks: `turns`, `compactions`, the search index `turns_fts`, `entities` and `paths`. Turn ids stay the same. It does not change the blocks, the session metadata, the observations, or the injection log and its labels. `terminus observations regenerate` is the only rebuild for observations.
+
+An evicted session has no blocks to rebuild from, so its rows in those tables stay as they are and it stays searchable. `reindex` prints how many evicted sessions it carried across, on stderr when there are any. It takes the ingest lock and exits 1 when another process holds it. A session that cannot be rebuilt is skipped and named on stderr, every other session is still rebuilt, and the command exits 1.
 
 - `--json`
 
@@ -127,7 +129,7 @@ Prints the store's path and size, the number of sessions and turns, how far into
 
 ### `terminus compact`
 
-Gives back the disk space retention freed. It rebuilds the database file without its free pages and then empties the write-ahead log, and prints the store's size before and after and the bytes reclaimed. It deletes nothing itself. It takes the ingest lock and exits 1 when a pass is running. With no store, it says there is nothing to reclaim and exits 0. A store it cannot read is an operational failure and exits 1.
+Gives back the disk space retention freed. It rebuilds the database file without its free pages, which is also what clears the bytes of deleted rows out of the file, and then empties the write-ahead log, and prints the store's size before and after and the bytes reclaimed. It deletes nothing itself. It takes the ingest lock and exits 1 when a pass is running. With no store, it says there is nothing to reclaim and exits 0. A store it cannot read is an operational failure and exits 1.
 
 - `--json`
 
@@ -159,13 +161,13 @@ Trailing slashes and `.` parts are dropped from `<path>` before it is checked, a
 
 ### `terminus stats`
 
-Reports whether the text Terminus hands Claude Code on each prompt is helping: how many prompts were logged, how many turns were injected, the hits and false positives among them, the precision, the misses, the wasted budget, and the characters injected and the part of them the hits carried. The prompt count is split into compacted decisions, taken on the one prompt after a compaction, and ordinary ones, and a prompt logged by a build that did not record which it was is in neither. The counts are characters, not tokens. An injection is labelled only once its session is closed. What each number means is in [json-shapes.md](json-shapes.md#stats).
+Reports whether the text Terminus hands Claude Code on each prompt is helping: how many prompts were logged, how many turns were injected, the hits and false positives among them, the precision, the misses, the wasted budget, and the characters injected and the part of them the hits carried. The prompt count is split into compacted decisions, taken on the one prompt after a compaction, and ordinary ones, and a prompt logged by a build that did not record which it was is in neither. The counts are characters, not tokens. An injection is labelled only once its session is closed. A prompt in an [excluded](configuration.md#exclude) project is not logged. One logged before its project was excluded stays in these counts. What each number means is in [json-shapes.md](json-shapes.md#stats).
 
 - `--json`
 
 ### `terminus replay`
 
-Re-scores the logged prompts of closed sessions under other injection thresholds, and prints how each label count would move from what was recorded. It opens the store read-only and writes nothing.
+Re-scores the logged prompts of closed sessions under other injection thresholds, and prints how each label count would move from what was recorded. It opens the store read-only and writes nothing. A logged prompt from a project excluded since then is scored as injecting nothing.
 
 Each option takes a whole number and defaults to the value Terminus injects with. They change this report and nothing else. No setting, option or environment variable changes the thresholds the hooks use.
 

@@ -90,7 +90,7 @@ The truth. They are never dropped, never rebuilt and never converted.
 | `last_turn_at` | `TEXT` | The last turn's timestamp, which the idle rule and retention measure age from. |
 | `project` | `TEXT` | The project key, from the first `cwd` through git, with a worktree folded into its repository. |
 | `cwd` | `TEXT` | The session's first `cwd`. |
-| `branch` | `TEXT` | The git branch the records carry. |
+| `branch` | `TEXT` | The `gitBranch` of the last record that carried one. Each append that carries one replaces it. A session archived by an earlier version that has taken no record since holds the first branch it named. |
 | `is_final` | `INTEGER` | 1 once the session has been idle for 6 hours. |
 | `is_evicted` | `INTEGER` | 1 once retention has deleted the session's block rows. |
 | `parent_session_key` | `TEXT` | For a sidecar, the session key of the transcript it belongs to, in the same form, such as `<sessionId>.jsonl`, read from the sidecar's path. |
@@ -101,9 +101,9 @@ The truth. They are never dropped, never rebuilt and never converted.
 
 ### Kept tables
 
-They hold what happened at prompt time, or facts read from block rows that retention may later delete, so no rebuild can reproduce them. A rebuild never drops them.
+They hold what happened at prompt time, or facts read from block rows that retention may later delete, so no rebuild can reproduce them. A rebuild never drops them. Retention's delete does: it removes a session's observation, and the decisions and labels of its `session_id` once no top-level session with that id is archived.
 
-`decisions`, one row per prompt the injection logged, including prompts that injected nothing:
+`decisions`, one row per prompt the injection logged, including prompts that injected nothing. A prompt in an excluded project is not logged, and a row logged before its project was excluded stays:
 
 | Column | Type | What it holds |
 |---|---|---|
@@ -144,7 +144,7 @@ They hold what happened at prompt time, or facts read from block rows that reten
 
 ### Derived tables
 
-`DERIVED_TABLES` lists them in this order: `turns`, `compactions`, `turns_fts`, `entities`, `paths`. Every row in them comes from the block rows, through [`crates/terminus-core/src/derive.rs`](../../crates/terminus-core/src/derive.rs), and `terminus reindex` drops and rebuilds them.
+`DERIVED_TABLES` lists them in this order: `turns`, `compactions`, `turns_fts`, `entities`, `paths`. Every row in them comes from the block rows, through [`crates/terminus-core/src/derive.rs`](../../crates/terminus-core/src/derive.rs), and `terminus reindex` drops and rebuilds them, except an evicted session's rows, which it leaves standing.
 
 `turns`, one row per turn, unique on `(session_key, turn_seq)`:
 
