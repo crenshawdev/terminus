@@ -40,7 +40,7 @@ What every check refuses, and the release steps one at a time, are already in [t
 | [`crates/terminus/src/cmd/doctor.rs`](../../crates/terminus/src/cmd/doctor.rs) | `terminus doctor`: 14 checks, each with a state, a one-line finding and, where there is one, the command that fixes it. Writes nothing on any path. |
 | [`.github/workflows/release.yml`](../../.github/workflows/release.yml) | On a version tag: four builds, one per platform on its own runner, then one draft holding exactly the eight files. |
 | [`.github/workflows/release-check.yml`](../../.github/workflows/release-check.yml) | On a published release: installs it with the public one-line command on the same four runners and checks the installed version. |
-| [`.github/workflows/test.yml`](../../.github/workflows/test.yml) | On every pull request and every push to `main`: the whole suite on the four runners, in a release build each, plus a debug build on `ubuntu-24.04`. |
+| [`.github/workflows/test.yml`](../../.github/workflows/test.yml) | On every pull request and every push to `main`: the whole suite in a release build on `ubuntu-24.04`, `ubuntu-24.04-arm` and `macos-15`, plus a debug build on `ubuntu-24.04`. |
 | [`scripts/sign-release.sh`](../../scripts/sign-release.sh) | Run by the owner on his own machine: checks a draft, signs its four manifests, verifies each signature the way `install.sh` will, uploads them and publishes the release as latest. |
 
 The boundaries:
@@ -113,7 +113,7 @@ Options are in [the command reference](../guide/reference/commands.md#setup), an
 ### The CI runs
 
 - **`release-check.yml`**, on `release: published`. On `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15-intel` and `macos-15`, it puts a stand-in `claude` that exits 0 on `PATH`, runs `curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh` with pipefail, and checks that `~/.local/bin/terminus --version` is the release's version.
-- **`test.yml`**, on every pull request and every push to `main`. On the same four runners, in a release build each, plus a debug build on `ubuntu-24.04`, five jobs, it runs `cargo test --workspace --all-features --locked`, with a 15-minute limit on the test step that prints the processes and their open files before it stops a hung run. It reads no secret, so the tests over the private transcript corpus skip themselves. Three timing tests of a hook spawn's p99 are skipped on every runner, and three budgets on a single spawn on the two macOS runners, because a hosted VM's timing measures the VM.
+- **`test.yml`**, on every pull request and every push to `main`. On `ubuntu-24.04`, `ubuntu-24.04-arm` and `macos-15`, in a release build each, plus a debug build on `ubuntu-24.04`, four jobs, it runs `cargo test --workspace --all-features --locked`, with a 15-minute limit on the test step that prints the processes and their open files before it stops a hung run. It reads no secret, so the tests over the private transcript corpus skip themselves. Three timing tests of a hook spawn's p99 are skipped on every runner, and three budgets on a single spawn on the macOS runner, because a hosted VM's timing measures the VM. The suite doesn't run on `macos-15-intel`: `release.yml` builds that binary and `release-check.yml` checks that it installs.
 
 ## 6. States and workflows
 
