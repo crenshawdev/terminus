@@ -14,7 +14,7 @@
 //! change of two lines. `serde_json`'s `preserve_order`
 //! feature would fix that and is deliberately not enabled: it is a
 //! workspace-wide feature that would silently reorder the keys of every `--json`
-//! document the six commands in `docs/json-shapes.md` promise.
+//! document the six commands in `docs/guide/reference/json-shapes.md` promise.
 //!
 //! So this module carries its own reader and writer. They are small because
 //! they are faithful rather than clever: **every scalar is kept as the source

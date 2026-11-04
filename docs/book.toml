@@ -1,0 +1,17 @@
+[book]
+title = "Terminus"
+authors = ["John Crenshaw"]
+description = "A working guide to archiving, searching and recalling Claude Code sessions with Terminus."
+language = "en"
+src = "guide"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "coal"
+additional-css = ["theme/terminus.css"]
+git-repository-url = "https://github.com/jcrenshaw-dev/terminus"
+site-url = "/terminus/"

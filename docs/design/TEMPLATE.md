@@ -34,7 +34,7 @@ The tables and files this part writes, and what each one holds. A file is named 
 
 ## 5. Commands and operations
 
-One subsection for each command and operation this part owns. Options are in [commands.md](../commands.md), and the `--json` fields and exit codes are in [json-shapes.md](../json-shapes.md). Link to them, don't restate them.
+One subsection for each command and operation this part owns. Options are in [the command reference](../guide/reference/commands.md), and the `--json` fields and exit codes are in [JSON output and exit codes](../guide/reference/json-shapes.md). Link to them, don't restate them.
 
 ### operation-name
 
@@ -80,7 +80,7 @@ sequenceDiagram
 
 ## 7. Settings
 
-The keys in `terminus.toml` that change how this part behaves. Each key links its entry in [configuration.md](../configuration.md), which gives its default and its full effect. A part with no key of its own says so in one sentence.
+The keys in `terminus.toml` that change how this part behaves. Each key links its entry in [the settings reference](../guide/configuration/index.md), which gives its default and its full effect. A part with no key of its own says so in one sentence.
 
 | Key | What it changes here |
 |---|---|

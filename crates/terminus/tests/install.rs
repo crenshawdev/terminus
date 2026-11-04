@@ -1292,7 +1292,7 @@ fn install_takes_no_json_flag() {
 // ---------------------------------------------------------------------------
 
 /// The receipt states `cleanupPeriodDays` at every value,
-/// says what is already gone, and prints the line that raises it, and install
+/// says what may already be gone, and prints the line that raises it, and install
 /// changes neither it nor `autoCompactEnabled`. It also names every file the
 /// run touched and where to watch the backfill.
 #[test]
@@ -1325,7 +1325,7 @@ fn install_reports_the_two_settings_it_never_changes() {
 
         assert!(said.contains(stated), "{said}");
         assert!(
-            said.contains(&format!("older than {days} days are already gone")),
+            said.contains(&format!("older than {days} days may already be gone")),
             "{said}"
         );
         assert!(

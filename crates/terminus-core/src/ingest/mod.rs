@@ -1620,8 +1620,13 @@ fn first_cwd(scan: &Scan) -> Option<String> {
 ///
 /// Every column that describes the session as a whole is `coalesce`d onto what
 /// is already there: a tail pass sees only the tail, and `session_id`, `cwd`,
-/// `gitBranch`, the project, the sidecar's parent and the first turn's
-/// timestamp were established by the first pass.
+/// the project, the sidecar's parent and the first turn's timestamp were
+/// established by the first pass.
+///
+/// `branch` runs the other way, like `last_turn_at`: it is the `gitBranch` of the
+/// last record that carried one, so a tail that names a branch replaces what is
+/// stored and a tail that names none leaves it. The brief reports it as the
+/// branch the session ended on.
 ///
 /// `is_final` is not written here and is not written by any ingest of a file:
 /// it is the idle rule's, evaluated once at the end of a whole pass over
@@ -1647,7 +1652,7 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
     let scan = row.scan;
     let session_id = scan.records.iter().find_map(|r| r.session_id.clone());
     let cwd = first_cwd(scan);
-    let branch = scan.records.iter().find_map(|r| r.git_branch.clone());
+    let branch = scan.records.iter().rev().find_map(|r| r.git_branch.clone());
     // Byte order, not clock order: the "first" turn is the first in the file
     // even when its timestamp is later than its neighbour's.
     let first_turn_at = scan.turns().next().map(|(_, t)| t.timestamp.clone());
@@ -1674,7 +1679,7 @@ fn write_session_meta(tx: &Connection, row: MetaRow<'_>) -> Result<()> {
             first_turn_at = coalesce(session_meta.first_turn_at, excluded.first_turn_at),
             last_turn_at = coalesce(excluded.last_turn_at, session_meta.last_turn_at),
             cwd = coalesce(session_meta.cwd, excluded.cwd),
-            branch = coalesce(session_meta.branch, excluded.branch),
+            branch = coalesce(excluded.branch, session_meta.branch),
             project = coalesce(session_meta.project, excluded.project),
             project_pre_worktree = coalesce(
                 session_meta.project_pre_worktree, excluded.project_pre_worktree),

@@ -90,7 +90,7 @@ The truth. They are never dropped, never rebuilt and never converted.
 | `last_turn_at` | `TEXT` | The last turn's timestamp, which the idle rule and retention measure age from. |
 | `project` | `TEXT` | The project key, from the first `cwd` through git, with a worktree folded into its repository. |
 | `cwd` | `TEXT` | The session's first `cwd`. |
-| `branch` | `TEXT` | The git branch the records carry. |
+| `branch` | `TEXT` | The `gitBranch` of the last record that carried one. Each append that carries one replaces it. A session archived by an earlier version that has taken no record since holds the first branch it named. |
 | `is_final` | `INTEGER` | 1 once the session has been idle for 6 hours. |
 | `is_evicted` | `INTEGER` | 1 once retention has deleted the session's block rows. |
 | `parent_session_key` | `TEXT` | For a sidecar, the session key of the transcript it belongs to, in the same form, such as `<sessionId>.jsonl`, read from the sidecar's path. |
@@ -101,9 +101,9 @@ The truth. They are never dropped, never rebuilt and never converted.
 
 ### Kept tables
 
-They hold what happened at prompt time, or facts read from block rows that retention may later delete, so no rebuild can reproduce them. A rebuild never drops them.
+They hold what happened at prompt time, or facts read from block rows that retention may later delete, so no rebuild can reproduce them. A rebuild never drops them. Retention's delete does: it removes a session's observation, and the decisions and labels of its `session_id` once no top-level session with that id is archived.
 
-`decisions`, one row per prompt the injection logged, including prompts that injected nothing:
+`decisions`, one row per prompt the injection logged, including prompts that injected nothing. A prompt in an excluded project is not logged, and a row logged before its project was excluded stays:
 
 | Column | Type | What it holds |
 |---|---|---|
@@ -144,7 +144,7 @@ They hold what happened at prompt time, or facts read from block rows that reten
 
 ### Derived tables
 
-`DERIVED_TABLES` lists them in this order: `turns`, `compactions`, `turns_fts`, `entities`, `paths`. Every row in them comes from the block rows, through [`crates/terminus-core/src/derive.rs`](../../crates/terminus-core/src/derive.rs), and `terminus reindex` drops and rebuilds them.
+`DERIVED_TABLES` lists them in this order: `turns`, `compactions`, `turns_fts`, `entities`, `paths`. Every row in them comes from the block rows, through [`crates/terminus-core/src/derive.rs`](../../crates/terminus-core/src/derive.rs), and `terminus reindex` drops and rebuilds them, except an evicted session's rows, which it leaves standing.
 
 `turns`, one row per turn, unique on `(session_key, turn_seq)`:
 
@@ -245,7 +245,7 @@ An append, which is how every pass after a session's first adds to it, rewrites 
 
 ## 5. Commands and operations
 
-Options are in [commands.md](../commands.md#the-store), and the `--json` fields and exit codes are in [json-shapes.md](../json-shapes.md).
+Options are in [the command reference](../guide/reference/commands.md#the-store), and the `--json` fields and exit codes are in [JSON output and exit codes](../guide/reference/json-shapes.md).
 
 ### Opening the store
 
@@ -463,13 +463,13 @@ flowchart TD
 
 ## 7. Settings
 
-The archive reads no key in `terminus.toml` of its own. Where it lives is decided outside the file, as [configuration.md](../configuration.md#the-data-directory) gives in full:
+The archive reads no key in `terminus.toml` of its own. Where it lives is decided outside the file, as [the settings reference](../guide/configuration/paths.md#the-data-directory) gives in full:
 
 | Setting | What it changes here |
 |---|---|
 | `TERMINUS_DATA_DIR` | When set and not empty, the data directory, ahead of everything else. |
 | The `data-location` pointer | A plain text file in the config directory holding one absolute path, written by `terminus data move` and by nothing else. A pointer that cannot be read, or names a relative path, is an error rather than a fall back to the default. |
 | `$XDG_DATA_HOME`, `$HOME` | The platform default: `$XDG_DATA_HOME/terminus` or `~/.local/share/terminus` on Linux, and `~/Library/Application Support/terminus` on macOS. |
-| [`exclude`](../configuration.md#exclude) | Which sessions `usage` and `export` leave out. The rows stay in the store. |
+| [`exclude`](../guide/configuration/archiving.md#exclude) | Which sessions `usage` and `export` leave out. The rows stay in the store. |
 
 The block size, the zstd level and the two format versions are constants, and no key or variable changes them.

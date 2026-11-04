@@ -209,7 +209,7 @@ file it points at, and a path outside those two shapes, such as a file under no
 - `project_pre_worktree` is null unless the session's `cwd` was in a git
   worktree and its project was folded onto the parent repository. It is also
   null on a store too old to have the column.
-- `branch` is null when no record in the session carried a `gitBranch`.
+- `branch` is the `gitBranch` of the last record that carried one, and null when none did. It is stored as records are archived, so a session archived by an earlier version that has taken no record since holds the first branch it named.
 - `first_turn_at` and `last_turn_at` are null until a pass has archived a turn
   of the session. A transcript holding only state records, with no turn among
   them, has neither.
@@ -295,7 +295,8 @@ and unchanged.
 ```
 
 - `decisions` counts **every** logged prompt, including the ones that injected
-  nothing and the ones that never opened the store. That is the denominator the
+  nothing and the ones that never opened the store. A prompt in an excluded
+  project is not logged, and retention's `delete` removes a deleted session's. That is the denominator the
   whole report is for: a precision computed only over the prompts that fired
   would be a number about a subset that flatters itself.
 - `compacted_decisions` counts the decisions taken on the one prompt after a
@@ -308,8 +309,7 @@ and unchanged.
   are all still open has no precision, and zero would read as "injection never
   helps".
 - `misses` counts decisions where the model went to recall for something the
-  prompt had named and the injector declined to hand over. It reads zero on real
-  history today: no `recall_search` call exists in any measured transcript.
+  prompt had named and the injector declined to hand over.
 - `chars_injected` is what was spent; `chars_referenced` is the part of it
   carried by turns that turned out to be hits. **Characters, never tokens** -
   the same proxy the injection budget is spent in.
@@ -382,8 +382,10 @@ and unchanged.
   present and not named there is the whole of what the session did.
 - `duration_seconds` is the wall clock between the first and the last turn, and
   it is null on a session carrying no timestamp to measure from.
-  `first_turn_at` and `last_turn_at` are null on the same terms, and `branch` is
-  null when no record in the session carried a `gitBranch`. All four are null
+  `first_turn_at` and `last_turn_at` are null on the same terms. `branch` is the
+  session's stored branch when the observation was recorded, as `sessions`
+  describes it, and null when no record in the session carried a `gitBranch`.
+  All four are null
   for a session with no `session_meta` row.
 - `session_id` is null when the session's `session_meta` row holds none.
   `generated_at` and `mechanical` are null only when their column is; the ingest
@@ -459,9 +461,10 @@ What the two verbs mean for everything else you can ask this store:
   turn, and `terminus show` reports `body_evicted: true` with a null `body`. Its
   `excerpt` in a search hit is empty, because the bytes an excerpt is cut from
   are the ones that were reclaimed.
-- A **deleted** session is gone from both: no listing, no search hit, no turn.
-  `delete` acts only on sessions whose transcript file Claude Code's own
-  `cleanupPeriodDays` has already removed, so a session still on disk is never
+- A **deleted** session is gone from both: no listing, no search hit, no turn,
+  and no logged prompt or label once its top-level session is gone. `delete` acts
+  only on sessions whose transcript file is gone, usually to Claude Code's own
+  `cleanupPeriodDays`, so a session still on disk is never
   deleted however old it is - it would simply be re-ingested on the next hook
   spawn.
 
@@ -527,15 +530,13 @@ other's total is the mistake it exists to prevent.
 - The ARCHIVE table is `by_project` and `by_month`. The bytes in each add up to
   `archive_bytes`, which is the sum of each session's block byte lengths
   (`length(bytes)` over its `blocks` rows) over the sessions a read path may
-  see - and **not** to `file_bytes`. On the live store measured 2026-08-22 the
-  file is 1,103,396,864 bytes against 465,985,120 of archive, 2.4x everything
-  the projects account for; the rest is the derived tables, and attributing them
-  to projects pro-rata would make every per-project number an estimate rather
-  than a measurement.
+  see - and **not** to `file_bytes`. The file is larger because it also holds the
+  derived tables, and attributing them to projects pro-rata would make every
+  per-project number an estimate rather than a measurement.
 - A session with no `project` and a session with no `first_turn_at` each get a
   bucket whose key is `null`. They are counted and their bytes are inside the
-  totals: a null quietly dropped is a total that no longer reconciles, and the
-  live store has exactly one of each. Buckets are biggest first, with the `null`
+  totals: a null quietly dropped is a total that no longer reconciles. Buckets
+  are biggest first, with the `null`
   one last whatever its size.
 - A session is filed under one month, by `substr(first_turn_at, 1, 7)`.
   `first_turn_at` is established by byte order and never revised by a tail pass,
@@ -626,7 +627,7 @@ the same 14 keys: `binary`, `settings_file`, `hook_SessionStart`,
 | `fix` | string or null | What to run, or the settings edit to make. Null wherever doctor has no one command or edit to give, as listed below. |
 
 - `note` is true, worth saying, and not a failure: a machine before its first
-  ingest, or a setting terminus would choose differently and never changes
+  ingest, or a setting with a cost worth knowing that terminus never changes
   itself. `unknown` is doctor declining to guess - no `claude` on `PATH`, a
   settings file that will not parse - and, like `note`, never reaches the exit
   code.
@@ -639,8 +640,9 @@ the same 14 keys: `binary`, `settings_file`, `hook_SessionStart`,
 - `fix` is set only where doctor can name one command to run or one settings
   edit to make. It is null for every `ok` and every `unknown`. It is null for a
   `note` with nothing to run: a settings file, data directory or store not
-  there yet, no ingest run yet, more than one config root, or a hook event
-  another install's entry also runs. It is null for a `problem` doctor has no
+  there yet, no ingest run yet, more than one config root, a hook event
+  another install's entry also runs, or `autoCompactEnabled` on, where either
+  value has a cost and the finding names both. It is null for a `problem` doctor has no
   one command for: a `settings.json` or `.claude.json` that cannot be read or
   is not JSON, a duplicated hook entry, a config that does not load or resolves
   no root, a data directory that cannot be resolved or read or is not a

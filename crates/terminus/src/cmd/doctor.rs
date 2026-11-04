@@ -883,15 +883,13 @@ impl Doctor {
     }
 
     // -----------------------------------------------------------------------
-    // The two Claude Code settings terminus has an opinion about and never
-    // changes.
+    // The two Claude Code settings terminus reports and never changes.
     //
     // Reported, and only reported. `cleanupPeriodDays` is how long Claude Code
     // keeps its own transcripts, which is terminus's second recovery path for a
-    // session it never got to read; auto-compact spends tokens summarizing
-    // context this store already holds losslessly. Both are the user's to set,
-    // through their own editor or `/config`, and doctor prints the edit rather
-    // than making it.
+    // session it never got to read. Auto-compact is a trade-off with a cost
+    // either way, and the archive does not settle it. Both are the user's to
+    // set, through their own editor or `/config`.
     // -----------------------------------------------------------------------
 
     fn claude_settings(&mut self) {
@@ -928,9 +926,9 @@ impl Doctor {
                 "cleanup_period_days",
                 State::Note,
                 format!(
-                    "{finding}. Claude Code deletes its own transcripts that many days after they \
-                     are written; what terminus has archived stays, and a session it never got to \
-                     read goes with them"
+                    "{finding}. Claude Code deletes its own transcripts once they are older than \
+                     that; what terminus has archived stays, and a session it never got to read \
+                     goes with them"
                 ),
             )
             .with_fix(format!(
@@ -986,16 +984,16 @@ impl Doctor {
                 "auto_compact",
                 State::Note,
                 format!(
-                    "autoCompactEnabled is true, {source}. Terminus never changes it and \
-                     recommends off: compaction spends tokens summarizing context this store \
-                     already holds losslessly, and a fresh session plus targeted recall beats a \
-                     self-summarization"
+                    "autoCompactEnabled is true, {source}. Terminus never changes it, and either \
+                     value has a cost. On, Claude Code summarizes older history as context fills, \
+                     which spends tokens and loses detail, and the session keeps going. Off, a \
+                     session that reaches the context limit stops with an error until you run \
+                     /compact or /clear. The archive keeps the full history either way but does \
+                     not manage active context: recall offers at most three matching turns on a \
+                     prompt. To turn it off, set \"autoCompactEnabled\": false in {} or use /config",
+                    target.display()
                 ),
             )
-            .with_fix(format!(
-                "set \"autoCompactEnabled\": false in {} (or /config inside Claude Code)",
-                target.display()
-            ))
         } else {
             Check::new(
                 "auto_compact",

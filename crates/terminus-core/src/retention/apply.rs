@@ -30,6 +30,9 @@ pub struct Applied {
     /// block rows, and the delete takes those too, which is why `reindex`
     /// deliberately does not touch that table.
     pub observations_lost: usize,
+    /// Logged prompts the deletions removed, each with its labels. Counted and
+    /// said for the reason an observation is: nothing can rebuild one.
+    pub decisions_lost: usize,
     /// Eligible sessions the per-pass bound left for the next pass.
     pub over: usize,
     /// Sessions an excluded project holds, which retention passed over.
@@ -81,6 +84,13 @@ impl Applied {
             }
             out.push(line);
         }
+        if self.decisions_lost > 0 {
+            out.push(format!(
+                "retention removed {} logged prompt(s) and their labels with those sessions; \
+                 terminus stats and terminus replay no longer count them",
+                self.decisions_lost
+            ));
+        }
         if self.over > 0 {
             out.push(format!(
                 "{} more session(s) are waiting on retention; the next ingest takes the next {}",
@@ -119,11 +129,12 @@ pub fn apply(store: &mut Store, selection: &super::Selection) -> Applied {
     }
     for session_key in &selection.delete {
         match delete_one(store.conn_mut(), session_key) {
-            Ok(Some(observation)) => {
+            Ok(Some(deleted)) => {
                 out.deleted.push(session_key.clone());
-                if observation {
+                if deleted.observations > 0 {
                     out.observations_lost += 1;
                 }
+                out.decisions_lost += deleted.decisions;
             }
             Ok(None) => out.kept += 1,
             Err(e) => out
@@ -156,8 +167,14 @@ fn evict_one(conn: &mut Connection, session_key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove one session and everything keyed on it, answering whether an
-/// `observations` row went with it, or `None` when the session was kept.
+/// What one deletion took that nothing can rebuild.
+pub(crate) struct Deleted {
+    observations: usize,
+    decisions: usize,
+}
+
+/// Remove one session and everything keyed on it, answering what went with it,
+/// or `None` when the session was kept.
 ///
 /// **It asks about the transcript again first (#43).** [`super::evaluate`] named
 /// this session when its transcript was gone, and a transcript can come back
@@ -179,18 +196,18 @@ fn evict_one(conn: &mut Connection, session_key: &str) -> Result<()> {
 /// `blocks` off `sessions(session_no)`, so they go after the derived rows and
 /// before `sessions`.
 ///
-/// **`decisions` and `labels` are deliberately untouched.** `decisions` is
-/// keyed on `session_id` with no declared reference and `labels.turn_id`
-/// carries no foreign key on purpose, and the replay history has to survive a
-/// deletion - it is the record of what injection decided, which the archive
-/// never contained and no reingest can rebuild.
+/// **The session's `decisions` and their `labels` go too.** A decision holds a
+/// whole prompt, so a deletion that left it would keep the text the user asked
+/// retention to remove. See [`delete_decisions`] for which ones belong to a
+/// session. `terminus stats` and `terminus replay` lose them, and the note says
+/// so.
 ///
 /// The watermark goes last, keyed on the session key: `watermarks` is keyed on
 /// the transcript path, and the session key IS that path (`recover::recover`
 /// joins them on exactly that equality). Leaving it would let a row claim bytes
 /// for a session that is gone - and `recover`'s orphan sweep would delete it on
 /// the next pass and report a repair for damage retention caused.
-fn delete_one(conn: &mut Connection, session_key: &str) -> Result<Option<bool>> {
+fn delete_one(conn: &mut Connection, session_key: &str) -> Result<Option<Deleted>> {
     let tx = conn.transaction()?;
     let transcript_path: String = tx.query_row(
         "SELECT transcript_path FROM session_meta WHERE session_key = ?1",
@@ -200,15 +217,20 @@ fn delete_one(conn: &mut Connection, session_key: &str) -> Result<Option<bool>> 
     if !super::transcript_is_gone(&transcript_path) {
         return Ok(None);
     }
-    let observations = delete_session(&tx, session_key)?;
+    let deleted = delete_session(&tx, session_key)?;
     tx.commit()?;
-    Ok(Some(observations > 0))
+    Ok(Some(deleted))
 }
 
 /// Delete one session and every row keyed on it, inside the caller's
 /// transaction: the derived rows through `reindex::clear_derived`, then the
-/// rows retention owns, child first. Answers how many `observations` rows went.
-pub(crate) fn delete_session(tx: &Connection, session_key: &str) -> Result<usize> {
+/// rows retention owns, child first.
+pub(crate) fn delete_session(tx: &Connection, session_key: &str) -> Result<Deleted> {
+    let session_id: Option<String> = tx.query_row(
+        "SELECT session_id FROM session_meta WHERE session_key = ?1",
+        [session_key],
+        |r| r.get(0),
+    )?;
     crate::reindex::clear_derived(tx, session_key)?;
     let observations = tx.execute(
         "DELETE FROM observations WHERE session_key = ?1",
@@ -224,5 +246,43 @@ pub(crate) fn delete_session(tx: &Connection, session_key: &str) -> Result<usize
         "DELETE FROM watermarks WHERE transcript_path = ?1",
         [session_key],
     )?;
-    Ok(observations)
+    let decisions = match session_id {
+        Some(session_id) => delete_decisions(tx, &session_id)?,
+        None => 0,
+    };
+    Ok(Deleted {
+        observations,
+        decisions,
+    })
+}
+
+/// Delete the decisions of `session_id` and their labels, unless a top-level
+/// session with that id is still archived. Answers how many decisions went.
+///
+/// A decision belongs to a session through `session_id`, and a subagent's
+/// transcript reports its parent's id. So deleting a subagent's session leaves
+/// the parent's decisions alone, and deleting the parent takes them even when
+/// one of its subagents is still archived, because those prompts were typed in
+/// the parent.
+///
+/// A label on another session's decision can name a turn of the deleted
+/// session. It stays with that decision, and it holds an id and a verdict.
+fn delete_decisions(tx: &Connection, session_id: &str) -> Result<usize> {
+    let still_archived: bool = tx.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM session_meta
+              WHERE session_id = ?1 AND parent_session_key IS NULL
+         )",
+        [session_id],
+        |r| r.get(0),
+    )?;
+    if still_archived {
+        return Ok(0);
+    }
+    tx.execute(
+        "DELETE FROM labels
+          WHERE decision_id IN (SELECT id FROM decisions WHERE session_id = ?1)",
+        [session_id],
+    )?;
+    Ok(tx.execute("DELETE FROM decisions WHERE session_id = ?1", [session_id])?)
 }

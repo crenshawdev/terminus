@@ -70,7 +70,7 @@ Search writes three derived tables at ingest and reads them, with `turns` and `s
 - the top-level `toolUseResult`, the tool's output, such as `stdout` and `stderr`;
 - the string values of the top-level `attachment`.
 
-JSON keys are never emitted, and neither are numbers or booleans. The text stops at `MAX_BODY_BYTES`. Under `[capture] mode` `lean` or `minimal`, an elided `toolUseResult` or `attachment` contributes nothing.
+JSON keys are never emitted, and neither are numbers or booleans. A `message.content` block of any other type, such as `thinking`, contributes nothing. The text stops at `MAX_BODY_BYTES`, and what lies past it stays in the block rows, where `show` and `recall_get` read it and search does not find it. Under `[capture] mode` `lean` or `minimal`, an elided `toolUseResult` or `attachment` contributes nothing.
 
 Then `index::expand` appends expansion tokens. The table uses FTS5's default tokenizer, plain `unicode61`, with no custom tokenizer. `unicode61` makes tokens from characters in the Unicode letter, number and private-use categories and splits on everything else, so snake_case, kebab-case and path parts are already tokens of their own: a query for `worker` finds `src/worker/S.ts` and a query for `manager` finds `search_manager_new`, with nothing appended. What it splits on includes some characters Rust counts as letters, such as combining marks like U+0345 and circled letters like U+24B6, so the query drops a word made only of them. What `unicode61` does not split is a case boundary, so `SearchManager` would not be found by `manager`. For each word, the expansion appends its camelCase or PascalCase pieces, `Search` and `Manager` here, but only pieces the body does not already contain, in the order the text gives them, up to `MAX_EXPANSION_BYTES`. Digits stay with their piece, so `S3Client` gives `S3` and `Client`, and the last capital of a run starts the next piece, so `HTTPServer` gives `HTTP` and `Server`.
 
@@ -90,7 +90,7 @@ No value is ever rejected for being common, because what counts as common change
 
 ## 5. Commands and operations
 
-Options are in [commands.md](../commands.md#reading-the-archive), and the `--json` fields and exit codes are in [json-shapes.md](../json-shapes.md#search). All three commands open the store through `cmd/read.rs`, read-only, and never create one.
+Options are in [the command reference](../guide/reference/commands.md#reading-the-archive), and the `--json` fields and exit codes are in [JSON output and exit codes](../guide/reference/json-shapes.md#search). All three commands open the store through `cmd/read.rs`, read-only, and never create one.
 
 ### Scope
 
@@ -170,8 +170,8 @@ flowchart TD
 
 | Key | What it changes here |
 |---|---|
-| [`exclude`](../configuration.md#exclude) | Projects no search, show or listing returns, under every scope, `*` included, and including sessions archived before the project was excluded. |
-| [`[privacy] redact_recall`](../configuration.md#privacy) | Whether excerpts and shown records are filtered on their way out. Off by default. `--raw` on `search` or `show` turns it off for that one run, and no setting or variable turns it off for the hooks or the MCP server. |
-| [`[capture] mode`](../configuration.md#capture) | Under `lean` or `minimal`, text that was only in elided tool output is not in the body and is not found. |
+| [`exclude`](../guide/configuration/archiving.md#exclude) | Projects no search, show or listing returns, under every scope, `*` included, and including sessions archived before the project was excluded. |
+| [`[privacy] redact_recall`](../guide/configuration/recall.md#privacy) | Whether excerpts and shown records are filtered on their way out. Off by default. `--raw` on `search` or `show` turns it off for that one run, and no setting or variable turns it off for the hooks or the MCP server. |
+| [`[capture] mode`](../guide/configuration/archiving.md#capture) | Under `lean` or `minimal`, text that was only in elided tool output is not in the body and is not found. |
 
 The query limits, `MAX_QUERY_TOKENS`, `MAX_RESULTS`, the candidate pool and the entity weights, are constants, and no key changes them.

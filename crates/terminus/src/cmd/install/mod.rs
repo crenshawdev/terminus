@@ -402,19 +402,22 @@ fn advise(settings: &Document) -> Result<(), Failure> {
     outln!();
     outln!(
         "  {how}.\n  \
-         Claude Code deletes its own transcripts that many days after they are written,\n  \
-         so its transcripts older than {effective} days are already gone. What terminus\n  \
-         has archived stays. install leaves the setting as it is. To keep them longer:"
+         Claude Code deletes its own transcripts once they are older than that, in a\n  \
+         sweep after a session starts, so any older than {effective} days may already be gone.\n  \
+         What terminus has archived stays. install leaves the setting as it is. To keep\n  \
+         them longer:"
     );
     outln!(
         "    set \"cleanupPeriodDays\": {KEEP_CLEANUP_DAYS} in {}",
         settings.path().display()
     );
     outln!(
-        "  autoCompactEnabled is left as it is, and terminus never sets it. Turning it\n  \
-         off is the recommendation: compaction spends tokens summarizing context this\n  \
-         store already holds losslessly, and a fresh session plus targeted recall beats\n  \
-         a self-summarization."
+        "  autoCompactEnabled is left as it is, and terminus never sets it. Either value\n  \
+         has a cost. On, Claude Code summarizes older history as context fills, which\n  \
+         spends tokens and loses detail. Off, a session that reaches the context limit\n  \
+         stops with an error until you run /compact or /clear. The archive keeps the\n  \
+         full history either way but does not manage active context: recall offers at\n  \
+         most three matching turns on a prompt."
     );
     Ok(())
 }

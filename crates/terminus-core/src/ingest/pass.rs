@@ -292,16 +292,17 @@ impl Walk for Tree<'_> {
         // A drain that fails is a note and not a failed pass: the archive is
         // the work, and a decision log that could not be moved is worth saying
         // and not worth losing a tree walk over.
-        summary.feedback = match crate::feedback::drain(store.conn_mut(), self.data_dir) {
-            Ok(drained) => drained,
-            Err(e) => crate::feedback::Drained {
-                decisions: 0,
-                discarded: vec![(
-                    self.data_dir.join(crate::inject::decision::DIR_NAME),
-                    format!("the decision log could not be drained: {e}"),
-                )],
-            },
-        };
+        summary.feedback =
+            match crate::feedback::drain(store.conn_mut(), self.data_dir, self.config) {
+                Ok(drained) => drained,
+                Err(e) => crate::feedback::Drained {
+                    discarded: vec![(
+                        self.data_dir.join(crate::inject::decision::DIR_NAME),
+                        format!("the decision log could not be drained: {e}"),
+                    )],
+                    ..crate::feedback::Drained::default()
+                },
+            };
 
         let found = discover::discover(self.config);
         summary.unreadable = found.unreadable;

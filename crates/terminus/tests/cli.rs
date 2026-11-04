@@ -1143,7 +1143,7 @@ fn verify_checks_a_clean_store_past_a_config_that_does_not_parse() {
 // ---------------------------------------------------------------------------
 
 /// Every data command, the arguments that make it answer, and the `data` fields
-/// `docs/json-shapes.md` says it emits.
+/// `docs/guide/reference/json-shapes.md` says it emits.
 ///
 /// The field lists are the documented shape, transcribed. That transcription is
 /// the point: a shape that drifts from the doc fails here, and a doc updated
@@ -1285,7 +1285,7 @@ fn swept() -> (Bench, String) {
 ///
 /// A command NAME may be two words (`observations regenerate`). The name
 /// is one string because that is what `value["command"]` reports and what
-/// `docs/json-shapes.md` heads its section with; the split into command-line
+/// `docs/guide/reference/json-shapes.md` heads its section with; the split into command-line
 /// words lives here, so a second column no one-word command would use never has
 /// to exist.
 fn sweep_args<'a>(
@@ -1359,7 +1359,7 @@ fn every_data_command_emits_the_documented_shape() {
         assert_eq!(
             present,
             documented,
-            "`{}` does not match docs/json-shapes.md",
+            "`{}` does not match docs/guide/reference/json-shapes.md",
             argv.join(" ")
         );
     }

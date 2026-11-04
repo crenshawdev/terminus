@@ -8,7 +8,7 @@ It also covers `terminus uninstall`, which takes out what install put in, `termi
 
 It does not cover what the wiring then does. The four hook entries it writes are the hooks in [0002: Hooks](0002-hooks.md). The MCP entry it registers is the server in [0006: Recall through MCP](0006-recall-through-mcp.md). The backfill it starts last is the one in [0003: Ingest](0003-ingest.md). `terminus uninstall --purge` deletes the data directory the [0001: Overview](0001-overview.md) describes.
 
-What every check refuses, and the release steps one at a time, are already in [release.md](../release.md) and [install.md](../install.md). This doc says how the parts fit and links there for the rest.
+What every check refuses, and the release steps one at a time, are already in [the release page](../guide/reference/release.md) and [the install page](../guide/getting-started/install.md). This doc says how the parts fit and links there for the rest.
 
 ## 2. Terms
 
@@ -65,12 +65,12 @@ This part owns no table. It writes files outside the data directory, and the rel
 
 ## 5. Commands and operations
 
-Options are in [commands.md](../commands.md#setup), and `doctor`'s `--json` fields in [json-shapes.md](../json-shapes.md#doctor). The installer's behaviour is in [install.md](../install.md), and every release and installer check in [release.md](../release.md).
+Options are in [the command reference](../guide/reference/commands.md#setup), and `doctor`'s `--json` fields in [JSON output and exit codes](../guide/reference/json-shapes.md#doctor). The installer's behaviour is in [the install page](../guide/getting-started/install.md), and every release and installer check in [the release page](../guide/reference/release.md).
 
 ### `install.sh`
 
 - **Inputs:** no argument, which downloads from `https://github.com/jcrenshaw-dev/terminus/releases/latest/download`, or one `https://` source. `HOME`, `uname -s` and `uname -m`, `curl`, `ssh-keygen`, and `sha256sum` or `shasum -a 256`.
-- **Outputs:** in the order [release.md](../release.md#what-installsh-checks) lists: the environment and the stable path are checked, the manifest and its signature are downloaded, and the manifest is verified with `ssh-keygen -Y verify -I crenshawdev-release -n terminus-release` against an allowed-signers file the script writes from `release_key`, so no allowed-signers file of the user's is read. Only then is the binary downloaded, the manifest's two lines checked, and the binary's SHA-256 compared with the manifest's. Then the binary is stored as `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus` through a temporary and a rename, the stable path is checked again, a new link is made beside it and renamed over `~/.local/bin/terminus`, the versions present are printed, and `terminus install` runs through the link. The script exits with its status.
+- **Outputs:** in the order [the release page](../guide/reference/release.md#what-installsh-checks) lists: the environment and the stable path are checked, the manifest and its signature are downloaded, and the manifest is verified with `ssh-keygen -Y verify -I crenshawdev-release -n terminus-release` against an allowed-signers file the script writes from `release_key`, so no allowed-signers file of the user's is read. Only then is the binary downloaded, the manifest's two lines checked, and the binary's SHA-256 compared with the manifest's. Then the binary is stored as `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus` through a temporary and a rename, the stable path is checked again, a new link is made beside it and renamed over `~/.local/bin/terminus`, the versions present are printed, and `terminus install` runs through the link. The script exits with its status.
 - **Refusals:** every check refuses with `terminus: <reason>` on stderr and exit 1, with nothing installed. Among them, `TERMINUS_BIN_DIR` set, because `terminus install` would point the wiring into that folder while the script links `~/.local/bin/terminus`; a `HOME` that is unset, relative, not UTF-8, has a path part that is exactly `..`, or changes when the shell copies it; a stable path holding a folder or a file that does not carry the marker; and a manifest that does not verify against the pinned key. Nothing overrides the key.
 
 ### `terminus install`
@@ -113,7 +113,7 @@ Options are in [commands.md](../commands.md#setup), and `doctor`'s `--json` fiel
 ### The CI runs
 
 - **`release-check.yml`**, on `release: published`. On `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15-intel` and `macos-15`, it puts a stand-in `claude` that exits 0 on `PATH`, runs `curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install.sh | sh` with pipefail, and checks that `~/.local/bin/terminus --version` is the release's version.
-- **`test.yml`**, on every pull request and every push to `main`. On the same four runners, in a debug and a release build each, eight jobs, it runs `cargo test --workspace --all-features --locked`, with a 15-minute limit on the test step that prints the processes and their open files before it stops a hung run. It reads no secret. Three timing tests of a hook spawn's p99 are skipped on every runner, and three budgets on a single spawn on the two macOS runners, because a hosted VM's timing measures the VM.
+- **`test.yml`**, on every pull request and every push to `main`. On the same four runners, in a debug and a release build each, eight jobs, it runs `cargo test --workspace --all-features --locked`, with a 15-minute limit on the test step that prints the processes and their open files before it stops a hung run. It reads no secret, so the tests over the private transcript corpus skip themselves. Three timing tests of a hook spawn's p99 are skipped on every runner, and three budgets on a single spawn on the two macOS runners, because a hosted VM's timing measures the VM.
 
 ## 6. States and workflows
 
@@ -153,7 +153,7 @@ sequenceDiagram
 
 *Figure 1. One release, from the tag to the check. CI builds and drafts with no key. The owner signs and publishes from his own machine, and only a draft is signed. Publishing starts `release-check.yml`, which installs the release with the public command on every platform it ships for.*
 
-The key and the build never meet. CI holds no signing key, and the owner's machine builds nothing: it checks what CI built against what CI wrote down, signs the manifest and not the binary, and checks its own signature with the same command every user's `install.sh` runs. A signature therefore says the owner's key approved this manifest under `terminus-release`, and the manifest's `sha256` line ties that approval to one binary. What that protects and what it does not is in [release.md](../release.md#what-the-signature-protects).
+The key and the build never meet. CI holds no signing key, and the owner's machine builds nothing: it checks what CI built against what CI wrote down, signs the manifest and not the binary, and checks its own signature with the same command every user's `install.sh` runs. A signature therefore says the owner's key approved this manifest under `terminus-release`, and the manifest's `sha256` line ties that approval to one binary. What that protects and what it does not is in [the release page](../guide/reference/release.md#what-the-signature-protects).
 
 ### An install
 
@@ -195,13 +195,13 @@ An update is this same flowchart. The new version gets a folder of its own besid
 
 ## 7. Settings
 
-Install reads no `terminus.toml` key of its own. `roots` is listed in the receipt and is what the backfill walks, but where the hook entries go is Claude Code's settings file, which `CLAUDE_CONFIG_DIR` picks. What the installer needs is in [install.md](../install.md#what-it-needs), and every variable below is in [configuration.md](../configuration.md#environment-variables).
+Install reads no `terminus.toml` key of its own. `roots` is listed in the receipt and is what the backfill walks, but where the hook entries go is Claude Code's settings file, which `CLAUDE_CONFIG_DIR` picks. What the installer needs is in [the install page](../guide/getting-started/install.md#what-it-needs), and every variable below is in [the settings reference](../guide/configuration/paths.md#environment-variables).
 
 | Variable | What it changes here |
 |---|---|
 | `TERMINUS_BIN_DIR` | `install.sh` refuses to run while it is set. `terminus install`, `uninstall` and `doctor` read it as the stable path's folder in place of `~/.local/bin`, which is what keeps a test off the real stable path. The versions folder stays under `HOME` either way. |
 | `HOME` | Where the stable path and the versions folder are. Both `install.sh` and `terminus install` require it to be set and absolute. |
 | `CLAUDE_CONFIG_DIR` | When set, the hook entries go in `$CLAUDE_CONFIG_DIR/settings.json` and the MCP entry in `$CLAUDE_CONFIG_DIR/.claude.json`. It is passed through to `claude`, so `claude` writes the file install read. |
-| `TERMINUS_DATA_DIR`, `TERMINUS_CONFIG_DIR` | The data directory the receipt prints, the backfill fills and `--purge` deletes, and where `terminus.toml` is read from, as in [the data directory](../configuration.md#the-data-directory). |
+| `TERMINUS_DATA_DIR`, `TERMINUS_CONFIG_DIR` | The data directory the receipt prints, the backfill fills and `--purge` deletes, and where `terminus.toml` is read from, as in [the data directory](../guide/configuration/paths.md#the-data-directory). |
 | `PATH` | Where `claude` is found. Its absolute path is what runs. |
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | Never read. Set to `1` on every `claude` process install and uninstall start and on every `--version` doctor runs, so `claude mcp` opens no network connection. |

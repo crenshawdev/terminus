@@ -32,7 +32,7 @@ use super::Failure;
 const COMMAND: &str = "observations";
 
 /// The rebuild's own name in the envelope: both words, because both words are
-/// what a caller typed and `docs/json-shapes.md` documents the two shapes apart.
+/// what a caller typed and `docs/guide/reference/json-shapes.md` documents the two shapes apart.
 const REGENERATE_COMMAND: &str = "observations regenerate";
 
 pub fn run(args: Args) -> Result<(), Failure> {
