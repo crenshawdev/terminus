@@ -1,8 +1,8 @@
 # Terminus
 
-[![Test](https://github.com/jcrenshaw-dev/terminus/actions/workflows/test.yml/badge.svg)](https://github.com/jcrenshaw-dev/terminus/actions/workflows/test.yml)
-[![Latest release](https://img.shields.io/github/v/release/jcrenshaw-dev/terminus?label=release)](https://github.com/jcrenshaw-dev/terminus/releases/latest)
-[![License: MIT](https://img.shields.io/github/license/jcrenshaw-dev/terminus)](LICENSE)
+[![Test](https://github.com/crenshawdev/terminus/actions/workflows/test.yml/badge.svg)](https://github.com/crenshawdev/terminus/actions/workflows/test.yml)
+[![Latest release](https://img.shields.io/github/v/release/crenshawdev/terminus?label=release)](https://github.com/crenshawdev/terminus/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/crenshawdev/terminus)](LICENSE)
 
 Terminus is a local archive of your Claude Code sessions, for a developer who comes back to the same projects and wants what was said and decided in them to still be there.
 
@@ -20,22 +20,22 @@ Terminus keeps the session instead: every prompt, every reply, every tool call a
 
 Under the defaults:
 
-- Each session is stored as compressed blocks of its transcript, and the archived bytes are the transcript exactly. Each block carries a BLAKE3 hash, and `terminus verify` checks every one. [`[capture]`](https://jcrenshaw-dev.github.io/terminus/configuration/archiving.html#capture) can store less.
+- Each session is stored as compressed blocks of its transcript, and the archived bytes are the transcript exactly. Each block carries a BLAKE3 hash, and `terminus verify` checks every one. [`[capture]`](https://crenshawdev.github.io/terminus/configuration/archiving.html#capture) can store less.
 - Search is SQLite FTS5 with no embeddings. It finds turns by text, path, error and identifier, and it indexes an identifier by its parts, so `manager` finds `SearchManager`. It doesn't find turns by meaning.
 - The index covers up to 256 KiB of text per turn, whether it happened a few minutes ago or in the first session Terminus archived. Text past that limit stays in the archive, where `recall_get` and `terminus show` read it and search doesn't find it.
 - Terminus makes no model call of its own, so nothing runs up your bill or your usage limit in the background. It runs no daemon and opens no network connection, and a test fails if any source file names a socket type.
-- What it hands Claude goes into the session like anything else you type, so it goes to Claude's model and takes up context. That's at most 6,000 characters when a session starts and 4,000 on a prompt, and [`[injection]`](https://jcrenshaw-dev.github.io/terminus/configuration/recall.html#injection) can set either one up to 10,000.
+- What it hands Claude goes into the session like anything else you type, so it goes to Claude's model and takes up context. That's at most 6,000 characters when a session starts and 4,000 on a prompt, and [`[injection]`](https://crenshawdev.github.io/terminus/configuration/recall.html#injection) can set either one up to 10,000.
 
 Terminus doesn't manage your active context. It offers at most three matching turns on a prompt, and no measurement shows that replaces compaction. `terminus stats` reports how often what it handed over came up again in your own sessions, and `terminus replay` re-scores your logged prompts under other thresholds, so you can judge it on your own work.
 
-Read [the archive chapter](https://jcrenshaw-dev.github.io/terminus/archive/what-is-kept.html) for what's stored, what search covers, and how to keep less.
+Read [the archive chapter](https://crenshawdev.github.io/terminus/archive/what-is-kept.html) for what's stored, what search covers, and how to keep less.
 
 ## Get started
 
 You'll need Linux or macOS on x86_64 or aarch64, Claude Code and its `claude` command, `curl`, `ssh-keygen`, and `sha256sum` or `shasum`. Terminus reads only Claude Code's transcripts, so it does nothing for another coding agent. Windows isn't supported, and a build for it fails at compile time. [TRUST.md](TRUST.md) says why.
 
 ```console
-$ curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install.sh | sh
+$ curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh
 ```
 
 The script checks the release's signature before it installs anything, wires Terminus into Claude Code, and archives the transcripts already on disk. Start a new Claude Code session and it's working. Typing `terminus` by name needs `~/.local/bin` on your `PATH`, and nothing edits your shell profile to add it.
@@ -69,18 +69,18 @@ The first four answer for the project you're in. `--project <path>` picks anothe
 
 ## Documentation
 
-[Read the Terminus guide](https://jcrenshaw-dev.github.io/terminus/), or [browse the Markdown on GitHub](./docs/guide/SUMMARY.md).
+[Read the Terminus guide](https://crenshawdev.github.io/terminus/), or [browse the Markdown on GitHub](./docs/guide/SUMMARY.md).
 
 | Start here | What you'll find |
 |---|---|
-| [Getting started](https://jcrenshaw-dev.github.io/terminus/getting-started/install.html) | Installing, checking the wiring, updating and removing. |
-| [Working with Terminus](https://jcrenshaw-dev.github.io/terminus/working/what-claude-gets.html) | What Claude gets and when, reading the archive, and what to do when something's wrong. |
-| [The archive](https://jcrenshaw-dev.github.io/terminus/archive/what-is-kept.html) | What's stored, what search finds, whether it's helping, and how to keep less. |
-| [Configuration](https://jcrenshaw-dev.github.io/terminus/configuration/index.html) | Every key in `terminus.toml`, its default and what it changes. |
-| [Commands](https://jcrenshaw-dev.github.io/terminus/reference/commands.html) · [JSON output](https://jcrenshaw-dev.github.io/terminus/reference/json-shapes.html) | Every command and option, and the `--json` contract with its exit codes. |
-| [Permissions and data](https://jcrenshaw-dev.github.io/terminus/reference/permissions.html) | What it reads, writes, runs and sends, and what is and isn't protected. |
-| [Releases](https://jcrenshaw-dev.github.io/terminus/reference/release.html) | How a release is built, signed and checked, and how to check one by hand. |
-| [How it works](https://jcrenshaw-dev.github.io/terminus/how-it-works/overview.html) · [Design docs](./docs/design/README.md) | How the parts fit together, the limits of each check, and the detailed design. |
+| [Getting started](https://crenshawdev.github.io/terminus/getting-started/install.html) | Installing, checking the wiring, updating and removing. |
+| [Working with Terminus](https://crenshawdev.github.io/terminus/working/what-claude-gets.html) | What Claude gets and when, reading the archive, and what to do when something's wrong. |
+| [The archive](https://crenshawdev.github.io/terminus/archive/what-is-kept.html) | What's stored, what search finds, whether it's helping, and how to keep less. |
+| [Configuration](https://crenshawdev.github.io/terminus/configuration/index.html) | Every key in `terminus.toml`, its default and what it changes. |
+| [Commands](https://crenshawdev.github.io/terminus/reference/commands.html) · [JSON output](https://crenshawdev.github.io/terminus/reference/json-shapes.html) | Every command and option, and the `--json` contract with its exit codes. |
+| [Permissions and data](https://crenshawdev.github.io/terminus/reference/permissions.html) | What it reads, writes, runs and sends, and what is and isn't protected. |
+| [Releases](https://crenshawdev.github.io/terminus/reference/release.html) | How a release is built, signed and checked, and how to check one by hand. |
+| [How it works](https://crenshawdev.github.io/terminus/how-it-works/overview.html) · [Design docs](./docs/design/README.md) | How the parts fit together, the limits of each check, and the detailed design. |
 
 ## Trust
 
@@ -88,13 +88,13 @@ Terminus collects nothing about you and sends no telemetry. The platforms it sup
 
 What leaves your machine: install and update fetch `install.sh` from `raw.githubusercontent.com`, then the manifest, its signature and the binary from this repository's GitHub releases, or from the `https://` source you pass. The archived turns Terminus hands Claude Code go to Claude's model with the rest of the session. Nothing else.
 
-The archive has no encryption at rest. Its files are protected only by being readable by your user alone, and it holds whatever your transcripts hold, secrets you pasted included. Claude Code's own transcripts sit unencrypted in its folder too. [Permissions and data](https://jcrenshaw-dev.github.io/terminus/reference/permissions.html) lists what is and isn't protected.
+The archive has no encryption at rest. Its files are protected only by being readable by your user alone, and it holds whatever your transcripts hold, secrets you pasted included. Claude Code's own transcripts sit unencrypted in its folder too. [Permissions and data](https://crenshawdev.github.io/terminus/reference/permissions.html) lists what is and isn't protected.
 
 Releases are signed on the maintainer's machine, never in CI, and `install.sh` checks the signature before it installs anything. How these claims are checked is in [SECURITY.md](SECURITY.md).
 
 ## Help
 
-Questions go on the [jcrenshaw.dev Discord](https://jcrenshaw.dev/discord). Bugs and anything in the docs that's wrong go to [GitHub issues](https://github.com/jcrenshaw-dev/terminus/issues). Pull requests are by invitation only, so open an issue first, and see [Contributing](https://jcrenshaw-dev.github.io/terminus/contributing.html). Security problems go through [SECURITY.md](SECURITY.md), not a public issue.
+Questions go on the [jcrenshaw.dev Discord](https://jcrenshaw.dev/discord). Bugs and anything in the docs that's wrong go to [GitHub issues](https://github.com/crenshawdev/terminus/issues). Pull requests are by invitation only, so open an issue first, and see [Contributing](https://crenshawdev.github.io/terminus/contributing.html). Security problems go through [SECURITY.md](SECURITY.md), not a public issue.
 
 Terminus is maintained by John Crenshaw and distributed under the [MIT License](LICENSE).
 

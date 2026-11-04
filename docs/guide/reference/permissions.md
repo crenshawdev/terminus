@@ -61,4 +61,4 @@ Every file Terminus creates in the data directory is readable only by your user.
 - **`install.sh` itself.** It's fetched unsigned over HTTPS from `main`.
 - **Network filesystems.** The store isn't safe on one, and `terminus data move` warns you.
 
-Reports about any of this go through [SECURITY.md](https://github.com/jcrenshaw-dev/terminus/blob/main/SECURITY.md). [TRUST.md](https://github.com/jcrenshaw-dev/terminus/blob/main/TRUST.md) is the standard these claims are held to.
+Reports about any of this go through [SECURITY.md](https://github.com/crenshawdev/terminus/blob/main/SECURITY.md). [TRUST.md](https://github.com/crenshawdev/terminus/blob/main/TRUST.md) is the standard these claims are held to.

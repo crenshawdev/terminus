@@ -5,7 +5,7 @@
 Run the install line again:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh
 ```
 
 `install.sh` stores the newer version beside the older ones and moves the link to it, then runs `terminus install`. The hook entries and the MCP entry name `~/.local/bin/terminus`, which never moves, so install finds them current and rewrites neither.
@@ -16,7 +16,7 @@ curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install
 
 ## Version numbers
 
-Each release bumps the middle number of the version, a release with only fixes bumps the last, and the first moves only for a large change. The number doesn't promise compatibility. The [changelog](https://github.com/jcrenshaw-dev/terminus/blob/main/CHANGELOG.md) says what each release changes, and `terminus --version` prints the version you have.
+Each release bumps the middle number of the version, a release with only fixes bumps the last, and the first moves only for a large change. The number doesn't promise compatibility. The [changelog](https://github.com/crenshawdev/terminus/blob/main/CHANGELOG.md) says what each release changes, and `terminus --version` prints the version you have.
 
 ## Uninstall
 

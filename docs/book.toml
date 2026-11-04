@@ -13,5 +13,5 @@ create-missing = false
 default-theme = "light"
 preferred-dark-theme = "coal"
 additional-css = ["theme/terminus.css"]
-git-repository-url = "https://github.com/jcrenshaw-dev/terminus"
+git-repository-url = "https://github.com/crenshawdev/terminus"
 site-url = "/terminus/"

@@ -4,7 +4,7 @@ Terminus installs with one line and checks the release's signature before it ins
 
 ## What it needs
 
-- Linux or macOS, on x86_64 or aarch64. Windows isn't supported, and a build for it fails at compile time. [TRUST.md](https://github.com/jcrenshaw-dev/terminus/blob/main/TRUST.md) says why.
+- Linux or macOS, on x86_64 or aarch64. Windows isn't supported, and a build for it fails at compile time. [TRUST.md](https://github.com/crenshawdev/terminus/blob/main/TRUST.md) says why.
 - Claude Code. Terminus reads only Claude Code's transcripts and wires only into Claude Code.
 - `curl`, to download the release.
 - `ssh-keygen`, to check the release's signature. On Linux it comes in `openssh-client` on Debian and Ubuntu, `openssh-clients` on Fedora and `openssh` on Arch.
@@ -16,7 +16,7 @@ Terminus installs with one line and checks the release's signature before it ins
 ## Install it
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh
 ```
 
 `install.sh` downloads three files from the latest GitHub release for your system: `terminus-<os>-<arch>.manifest`, `terminus-<os>-<arch>.manifest.sig` and the binary `terminus-<os>-<arch>`. It checks the manifest's signature against the key pinned in the script before it reads the manifest or downloads the binary, then checks the binary's SHA-256 against the manifest. Every check it makes, and the condition behind each refusal, is in [How a release is built and signed](../reference/release.md#what-installsh-checks).
@@ -28,7 +28,7 @@ Claude Code runs Terminus by its full path, so the hooks and the MCP server work
 ### From another source
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install.sh | sh -s -- https://<source>
+curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh -s -- https://<source>
 ```
 
 The argument replaces the GitHub release as the place the three files come from, and must start with `https://`. The same three file names are fetched under it, and the same pinned key has to verify the manifest, so a source can only serve a release that key signed.
