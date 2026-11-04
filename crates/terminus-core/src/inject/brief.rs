@@ -24,7 +24,8 @@
 //! the budget before reading a useful row.
 //!
 //! **The working-state delta is the branch and nothing else.**
-//! `session_meta.branch` is the only git fact the archive holds. A fuller delta
+//! `session_meta.branch`, the branch the session's last record that named one
+//! was on, is the only git fact the archive holds. A fuller delta
 //! would add HEAD-then-versus-now and a dirty-file list, and both need `git`,
 //! whose 10-30 ms process spawn is the whole budget several times over -
 //! `project::Resolver` is already kept off the cold-start path for the same

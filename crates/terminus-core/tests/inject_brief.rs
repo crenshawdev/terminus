@@ -96,30 +96,52 @@ impl Bench {
     /// ascending without a date library.
     fn archive_records(&self, session: &Session<'_>, records: &[serde_json::Value]) {
         assert!(records.len() < 10, "the hour in the timestamp is one digit");
-        let cwd = self.project(session.project);
         let mut body = String::new();
         for (n, particular) in records.iter().enumerate() {
-            let mut record = serde_json::json!({
-                "parentUuid": null,
-                "isSidechain": false,
-                "cwd": cwd.to_string_lossy(),
-                "sessionId": session.id,
-                "uuid": format!("{}-{n}", session.id),
-                "timestamp": format!("{}T1{n}:00:00.000Z", session.day),
-            });
-            if let Some(branch) = session.branch {
-                record["gitBranch"] = serde_json::Value::String(branch.to_owned());
-            }
-            for (key, value) in particular.as_object().expect("a record is an object") {
-                record[key] = value.clone();
-            }
-            body.push_str(&record.to_string());
-            body.push('\n');
+            body.push_str(&self.line(session, n, particular));
         }
 
         let path = self.work.join(session.file);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, body).unwrap();
+        match ingest::run(&self.data_dir, &path).unwrap() {
+            ingest::Outcome::Committed(_) => {}
+            other => panic!("{}: {other:?}", session.file),
+        }
+    }
+
+    /// One record of a session, as the line its transcript holds.
+    fn line(&self, session: &Session<'_>, n: usize, particular: &serde_json::Value) -> String {
+        let cwd = self.project(session.project);
+        let mut record = serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "cwd": cwd.to_string_lossy(),
+            "sessionId": session.id,
+            "uuid": format!("{}-{n}", session.id),
+            "timestamp": format!("{}T1{n}:00:00.000Z", session.day),
+        });
+        if let Some(branch) = session.branch {
+            record["gitBranch"] = serde_json::Value::String(branch.to_owned());
+        }
+        for (key, value) in particular.as_object().expect("a record is an object") {
+            record[key] = value.clone();
+        }
+        let mut line = record.to_string();
+        line.push('\n');
+        line
+    }
+
+    /// Add one record to an archived session's transcript and ingest the tail.
+    fn append(&self, session: &Session<'_>, n: usize, particular: &serde_json::Value) {
+        use std::io::Write as _;
+        let path = self.work.join(session.file);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(self.line(session, n, particular).as_bytes())
+            .unwrap();
         match ingest::run(&self.data_dir, &path).unwrap() {
             ingest::Outcome::Committed(_) => {}
             other => panic!("{}: {other:?}", session.file),
@@ -340,6 +362,43 @@ const LATE: Session<'static> = Session {
     prompt: "the late prompt, about sprockets",
     reply: "the late reply, about sprockets",
 };
+
+/// A session that changes branch ended on the last branch it named, whether the
+/// change arrives in one pass or in a later one. A later record naming no branch
+/// changes nothing.
+#[test]
+fn the_brief_names_the_branch_the_session_ended_on() {
+    let bench = bench();
+    let session = Session {
+        file: "branches.jsonl",
+        id: "77777777-7777-4777-8777-777777777777",
+        project: "project-alpha",
+        branch: None,
+        day: "2026-08-14",
+        prompt: "",
+        reply: "",
+    };
+    let on = |branch: &str, text: &str| {
+        let mut record = text_record("assistant", text);
+        record["gitBranch"] = serde_json::Value::String(branch.to_owned());
+        record
+    };
+
+    bench.archive_records(
+        &session,
+        &[on("first-branch", "started"), on("second-branch", "moved")],
+    );
+    let brief = bench.brief("project-alpha").expect("a brief");
+    assert!(brief.contains("on branch second-branch."), "{brief}");
+
+    bench.append(&session, 2, &on("third-branch", "moved again"));
+    let brief = bench.brief("project-alpha").expect("a brief");
+    assert!(brief.contains("on branch third-branch."), "{brief}");
+
+    bench.append(&session, 3, &text_record("assistant", "no branch named"));
+    let brief = bench.brief("project-alpha").expect("a brief");
+    assert!(brief.contains("on branch third-branch."), "{brief}");
+}
 
 /// The brief names the session with the greatest `last_turn_at`, at day
 /// resolution, with the branch it ended on and the last thing said in each
