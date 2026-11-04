@@ -469,8 +469,7 @@ mod tests {
     fn a_plan_that_starts_from_the_sessions_turns() {
         let dir = tempfile::tempdir().unwrap();
         let conn = Connection::open(dir.path().join("terminus.db")).unwrap();
-        conn.execute_batch(crate::store::schema::CREATE_SQL)
-            .unwrap();
+        conn.execute_batch(crate::store::schema::CREATE_SQL).unwrap();
 
         let mut statement = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {ENTITY_VALUES_SQL}"))
