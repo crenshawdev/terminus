@@ -493,46 +493,87 @@ fn a_deletion_removes_every_row_the_session_owns() {
     );
 }
 
-/// The replay history outlives the session it was recorded against.
-/// `decisions` records prompt-time state no blob ever held, so a deletion that
-/// took it would silently delete what `terminus replay` and `stats` are
-/// computed over.
+/// A decision holds a whole prompt, so a deletion takes it and its labels. A
+/// subagent reports its parent's session id, so deleting one leaves the parent's
+/// decisions, and another session's decisions are never touched.
 #[test]
-fn a_decision_naming_the_deleted_session_survives_it() {
+fn a_deletion_takes_the_decisions_of_its_session_and_no_others() {
     let bench = bench();
-    let key = bench.archive("doomed.jsonl");
-    let session_id: String = bench
-        .conn()
-        .query_row(
-            "SELECT session_id FROM session_meta WHERE session_key = ?1",
-            [&key],
-            |r| r.get(0),
+    let parent = bench.plant("parent.jsonl", "/p", Some(ANCIENT), true);
+    let subagent = bench.plant("subagent.jsonl", "/p", Some(ANCIENT), true);
+    {
+        let conn = bench.conn();
+        conn.execute(
+            "UPDATE session_meta SET session_id = 'doomed' WHERE session_key IN (?1, ?2)",
+            [&parent, &subagent],
         )
         .unwrap();
-    bench
-        .conn()
-        .execute(
-            "INSERT INTO decisions (session_id, ts, prompt, chars_injected)
-             VALUES (?1, '2026-08-22T00:00:00.000Z', 'what did we decide', 0)",
-            [&session_id],
+        conn.execute(
+            "UPDATE session_meta SET parent_session_key = ?1 WHERE session_key = ?2",
+            [&parent, &subagent],
         )
         .unwrap();
-    bench.remove_transcript(&key);
+        for session_id in ["doomed", "other"] {
+            conn.execute(
+                "INSERT INTO decisions (session_id, ts, prompt, chars_injected)
+                 VALUES (?1, '2026-08-22T00:00:00.000Z', 'what did we decide', 0)",
+                [session_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO labels (decision_id, turn_id, label)
+                 VALUES (last_insert_rowid(), 1, 'hit')",
+                [],
+            )
+            .unwrap();
+        }
+    }
+    let decisions = |session_id: &str| {
+        bench.count(
+            "SELECT count(*) FROM decisions WHERE session_id = ?1",
+            session_id,
+        )
+    };
+    let labels = |session_id: &str| {
+        bench.count(
+            "SELECT count(*) FROM labels WHERE decision_id IN
+                 (SELECT id FROM decisions WHERE session_id = ?1)",
+            session_id,
+        )
+    };
 
-    bench.apply(&Selection {
-        delete: vec![key.clone()],
+    bench.remove_transcript(&subagent);
+    let applied = bench.apply(&Selection {
+        delete: vec![subagent.clone()],
         ..Selection::default()
     });
+    assert_eq!(applied.deleted, vec![subagent], "{:?}", applied.notes);
+    assert_eq!(applied.decisions_lost, 0);
+    assert_eq!(decisions("doomed"), 1, "the parent is still archived");
 
-    let decisions: i64 = bench
+    bench.remove_transcript(&parent);
+    let applied = bench.apply(&Selection {
+        delete: vec![parent.clone()],
+        ..Selection::default()
+    });
+    assert_eq!(applied.deleted, vec![parent], "{:?}", applied.notes);
+    assert_eq!(applied.decisions_lost, 1);
+    assert!(
+        applied.notes().iter().any(|l| l.contains("logged prompt")),
+        "removing a prompt no rebuild reproduces has to be said out loud: {:?}",
+        applied.notes()
+    );
+    assert_eq!(decisions("doomed"), 0);
+    let labels_total: i64 = bench
         .conn()
-        .query_row(
-            "SELECT count(*) FROM decisions WHERE session_id = ?1",
-            [&session_id],
-            |r| r.get(0),
-        )
+        .query_row("SELECT count(*) FROM labels", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(decisions, 1, "the replay history went with the session");
+    assert_eq!(
+        labels_total, 1,
+        "the doomed decision's label is still there"
+    );
+    assert_eq!(decisions("other"), 1, "an unrelated decision went too");
+    assert_eq!(labels("other"), 1, "an unrelated label went too");
 }
 
 /// Retention must not be able to wedge on one damaged row, the way `pass::walk`
