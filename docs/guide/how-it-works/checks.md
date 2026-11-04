@@ -19,8 +19,8 @@ Nothing makes Claude use what it's handed, or reach for the MCP tools. No measur
 
 ## Compatibility
 
-The version number doesn't promise compatibility. A store in an older archive format than the build reads is refused, and the refusal prints the steps for a clean install. It's never converted. The [changelog](https://github.com/jcrenshaw-dev/terminus/blob/main/CHANGELOG.md) says what each release changes.
+The version number doesn't promise compatibility. A store in an older archive format than the build reads is refused, and the refusal prints the steps for a clean install. It's never converted. The [changelog](https://github.com/crenshawdev/terminus/blob/main/CHANGELOG.md) says what each release changes.
 
 ## How the claims are held to
 
-[SECURITY.md](https://github.com/jcrenshaw-dev/terminus/blob/main/SECURITY.md) covers what's in scope for a report, the fuzz targets, and the one `unsafe` block under Miri. Every fixed finding gets a regression test that fails before the fix and passes after.
+[SECURITY.md](https://github.com/crenshawdev/terminus/blob/main/SECURITY.md) covers what's in scope for a report, the fuzz targets, and the one `unsafe` block under Miri. Every fixed finding gets a regression test that fails before the fix and passes after.

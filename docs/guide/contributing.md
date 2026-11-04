@@ -1,8 +1,8 @@
 # Contributing
 
-Bug reports, questions and reports of anything in these docs that's wrong are welcome in [GitHub issues](https://github.com/jcrenshaw-dev/terminus/issues). Tell me what you ran, what you expected and what happened. `terminus doctor` and `terminus status` output helps, once you've removed anything private. Terminus is an archive of your sessions, so check any excerpt before you paste it.
+Bug reports, questions and reports of anything in these docs that's wrong are welcome in [GitHub issues](https://github.com/crenshawdev/terminus/issues). Tell me what you ran, what you expected and what happened. `terminus doctor` and `terminus status` output helps, once you've removed anything private. Terminus is an archive of your sessions, so check any excerpt before you paste it.
 
-Pull requests are by invitation only, so open an issue first. Security problems go through [SECURITY.md](https://github.com/jcrenshaw-dev/terminus/blob/main/SECURITY.md), not a public issue. Issues opened from Windows are closed, and [TRUST.md](https://github.com/jcrenshaw-dev/terminus/blob/main/TRUST.md) says why.
+Pull requests are by invitation only, so open an issue first. Security problems go through [SECURITY.md](https://github.com/crenshawdev/terminus/blob/main/SECURITY.md), not a public issue. Issues opened from Windows are closed, and [TRUST.md](https://github.com/crenshawdev/terminus/blob/main/TRUST.md) says why.
 
 ## Tests
 
@@ -27,7 +27,7 @@ mdbook serve docs
 
 The build writes `docs/book/`, which Git ignores. `serve` gives you a local preview. Check the rendered page as well as the Markdown, especially after changing tables or navigation.
 
-Write from the reader's task. Say what a command does, what it changes and what the result establishes. Link to the design docs when the detail helps. A setting's description has to agree with the code that reads it, in [`config.rs`](https://github.com/jcrenshaw-dev/terminus/blob/main/crates/terminus-core/src/config.rs). Links out of the book use full GitHub URLs, because a relative path outside `docs/guide/` doesn't exist on the published site.
+Write from the reader's task. Say what a command does, what it changes and what the result establishes. Link to the design docs when the detail helps. A setting's description has to agree with the code that reads it, in [`config.rs`](https://github.com/crenshawdev/terminus/blob/main/crates/terminus-core/src/config.rs). Links out of the book use full GitHub URLs, because a relative path outside `docs/guide/` doesn't exist on the published site.
 
 ## Publishing the book
 

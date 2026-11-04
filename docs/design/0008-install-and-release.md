@@ -69,7 +69,7 @@ Options are in [the command reference](../guide/reference/commands.md#setup), an
 
 ### `install.sh`
 
-- **Inputs:** no argument, which downloads from `https://github.com/jcrenshaw-dev/terminus/releases/latest/download`, or one `https://` source. `HOME`, `uname -s` and `uname -m`, `curl`, `ssh-keygen`, and `sha256sum` or `shasum -a 256`.
+- **Inputs:** no argument, which downloads from `https://github.com/crenshawdev/terminus/releases/latest/download`, or one `https://` source. `HOME`, `uname -s` and `uname -m`, `curl`, `ssh-keygen`, and `sha256sum` or `shasum -a 256`.
 - **Outputs:** in the order [the release page](../guide/reference/release.md#what-installsh-checks) lists: the environment and the stable path are checked, the manifest and its signature are downloaded, and the manifest is verified with `ssh-keygen -Y verify -I crenshawdev-release -n terminus-release` against an allowed-signers file the script writes from `release_key`, so no allowed-signers file of the user's is read. Only then is the binary downloaded, the manifest's two lines checked, and the binary's SHA-256 compared with the manifest's. Then the binary is stored as `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus` through a temporary and a rename, the stable path is checked again, a new link is made beside it and renamed over `~/.local/bin/terminus`, the versions present are printed, and `terminus install` runs through the link. The script exits with its status.
 - **Refusals:** every check refuses with `terminus: <reason>` on stderr and exit 1, with nothing installed. Among them, `TERMINUS_BIN_DIR` set, because `terminus install` would point the wiring into that folder while the script links `~/.local/bin/terminus`; a `HOME` that is unset, relative, not UTF-8, has a path part that is exactly `..`, or changes when the shell copies it; a stable path holding a folder or a file that does not carry the marker; and a manifest that does not verify against the pinned key. Nothing overrides the key.
 
@@ -112,7 +112,7 @@ Options are in [the command reference](../guide/reference/commands.md#setup), an
 
 ### The CI runs
 
-- **`release-check.yml`**, on `release: published`. On `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15-intel` and `macos-15`, it puts a stand-in `claude` that exits 0 on `PATH`, runs `curl -fsSL https://raw.githubusercontent.com/jcrenshaw-dev/terminus/main/install.sh | sh` with pipefail, and checks that `~/.local/bin/terminus --version` is the release's version.
+- **`release-check.yml`**, on `release: published`. On `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15-intel` and `macos-15`, it puts a stand-in `claude` that exits 0 on `PATH`, runs `curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.sh | sh` with pipefail, and checks that `~/.local/bin/terminus --version` is the release's version.
 - **`test.yml`**, on every pull request and every push to `main`. On the same four runners, in a debug and a release build each, eight jobs, it runs `cargo test --workspace --all-features --locked`, with a 15-minute limit on the test step that prints the processes and their open files before it stops a hung run. It reads no secret, so the tests over the private transcript corpus skip themselves. Three timing tests of a hook spawn's p99 are skipped on every runner, and three budgets on a single spawn on the two macOS runners, because a hosted VM's timing measures the VM.
 
 ## 6. States and workflows

@@ -21,4 +21,4 @@ If you're new to Terminus, start with [installation](getting-started/install.md)
 | Check a release by hand | [How a release is built and signed](reference/release.md#checking-a-release-by-hand) |
 | See inside it | [How it fits together](how-it-works/overview.md) |
 
-The guide is published from the `main` branch, so it can be ahead of the latest release. `terminus --version` prints the version you have, and the [changelog](https://github.com/jcrenshaw-dev/terminus/blob/main/CHANGELOG.md) says what each release changes. The [full contents](https://github.com/jcrenshaw-dev/terminus/blob/main/docs/guide/SUMMARY.md) are also readable on GitHub.
+The guide is published from the `main` branch, so it can be ahead of the latest release. `terminus --version` prints the version you have, and the [changelog](https://github.com/crenshawdev/terminus/blob/main/CHANGELOG.md) says what each release changes. The [full contents](https://github.com/crenshawdev/terminus/blob/main/docs/guide/SUMMARY.md) are also readable on GitHub.

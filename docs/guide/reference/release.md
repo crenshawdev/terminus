@@ -4,19 +4,19 @@ A Terminus release is built in CI, signed on the owner's machine with a key CI n
 
 ## What the binary never does
 
-- It opens no network connection. No source file in either crate names a socket type, and [`no_network.rs`](https://github.com/jcrenshaw-dev/terminus/blob/main/crates/terminus-core/tests/no_network.rs) fails the test run if one ever does, comment lines included.
-- It calls no model and reads no API key. A `terminus.toml` that still has a `[provider]` table fails to load with `<path> still has a [provider] table. Model calls were removed from Terminus, so nothing reads that table any more. Delete it from the file to continue.` ([`config.rs`](https://github.com/jcrenshaw-dev/terminus/blob/main/crates/terminus-core/src/config.rs)).
-- The only text it hands to a model goes through Claude Code. Hooks and the MCP server write archived text into Claude Code's session, and Claude Code sends it to its model. With `[privacy] redact_recall` on, that text is filtered on the way out ([`egress.rs`](https://github.com/jcrenshaw-dev/terminus/blob/main/crates/terminus-core/src/observe/egress.rs)).
+- It opens no network connection. No source file in either crate names a socket type, and [`no_network.rs`](https://github.com/crenshawdev/terminus/blob/main/crates/terminus-core/tests/no_network.rs) fails the test run if one ever does, comment lines included.
+- It calls no model and reads no API key. A `terminus.toml` that still has a `[provider]` table fails to load with `<path> still has a [provider] table. Model calls were removed from Terminus, so nothing reads that table any more. Delete it from the file to continue.` ([`config.rs`](https://github.com/crenshawdev/terminus/blob/main/crates/terminus-core/src/config.rs)).
+- The only text it hands to a model goes through Claude Code. Hooks and the MCP server write archived text into Claude Code's session, and Claude Code sends it to its model. With `[privacy] redact_recall` on, that text is filtered on the way out ([`egress.rs`](https://github.com/crenshawdev/terminus/blob/main/crates/terminus-core/src/observe/egress.rs)).
 
 The one network use in installing or updating Terminus is `install.sh`'s `curl` downloads.
 
 ## Version numbers
 
-From 1.0.0 on, each release bumps the middle number of the version, a release with only fixes bumps the last, and the first moves only for a large change. The number does not promise compatibility. The [changelog](https://github.com/jcrenshaw-dev/terminus/blob/main/CHANGELOG.md) says what each release changes.
+From 1.0.0 on, each release bumps the middle number of the version, a release with only fixes bumps the last, and the first moves only for a large change. The number does not promise compatibility. The [changelog](https://github.com/crenshawdev/terminus/blob/main/CHANGELOG.md) says what each release changes.
 
 ## How a release is built
 
-From [`.github/workflows/release.yml`](https://github.com/jcrenshaw-dev/terminus/blob/main/.github/workflows/release.yml):
+From [`.github/workflows/release.yml`](https://github.com/crenshawdev/terminus/blob/main/.github/workflows/release.yml):
 
 1. Pushing a tag of the form `v<X.Y.Z>` starts the workflow. Nothing else does.
 2. Four build jobs, each on its own runner, build `terminus-linux-x86_64`, `terminus-linux-aarch64`, `terminus-macos-x86_64` and `terminus-macos-aarch64` with `cargo build --release --locked` and no features. Each job checks that the binary's `--version` matches the tag, that a Linux binary is statically linked, that a macOS binary links nothing outside `/usr/lib/`, and that the binary carries the marker `install.sh` and `terminus install` look for.
@@ -34,7 +34,7 @@ The workflow's permissions are `contents: read`. The build jobs add `id-token: w
 
 ## How a release is signed
 
-The owner runs [`scripts/sign-release.sh`](https://github.com/jcrenshaw-dev/terminus/blob/main/scripts/sign-release.sh) on his own machine as `sh scripts/sign-release.sh v<X.Y.Z>`. In order, it:
+The owner runs [`scripts/sign-release.sh`](https://github.com/crenshawdev/terminus/blob/main/scripts/sign-release.sh) on his own machine as `sh scripts/sign-release.sh v<X.Y.Z>`. In order, it:
 
 1. Refuses a tag that does not start with `v`.
 2. Reads the public key from `install.sh`'s one `release_key=` line, and keeps no copy of its own.
@@ -48,9 +48,9 @@ The owner runs [`scripts/sign-release.sh`](https://github.com/jcrenshaw-dev/term
 
 ## What install.sh checks
 
-[`install.sh`](https://github.com/jcrenshaw-dev/terminus/blob/main/install.sh) makes these checks in this order. Each refusal prints `terminus: <reason>` to stderr and exits 1, and nothing is installed.
+[`install.sh`](https://github.com/crenshawdev/terminus/blob/main/install.sh) makes these checks in this order. Each refusal prints `terminus: <reason>` to stderr and exits 1, and nothing is installed.
 
-1. **The source.** With no argument it downloads from `https://github.com/jcrenshaw-dev/terminus/releases/latest/download`. One argument names another source, and it must start with `https://`. More than one argument is refused.
+1. **The source.** With no argument it downloads from `https://github.com/crenshawdev/terminus/releases/latest/download`. One argument names another source, and it must start with `https://`. More than one argument is refused.
 2. **`TERMINUS_BIN_DIR`.** Refused when it is set, because `terminus install` would point the hooks and the MCP entry into that folder while the script links `~/.local/bin/terminus`.
 3. **`HOME`.** Refused when it is unset or empty, relative, not valid UTF-8, has a path part that is exactly `..`, or when the shell changes its bytes on copying it, which dash does when started without a UTF-8 locale.
 4. **What sits at `~/.local/bin/terminus`.** Refused when it is a folder or a link to one, a file that is not a Terminus build, a link to nothing that does not point into `~/.local/lib/crenshawdev/terminus/versions/`, or anything other than a file or a link. Nothing there, a Terminus build, or a link to `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus` is fine.
@@ -97,9 +97,9 @@ This repeats `install.sh`'s own check. `<os>` is `linux` or `macos`, and `<arch>
 1. Download `terminus-<os>-<arch>`, `terminus-<os>-<arch>.manifest` and `terminus-<os>-<arch>.manifest.sig` from the release, for example:
 
    ```sh
-   curl -fsSLO https://github.com/jcrenshaw-dev/terminus/releases/latest/download/terminus-<os>-<arch>
-   curl -fsSLO https://github.com/jcrenshaw-dev/terminus/releases/latest/download/terminus-<os>-<arch>.manifest
-   curl -fsSLO https://github.com/jcrenshaw-dev/terminus/releases/latest/download/terminus-<os>-<arch>.manifest.sig
+   curl -fsSLO https://github.com/crenshawdev/terminus/releases/latest/download/terminus-<os>-<arch>
+   curl -fsSLO https://github.com/crenshawdev/terminus/releases/latest/download/terminus-<os>-<arch>.manifest
+   curl -fsSLO https://github.com/crenshawdev/terminus/releases/latest/download/terminus-<os>-<arch>.manifest.sig
    ```
 
 2. Write an allowed-signers file holding this one line, with the full key:

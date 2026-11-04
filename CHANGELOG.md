@@ -73,5 +73,5 @@ you run and gives that history back to Claude and to you.
 
 It calls no model, runs no daemon and opens no network connection.
 
-[1.1.0]: https://github.com/jcrenshaw-dev/terminus/releases/tag/v1.1.0
-[1.0.0]: https://github.com/jcrenshaw-dev/terminus/releases/tag/v1.0.0
+[1.1.0]: https://github.com/crenshawdev/terminus/releases/tag/v1.1.0
+[1.0.0]: https://github.com/crenshawdev/terminus/releases/tag/v1.0.0
