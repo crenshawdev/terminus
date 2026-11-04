@@ -10,7 +10,7 @@ How much text Terminus hands Claude Code when a hook fires. Both counts are char
 
 **Default:** `6000` · **Type:** whole number · **Range:** up to 10,000 takes effect.
 
-The most the brief at the start of a session may carry. The brief says where the last session in the project left off: its date, the branch it ended on, the last thing said in each direction, and how much of the project is archived. A smaller number shortens the quotes first. A number too small for the brief's own wording means no brief.
+The most the brief at the start of a session may carry. The brief says where the last session in the project left off: its date, its branch, what it was last asked, what it last answered, the files it edited, and how much of the project is archived. A smaller number drops the file list first, then shortens the quotes. A number too small for the brief's own wording means no brief.
 
 ### `prompt_chars`
 

@@ -236,7 +236,7 @@ fn unchanged(text: &str) -> Cow<'_, str> {
 /// The projected text is newline-joined by construction - one line per text
 /// block, per tool input leaf, per stderr line - and an excerpt is read on one
 /// terminal row or inside one JSON string.
-fn flatten(text: &str) -> String {
+pub(crate) fn flatten(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut pending = false;
     for c in text.chars() {

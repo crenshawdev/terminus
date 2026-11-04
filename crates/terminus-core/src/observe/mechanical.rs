@@ -62,7 +62,7 @@ pub const ELISION: &str = " [...]";
 /// a read, so a tool added upstream shows its paths under `files_read` - which
 /// is the safe direction to be wrong in: it understates what a session altered
 /// rather than inventing an edit that never happened.
-const WRITING_TOOLS: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
+pub(crate) const WRITING_TOOLS: [&str; 4] = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
 
 /// Whole seconds from `first_turn_at` to `last_turn_at`, in SQL.
 ///
