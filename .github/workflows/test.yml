@@ -20,7 +20,10 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
-        build: [debug, release]
+        build: [release]
+        include:
+          - runner: ubuntu-24.04
+            build: debug
     runs-on: ${{ matrix.runner }}
     # The backstop behind the Test step's own 15-minute limit, instead of
     # GitHub's default of six hours. Hung Linux jobs have run past it and lost
@@ -129,10 +132,12 @@ jobs:
             exit 1
           fi
 
-      # Every runner tests two builds, as two jobs: debug, with debug assertions
-      # and overflow checks on, as the suite runs locally, and release, the
-      # profile users get. Both take --all-features, because the crash and fault
-      # tests need testkit's points compiled in; the shipped binary has none.
+      # Every runner tests release, the profile users get. ubuntu-24.04 also
+      # tests debug, as the suite runs locally, for its debug assertions and
+      # overflow checks. One runner is enough: in about 70 runs, debug on the
+      # others never failed without release failing too. Both take
+      # --all-features, because the crash and fault tests need testkit's points
+      # compiled in; the shipped binary has none.
       #
       # The tests are built in a step of their own, so the Test step's 15-minute
       # limit times the tests and not a release link.
