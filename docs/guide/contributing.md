@@ -10,7 +10,7 @@ Pull requests are by invitation only, so open an issue first. Security problems 
 cargo test --workspace --all-features
 ```
 
-CI runs them on every pull request and every push to `main`, on the release build on Linux and macOS, on x86_64 and aarch64, and on the debug build on x86_64 Linux. CI skips three tests of a hook spawn's p99 on every runner and three time budgets on a single spawn on the macOS runners, because a hosted VM's timing measures the VM. The tests over a real transcript corpus need `TERMINUS_TEST_CORPUS` and that private data, so they skip themselves in CI and on any machine without it.
+CI runs them on every pull request and every push to `main`, on the release build on x86_64 Linux, aarch64 Linux and aarch64 macOS, and on the debug build on x86_64 Linux. They don't run on Intel Macs, where the release only builds the binary and checks that it installs. CI skips three tests of a hook spawn's p99 on every runner and three time budgets on a single spawn on the macOS runner, because a hosted VM's timing measures the VM. The tests over a real transcript corpus need `TERMINUS_TEST_CORPUS` and that private data, so they skip themselves in CI and on any machine without it.
 
 `main` takes changes only through pull requests with signed commits, and only once the tests pass.
 

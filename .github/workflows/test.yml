@@ -1,8 +1,10 @@
 name: test
 
-# The whole suite on every pull request and every push to main, on the four
-# runners the release builds on. It reads no secret, so corpus.rs skips the
-# private corpus here as it does on any machine without it.
+# The whole suite on every pull request and every push to main, on the runners
+# the release builds on except macos-15-intel. Apple doesn't make Intel Macs any
+# more and that job was the slowest by far, so the release still builds and
+# install-checks that binary but the suite doesn't run on it. It reads no secret,
+# so corpus.rs skips the private corpus here as it does on any machine without it.
 on:
   pull_request:
   push:
@@ -19,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15-intel, macos-15]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
         build: [release]
         include:
           - runner: ubuntu-24.04
@@ -162,7 +164,7 @@ jobs:
       # measures the shared VM, not the hook.
       #
       # The three budgets on a single spawn, two in backfill.rs and one in
-      # lock_race.rs, are skipped on the two macOS runners only. Measured there,
+      # lock_race.rs, are skipped on the macOS runner only. Measured there,
       # starting /usr/bin/true once took up to 150 ms and a release
       # `terminus --version` up to 115 ms, against budgets of 50 and 100 ms.
       # On the Linux runners the same measurements stayed under 4.2 ms.
