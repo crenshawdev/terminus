@@ -142,7 +142,7 @@ The search `terminus search` runs, with the same ranking, in [0005: Search](0005
   | `paths` | array of strings | Only turns that touched one of these files, as recorded in `paths`. |
   | `tool` | string | Only turns using this tool, such as `Bash` or `Read`. |
   | `kind` | string | Only turns of this record type: `user`, `assistant`, `system` or `attachment`. Claude Code writes tool results and notices as `user` records too. |
-  | `typed` | boolean | Only what a person typed: a turn with `is_typed` 1 in a session with no `parent_session_key`. A prompt a script sent to Claude Code still passes. False or absent narrows nothing. |
+  | `typed` | boolean | Only what a person typed: a turn with `is_typed` 1 in a session with no `parent_session_key`. False or absent narrows nothing. |
   | `since` | string | Inclusive lower bound, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS.mmmZ`, naming a real calendar date and, in the long form, a real time of day. A bare date means the start of that day. |
   | `until` | string | Inclusive upper bound, in the same two forms. A bare date means the end of that day. |
   | `limit` | integer | How many hits, `DEFAULT_HITS`, 10, when absent. A larger number than `MAX_HITS`, 50, is lowered to 50. |

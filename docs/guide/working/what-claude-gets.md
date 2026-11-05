@@ -17,12 +17,15 @@ It last asked: <the last prompt the person typed>
 It last answered: <the last assistant turn>
 It edited: <the files it edited>.
 
+Other recent sessions, titled by how each began:
+<day> <title>
+
 Terminus has <n> sessions and <m> turns archived for <project>, searchable at turn granularity.
 Reach them with the recall_search, recall_context and recall_get tools rather than guessing.
 </terminus-recall>
 ```
 
-The last session is the newest one with a typed prompt on the branch you're on. If that branch has none, it's the newest with a typed prompt in the project, and if nothing in the project has one, it's the project's newest. A subagent's session never counts. When a later session exists on another branch, the head line names your branch and a second line says so:
+A prompt sent through the Agent SDK or `claude -p` doesn't count as typed, so a session a script ran is the last session only when nothing in the project has a typed prompt. The last session is the newest one with a typed prompt on the branch you're on. If that branch has none, it's the newest with a typed prompt in the project, and if nothing in the project has one, it's the project's newest. A subagent's session never counts. When a later session exists on another branch, the head line names your branch and a second line says so:
 
 ```text
 The last session on branch <branch> in <project> ended <day>.
@@ -35,7 +38,9 @@ The brief quotes up to three prompts, oldest first, from the newest 12 you typed
 
 The file line lists what the session called `Edit`, `MultiEdit`, `Write` or `NotebookEdit` on, newest first, relative to the project. It names at most 8 and says how many more there were. Files outside the project are left out. A call that failed is still listed, and a file changed through `Bash` isn't.
 
-The whole brief is capped by [`brief_chars`](../configuration/recall.md#injection), 6,000 characters by default. When it's over, the file line goes first and then the quotes are cut. A project with no archived session gets no brief, and neither does an [excluded](../configuration/archiving.md#exclude) one.
+The list of other sessions names the 5 newest in the project with a typed prompt and a title, each with the day it ended and its title. Claude Code writes a title once, so it describes how a session opened and not what it did later, and the list says so. A session with no title isn't listed.
+
+The whole brief is capped by [`brief_chars`](../configuration/recall.md#injection), 6,000 characters by default. When it's over, the list of other sessions goes first, then the file line, and then the quotes are cut. A project with no archived session gets no brief, and neither does an [excluded](../configuration/archiving.md#exclude) one.
 
 ## On a prompt
 
@@ -43,8 +48,9 @@ Terminus looks up the paths and identifier-shaped words your prompt names, at mo
 
 A past turn is handed over only when it matches on something structural, a stored path, command, error, identifier or tool, and either ranks in the top 3 or matches at least 2 distinct things at any rank. A turn that only matched on free text is never handed over, whatever its score, because a search score can't be compared across queries.
 
-Three more rules narrow it:
+Four more rules narrow it:
 
+- A prompt sent through the Agent SDK or `claude -p` is never handed over, because a script wrote it.
 - A tool result is never handed over. That's text Claude read, such as a file, a web page or a command's output, and quoting it on a later prompt would present it as the project's own history, planted instructions included. The trade is that pasting an error line doesn't fire, because error matches exist only on tool-result turns. A named file still fires, because a `Read` also matches on its tool call. `recall_search` reaches the tool results.
 - A turn isn't handed over twice in a session, and neither is one still visible in the session you're in or one the brief already quoted.
 - At most 3 turns get through, sharing [`prompt_chars`](../configuration/recall.md#injection), 4,000 characters by default.
