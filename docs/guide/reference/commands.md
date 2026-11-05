@@ -64,7 +64,8 @@ Each hit is two lines: the turn id, the day, the transcript's file name, the pro
 
 - `--project <path>`: which project to search, as [above](#which-project-a-read-command-sees).
 - `--tool <name>`: only turns that called this tool, such as `Bash` or `Read`.
-- `--kind <type>`: only turns of this record type: `user`, `assistant`, `system` or `attachment`. Any other value is accepted and matches nothing, so a misspelled type returns no hits.
+- `--kind <type>`: only turns of this record type: `user`, `assistant`, `system` or `attachment`. Any other value is accepted and matches nothing, so a misspelled type returns no hits. Claude Code writes tool results, command caveats and task notifications as `user` records too, so `--kind user` finds much more than what you typed.
+- `--typed`: only what a person typed, in a main session. It leaves out the `user` records Claude Code wrote and the prompts subagents were given. An evicted session's prompts are still found, with an empty excerpt.
 - `--path <path>`: only turns whose tool call or tool result names this path in a structured field, such as a `Read`'s `file_path`. The match is exact, not a prefix, and a turn that only mentions the path in text does not match. Repeat it to match any of several paths.
 - `--since <time>`, `--until <time>`: only turns inside these [bounds](#time-bounds).
 - `--limit <n>`: how many hits, default 10. A number above 50 is treated as 50, and 0 exits 2.
