@@ -14,8 +14,9 @@ use terminus_core::recall::{
     context, get, search, EntityMatch, Filters, Hit, Query, Reason, Request, Response, Scope,
     Window, MAX_CONTEXT_SIDE, MAX_QUERY_TOKENS, MAX_RESULTS,
 };
-use terminus_core::store::DB_FILE_NAME;
-use terminus_core::{ingest, testkit};
+use terminus_core::retention::{self, Selection};
+use terminus_core::store::{Store, DB_FILE_NAME};
+use terminus_core::{ingest, reindex, testkit};
 
 struct Bench {
     _dir: tempfile::TempDir,
@@ -872,6 +873,141 @@ fn a_kind_filter_returns_only_that_record_type() {
     .unwrap();
     assert!(!users.hits.is_empty());
     assert!(users.hits.iter().all(|hit| hit.record_type == "user"));
+}
+
+fn typed_only() -> Filters {
+    Filters {
+        typed: true,
+        ..Filters::default()
+    }
+}
+
+fn kind_user() -> Filters {
+    Filters {
+        kind: Some("user".into()),
+        ..Filters::default()
+    }
+}
+
+/// `quince` is in a prompt and in a tool result, and both are `user` records.
+#[test]
+fn a_typed_filter_returns_only_what_a_person_typed() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let users = narrowed(&conn, "quince", kind_user()).unwrap();
+    assert!(
+        users.hits.iter().any(|hit| hit.is_typed == Some(false)),
+        "the premise: kind user holds a turn nobody typed: {users:?}"
+    );
+
+    let typed = narrowed(&conn, "quince", typed_only()).unwrap();
+    assert_eq!(typed.hits.len(), 1, "{typed:?}");
+    assert_eq!(typed.hits[0].is_typed, Some(true));
+    assert!(typed.hits[0]
+        .excerpt
+        .contains("wire up the quince exporter"));
+}
+
+/// A subagent's prompt passes `is_typed`, and Claude wrote it.
+#[test]
+fn a_typed_filter_leaves_out_a_subagents_prompt() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let users = narrowed(&conn, "framing", kind_user()).unwrap();
+    assert!(
+        users
+            .hits
+            .iter()
+            .any(|hit| hit.sidechain && hit.is_typed == Some(true)),
+        "the premise: a subagent's prompt reads as typed: {users:?}"
+    );
+
+    let typed = narrowed(&conn, "framing", typed_only()).unwrap();
+    assert!(typed.hits.iter().all(|hit| !hit.sidechain), "{typed:?}");
+}
+
+/// Filtering after the ranking query would lose this prompt: the tool results
+/// outrank it and there are more of them than the query keeps.
+#[test]
+fn a_typed_turn_behind_a_full_candidate_pool_is_still_found() {
+    let bench = bench();
+    let record = |n: usize, content: serde_json::Value| {
+        serde_json::json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "cwd": bench.work.join("pool").to_string_lossy(),
+            "sessionId": "55555555-5555-4555-8555-555555555555",
+            "type": "user",
+            "uuid": format!("bbbbbbbb-0000-4000-8000-{n:012}"),
+            "timestamp": format!("2026-08-12T20:{:02}:{:02}.000Z", n / 60, n % 60),
+            "message": {"role": "user", "content": content},
+        })
+        .to_string()
+    };
+
+    let results = MAX_RESULTS * 4 + 1;
+    let mut lines: Vec<String> = (0..results)
+        .map(|n| {
+            record(
+                n,
+                serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": format!("toolu_p{n}"),
+                    "content": "poolword",
+                }]),
+            )
+        })
+        .collect();
+    // Long, so bm25 ranks it under every one of those one-word results.
+    let prompt = format!("poolword {}", "padding ".repeat(200));
+    lines.push(record(
+        results,
+        serde_json::json!([{"type": "text", "text": prompt}]),
+    ));
+    bench.archive("pool.jsonl", &(lines.join("\n") + "\n"));
+
+    let conn = bench.conn();
+    let top = ranked(&conn, "poolword", MAX_RESULTS);
+    assert!(
+        top.iter().all(|hit| hit.is_typed == Some(false)),
+        "the premise: the results outrank the prompt"
+    );
+
+    let typed = narrowed(&conn, "poolword", typed_only()).unwrap();
+    assert_eq!(typed.hits.len(), 1, "{typed:?}");
+    assert_eq!(typed.hits[0].is_typed, Some(true));
+}
+
+/// Eviction takes the text and a rebuild skips the session, and neither touches
+/// the turn's own row, so what a person typed is still found, with no excerpt.
+#[test]
+fn a_typed_filter_still_finds_an_evicted_turn_after_a_rebuild() {
+    let bench = bench();
+    let conn = bench.conn();
+
+    let before = narrowed(&conn, "quince", typed_only()).unwrap();
+    assert_eq!(before.hits.len(), 1, "{before:?}");
+    let hit = &before.hits[0];
+
+    let mut store = Store::open(&bench.data_dir).unwrap();
+    let applied = retention::apply(
+        &mut store,
+        &Selection {
+            evict: vec![hit.session_key.clone()],
+            ..Selection::default()
+        },
+    );
+    assert_eq!(applied.evicted, vec![hit.session_key.clone()]);
+    let rebuilt = reindex::reindex(&mut store).unwrap();
+    assert_eq!(rebuilt.preserved, 1, "the rebuild took the wrong path");
+
+    let after = narrowed(&conn, "quince", typed_only()).unwrap();
+    assert_eq!(after.hits.len(), 1, "{after:?}");
+    assert_eq!(after.hits[0].turn_id, hit.turn_id);
+    assert_eq!(after.hits[0].is_typed, Some(true));
+    assert_eq!(after.hits[0].excerpt, "");
 }
 
 /// The path filter is structural: it reads the `paths` table, so a turn that

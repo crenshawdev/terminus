@@ -221,6 +221,7 @@ pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
             Long("project") => project = Some(super::value(parser, "project")?),
             Long("tool") => filters.tool = Some(super::value(parser, "tool")?),
             Long("kind") => filters.kind = Some(super::value(parser, "kind")?),
+            Long("typed") => filters.typed = true,
             // Repeatable: a turn carrying any of the named paths is a hit, and
             // it is one hit however many of them it carries.
             Long("path") => filters.paths.push(super::value(parser, "path")?),

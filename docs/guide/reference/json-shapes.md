@@ -134,6 +134,11 @@ file it points at, and a path outside those two shapes, such as a file under no
 - `--kind` is matched against `record_type` exactly, and any value is accepted.
   The record types are `user`, `assistant`, `system` and `attachment`; any other
   value matches nothing, so a misspelled kind is an empty result with exit 0.
+  Claude Code writes tool results, command caveats and task notifications as
+  `user` records too.
+- `--typed` keeps only what a person typed, in a main session, so every hit has
+  `record_type` `user` and `sidechain` false. A prompt a script sent to Claude
+  Code still counts.
 
 ### `show`
 
