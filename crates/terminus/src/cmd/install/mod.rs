@@ -339,12 +339,14 @@ fn start_backfill(stable: &Path, data_dir: &Path, config: &Config) -> bool {
     outln!();
     // Asked of the core directly, where the error is still typed: a `Failure`
     // carries only text. A store that is not there yet is not refused.
-    if let Err(refused @ terminus_core::Error::ArchiveFormatTooOld { .. }) =
-        terminus_core::Store::open_read_only(data_dir)
-    {
-        outln!("  problem: {refused}");
-        return true;
-    }
+    let rebuilds = match terminus_core::Store::open_read_only(data_dir) {
+        Err(refused @ terminus_core::Error::ArchiveFormatTooOld { .. }) => {
+            outln!("  problem: {refused}");
+            return true;
+        }
+        Ok(store) => store.predates_this_build(),
+        Err(_) => false,
+    };
     let estimate = match backfill::estimate(data_dir, config) {
         Ok(estimate) => estimate,
         Err(why) => {
@@ -361,23 +363,48 @@ fn start_backfill(stable: &Path, data_dir: &Path, config: &Config) -> bool {
     // The stable path, not this process: it is the build every hook entry runs.
     // This process may be a build outside the versions folder, such as
     // `target/release/terminus`, which the next `cargo` run replaces.
-    match backfill::start_from(Some(stable), data_dir, &estimate) {
-        Ok(true) => outln!(
+    let started = match backfill::start_from(Some(stable), data_dir, &estimate) {
+        Ok(started) => started,
+        Err(why) => {
+            outln!("  problem: {}", why.text());
+            false
+        }
+    };
+    if started {
+        outln!(
             "archiving that now, in a detached process - this install is done and the\n\
              archive fills in behind it. `terminus status` is where to watch it: there is\n\
              no log file by design, and the pass writes a `runs` row this reads."
-        ),
+        );
+    } else if estimate.transcripts == 0 {
         // Nothing on disk to archive, so nothing was started and no store was
         // created by installing. The hooks take it from the first session.
-        Ok(false) => outln!(
+        outln!(
             "nothing to archive yet - the hooks above start doing that from your next\n\
              session, and `terminus status` is where to watch it."
-        ),
-        Err(why) => {
-            outln!("  problem: {}", why.text());
-        }
+        );
+    }
+    if rebuilds {
+        warn_of_rebuild(started);
     }
     false
+}
+
+/// An update's one surprise, said last so it's what's on screen: the hooks stay
+/// silent until the rebuild is done, and nothing else would tell you why.
+fn warn_of_rebuild(started: bool) {
+    let when = if started {
+        "that has started\n  in the background"
+    } else {
+        "that starts with\n  your next session"
+    };
+    outln!();
+    outln!(
+        "  this version rebuilds your archive's search tables, once, and {when}. It took about 4 minutes on a 3 GB archive.\n  \
+         until it finishes, new sessions get no brief, prompts get no earlier turns, and\n  \
+         search results may be incomplete. your archived sessions aren't touched.\n  \
+         `terminus status` stops saying the tables predate this build when it's done."
+    );
 }
 
 /// The advisories install gives and the settings it never changes.

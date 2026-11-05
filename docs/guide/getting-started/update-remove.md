@@ -14,6 +14,8 @@ curl -fsSL https://raw.githubusercontent.com/crenshawdev/terminus/main/install.s
 - An MCP server a running session started keeps running the file it started from. The next hook call runs the new version.
 - An older release that the pinned key signed installs too. There's no version floor.
 
+Some updates change the search tables, and then the archive rebuilds them once. `terminus install` says so when it happens, and the rebuild starts in the background as the update finishes. It took about 4 minutes on a 3 GB archive. Until it's done, new sessions get no brief, prompts get no earlier turns, and search results may be incomplete. Your archived sessions aren't touched, and `terminus status` stops saying the tables predate this build when it's finished.
+
 ## Version numbers
 
 Each release bumps the middle number of the version, a release with only fixes bumps the last, and the first moves only for a large change. The number doesn't promise compatibility. The [changelog](https://github.com/crenshawdev/terminus/blob/main/CHANGELOG.md) says what each release changes, and `terminus --version` prints the version you have.

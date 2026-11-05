@@ -108,7 +108,7 @@ The transcripts Terminus reads are the `projects` folder of each Claude Code con
 The `meta` table holds two integers, and every open of the store checks them against the build.
 
 - `ARCHIVE_FORMAT` is 2. It changes only when the archived bytes change meaning. A store in any other archive format is refused, never converted.
-- `DERIVED_SCHEMA` is 5. It changes whenever anything that can be rebuilt from the archive changes shape. A store whose derived schema differs gets its derived tables rebuilt from the block rows at the start of the next ingest pass.
+- `DERIVED_SCHEMA` is 6. It changes whenever anything that can be rebuilt from the archive changes shape. A store whose derived schema differs gets its derived tables rebuilt from the block rows at the start of the next ingest pass.
 
 Both are defined in [`crates/terminus-core/src/store/open.rs`](../../crates/terminus-core/src/store/open.rs). The archive doc, 0004, gives the tables each one covers.
 

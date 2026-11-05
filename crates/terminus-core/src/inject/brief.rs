@@ -11,6 +11,11 @@
 //! prompt on this branch, then newest with a typed prompt, then just newest.
 //! `HEAD` only chooses a row and never reaches the text.
 //!
+//! **The other sessions are named by their titles.** Nothing else shows Claude
+//! what else is here, and it can't search for what it doesn't know exists. A
+//! title describes how a session opened and never changes, so the list says that
+//! rather than letting it read as what the session did.
+//!
 //! **The quoted prompt is a turn the person typed.** "The last thing
 //! said" in the user's direction is not the last `user` record: the harness
 //! writes tool results, `isMeta` command caveats and `<task-notification>`
@@ -237,8 +242,20 @@ fn render(
     if continuity.is_none() && pointer.is_none() {
         return None;
     }
+    let picked = continuity.as_ref().map(|c| c.session_key.as_str());
+    let others = other_sessions(conn, scoped, picked, redaction);
 
-    let full = assemble(continuity.as_ref(), pointer.as_deref());
+    let full = assemble(continuity.as_ref(), others.as_deref(), pointer.as_deref());
+    if chars(&full) <= budget {
+        return Some(Brief {
+            turns: quoted(continuity.as_ref()),
+            text: super::frame(DESCRIPTION, &full, framed)?,
+            reads,
+        });
+    }
+
+    // The other sessions go first, because this brief is about the last one.
+    let full = assemble(continuity.as_ref(), None, pointer.as_deref());
     if chars(&full) <= budget {
         return Some(Brief {
             turns: quoted(continuity.as_ref()),
@@ -250,7 +267,7 @@ fn render(
     // The file list goes before any quote gets cut: what was asked beats what
     // was touched, and the model can get the rest from the archive.
     let continuity = continuity.map(Continuity::without_edited);
-    let full = assemble(continuity.as_ref(), pointer.as_deref());
+    let full = assemble(continuity.as_ref(), None, pointer.as_deref());
     if chars(&full) <= budget {
         return Some(Brief {
             turns: quoted(continuity.as_ref()),
@@ -266,6 +283,7 @@ fn render(
     // the only parts whose size the archive controls.
     let spent = chars(&assemble(
         continuity.as_ref().map(Continuity::bare).as_ref(),
+        None,
         pointer.as_deref(),
     ));
     let cut = continuity.map(|continuity| continuity.within(budget.saturating_sub(spent)));
@@ -277,7 +295,7 @@ fn render(
         turns: quoted(cut.as_ref()),
         text: super::frame(
             DESCRIPTION,
-            &assemble(cut.as_ref(), pointer.as_deref()),
+            &assemble(cut.as_ref(), None, pointer.as_deref()),
             framed,
         )?,
         reads,
@@ -308,11 +326,18 @@ fn quoted(continuity: Option<&Continuity>) -> Vec<i64> {
         .collect()
 }
 
-/// The brief as text: the continuity block, then the pointer.
-fn assemble(continuity: Option<&Continuity>, pointer: Option<&str>) -> String {
+/// The brief as text: the continuity block, the other sessions, then the pointer.
+fn assemble(
+    continuity: Option<&Continuity>,
+    others: Option<&str>,
+    pointer: Option<&str>,
+) -> String {
     let mut blocks: Vec<String> = Vec::new();
     if let Some(continuity) = continuity {
         blocks.push(continuity.text());
+    }
+    if let Some(others) = others {
+        blocks.push(others.to_owned());
     }
     if let Some(pointer) = pointer {
         blocks.push(pointer.to_owned());
@@ -326,6 +351,7 @@ fn assemble(continuity: Option<&Continuity>, pointer: Option<&str>) -> String {
 /// names; the quoted turns are whatever the archive holds. Rendering them
 /// separately is what lets the budget cut the quotes without touching the head.
 struct Continuity {
+    session_key: String,
     head: String,
     /// Oldest first, so the block reads in the order it happened.
     prompts: Vec<Quote>,
@@ -383,6 +409,7 @@ impl Continuity {
             shown: quote.shown,
         };
         Continuity {
+            session_key: self.session_key.clone(),
             head: self.head.clone(),
             prompts: self.prompts.iter().map(empty).collect(),
             reply: self.reply.as_ref().map(empty),
@@ -408,6 +435,7 @@ impl Continuity {
         let mut given = shares(&wants, allowance).into_iter();
         let mut cut = |quote: &Quote| cut_to(quote, given.next().unwrap_or(0));
         Continuity {
+            session_key: self.session_key,
             head: self.head,
             prompts: self.prompts.iter().map(&mut cut).collect(),
             reply: self.reply.as_ref().map(&mut cut),
@@ -487,6 +515,7 @@ fn last_session(
     let head = head(scoped, row, pick.later.as_ref());
     let (prompts, reply, reads) = last_exchange(conn, &row.session_key, redaction);
     let continuity = Continuity {
+        session_key: row.session_key.clone(),
         head,
         prompts,
         reply,
@@ -536,6 +565,73 @@ fn head(scoped: &Scoped, row: &LastSession, later: Option<&LastSession>) -> Stri
         (None, None) => "\nA later session is archived.".to_owned(),
     });
     head
+}
+
+/// How many other sessions the brief names.
+const SESSIONS_NAMED: usize = 5;
+
+/// The longest a named session's title gets. Most run far shorter, and the
+/// longest on a live archive is 109.
+const TITLE_CHARS: usize = 80;
+
+/// The newest sessions other than the one the brief is about, with a typed
+/// prompt and a title, one `<day> <title>` line each.
+///
+/// `CROSS JOIN` for the reason [`edited_files`] gives: left alone, SQLite may start
+/// from every title in the store. A session a script ran has no typed prompt, so
+/// it isn't listed. Any failure is just no list.
+fn other_sessions(
+    conn: &Connection,
+    scoped: &Scoped,
+    picked: Option<&str>,
+    redaction: &Redaction,
+) -> Option<String> {
+    let mut sql = String::from(
+        "SELECT m.session_key, m.last_turn_at, s.title FROM session_meta m \
+         CROSS JOIN session_titles s ON s.session_key = m.session_key \
+         WHERE m.parent_session_key IS NULL",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    scoped.push_filter(&mut sql, &mut params);
+    sql.push_str(" ORDER BY m.last_turn_at DESC, m.session_key DESC LIMIT ?");
+    params.push(Box::new(SESSIONS_LOOKED_AT));
+
+    let mut statement = conn.prepare(&sql).ok()?;
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .ok()?;
+
+    let mut lines: Vec<String> = Vec::new();
+    for (session_key, last_turn_at, title) in rows.flatten() {
+        if lines.len() == SESSIONS_NAMED {
+            break;
+        }
+        if picked == Some(session_key.as_str())
+            || !has_typed_prompt(conn, &session_key).unwrap_or(false)
+        {
+            continue;
+        }
+        let title = clip(
+            &excerpt::flatten(&super::neutralize(&redaction.apply(&title))),
+            TITLE_CHARS,
+        );
+        lines.push(match last_turn_at.as_deref() {
+            Some(ts) => format!("{} {title}", super::neutralize(day(ts))),
+            None => title,
+        });
+    }
+    (!lines.is_empty()).then(|| {
+        format!(
+            "Other recent sessions, titled by how each began:\n{}",
+            lines.join("\n")
+        )
+    })
 }
 
 /// The session the brief is about, and the later one it has to mention when it
@@ -832,11 +928,10 @@ fn says_something(text: &str) -> bool {
 /// **`is_typed IS NOT 0` and not `is_typed = 1`**, which is what lets one
 /// statement serve all three callers. `IS NOT` is SQLite's null-safe
 /// comparison, so a null passes: an `assistant` row carries null by
-/// construction (`parse::record` classifies `user` records and nothing else),
-/// and a preserved evicted session's rows keep null because `reindex` skips
-/// them. For an evicted session the choice is
-/// unobservable anyway - `retention::apply` deletes its block rows, so
-/// [`last_exchange`] reads no bytes and renders no quote either way.
+/// construction (`parse::record` classifies `user` records and nothing else).
+/// For an evicted session the choice is unobservable -
+/// `retention::apply` deletes its block rows, so [`last_exchange`] reads no bytes
+/// and renders no quote either way.
 ///
 /// One `AND` and no new index. Measured against the live 1.16 GB store
 /// (450,834 turns), the lookup costs 0.002 ms and a variant forced to scan a

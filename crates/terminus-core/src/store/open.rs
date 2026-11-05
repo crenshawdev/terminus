@@ -22,12 +22,13 @@ pub const ARCHIVE_FORMAT: i64 = 2;
 /// The derived-table schema this build writes.
 ///
 /// Bumped whenever anything rebuildable from the archive changes shape: `turns`,
-/// `compactions`, `turns_fts`, `entities`, `paths`. A separate integer from
+/// `compactions`, `session_titles`, `turns_fts`, `entities`, `paths`, or what a
+/// rule writes into them, as `is_typed`'s did at 6. A separate integer from
 /// [`ARCHIVE_FORMAT`], because one cannot tell "derived tables need a rebuild"
 /// from "the archive itself changed". A store with an older number has its
 /// derived tables rebuilt from the archive by
 /// [`crate::reindex::open_up_to_date`].
-pub const DERIVED_SCHEMA: i64 = 5;
+pub const DERIVED_SCHEMA: i64 = 6;
 
 /// The store file inside the data directory.
 pub const DB_FILE_NAME: &str = "terminus.db";

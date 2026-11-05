@@ -274,20 +274,19 @@ CREATE TABLE IF NOT EXISTS turns (
     ts            TEXT,
     stream_offset INTEGER NOT NULL,
     byte_len      INTEGER NOT NULL,
-    -- Whether the PERSON typed this turn or the harness wrote it: 1 typed, 0
-    -- harness-authored. The rule reads the record's own `message.content`
-    -- blocks and nothing else, so it survives `[capture]` elision and needs no
-    -- cross-record join.
+    -- Whether the PERSON typed this turn or something else wrote it: 1 typed, 0
+    -- written by the harness or sent by a script. The rule reads the record's
+    -- own `message.content` blocks, `isMeta` and `entrypoint`, so it survives
+    -- `[capture]` elision and needs no cross-record join.
     --
     -- Null means nothing derived this, which is what a non-`user` row is - the
     -- classification is written for `record_type = 'user'` and for no other
-    -- type - and what a preserved evicted session's rows are: `reindex` skips
-    -- them, so they keep null whatever the declaration says. Nullable rather
-    -- than `NOT NULL DEFAULT` for exactly that reason: a default would silently
-    -- read every preserved row as one class, and the no-third-state claim is
-    -- asserted as a count query returning zero instead. The `capture_mode`
-    -- column above is the same shape - a nullable added column whose null has a
-    -- documented meaning.
+    -- type. Nullable rather than `NOT NULL DEFAULT` for exactly that reason: a
+    -- default would silently read every other type as one class, and the
+    -- no-third-state claim is asserted as a count query returning zero instead.
+    -- `reindex` skips an evicted session, so its rows keep what ingest wrote.
+    -- The `capture_mode` column above is the same shape - a nullable added
+    -- column whose null has a documented meaning.
     is_typed      INTEGER,
     UNIQUE (session_key, turn_seq)
 );
@@ -311,6 +310,15 @@ CREATE TABLE IF NOT EXISTS compactions (
     stream_offset INTEGER NOT NULL,
     metadata      BLOB,
     PRIMARY KEY (session_key, stream_offset)
+);
+
+-- One row per session that has a title, off its `ai-title` and `custom-title`
+-- records. `is_custom` is what stops a later generated title replacing one a
+-- person set.
+CREATE TABLE IF NOT EXISTS session_titles (
+    session_key TEXT    PRIMARY KEY REFERENCES sessions(session_key),
+    title       TEXT    NOT NULL,
+    is_custom   INTEGER NOT NULL
 );
 
 -- content='' because the text lives in the archive and storing it twice would
@@ -396,6 +404,7 @@ pub const TABLES: &[&str] = &[
     "observations",
     "turns",
     "compactions",
+    "session_titles",
     "turns_fts",
     "entities",
     "paths",
@@ -416,8 +425,15 @@ pub const TABLES: &[&str] = &[
 /// `paths` reference `turns(id)`, so they sit **after** `turns` here and are
 /// therefore dropped **before** it. `compactions` references only
 /// `sessions(session_key)`, which no rebuild drops, so its place among them is
-/// free.
-pub const DERIVED_TABLES: &[&str] = &["turns", "compactions", "turns_fts", "entities", "paths"];
+/// free, and so does `session_titles`.
+pub const DERIVED_TABLES: &[&str] = &[
+    "turns",
+    "compactions",
+    "session_titles",
+    "turns_fts",
+    "entities",
+    "paths",
+];
 
 /// Columns added to an existing table after that table first shipped, with the
 /// type clause that adds each one.

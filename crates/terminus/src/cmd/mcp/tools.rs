@@ -128,8 +128,7 @@ pub fn descriptors() -> Vec<Value> {
                         "type": "boolean",
                         "description": "Only prompts in a main session, leaving out the tool \
                                         results and notices Claude Code writes as user records \
-                                        and the prompts subagents get. A prompt a script sent \
-                                        still counts."
+                                        and the prompts subagents and scripts send."
                     },
                     "since": {
                         "type": "string",

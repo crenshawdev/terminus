@@ -645,6 +645,68 @@ fn the_top_level_tool_use_result_is_not_what_is_read() {
     );
 }
 
+/// The stamp is the only thing telling a script's prompt from a person's.
+#[test]
+fn a_prompt_a_script_sent_is_not_typed() {
+    let prompt = |entrypoint: serde_json::Value| {
+        classify(&line(serde_json::json!({
+            "entrypoint": entrypoint,
+            "message": { "role": "user", "content": "do the thing" },
+        })))
+    };
+    for scripted in ["sdk-py", "sdk-ts", "sdk-cli"] {
+        assert_eq!(
+            prompt(serde_json::json!(scripted)),
+            Some(false),
+            "{scripted}"
+        );
+    }
+    for person in ["cli", "claude-desktop", "claude-vscode"] {
+        assert_eq!(prompt(serde_json::json!(person)), Some(true), "{person}");
+    }
+    assert_eq!(prompt(serde_json::Value::Null), Some(true));
+    assert_eq!(
+        classify(&user(serde_json::json!("no stamp at all"))),
+        Some(true)
+    );
+}
+
+/// Real title records carry `aiTitle` or `customTitle`, and a blank one says
+/// nothing.
+#[test]
+fn a_title_record_names_its_session_and_nothing_else_does() {
+    let title_of = |fields: serde_json::Value| {
+        let bytes = [serde_json::to_vec(&fields).unwrap(), b"\n".to_vec()].concat();
+        parse::scan(&bytes).records[0].title.clone()
+    };
+    assert_eq!(
+        title_of(serde_json::json!({"type": "ai-title", "aiTitle": "generated"})),
+        Some(parse::Title {
+            text: "generated".into(),
+            custom: false
+        })
+    );
+    assert_eq!(
+        title_of(serde_json::json!({"type": "custom-title", "customTitle": "mine"})),
+        Some(parse::Title {
+            text: "mine".into(),
+            custom: true
+        })
+    );
+    assert_eq!(
+        title_of(serde_json::json!({"type": "ai-title", "aiTitle": " "})),
+        None
+    );
+    assert_eq!(
+        title_of(serde_json::json!({"type": "ai-title", "title": "other key"})),
+        None
+    );
+    assert_eq!(
+        title_of(serde_json::json!({"type": "user", "aiTitle": "not a title"})),
+        None
+    );
+}
+
 /// The question is asked of `user` records and of no other type, so
 /// nothing else carries a value at all.
 #[test]

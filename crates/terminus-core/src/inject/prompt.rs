@@ -46,7 +46,7 @@
 //! read - a file, a web page, a command's output - and quoting it on a later
 //! prompt hands it to the model as this project's own history, planted
 //! instructions included. So the hits the threshold admits lose every `user`
-//! turn the harness wrote (`turns.is_typed` = 0) before the suppressions and the
+//! turn the harness wrote or a script sent (`turns.is_typed` = 0) before the suppressions and the
 //! cap see them, and the step is [`quotable`], which `terminus replay` runs too.
 //! The trade is accepted: error entities exist only on result turns, so a prompt
 //! that pastes an error line no longer fires, and `recall_search` stays the way
@@ -668,7 +668,8 @@ pub fn eligible(hits: Vec<Hit>, thresholds: &Thresholds) -> Vec<Hit> {
 
 /// `hits` without the tool results, in the ranked order.
 ///
-/// A tool result is a `user` row with `turns.is_typed` = 0. Not keyed on
+/// A tool result is a `user` row with `turns.is_typed` = 0, and so is a script's
+/// prompt, which this drops for the same reason. Not keyed on
 /// [`Hit::record_type`], which is `user` for a typed prompt too, nor on the
 /// `toolUseResult` key, which some result records do not carry. A null
 /// `is_typed` is left alone: nothing derived it, so nothing can say it was a

@@ -137,8 +137,7 @@ file it points at, and a path outside those two shapes, such as a file under no
   Claude Code writes tool results, command caveats and task notifications as
   `user` records too.
 - `--typed` keeps only what a person typed, in a main session, so every hit has
-  `record_type` `user` and `sidechain` false. A prompt a script sent to Claude
-  Code still counts.
+  `record_type` `user` and `sidechain` false.
 
 ### `show`
 
@@ -204,13 +203,15 @@ file it points at, and a path outside those two shapes, such as a file under no
 {"sessions": [
   {"session_key": "...", "session_no": 3, "project": "...", "project_pre_worktree": null,
    "branch": "main", "first_turn_at": "...", "last_turn_at": "...", "turns": 47,
-   "watermark": 12034, "sidecar": false, "evicted": false}]}
+   "watermark": 12034, "sidecar": false, "evicted": false, "title": "Fix the retry budget"}]}
 ```
 
 - Sessions are listed in `session_no` order, for the project the working
   directory sits in unless `--project` names another, or `*` for every project.
 - `project` is null when no record in the session carried a `cwd`, so there was
   no directory to resolve a project from.
+- `title` is null when the session has no title. With `[privacy] redact_recall`
+  on, it is filtered.
 - `project_pre_worktree` is null unless the session's `cwd` was in a git
   worktree and its project was folded onto the parent repository. It is also
   null on a store too old to have the column.

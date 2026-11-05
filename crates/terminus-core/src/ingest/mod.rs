@@ -699,6 +699,7 @@ pub(crate) fn apply(
     // the stored stream, which is the coordinate `derive_turn` got.
     for record in &scan.records {
         derive::derive_boundary(&tx, &session_key, record)?;
+        derive::derive_title(&tx, &session_key, record)?;
     }
     fault::stall(fault::IN_TX_AFTER_TURNS);
     write_watermark(&tx, &session_key, pass.watermark)?;

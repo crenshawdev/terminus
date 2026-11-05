@@ -65,7 +65,7 @@ Each hit is two lines: the turn id, the day, the transcript's file name, the pro
 - `--project <path>`: which project to search, as [above](#which-project-a-read-command-sees).
 - `--tool <name>`: only turns that called this tool, such as `Bash` or `Read`.
 - `--kind <type>`: only turns of this record type: `user`, `assistant`, `system` or `attachment`. Any other value is accepted and matches nothing, so a misspelled type returns no hits. Claude Code writes tool results, command caveats and task notifications as `user` records too, so `--kind user` finds much more than what you typed.
-- `--typed`: only what a person typed, in a main session. It leaves out the `user` records Claude Code wrote and the prompts subagents were given. A prompt a script sent to Claude Code still counts, because Terminus doesn't store how a session was started. An evicted session's prompts are still found, with an empty excerpt.
+- `--typed`: only what a person typed, in a main session. It leaves out the `user` records Claude Code wrote, the prompts subagents were given and prompts sent through the Agent SDK or `claude -p`. That includes a `claude -p` you typed yourself, because its record looks the same as a script's. An evicted session's prompts are still found, with an empty excerpt.
 - `--path <path>`: only turns whose tool call or tool result names this path in a structured field, such as a `Read`'s `file_path`. The match is exact, not a prefix, and a turn that only mentions the path in text does not match. Repeat it to match any of several paths.
 - `--since <time>`, `--until <time>`: only turns inside these [bounds](#time-bounds).
 - `--limit <n>`: how many hits, default 10. A number above 50 is treated as 50, and 0 exits 2.
@@ -83,7 +83,7 @@ Prints the archived record behind each turn id, byte for byte as it was archived
 
 ### `terminus sessions`
 
-Lists every archived session in the project, one line each: the day of its first turn, the transcript's file name, the number of turns, the project, the branch its last record named, `(subagent)` for a subagent's session, and `(evicted)` when retention has evicted its text. The count goes to stderr.
+Lists every archived session in the project, one line each: the day of its first turn, the transcript's file name, the number of turns, the project, the branch its last record named, `(subagent)` for a subagent's session, `(evicted)` when retention has evicted its text, and last the session's title when it has one. The title is the one you set, otherwise the one Claude Code generated, which it writes once, so it describes how the session opened. With [`[privacy] redact_recall`](../configuration/recall.md#privacy) on, titles are filtered. The count goes to stderr.
 
 - `--project <path>`: which project to list, as [above](#which-project-a-read-command-sees).
 - `--since <time>`, `--until <time>`: only sessions that overlap these [bounds](#time-bounds), meaning still going at `--since` and started by `--until`.

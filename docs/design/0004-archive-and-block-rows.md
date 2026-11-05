@@ -20,7 +20,7 @@ The archive does not decide what goes into it. The ingest pass in [0003: Ingest]
 | Session checksum | BLAKE3 over the session's block hashes, concatenated in `block_no` order, in `session_meta.checksum`. |
 | Turn id | `turns.id`, which is `session_no << 24 \| turn_seq`. `turn_seq` is the turn's position in its transcript, so a rebuild gives every turn the same id. |
 | Archive format | The integer `ARCHIVE_FORMAT`, 2, and the `meta` key `archive_format`. It says what the archived bytes mean. |
-| Derived schema | The integer `DERIVED_SCHEMA`, 5, and the `meta` key `derived_schema`. It says what shape the derived tables are in. |
+| Derived schema | The integer `DERIVED_SCHEMA`, 6, and the `meta` key `derived_schema`. It says what shape the derived tables are in. |
 | Evicted | A session whose block rows retention deleted, marked by `session_meta.is_evicted`. Its session row, metadata and derived rows stay. |
 
 ## 3. Crate, modules and boundaries
@@ -144,7 +144,7 @@ They hold what happened at prompt time, or facts read from block rows that reten
 
 ### Derived tables
 
-`DERIVED_TABLES` lists them in this order: `turns`, `compactions`, `turns_fts`, `entities`, `paths`. Every row in them comes from the block rows, through [`crates/terminus-core/src/derive.rs`](../../crates/terminus-core/src/derive.rs), and `terminus reindex` drops and rebuilds them, except an evicted session's rows, which it leaves standing.
+`DERIVED_TABLES` lists them in this order: `turns`, `compactions`, `session_titles`, `turns_fts`, `entities`, `paths`. Every row in them comes from the block rows, through [`crates/terminus-core/src/derive.rs`](../../crates/terminus-core/src/derive.rs), and `terminus reindex` drops and rebuilds them, except an evicted session's rows, which it leaves standing.
 
 `turns`, one row per turn, unique on `(session_key, turn_seq)`:
 
@@ -160,7 +160,7 @@ They hold what happened at prompt time, or facts read from block rows that reten
 | `ts` | `TEXT` | The record's timestamp. |
 | `stream_offset` | `INTEGER NOT NULL` | Where the record starts in the session stream. |
 | `byte_len` | `INTEGER NOT NULL` | The record's length in the stream. |
-| `is_typed` | `INTEGER` | For a `user` turn, 1 when the person typed it and 0 when the harness wrote it. Null for every other type. |
+| `is_typed` | `INTEGER` | For a `user` turn, 1 when the person typed it, and 0 when the harness wrote it or a script sent it, which the record's `entrypoint` says by starting with `sdk-`. A `claude -p` typed by hand carries the same stamp and gets 0 too. Null for every other type. |
 
 `compactions`, one row per compaction boundary, primary key `(session_key, stream_offset)`:
 
@@ -169,6 +169,14 @@ They hold what happened at prompt time, or facts read from block rows that reten
 | `session_key` | `TEXT NOT NULL`, references `sessions(session_key)` | The session. |
 | `stream_offset` | `INTEGER NOT NULL` | Where the `compact_boundary` record starts in the stream. |
 | `metadata` | `BLOB` | The record's `compactMetadata`, as stored. |
+
+`session_titles`, one row per session that has a title, primary key `session_key`:
+
+| Column | Type | What it holds |
+|---|---|---|
+| `session_key` | `TEXT`, references `sessions(session_key)` | The session. |
+| `title` | `TEXT NOT NULL` | The `customTitle` of the newest `custom-title` record, otherwise the `aiTitle` of the newest `ai-title` record. A blank title is ignored. |
+| `is_custom` | `INTEGER NOT NULL` | 1 when `title` came from a `custom-title` record, which is what stops a later `ai-title` replacing it. |
 
 `turns_fts`, the full-text index, an FTS5 table declared `content=''` and `contentless_delete=1`:
 
@@ -237,10 +245,10 @@ An append, which is how every pass after a session's first adds to it, rewrites 
 
 ### The format versions
 
-`meta` holds `archive_format` and `derived_schema`, and every open compares them with the build's `ARCHIVE_FORMAT`, 2, and `DERIVED_SCHEMA`, 5, before it opens a writable connection.
+`meta` holds `archive_format` and `derived_schema`, and every open compares them with the build's `ARCHIVE_FORMAT`, 2, and `DERIVED_SCHEMA`, 6, before it opens a writable connection.
 
 - An archive format other than 2, older or newer, is refused, and the store is not changed. There is no conversion.
-- A derived schema other than 5, older or newer, opens and is marked as needing a rebuild. The next ingest pass rebuilds every derived table from the block rows before it reads any transcript, and `terminus reindex` does the same.
+- A derived schema other than 6, older or newer, opens and is marked as needing a rebuild. The next ingest pass rebuilds every derived table from the block rows before it reads any transcript, and `terminus reindex` does the same.
 - Every writable open of an existing store creates any table in `TABLES` the store lacks. A read-only open changes nothing and reports what is missing.
 
 ## 5. Commands and operations
@@ -374,6 +382,11 @@ erDiagram
     INTEGER stream_offset PK
     BLOB metadata
   }
+  session_titles {
+    TEXT session_key PK, FK
+    TEXT title
+    INTEGER is_custom
+  }
   turns_fts {
     INTEGER rowid
     FTS5 body
@@ -414,6 +427,7 @@ erDiagram
   sessions ||--o| observations : "session_key"
   sessions ||--o{ turns : "session_key"
   sessions ||--o{ compactions : "session_key"
+  sessions ||--o| session_titles : "session_key"
   sessions |o--o| watermarks : "transcript_path holds the session_key, not enforced"
   turns ||--o| turns_fts : "rowid is the turn id"
   turns ||--o{ entities : "turn_id"
@@ -422,7 +436,7 @@ erDiagram
   turns |o--o{ labels : "turn_id, not enforced"
 ```
 
-*Figure 1. Every table in `terminus.db` with its columns and types. `sessions`, `blocks` and `session_meta` are the archive. `decisions`, `labels` and `observations` are kept. `turns`, `compactions`, `turns_fts`, `entities` and `paths` are derived from the block rows. `watermarks`, `runs` and `meta` are operational. Two references are not enforced: a watermark can exist before or after its session, and a label outlives the `turns` rows a rebuild drops.*
+*Figure 1. Every table in `terminus.db` with its columns and types. `sessions`, `blocks` and `session_meta` are the archive. `decisions`, `labels` and `observations` are kept. `turns`, `compactions`, `session_titles`, `turns_fts`, `entities` and `paths` are derived from the block rows. `watermarks`, `runs` and `meta` are operational. Two references are not enforced: a watermark can exist before or after its session, and a label outlives the `turns` rows a rebuild drops.*
 
 ### Opening the store
 

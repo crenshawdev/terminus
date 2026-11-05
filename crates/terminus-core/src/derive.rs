@@ -1,7 +1,7 @@
 //! The one seam between a turn and everything derived from it.
 //!
-//! Ingest and rebuild both call [`derive_turn`] and [`derive_boundary`] and
-//! neither writes a derived row any other way, so a rebuild cannot drift from
+//! Ingest and rebuild both call [`derive_turn`], [`derive_boundary`] and
+//! [`derive_title`] and neither writes a derived row any other way, so a rebuild cannot drift from
 //! what ingest wrote. That is the whole point of the module: the blobs alone
 //! must reproduce the derived tables, and the cheapest way to keep that true is
 //! to give both paths one function.
@@ -202,6 +202,22 @@ pub fn derive_boundary(tx: &Connection, session_key: &str, record: &Record) -> R
         true,
         record.compact_metadata.as_deref(),
     )
+}
+
+/// Keep the title a record gives its session. Callers go in stream order, so the
+/// newest wins, except that a generated title never replaces one a person set.
+pub fn derive_title(tx: &Connection, session_key: &str, record: &Record) -> Result<()> {
+    let Some(title) = &record.title else {
+        return Ok(());
+    };
+    tx.prepare_cached(
+        "INSERT INTO session_titles (session_key, title, is_custom) VALUES (?1, ?2, ?3)
+         ON CONFLICT(session_key) DO UPDATE SET
+            title = excluded.title, is_custom = excluded.is_custom
+         WHERE excluded.is_custom >= session_titles.is_custom",
+    )?
+    .execute(rusqlite::params![session_key, title.text, title.custom])?;
+    Ok(())
 }
 
 /// The one `compactions` row at a stream position: cleared, then written again
