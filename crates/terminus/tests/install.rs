@@ -1553,6 +1553,46 @@ fn wait_for_sessions(fixture: &Fixture, expected: i64) {
     }
 }
 
+/// An update is the one moment anyone can be told the hooks are about to go
+/// quiet, and a store already on this build has nothing to be told.
+#[test]
+fn install_warns_of_a_rebuild_only_when_the_store_needs_one() {
+    use terminus_core::store::{DB_FILE_NAME, DERIVED_SCHEMA, META_DERIVED_SCHEMA};
+
+    const WARNING: &str = "this version rebuilds your archive's search tables, once";
+
+    let fixture = fixture();
+    fixture.seed();
+    let data_dir = fixture.root.join("data");
+    drop(terminus_core::Store::open(&data_dir).unwrap());
+
+    let said = text(&fixture.run(&["install"]));
+    assert!(!said.contains(WARNING), "{said}");
+
+    {
+        let conn = rusqlite::Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = ?2",
+            rusqlite::params![(DERIVED_SCHEMA - 1).to_string(), META_DERIVED_SCHEMA],
+        )
+        .unwrap();
+    }
+    let output = fixture.run(&["install"]);
+    let said = text(&output);
+    assert!(output.status.success(), "{said}");
+    assert!(said.contains(WARNING), "{said}");
+    // Nothing on disk to archive here, so nothing started the rebuild yet.
+    assert!(
+        said.contains("that starts with\n  your next session"),
+        "{said}"
+    );
+    assert!(said.contains("new sessions get no brief"), "{said}");
+    assert!(
+        said.contains("your archived sessions aren't touched"),
+        "{said}"
+    );
+}
+
 /// On a store in an older archive format, install still
 /// places the binary and writes both settings files, then prints the refusal
 /// with its clean-install steps instead of promising that the next hook will

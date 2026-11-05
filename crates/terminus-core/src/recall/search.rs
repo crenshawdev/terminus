@@ -47,7 +47,6 @@ pub struct Filters {
     /// Only what a person typed: `turns.is_typed = 1` in a main session. `kind`
     /// can't answer this, Claude Code writes tool results and notices as `user`
     /// records too, and a subagent's prompts pass `is_typed` but Claude wrote them.
-    /// A script's prompt still gets through: nothing stored says how a session started.
     pub typed: bool,
     /// Turns carrying any of these in the `paths` table. Structural, not
     /// textual: a turn that merely names a path in prose has no `paths` row and

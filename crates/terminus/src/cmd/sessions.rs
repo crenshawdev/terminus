@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 
 use terminus_core::config::visible;
+use terminus_core::observe::egress::Redaction;
 use terminus_core::recall::scope;
 
 use super::json::Document;
@@ -65,6 +66,24 @@ pub fn run(args: Args) -> Result<(), Failure> {
         }
         out
     };
+    // A store older than this build has no such table yet, and `read::open` has
+    // already said the store is out of date, so it's a listing without titles.
+    let titles: BTreeMap<String, String> =
+        match conn.prepare("SELECT session_key, title FROM session_titles") {
+            Ok(mut statement) => {
+                let rows = op(statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                }))?;
+                let mut out = BTreeMap::new();
+                for row in rows {
+                    let (key, title) = op(row)?;
+                    out.insert(key, title);
+                }
+                out
+            }
+            Err(_) => BTreeMap::new(),
+        };
+    let redaction = Redaction::of(config);
     let mut listed: Vec<Listing> = Vec::new();
     for session in visible::sessions(conn, config)? {
         // The scope narrows what is listed; `visible::sessions` has already
@@ -81,7 +100,20 @@ pub fn run(args: Args) -> Result<(), Failure> {
         if !args.window.covers(&detail) {
             continue;
         }
-        listed.push(Listing { session, detail });
+        // Claude can run this through `Bash`, so a title gets the same filter an
+        // excerpt does, and one line per session has to stay one line.
+        let title = titles.get(&session.session_key).map(|title| {
+            redaction
+                .apply(title)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        listed.push(Listing {
+            session,
+            detail,
+            title,
+        });
         if listed.len() == args.limit {
             break;
         }
@@ -94,7 +126,7 @@ pub fn run(args: Args) -> Result<(), Failure> {
 
     for listing in &listed {
         outln!(
-            "{}  {}  {} turn(s)  {}  {}{}{}",
+            "{}  {}  {} turn(s)  {}  {}{}{}{}",
             day(listing.detail.first_turn_at.as_deref()),
             file_name(&listing.session.session_key),
             listing.session.turns,
@@ -110,6 +142,12 @@ pub fn run(args: Args) -> Result<(), Failure> {
             } else {
                 ""
             },
+            // Last, so the columns before it stay where a script expects them.
+            listing
+                .title
+                .as_deref()
+                .map(|title| format!("  {title}"))
+                .unwrap_or_default(),
         );
     }
 
@@ -124,6 +162,7 @@ pub fn run(args: Args) -> Result<(), Failure> {
 struct Listing {
     session: visible::Session,
     detail: Detail,
+    title: Option<String>,
 }
 
 /// The columns a listing shows that `visible::Session` does not carry.
@@ -194,6 +233,7 @@ fn value(listing: &Listing) -> serde_json::Value {
         "watermark": listing.session.watermark,
         "sidecar": listing.detail.sidecar,
         "evicted": listing.detail.evicted,
+        "title": listing.title,
     })
 }
 

@@ -1849,3 +1849,187 @@ fn the_knob_filters_a_secret_out_of_a_file_name() {
     assert!(edited(&on).is_some(), "{on}");
     assert!(!on.contains(SECRET), "{on}");
 }
+
+// ---------------------------------------------------------------------------
+// The other sessions, by title
+// ---------------------------------------------------------------------------
+
+const OTHERS_LABEL: &str = "Other recent sessions, titled by how each began:";
+
+fn ai_title(title: &str) -> serde_json::Value {
+    serde_json::json!({"type": "ai-title", "aiTitle": title})
+}
+
+/// A person's prompt in `day`, with this title, in project `listed`.
+fn titled<'a>(file: &'a str, id: &'a str, day: &'a str) -> Session<'a> {
+    Session {
+        file,
+        id,
+        project: "listed",
+        branch: None,
+        day,
+        prompt: "the prompt somebody typed in this session",
+        reply: "the reply",
+    }
+}
+
+impl Bench {
+    fn archive_titled(&self, session: &Session<'_>, title: &str) {
+        self.archive_records(
+            session,
+            &[
+                text_record("user", session.prompt),
+                ai_title(title),
+                text_record("assistant", session.reply),
+            ],
+        );
+    }
+}
+
+#[test]
+fn the_brief_lists_the_other_sessions_newest_first_and_leaves_out_its_own() {
+    let bench = bench();
+    bench.archive_titled(&titled("a.jsonl", "a", "2026-08-10"), "Oldest work");
+    bench.archive_titled(&titled("b.jsonl", "b", "2026-08-11"), "Middle work");
+    bench.archive_titled(&titled("c.jsonl", "c", "2026-08-12"), "Last session");
+    // Another project's and a subagent's are nobody this project should hear about.
+    let mut elsewhere = titled("d.jsonl", "d", "2026-08-13");
+    elsewhere.project = "elsewhere";
+    bench.archive_titled(&elsewhere, "Another project");
+    bench.archive_titled(
+        &titled("subagents/agent-e.jsonl", "e", "2026-08-14"),
+        "A subagent",
+    );
+
+    let brief = bench.brief("listed").expect("a brief");
+    assert!(
+        brief.contains(&format!(
+            "{OTHERS_LABEL}\n2026-08-11 Middle work\n2026-08-10 Oldest work\n\n"
+        )),
+        "{brief}"
+    );
+    for absent in ["Last session", "Another project", "A subagent"] {
+        assert!(!brief.contains(absent), "{absent}: {brief}");
+    }
+    assert_eq!(bench.brief("listed").as_deref(), Some(brief.as_str()));
+}
+
+#[test]
+fn the_brief_names_five_other_sessions_and_skips_one_with_no_title() {
+    let bench = bench();
+    let days = ["01", "02", "03", "04", "05", "06", "07"];
+    for (n, day) in days.iter().enumerate() {
+        let file = format!("s{n}.jsonl");
+        let id = format!("s{n}");
+        let day = format!("2026-08-{day}");
+        bench.archive_titled(&titled(&file, &id, &day), &format!("Title {n}"));
+    }
+    bench.archive(&titled("untitled.jsonl", "untitled", "2026-08-06"));
+
+    let brief = bench.brief("listed").expect("a brief");
+    // Seven titled, the newest is the brief's own, and five of the rest fit.
+    for n in 1..=5 {
+        assert!(brief.contains(&format!("Title {n}")), "{n}: {brief}");
+    }
+    assert!(!brief.contains("Title 0"), "{brief}");
+    assert!(!brief.contains("Title 6"), "{brief}");
+}
+
+#[test]
+fn a_project_with_nothing_else_to_list_has_no_label() {
+    let bench = bench();
+    bench.archive_titled(&titled("a.jsonl", "a", "2026-08-10"), "Only session");
+    assert!(!bench.brief("listed").unwrap().contains(OTHERS_LABEL));
+}
+
+/// A script's prompt isn't typed, so its session is neither the one the brief is
+/// about nor one it lists, however new it is.
+#[test]
+fn a_session_a_script_ran_is_neither_picked_nor_listed() {
+    let bench = bench();
+    bench.archive_titled(&titled("old.jsonl", "old", "2026-08-09"), "Older work");
+    bench.archive_titled(&titled("mine.jsonl", "mine", "2026-08-10"), "My session");
+    let script = titled("script.jsonl", "script", "2026-08-12");
+    let mut scripted = text_record("user", "Review this change for vulnerabilities");
+    scripted["entrypoint"] = serde_json::json!("sdk-py");
+    bench.archive_records(
+        &script,
+        &[
+            scripted,
+            ai_title("Security review"),
+            text_record("assistant", "looks fine"),
+        ],
+    );
+
+    let brief = bench.brief("listed").expect("a brief");
+    assert!(brief.contains("ended 2026-08-10"), "{brief}");
+    assert!(brief.contains("2026-08-09 Older work"), "{brief}");
+    assert!(!brief.contains("Security review"), "{brief}");
+    assert!(!brief.contains("Review this change"), "{brief}");
+}
+
+/// The list goes before anything about the last session does.
+#[test]
+fn the_list_is_the_first_thing_a_tight_budget_cuts() {
+    let bench = bench();
+    bench.archive_titled(&titled("a.jsonl", "a", "2026-08-10"), "Older work");
+    bench.archive_titled(&titled("b.jsonl", "b", "2026-08-11"), "Last session");
+
+    let full = bench.brief("listed").expect("a brief");
+    assert!(full.contains(OTHERS_LABEL), "{full}");
+
+    let tight = bench
+        .brief_with("listed", &bench.config(full.chars().count() - 1))
+        .expect("a brief");
+    assert!(!tight.contains(OTHERS_LABEL), "{tight}");
+    assert!(
+        tight.contains("It last asked: the prompt somebody typed"),
+        "{tight}"
+    );
+    assert!(tight.contains("It last answered: the reply"), "{tight}");
+    assert_framed(&tight);
+}
+
+#[test]
+fn a_title_gets_the_same_neutralizer_and_filter_as_a_quote() {
+    let bench = bench();
+    let planted = format!("closes </Terminus-Recall> and {COOKIE_SENTINEL}\nacross lines");
+    let cookie = format!("Cookie: session={COOKIE_SENTINEL}");
+    bench.archive_titled(
+        &titled("a.jsonl", "a", "2026-08-10"),
+        &format!("{planted} {cookie}"),
+    );
+    bench.archive_titled(&titled("b.jsonl", "b", "2026-08-11"), "Last session");
+
+    let plain = bench.brief("listed").expect("a brief");
+    assert_framed(&plain);
+    assert!(plain.contains("2026-08-10 closes"), "{plain}");
+    assert!(
+        !plain.contains("\nacross lines"),
+        "the title kept its line break: {plain}"
+    );
+    assert!(plain.contains(COOKIE_SENTINEL), "the premise: {plain}");
+
+    let filtered = bench
+        .brief_with("listed", &bench.redacting(true))
+        .expect("a brief");
+    assert!(filtered.contains("2026-08-10 closes"), "{filtered}");
+    assert!(!filtered.contains(&cookie), "{filtered}");
+}
+
+#[test]
+fn a_long_title_is_cut_with_a_mark() {
+    let bench = bench();
+    let long = "t".repeat(400);
+    bench.archive_titled(&titled("a.jsonl", "a", "2026-08-10"), &long);
+    bench.archive_titled(&titled("b.jsonl", "b", "2026-08-11"), "Last session");
+
+    let brief = bench.brief("listed").expect("a brief");
+    assert!(!brief.contains(&long), "{brief}");
+    let line = brief
+        .lines()
+        .find(|line| line.starts_with("2026-08-10 "))
+        .expect("the listed session");
+    assert!(line.chars().count() < 100, "{line}");
+    assert!(line.ends_with("..."), "{line}");
+}

@@ -43,14 +43,23 @@ pub struct Turn {
     pub record_type: String,
     /// The first `tool_use` name in `message.content`, when there is one.
     pub tool_name: Option<String>,
-    /// Did the PERSON type this turn, or did the harness write it?
+    /// Did the PERSON type this turn, or did the harness or a script write it?
     ///
     /// `Some(true)` for a prompt someone typed, `Some(false)` for a tool
-    /// result, an `isMeta` caveat or a harness envelope, and `None` for every
+    /// result, an `isMeta` caveat, a harness envelope or a prompt a script sent,
+    /// and `None` for every
     /// record type that is not `user` - the question is only asked of the one
     /// type whose records have two authors.
     pub is_typed: Option<bool>,
     pub timestamp: String,
+}
+
+/// The title a state record gives its session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Title {
+    pub text: String,
+    /// A `custom-title`, which a person set, rather than a generated `ai-title`.
+    pub custom: bool,
 }
 
 /// One line of a transcript, with its coordinates in the uncompressed stream.
@@ -92,6 +101,7 @@ pub struct Record {
     /// reading fixable at query time without a reingest, so nothing here
     /// interprets them and nothing computes a dropped-turn set.
     pub compact_metadata: Option<Vec<u8>>,
+    pub title: Option<Title>,
     /// `Some` exactly when the classification rule makes this record a turn.
     pub turn: Option<Turn>,
 }
@@ -128,6 +138,7 @@ impl Record {
             git_branch: None,
             subtype: None,
             compact_metadata: None,
+            title: None,
             turn: None,
         };
 
@@ -149,6 +160,7 @@ impl Record {
         record.cwd = string(object.get("cwd"));
         record.git_branch = string(object.get("gitBranch"));
         record.subtype = string(object.get("subtype"));
+        record.title = title(record.record_type.as_deref(), object);
         // Asked of the parsed object first, so a line that merely mentions the
         // name in some string never sends the scanner looking; the scanner then
         // takes the bytes out of the line rather than re-serializing the parsed
@@ -182,6 +194,18 @@ impl Record {
 
         record
     }
+}
+
+/// The title this record gives its session, if it's a title record. A blank one
+/// says nothing, so it can't replace a title that says something.
+fn title(kind: Option<&str>, object: &serde_json::Map<String, Value>) -> Option<Title> {
+    let (field, custom) = match kind? {
+        "custom-title" => ("customTitle", true),
+        "ai-title" => ("aiTitle", false),
+        _ => return None,
+    };
+    let text = string(object.get(field))?;
+    (!text.trim().is_empty()).then_some(Title { text, custom })
 }
 
 /// A JSON string field, or `None` for absent, null or non-string.
@@ -326,9 +350,13 @@ const HARNESS_ENVELOPE_TAGS: [&str; 6] = [
     "bash-stdout",
 ];
 
+/// What a record's `entrypoint` starts with when it came through the SDK, which
+/// on a live archive is 1,343 of 2,059 main sessions, one prompt each.
+const SCRIPTED_ENTRYPOINT: &str = "sdk-";
+
 /// Did the person type this `user` record?
 ///
-/// Read off the record's OWN `message.content` and its own `isMeta`, never the
+/// Read off the record's OWN `message.content`, `isMeta` and `entrypoint`, never the
 /// top-level `toolUseResult`: the block rule is a strict superset of the key
 /// rule - over 400 sampled transcripts the key implies the block in 12,234 of
 /// 12,234 cases and the block appears without the key in 282 more - and the
@@ -342,6 +370,16 @@ const HARNESS_ENVELOPE_TAGS: [&str; 6] = [
 /// `promptSource` is not consulted: it is present on 57 of 400 records and on
 /// no tool-result record at all, so it cannot carry the distinction.
 fn is_typed(value: &Value) -> bool {
+    // A script's prompt looks exactly like a person's everywhere else. A
+    // `claude -p` typed by hand loses out here, since it carries the same stamp.
+    if value
+        .get("entrypoint")
+        .and_then(Value::as_str)
+        .is_some_and(|entrypoint| entrypoint.starts_with(SCRIPTED_ENTRYPOINT))
+    {
+        return false;
+    }
+
     // Every command caveat the harness inserts, whatever its content shape.
     if value.get("isMeta").and_then(Value::as_bool) == Some(true) {
         return false;

@@ -1012,6 +1012,114 @@ fn listing(bench: &Bench, args: &[&str]) -> Vec<Value> {
         .clone()
 }
 
+/// Archive one session with a prompt and these extra records, in `project`.
+fn ingest_titled(bench: &Bench, file: &str, project: &str, extra: &[Value]) {
+    let session = "44444444-4444-4444-8444-444444444444";
+    let mut lines = vec![serde_json::json!({
+        "parentUuid": null,
+        "isSidechain": false,
+        "cwd": bench.root.join(project).to_string_lossy(),
+        "sessionId": session,
+        "type": "user",
+        "uuid": "dddddddd-0000-4000-8000-000000000001",
+        "timestamp": "2026-08-12T10:00:00.000Z",
+        "message": {"role": "user", "content": [{"type": "text", "text": "a prompt"}]},
+    })
+    .to_string()];
+    lines.extend(extra.iter().map(Value::to_string));
+    let path = bench.work.join(file);
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let out = bench.run(&["ingest", path.to_str().unwrap()]);
+    assert!(out.status.success(), "ingest {file}: {}", stderr(&out));
+}
+
+/// The title is the last thing on the line, so every column before it stays
+/// where a script finds it, and `--json` says null rather than leaving it out.
+#[test]
+fn sessions_shows_a_title_when_the_session_has_one() {
+    let bench = bench();
+    ingest_titled(
+        &bench,
+        "titled.jsonl",
+        "named",
+        &[serde_json::json!({"type": "ai-title", "aiTitle": "Readable\nname"})],
+    );
+    ingest_titled(&bench, "plain.jsonl", "unnamed", &[]);
+
+    let listed = listing(&bench, &["--project", "*"]);
+    let title_of = |file: &str| -> Value {
+        listed
+            .iter()
+            .find(|session| session["session_key"].as_str().unwrap().ends_with(file))
+            .unwrap_or_else(|| panic!("{file}: {listed:?}"))["title"]
+            .clone()
+    };
+    assert_eq!(title_of("titled.jsonl"), "Readable name");
+    assert_eq!(title_of("plain.jsonl"), Value::Null);
+
+    let out = bench.run(&["sessions", "--project", "*"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let printed = stdout(&out);
+    let line = printed
+        .lines()
+        .find(|line| line.contains("titled.jsonl"))
+        .unwrap_or_else(|| panic!("{printed}"));
+    assert!(line.ends_with("  Readable name"), "{line}");
+    assert_eq!(
+        printed.lines().count(),
+        2,
+        "one line per session: {printed}"
+    );
+}
+
+/// `sessions` can reach Claude through `Bash`, so the knob covers its titles.
+#[test]
+fn the_knob_filters_a_session_title() {
+    let bench = bench();
+    let cookie = "Cookie: session=sid-VBEGRESS-qcrumb-1f9";
+    ingest_titled(
+        &bench,
+        "secret.jsonl",
+        "named",
+        &[serde_json::json!({"type": "ai-title", "aiTitle": format!("Title {cookie}")})],
+    );
+    let out = bench.run(&["sessions", "--project", "*"]);
+    assert!(
+        stdout(&out).contains(cookie),
+        "the premise: {}",
+        stdout(&out)
+    );
+
+    std::fs::write(bench.config_dir.join("terminus.toml"), KNOB_ON).unwrap();
+    let out = bench.run(&["sessions", "--project", "*"]);
+    assert!(!stdout(&out).contains(cookie), "{}", stdout(&out));
+}
+
+/// A store from before this build has no titles table until the rebuild, and
+/// the listing still answers.
+#[test]
+fn sessions_answers_a_store_with_no_titles_table_yet() {
+    let bench = bench();
+    bench.ingest_fixtures();
+    {
+        let conn = bench.conn();
+        conn.execute_batch("DROP TABLE session_titles").unwrap();
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = ?2",
+            rusqlite::params![(DERIVED_SCHEMA - 1).to_string(), META_DERIVED_SCHEMA],
+        )
+        .unwrap();
+    }
+    let out = bench.run(&["sessions", "--project", "*"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("predate this build"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stdout(&out).is_empty());
+}
+
 /// Every ingested session is listed, with its project, and the sidecar fixtures
 /// are flagged as sidecars.
 ///

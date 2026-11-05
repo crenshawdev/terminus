@@ -202,6 +202,7 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
         // scan, through the same seam ingest used.
         for record in &scan.records {
             derive::derive_boundary(&tx, &session_key, record)?;
+            derive::derive_title(&tx, &session_key, record)?;
         }
     }
 
@@ -247,6 +248,7 @@ pub(crate) fn clear_derived(tx: &rusqlite::Connection, session_key: &str) -> Res
         format!("DELETE FROM paths WHERE turn_id IN ({TURN_IDS})"),
         format!("DELETE FROM entities WHERE turn_id IN ({TURN_IDS})"),
         "DELETE FROM compactions WHERE session_key = ?1".to_owned(),
+        "DELETE FROM session_titles WHERE session_key = ?1".to_owned(),
         format!("DELETE FROM turns_fts WHERE rowid IN ({TURN_IDS})"),
         "DELETE FROM turns WHERE session_key = ?1".to_owned(),
     ] {
