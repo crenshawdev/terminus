@@ -735,6 +735,20 @@ fn the_search_filters_and_the_result_budget_reach_the_query_layer() {
     assert!(found(json!({"query": "cargo", "until": "2000-01-01"})).is_empty());
     assert_eq!(found(json!({"query": "cargo", "limit": 1})).len(), 1);
 
+    // `kind: user` also matches the tool result naming `quince`, `typed` finds
+    // only the prompt, and false narrows nothing.
+    let quince = |extra: Value| {
+        let mut arguments = json!({"query": "quince", "project": "*"});
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        found(arguments)
+    };
+    assert!(quince(json!({"kind": "user"})).len() > 1);
+    assert_eq!(quince(json!({"typed": true})).len(), 1);
+    assert_eq!(quince(json!({"typed": false})), quince(json!({})));
+
     // A limit above the budget is lowered rather than refused, and the answer
     // says so instead of quietly returning fewer than asked.
     let document = bench.call(
@@ -1278,6 +1292,7 @@ fn a_malformed_call_is_an_empty_result_with_a_reason_and_never_a_throw() {
         // An argument of the wrong JSON type.
         ("recall_search", json!({"query": 12})),
         ("recall_search", json!({"query": "cargo", "tool": true})),
+        ("recall_search", json!({"query": "cargo", "typed": "yes"})),
         (
             "recall_search",
             json!({"query": "cargo", "paths": "src/a.rs"}),

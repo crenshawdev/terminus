@@ -44,6 +44,10 @@ pub struct Filters {
     pub tool: Option<String>,
     /// `turns.record_type`: `user`, `assistant`, `system`, `attachment`.
     pub kind: Option<String>,
+    /// Only what a person typed: `turns.is_typed = 1` in a main session. `kind`
+    /// can't answer this, Claude Code writes tool results and notices as `user`
+    /// records too, and a subagent's prompts pass `is_typed` but Claude wrote them.
+    pub typed: bool,
     /// Turns carrying any of these in the `paths` table. Structural, not
     /// textual: a turn that merely names a path in prose has no `paths` row and
     /// is not a match here.
@@ -635,6 +639,11 @@ impl Filters {
         if let Some(kind) = &self.kind {
             sql.push_str(" AND t.record_type = ?\n");
             params.push(Box::new(kind.clone()));
+        }
+        // Here and not on the results: filtering afterward would let tool
+        // results fill the candidate pool and cut the typed turns out of it.
+        if self.typed {
+            sql.push_str(" AND t.is_typed = 1 AND m.parent_session_key IS NULL\n");
         }
         if !self.paths.is_empty() {
             // EXISTS rather than a join: a turn carrying three of the named

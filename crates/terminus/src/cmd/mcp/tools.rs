@@ -120,7 +120,14 @@ pub fn descriptors() -> Vec<Value> {
                     "kind": {
                         "type": "string",
                         "description": "Only turns of this record type: user, assistant, \
-                                        system or attachment."
+                                        system or attachment. Claude Code writes tool results \
+                                        and notices as user records too, so use typed to find \
+                                        what a person typed."
+                    },
+                    "typed": {
+                        "type": "boolean",
+                        "description": "Only turns a person typed, leaving out the tool results \
+                                        and notices Claude Code writes as user records."
                     },
                     "since": {
                         "type": "string",
@@ -309,6 +316,7 @@ fn run_search(args: &Map<String, Value>) -> Result<Value, Refused> {
     let filters = Filters {
         tool: optional_string(args, "tool")?,
         kind: optional_string(args, "kind")?,
+        typed: optional_flag(args, "typed")?,
         paths: optional_strings(args, "paths")?,
         since: optional_time(args, "since")?,
         until: optional_time(args, "until")?,
@@ -699,6 +707,17 @@ fn optional_string(args: &Map<String, Value>, name: &str) -> Result<Option<Strin
         Some(Value::String(text)) => Ok(Some(text.clone())),
         Some(other) => Err(Refused::caller(format!(
             "{name} must be a string, not {}",
+            kind(other)
+        ))),
+    }
+}
+
+fn optional_flag(args: &Map<String, Value>, name: &str) -> Result<bool, Refused> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(flag)) => Ok(*flag),
+        Some(other) => Err(Refused::caller(format!(
+            "{name} must be a boolean, not {}",
             kind(other)
         ))),
     }

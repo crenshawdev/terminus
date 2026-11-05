@@ -694,6 +694,22 @@ fn the_command_line_filters_reach_the_query_layer() {
         assert_eq!(hit["record_type"], "assistant");
     }
 
+    // `--kind user` also matches the tool result naming `quince`, and `--typed`
+    // finds only the prompt.
+    assert!(hits(&["--kind", "user", "quince"]).len() > 1);
+    let typed = hits(&["--typed", "quince"]);
+    assert_eq!(typed.len(), 1, "{typed:?}");
+    assert_eq!(typed[0]["record_type"], "user");
+    assert_eq!(typed[0]["sidechain"], false);
+
+    // A subagent's prompt is a `user` record too, and Claude wrote it.
+    assert!(hits(&["--kind", "user", "framing"])
+        .iter()
+        .any(|hit| hit["sidechain"] == true));
+    assert!(hits(&["--typed", "framing"])
+        .iter()
+        .all(|hit| hit["sidechain"] == false));
+
     // A time window that ends before the corpus begins returns nothing, and
     // exits 0 doing it.
     assert!(hits(&["--until", "2000-01-01", "cargo"]).is_empty());
