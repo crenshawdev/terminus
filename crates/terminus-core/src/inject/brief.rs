@@ -570,7 +570,8 @@ fn head(scoped: &Scoped, row: &LastSession, later: Option<&LastSession>) -> Stri
 /// How many other sessions the brief names.
 const SESSIONS_NAMED: usize = 5;
 
-/// The longest a named session's title gets. Claude Code's own stop at 60.
+/// The longest a named session's title gets. Most run far shorter, and the
+/// longest on a live archive is 109.
 const TITLE_CHARS: usize = 80;
 
 /// The newest sessions other than the one the brief is about, with a typed

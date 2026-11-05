@@ -400,7 +400,7 @@ fn warn_of_rebuild(started: bool) {
     };
     outln!();
     outln!(
-        "  this version rebuilds your archive's search tables, once, and {when}. It took about 3 minutes on a 3 GB archive.\n  \
+        "  this version rebuilds your archive's search tables, once, and {when}. It took about 4 minutes on a 3 GB archive.\n  \
          until it finishes, new sessions get no brief, prompts get no earlier turns, and\n  \
          search results may be incomplete. your archived sessions aren't touched.\n  \
          `terminus status` stops saying the tables predate this build when it's done."
