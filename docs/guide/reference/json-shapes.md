@@ -137,7 +137,8 @@ file it points at, and a path outside those two shapes, such as a file under no
   Claude Code writes tool results, command caveats and task notifications as
   `user` records too.
 - `--typed` keeps only what a person typed, in a main session, so every hit has
-  `record_type` `user` and `sidechain` false.
+  `record_type` `user` and `sidechain` false. A prompt a script sent to Claude
+  Code still counts.
 
 ### `show`
 

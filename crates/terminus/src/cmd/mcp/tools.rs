@@ -126,8 +126,10 @@ pub fn descriptors() -> Vec<Value> {
                     },
                     "typed": {
                         "type": "boolean",
-                        "description": "Only turns a person typed, leaving out the tool results \
-                                        and notices Claude Code writes as user records."
+                        "description": "Only prompts in a main session, leaving out the tool \
+                                        results and notices Claude Code writes as user records \
+                                        and the prompts subagents get. A prompt a script sent \
+                                        still counts."
                     },
                     "since": {
                         "type": "string",

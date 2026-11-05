@@ -33,7 +33,7 @@ To narrow it down:
 | Option | What it keeps |
 |---|---|
 | `--tool Bash` | Turns that called this tool. |
-| `--typed` | What a person typed, in a main session. Use this to find what you said. |
+| `--typed` | What a person typed, in a main session. Use this to find what you said. A prompt a script sent to Claude Code still counts. |
 | `--kind user` | Turns of this record type: `user`, `assistant`, `system` or `attachment`. Claude Code writes tool results and notices as `user` records too. |
 | `--path src/worker/S.ts` | Turns whose tool call or result names this exact path in a structured field. Repeat it to match any of several. |
 | `--since 2026-10-01`, `--until 2026-10-31` | Turns inside these UTC bounds, both inclusive. |
