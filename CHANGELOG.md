@@ -7,6 +7,53 @@ Each release bumps the middle number of the version, a release with only fixes
 bumps the last, and the first moves only for a large change. The number does not
 promise compatibility; the entry for each release says what it changes.
 
+## [2.0.0] - 2026-11-05
+
+The first pass after this update rebuilds your archive's search tables, once.
+It took about 4 minutes on a 3 GB archive. Until it finishes, new sessions get
+no brief, prompts get no earlier turns, and search results may be incomplete.
+Your archived sessions aren't touched, and `terminus status` stops saying the
+tables predate this build when it's done.
+
+### Added
+
+- `search --typed` and `typed: true` on `recall_search` find what a person typed
+  in a main session. `--kind user` also matches the tool results, command caveats
+  and task notifications Claude Code writes as `user` records. (#141)
+- `sessions` ends each line with the session's title, and `--json` carries
+  `title`. (#144)
+- The brief lists the five newest other sessions with a typed prompt and a title.
+  Claude Code writes a title once, so it describes how a session opened. (#144)
+
+### Changed
+
+- The brief prefers the last session on your branch, passes over sessions with
+  nothing typed, quotes up to three prompts and lists the files the session
+  edited. (#139)
+- A prompt sent through the Agent SDK or `claude -p` no longer counts as typed,
+  including a `claude -p` you typed yourself, because its record looks the same
+  as a script's. Plain search still finds it. (#143)
+- `delete` in `[retention]` removes a session's logged prompts too, so `stats` and
+  `replay` lose that history.
+- `doctor` and `install` say what each auto-compact setting costs, and `doctor`
+  no longer recommends turning it off.
+- The repository moved to `crenshawdev/terminus`, and the user docs moved into a
+  guide.
+
+### Fixed
+
+- The brief reports the branch a session ended on instead of the first one it
+  named. A finished session keeps the branch it already has.
+
+### Security
+
+- With `redact_recall` on, a secret written as `name = value` is filtered, as in
+  `~/.aws/credentials`, INI, TOML, HCL and Python settings. (#131)
+- A project in `exclude` no longer has its prompts logged. Rows already stored
+  stay. (#133 covers removing them.)
+- Releases are signed with a new key, pinned in `install.sh`, because the old one
+  can no longer sign.
+
 ## [1.1.0] - 2026-10-28
 
 ### Changed
@@ -73,5 +120,6 @@ you run and gives that history back to Claude and to you.
 
 It calls no model, runs no daemon and opens no network connection.
 
+[2.0.0]: https://github.com/crenshawdev/terminus/releases/tag/v2.0.0
 [1.1.0]: https://github.com/crenshawdev/terminus/releases/tag/v1.1.0
 [1.0.0]: https://github.com/crenshawdev/terminus/releases/tag/v1.0.0
