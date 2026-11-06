@@ -781,3 +781,53 @@ fn elision_does_not_change_the_classification() {
         Some(true)
     );
 }
+
+/// What one line's `compactMetadata` comes out as.
+fn compact_metadata(line: &str) -> Option<Vec<u8>> {
+    let scan = parse::scan(format!("{line}\n").as_bytes());
+    scan.records[0].compact_metadata.clone()
+}
+
+#[test]
+fn compact_metadata_keeps_the_bytes_as_written() {
+    let line =
+        r#"{ "type" : "system", "compactMetadata" : { "b" : 1.0,  "a":"\u0041" } , "uuid":"u" }"#;
+    assert_eq!(
+        compact_metadata(line).as_deref(),
+        Some(&br#"{ "b" : 1.0,  "a":"\u0041" }"#[..])
+    );
+    assert_eq!(
+        compact_metadata(r#"{"compactMetadata":null}"#).as_deref(),
+        Some(&b"null"[..])
+    );
+}
+
+#[test]
+fn compact_metadata_is_only_ever_the_top_level_field() {
+    let line = r#"{"message":{"compactMetadata":{"a":1}},"note":"\"compactMetadata\":{}"}"#;
+    assert_eq!(compact_metadata(line), None);
+}
+
+#[test]
+fn an_escaped_compact_metadata_key_is_still_the_field() {
+    let line = r#"{"compact\u004detadata":{"a":1}}"#;
+    assert_eq!(compact_metadata(line).as_deref(), Some(&br#"{"a":1}"#[..]));
+}
+
+#[test]
+fn a_repeated_compact_metadata_key_keeps_the_last_value_like_every_other_field() {
+    let line = r#"{"compactMetadata":{"a":1},"compactMetadata":{"b":2}}"#;
+    assert_eq!(compact_metadata(line).as_deref(), Some(&br#"{"b":2}"#[..]));
+}
+
+/// The limit named in `Record::parse`. A record this deep has no fields at all,
+/// and its bytes stay in the archive.
+#[test]
+fn a_record_nested_past_the_json_limit_has_no_fields() {
+    let deep = format!("{}1{}", "[".repeat(128), "]".repeat(128));
+    let line = format!(r#"{{"type":"user","cwd":"/here","deep":{deep}}}"#);
+    let scan = parse::scan(format!("{line}\n").as_bytes());
+    assert_eq!(scan.records[0].record_type, None);
+    assert_eq!(scan.records[0].cwd, None);
+    assert_eq!(scan.records[0].len, line.len() as u64);
+}

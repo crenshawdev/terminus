@@ -11,6 +11,9 @@
 //! under `subagents/workflows/wf_*/` hold `{agentId, key, result, type}`, and a
 //! line of that shape parses as a record with no turn.
 
+use std::collections::BTreeMap;
+
+use serde_json::value::RawValue;
 use serde_json::Value;
 
 /// The four record types that can become a turn.
@@ -145,7 +148,9 @@ impl Record {
         // A line that is not JSON, or is JSON but not an object, is kept as a
         // record with no fields rather than dropped: its bytes are in the blob
         // either way, and a scan that aborted here would stop ingesting a
-        // transcript because of one malformed line.
+        // transcript because of one malformed line. A line nested past serde_json's
+        // 128-level limit lands here too, so `session_meta` gets nothing from it,
+        // and `reindex` never rebuilds that table.
         let value: Value = match serde_json::from_slice(line) {
             Ok(v) => v,
             Err(_) => return record,
@@ -161,14 +166,12 @@ impl Record {
         record.git_branch = string(object.get("gitBranch"));
         record.subtype = string(object.get("subtype"));
         record.title = title(record.record_type.as_deref(), object);
-        // Asked of the parsed object first, so a line that merely mentions the
-        // name in some string never sends the scanner looking; the scanner then
-        // takes the bytes out of the line rather than re-serializing the parsed
-        // value, because a round trip through `serde_json` renormalizes
-        // whitespace, escapes and number formatting and would make "verbatim"
-        // mean "equivalent".
+        // Asked of the parsed object first, so only a line that has the field
+        // pays for a second parse. That parse takes the bytes out of the line
+        // because re-serializing the value renormalizes whitespace, escapes and
+        // number formatting, and "verbatim" would come to mean "equivalent".
         if object.contains_key(COMPACT_METADATA_FIELD) {
-            record.compact_metadata = raw_field(line, COMPACT_METADATA_FIELD).map(<[u8]>::to_vec);
+            record.compact_metadata = raw_field(line, COMPACT_METADATA_FIELD);
         }
 
         let uuid = string(object.get("uuid"));
@@ -213,121 +216,12 @@ fn string(value: Option<&Value>) -> Option<String> {
     value?.as_str().map(str::to_owned)
 }
 
-/// The bytes of one **top-level** field's value, exactly as they appear in
-/// `line`.
-///
-/// Structural rather than a substring search: it walks the object's own
-/// key/value pairs, so a `"compactMetadata"` appearing inside some nested
-/// message content or inside a string value can never be mistaken for the field.
-/// Only the first occurrence of a key is returned; `serde_json` keeps the last
-/// of a duplicated key, and a line with duplicate top-level keys is malformed
-/// enough that either answer is a guess.
-///
-/// `None` for anything this cannot answer exactly - a line that is not a JSON
-/// object, a truncated value, a key written with an escape - and the caller
-/// stores nothing rather than storing bytes it is not sure of.
-fn raw_field<'a>(line: &'a [u8], key: &str) -> Option<&'a [u8]> {
-    let mut at = skip_ws(line, 0);
-    if *line.get(at)? != b'{' {
-        return None;
-    }
-    at = skip_ws(line, at + 1);
-    if line.get(at) == Some(&b'}') {
-        return None;
-    }
-
-    loop {
-        let name_end = string_end(line, at)?;
-        // The quoted content, undecoded: the keys this is ever asked for are
-        // plain ASCII, and an escaped key simply does not match rather than
-        // being decoded to something that might.
-        let name = &line[at + 1..name_end - 1];
-
-        at = skip_ws(line, name_end);
-        if *line.get(at)? != b':' {
-            return None;
-        }
-        at = skip_ws(line, at + 1);
-        let end = value_end(line, at)?;
-        if name == key.as_bytes() {
-            return Some(&line[at..end]);
-        }
-
-        at = skip_ws(line, end);
-        if line.get(at) != Some(&b',') {
-            return None;
-        }
-        at = skip_ws(line, at + 1);
-    }
-}
-
-/// The index just past a JSON string's closing quote.
-fn string_end(line: &[u8], start: usize) -> Option<usize> {
-    if *line.get(start)? != b'"' {
-        return None;
-    }
-    let mut at = start + 1;
-    while at < line.len() {
-        match line[at] {
-            // A backslash escapes whatever follows, including a quote and
-            // including another backslash, so both bytes are consumed together.
-            b'\\' => at += 2,
-            b'"' => return Some(at + 1),
-            _ => at += 1,
-        }
-    }
-    None
-}
-
-/// The index just past a JSON value that begins at `start`.
-fn value_end(line: &[u8], start: usize) -> Option<usize> {
-    match *line.get(start)? {
-        b'"' => string_end(line, start),
-        open @ (b'{' | b'[') => {
-            let close = if open == b'{' { b'}' } else { b']' };
-            let mut depth = 0usize;
-            let mut at = start;
-            while at < line.len() {
-                match line[at] {
-                    // Strings are skipped whole, so a brace inside one never
-                    // moves the depth.
-                    b'"' => {
-                        at = string_end(line, at)?;
-                        continue;
-                    }
-                    b'{' | b'[' => depth += 1,
-                    b'}' | b']' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return (line[at] == close).then_some(at + 1);
-                        }
-                    }
-                    _ => {}
-                }
-                at += 1;
-            }
-            None
-        }
-        // A number, `true`, `false` or `null`: it ends where the enclosing
-        // object does, at a comma, or at whitespace.
-        _ => {
-            let mut at = start;
-            while at < line.len()
-                && !matches!(line[at], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
-            {
-                at += 1;
-            }
-            (at > start).then_some(at)
-        }
-    }
-}
-
-fn skip_ws(line: &[u8], from: usize) -> usize {
-    let mut at = from;
-    while at < line.len() && matches!(line[at], b' ' | b'\t' | b'\n' | b'\r') {
-        at += 1;
-    }
-    at
+/// The bytes of one top-level field's value, exactly as they appear in `line`.
+/// A key is decoded and the last of a repeated key wins, the same as the `Value`
+/// every other field is read from.
+fn raw_field(line: &[u8], key: &str) -> Option<Vec<u8>> {
+    let fields: BTreeMap<String, &RawValue> = serde_json::from_slice(line).ok()?;
+    Some(fields.get(key)?.get().as_bytes().to_vec())
 }
 
 /// The tags a harness-written `user` record's text opens with.
