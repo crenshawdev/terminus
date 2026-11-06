@@ -28,9 +28,10 @@ From [`.github/workflows/release.yml`](https://github.com/crenshawdev/terminus/b
    ```
 
 4. Each build job attests its binary with [`actions/attest`](https://github.com/actions/attest), a signed statement that `release.yml` built it from the tag on a GitHub-hosted runner.
-5. The draft job runs only when all four builds pass. It checks that it holds exactly the four binaries and four manifests, and creates the release as a draft, never as a prerelease and never published.
+5. A license job writes `THIRD-PARTY-LICENSES` with [`cargo about`](https://github.com/EmbarkStudios/cargo-about), from [`about.toml`](https://github.com/crenshawdev/terminus/blob/main/about.toml) and [`about.hbs`](https://github.com/crenshawdev/terminus/blob/main/about.hbs). It holds the license text of every crate compiled into the binaries, the Rust standard library and musl, which the Linux binaries link statically. A dependency under a license `about.toml` doesn't accept fails the job.
+6. The draft job runs only when all four builds and the license job pass. It checks that it holds exactly the four binaries, the four manifests and `THIRD-PARTY-LICENSES`, and creates the release as a draft, never as a prerelease and never published.
 
-The workflow's permissions are `contents: read`. The build jobs add `id-token: write` and `attestations: write`, which they use only to attest their binaries. The draft job alone has `contents: write`, and it uses only the workflow's own token. No workflow names a signing key, so CI can build and attest a draft but cannot sign one.
+The workflow's permissions are `contents: read`. The build jobs add `id-token: write` and `attestations: write`, which they use only to attest their binaries. The license job adds nothing, and it's separate from the draft job so `cargo about`, compiled from crates.io, never runs beside a write token. The draft job alone has `contents: write`, and it uses only the workflow's own token. No workflow names a signing key, so CI can build and attest a draft but cannot sign one.
 
 ## How a release is signed
 
@@ -85,6 +86,7 @@ Identity `crenshawdev-release`, namespace `terminus-release`, fingerprint `SHA25
 ## What the signature does not protect
 
 - `install.sh` itself. It is fetched unsigned over HTTPS from `main`.
+- `THIRD-PARTY-LICENSES`. It has no manifest or signature, `sign-release.sh` doesn't check it, and `install.sh` doesn't download it.
 - An older, validly signed release served from a source you pass. It installs, because there is no version floor.
 - Key loss or rotation. There is no revocation, and a new key means a new `install.sh`.
 - Proof at install time that the binary was built from the tagged source. The signer checks the attestation before signing, and `install.sh` checks only the signature.

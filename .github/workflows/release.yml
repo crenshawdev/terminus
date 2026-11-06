@@ -12,6 +12,7 @@ permissions:
 
 env:
   RUST_VERSION: "1.97.1"
+  CARGO_ABOUT_VERSION: "0.9.3"
 
 jobs:
   build:
@@ -160,11 +161,51 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  licenses:
+    # A job of its own, so a tool compiled from crates.io never runs next to the
+    # draft job's write token. contents: read, from the top of this file.
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the named Rust version
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustc --version
+
+      # The binary sits behind the cli feature; without it cargo installs nothing.
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --version "$CARGO_ABOUT_VERSION" --features cli
+
+      # Frozen, so only what the crates ship goes in, and no license lookup online.
+      - name: Write the license file
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          mkdir dist
+          cargo about generate --frozen --config about.toml \
+            --manifest-path crates/terminus/Cargo.toml \
+            --output-file dist/THIRD-PARTY-LICENSES about.hbs
+
+      # The name matches the draft job's terminus-* download.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: terminus-third-party-licenses
+          path: dist/
+          if-no-files-found: error
+
   draft:
-    # needs waits on every platform, so one failed build leaves no draft. This
-    # is the only job that can write to the repo, and it does it with the
-    # job's own token.
-    needs: build
+    # needs waits on every platform and the license file, so one failure leaves
+    # no draft. This is the only job that can write to the repo, and it does it
+    # with the job's own token.
+    needs: [build, licenses]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -178,7 +219,7 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Check the draft holds exactly eight files
+      - name: Check the draft holds exactly nine files
         run: |
           set -euo pipefail
           want=()
@@ -187,6 +228,7 @@ jobs:
               want+=("terminus-$os-$arch" "terminus-$os-$arch.manifest")
             done
           done
+          want+=(THIRD-PARTY-LICENSES)
           missing="$(comm -23 <(printf '%s\n' "${want[@]}" | sort) <(ls -A dist | sort) | paste -sd ' ' -)"
           extra="$(comm -13 <(printf '%s\n' "${want[@]}" | sort) <(ls -A dist | sort) | paste -sd ' ' -)"
           if [ -n "$missing$extra" ]; then

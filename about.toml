@@ -1,0 +1,17 @@
+# cargo-about config for THIRD-PARTY-LICENSES, which release.yml attaches to every
+# release. Same license list as deny.toml's allow, so keep the two together: a
+# license missing here fails the licenses job and the tag gets no draft.
+accepted = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "Zlib", "Unicode-3.0"]
+
+# The four targets release.yml builds, and nothing the binaries don't contain.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+# Build scripts' dependencies run on the runner and never reach the binary.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# Our own crates are under LICENSE, not third party.
+private = { ignore = true }
