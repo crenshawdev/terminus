@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use rusqlite::types::Value;
 use rusqlite::Connection;
 use terminus_core::ingest::fault;
 use terminus_core::store::{Store, DB_FILE_NAME};
@@ -95,13 +96,18 @@ impl Dirs {
 }
 
 /// A transcript big enough that a timed kill has somewhere to land: a release
-/// pass over it takes long enough to sample.
+/// pass over it takes long enough to sample. It holds compaction boundaries, edits
+/// and a title, so a kill inside its transaction lands on one that writes those rows.
 fn big_transcript(dir: &Path, name: &str, repeats: usize) -> PathBuf {
     let mut bytes = Vec::new();
     for _ in 0..repeats {
         bytes.extend_from_slice(&testkit::fixture_bytes("session-basic.jsonl"));
         bytes.extend_from_slice(&testkit::fixture_bytes("session-large-record.jsonl"));
+        bytes.extend_from_slice(&testkit::fixture_bytes("session-compacted.jsonl"));
+        bytes.extend_from_slice(&testkit::fixture_bytes("session-edits.jsonl"));
     }
+    // session-basic's ai-title writes `title`, a field the parser doesn't read.
+    bytes.extend_from_slice(b"{\"type\":\"ai-title\",\"aiTitle\":\"crash corpus\"}\n");
     let path = dir.join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, &bytes).unwrap();
@@ -155,11 +161,17 @@ fn place(project: &Path, name: &str, fixture: &str) -> PathBuf {
 ///
 /// Distinct bytes per file and per record, so an append that landed on the
 /// wrong session or was written twice shows up as different block rows rather than
-/// as a coincidence.
+/// as a coincidence. The first is a compaction boundary, because that's how a real
+/// one arrives: in an append to a session already archived.
 fn append_records(path: &Path, count: usize) {
     let tag = path.file_stem().unwrap().to_str().unwrap().to_owned();
     let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-    for i in 0..count {
+    writeln!(
+        file,
+        r#"{{"type":"system","subtype":"compact_boundary","uuid":"appended-{tag}-0","timestamp":"2026-08-12T00:00:00.000Z","compactMetadata":{{"trigger":"auto","tag":"{tag}"}}}}"#
+    )
+    .unwrap();
+    for i in 1..count {
         writeln!(
             file,
             r#"{{"type":"user","uuid":"appended-{tag}-{i}","timestamp":"2026-08-12T0{i}:00:00.000Z","cwd":"/data/code/verbatim","message":{{"role":"user","content":"crash append {tag} {i}"}}}}"#
@@ -297,15 +309,45 @@ type BlockRow = (i64, Vec<u8>, Vec<u8>);
 /// `runs` is excluded on purpose: an interrupted store reaches the same
 /// contents in more passes than an uninterrupted one, and one row per committed
 /// pass is exactly the record it is supposed to keep.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 struct Snapshot {
     blocks: Vec<(String, Vec<BlockRow>)>,
     turns: Vec<(i64, String, i64, String, i64, i64)>,
     fts: Vec<i64>,
     watermarks: Vec<(String, i64)>,
+    compactions: Vec<Vec<Value>>,
+    session_meta: Vec<Vec<Value>>,
+    session_titles: Vec<Vec<Value>>,
+    entities: Vec<Vec<Value>>,
+    paths: Vec<Vec<Value>>,
+}
+
+/// Every row a query returns, each column as SQLite holds it.
+fn rows(conn: &Connection, sql: &str) -> Vec<Vec<Value>> {
+    let mut statement = conn.prepare(sql).unwrap();
+    let columns = statement.column_count();
+    let rows = statement
+        .query_map([], |r| (0..columns).map(|i| r.get(i)).collect())
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows
 }
 
 impl Snapshot {
+    /// An empty table compares equal to an empty table, which proves nothing.
+    fn assert_holds_every_table(&self) {
+        for (what, table) in [
+            ("compactions", &self.compactions),
+            ("session_meta", &self.session_meta),
+            ("session_titles", &self.session_titles),
+            ("entities", &self.entities),
+            ("paths", &self.paths),
+        ] {
+            assert!(!table.is_empty(), "the reference has no {what} rows");
+        }
+    }
+
     fn of(data_dir: &Path) -> Snapshot {
         let conn = Connection::open(data_dir.join(DB_FILE_NAME)).unwrap();
         let snapshot = Snapshot {
@@ -353,6 +395,11 @@ impl Snapshot {
                 .unwrap()
                 .map(Result::unwrap)
                 .collect(),
+            compactions: rows(&conn, "SELECT * FROM compactions ORDER BY 1, 2"),
+            session_meta: rows(&conn, "SELECT * FROM session_meta ORDER BY 1"),
+            session_titles: rows(&conn, "SELECT * FROM session_titles ORDER BY 1"),
+            entities: rows(&conn, "SELECT * FROM entities ORDER BY 1, 2, 3"),
+            paths: rows(&conn, "SELECT * FROM paths ORDER BY 1, 2"),
         };
         snapshot
     }
@@ -538,6 +585,7 @@ fn killing_ingest_anywhere_leaves_a_store_that_converges() {
     let pass_time = started.elapsed();
     let reference = Snapshot::of(&reference_dir);
     assert!(!reference.turns.is_empty());
+    reference.assert_holds_every_table();
     println!(
         "uninterrupted pass: {pass_time:?}, {} turns",
         reference.turns.len()
@@ -633,6 +681,7 @@ fn killing_a_tree_pass_converges_on_a_first_pass_and_on_an_append() {
         tree.len(),
         "the reference pass did not archive the whole tree"
     );
+    first_reference.assert_holds_every_table();
     println!(
         "uninterrupted tree pass: {first_time:?}, {} sessions, {} turns",
         first_reference.blocks.len(),
@@ -684,6 +733,11 @@ fn killing_a_tree_pass_converges_on_a_first_pass_and_on_an_append() {
         append_reference.turns.len(),
         first_reference.turns.len() + 3 * tree.len(),
         "the append pass did not add exactly the appended records"
+    );
+    assert_eq!(
+        append_reference.compactions.len(),
+        first_reference.compactions.len() + tree.len(),
+        "the append pass did not add exactly the appended boundaries"
     );
     println!(
         "uninterrupted append pass: {append_time:?}, {} turns",
@@ -855,6 +909,51 @@ fn shuffled_points(rng: &mut Rng) -> Vec<&'static str> {
         points.swap(i, rng.below(i as u64 + 1) as usize);
     }
     points
+}
+
+/// If a table can change without the snapshot noticing, comparing it is theatre.
+#[test]
+fn the_snapshot_notices_a_change_in_each_derived_table() {
+    let dirs = dirs();
+    let transcript = big_transcript(&dirs.work, "snapshot.jsonl", 1);
+    let reference_dir = dirs.data("reference");
+    ingest_fully(&dirs, &reference_dir, Some(&transcript));
+    let reference = Snapshot::of(&reference_dir);
+    reference.assert_holds_every_table();
+
+    for (what, sql) in [
+        ("compactions", "UPDATE compactions SET metadata = x'00'"),
+        (
+            "session_meta",
+            "UPDATE session_meta SET last_turn_at = 'moved'",
+        ),
+        (
+            "session_titles",
+            "UPDATE session_titles SET title = 'moved'",
+        ),
+        (
+            "entities",
+            "DELETE FROM entities WHERE rowid = (SELECT min(rowid) FROM entities)",
+        ),
+        (
+            "paths",
+            "DELETE FROM paths WHERE rowid = (SELECT min(rowid) FROM paths)",
+        ),
+    ] {
+        let changed = dirs.data(what);
+        copy_dir(&reference_dir, &changed);
+        let conn = Connection::open(changed.join(DB_FILE_NAME)).unwrap();
+        assert!(
+            conn.execute(sql, []).unwrap() > 0,
+            "{what}: nothing changed"
+        );
+        drop(conn);
+        assert_ne!(
+            Snapshot::of(&changed),
+            reference,
+            "the snapshot missed a change in {what}"
+        );
+    }
 }
 
 /// The negative confirmations, as tests rather than one-off edits.
