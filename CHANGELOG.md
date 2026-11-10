@@ -7,6 +7,22 @@ Each release bumps the middle number of the version, a release with only fixes
 bumps the last, and the first moves only for a large change. The number does not
 promise compatibility; the entry for each release says what it changes.
 
+## [2.1.0] - 2026-11-10
+
+### Added
+
+- `export --stdout` streams the sessions named on stdin to stdout, each behind
+  a header line with the watermark its lines were read under, so a tool that
+  reads the archive on every run doesn't need a copy on disk. An empty stdin
+  means every session. (#147)
+- Every release carries `THIRD-PARTY-LICENSES`, the license notices for the
+  crates, the Rust standard library and musl compiled into the binaries. (#121)
+
+### Fixed
+
+- A compaction's metadata with an escaped key no longer stores that key as
+  NULL, and a repeated key keeps its last value like every other field. (#16)
+
 ## [2.0.0] - 2026-11-05
 
 The first pass after this update rebuilds your archive's search tables, once.
@@ -120,6 +136,7 @@ you run and gives that history back to Claude and to you.
 
 It calls no model, runs no daemon and opens no network connection.
 
+[2.1.0]: https://github.com/crenshawdev/terminus/releases/tag/v2.1.0
 [2.0.0]: https://github.com/crenshawdev/terminus/releases/tag/v2.0.0
 [1.1.0]: https://github.com/crenshawdev/terminus/releases/tag/v1.1.0
 [1.0.0]: https://github.com/crenshawdev/terminus/releases/tag/v1.0.0
