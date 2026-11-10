@@ -15,7 +15,7 @@ terminus doctor
 ```text
 terminus doctor
 
-  ok       binary                 /home/you/.local/bin/terminus is this build (2.0.0)
+  ok       binary                 /home/you/.local/bin/terminus is this build (2.1.0)
   ok       settings_file          /home/you/.claude/settings.json reads as JSON
   ok       hook_SessionStart      /home/you/.claude/settings.json runs /home/you/.local/bin/terminus for SessionStart in exec form
   ok       mcp_server             /home/you/.claude.json runs /home/you/.local/bin/terminus as the 'terminus' server
