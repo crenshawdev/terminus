@@ -26,7 +26,8 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 zstd = "0.14"
 blake3 = "1.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# raw_value: parse/record.rs keeps `compactMetadata` as the bytes it was written in.
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 # Terminus's own config file. Default features off: `display` is the
 # *writer* half and nothing here ever writes a config, so it is dead weight on a

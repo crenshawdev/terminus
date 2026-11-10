@@ -94,8 +94,8 @@ Releases are signed on the maintainer's machine, never in CI, and `install.sh` c
 
 ## Help
 
-Questions go on the [jcrenshaw.dev Discord](https://jcrenshaw.dev/discord). Bugs and anything in the docs that's wrong go to [GitHub issues](https://github.com/crenshawdev/terminus/issues). Pull requests are by invitation only, so open an issue first, and see [Contributing](https://crenshawdev.github.io/terminus/contributing.html). Security problems go through [SECURITY.md](SECURITY.md), not a public issue.
+Questions go on the [jcrenshaw.dev Discord](https://discord.gg/CxDmkD6mAz). Bugs and anything in the docs that's wrong go to [GitHub issues](https://github.com/crenshawdev/terminus/issues). Pull requests are by invitation only, so open an issue first, and see [Contributing](https://crenshawdev.github.io/terminus/contributing.html). Security problems go through [SECURITY.md](SECURITY.md), not a public issue.
 
-Terminus is maintained by John Crenshaw and distributed under the [MIT License](LICENSE).
+Terminus is maintained by John Crenshaw and distributed under the [MIT License](LICENSE). Each release attaches `THIRD-PARTY-LICENSES`, with the licenses of the third-party code compiled into its binaries.
 
 [Support Terminus on GitHub Sponsors](https://github.com/sponsors/crenshawdev).

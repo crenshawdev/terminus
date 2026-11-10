@@ -41,7 +41,7 @@ The store lives in the library crate, `crates/terminus-core`. The commands that 
 | [`crates/terminus/src/cmd/reindex.rs`](../../crates/terminus/src/cmd/reindex.rs) | `terminus reindex`, under `LOCK`. |
 | [`crates/terminus/src/cmd/compact.rs`](../../crates/terminus/src/cmd/compact.rs) | `terminus compact`: `VACUUM`, then `PRAGMA wal_checkpoint(TRUNCATE)`, under `LOCK`. |
 | [`crates/terminus/src/cmd/usage.rs`](../../crates/terminus/src/cmd/usage.rs) | `terminus usage`: the archive's bytes by project and by month, and the file's bytes by table from SQLite's `dbstat`. |
-| [`crates/terminus/src/cmd/export.rs`](../../crates/terminus/src/cmd/export.rs) | `terminus export <dir>`: one `.jsonl` per visible session and a `manifest.json`. |
+| [`crates/terminus/src/cmd/export.rs`](../../crates/terminus/src/cmd/export.rs) | `terminus export <dir>`: one `.jsonl` per visible session and a `manifest.json`. `terminus export --stdout`: the sessions named on stdin, each behind a header line. |
 | [`crates/terminus/src/cmd/data.rs`](../../crates/terminus/src/cmd/data.rs) | `terminus data move <path>`: copies the data directory under `LOCK`, records the new location, then deletes the old one. |
 
 The boundaries:
@@ -290,6 +290,12 @@ Options are in [the command reference](../guide/reference/commands.md#the-store)
 - **Inputs:** a directory that does not exist or is empty, and the store, opened read-only.
 - **Outputs:** one `.jsonl` file per visible session in every project, holding its session stream exactly as archived, and a `manifest.json` describing them. Excluded projects are left out. An evicted session is an empty file. Nothing is redacted, so the command prints a notice that the files are the unredacted transcripts and writes the same notice into the manifest. The directory it creates is `0700` and every file `0600`. The derived tables, the decisions and the observations are not exported.
 - **Refusals:** a directory that already holds anything. Nothing is written.
+
+### `terminus export --stdout`
+
+- **Inputs:** session keys on stdin, one per line, with blank lines skipped. No keys means every visible session in ingest order; otherwise the keys are streamed in the order given. The store, opened read-only.
+- **Outputs:** on stdout, for each session, one header line `{"terminus":{"project":…,"session_key":…,"watermark":…}}` followed by its session stream exactly as archived. `watermark` is `watermarks.byte_offset`, or `null` when none is recorded. Each session's header row and stream are read inside one read transaction, so the watermark is the one those bytes were read under even when an ingest pass commits mid-stream. An evicted session gets `"evicted": true` in its header and no lines. A key that is not archived, sits in an excluded project, or was deleted by retention after the session list was read is named on stderr as `<key>: not found` and skipped, so an excluded project reads the same as a missing one. The notice goes to stderr. A reader that closes the pipe ends the stream with exit 0. Nothing is redacted and nothing is written to disk.
+- **Refusals:** a `<dir>` beside `--stdout`, and `--json` with it. Both are misuse, exit 2, before the store is opened.
 
 ### `terminus data move <path>`
 

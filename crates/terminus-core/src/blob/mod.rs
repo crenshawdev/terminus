@@ -16,8 +16,9 @@ pub use block::{append, write, Block, BlockReader, Written};
 
 /// Uncompressed bytes per block for a new session.
 ///
-/// Still unmeasured against the real turn-size distribution (p50 726 bytes,
-/// p90 4,860). Each session records the size it was cut at in
+/// On a real archive of 938,621 turns: p50 1,922 bytes, p90 8,677, p99 50,131,
+/// and 0.54% over this size. No other size has been tried, because nothing
+/// here looks slow. Each session records the size it was cut at in
 /// `session_meta.block_size`, so changing this applies to new sessions only
 /// and needs no rewrite.
 pub const BLOCK_SIZE: usize = 65536;

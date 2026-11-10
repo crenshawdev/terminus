@@ -850,3 +850,143 @@ fn export_without_a_destination_is_misuse() {
         stderr(&out)
     );
 }
+
+// ---------------------------------------------------------------------------
+// `export --stdout`
+// ---------------------------------------------------------------------------
+
+impl Bench {
+    fn run_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
+        use std::io::Write as _;
+        use std::process::Stdio;
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_terminus"))
+            .args(args)
+            .env("TERMINUS_DATA_DIR", &self.data_dir)
+            .env("TERMINUS_CONFIG_DIR", &self.config_dir)
+            .env("CLAUDE_CONFIG_DIR", &self.claude_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn terminus");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().expect("wait for terminus")
+    }
+}
+
+/// The header lines and the bytes after each, in the order they came.
+fn streamed(out: &Output) -> Vec<(serde_json::Value, Vec<u8>)> {
+    let mut sessions: Vec<(serde_json::Value, Vec<u8>)> = Vec::new();
+    for line in out.stdout.split_inclusive(|b| *b == b'\n') {
+        let value: serde_json::Value = serde_json::from_slice(line)
+            .unwrap_or_else(|e| panic!("a line is not JSON ({e}): {line:?}"));
+        match value.get("terminus") {
+            Some(header) => sessions.push((header.clone(), Vec::new())),
+            None => sessions
+                .last_mut()
+                .expect("a transcript line came before any header")
+                .1
+                .extend_from_slice(line),
+        }
+    }
+    sessions
+}
+
+/// An empty stdin is every session, each its archived stream behind a header
+/// carrying the watermark those bytes were read under.
+#[test]
+fn export_stdout_with_no_keys_streams_every_session_behind_its_header() {
+    let (bench, keys) = stocked();
+
+    let out = bench.run_with_stdin(&["export", "--stdout"], "");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(stderr(&out).contains("unredacted"), "{}", stderr(&out));
+
+    let sessions = streamed(&out);
+    assert_eq!(sessions.len(), SESSIONS as usize);
+    let conn = bench.conn();
+    for key in &keys {
+        let key = key_of(key);
+        let (header, body) = sessions
+            .iter()
+            .find(|(h, _)| h["session_key"] == key.as_str())
+            .unwrap_or_else(|| panic!("{key} was not streamed"));
+        assert_eq!(*body, testkit::stream(&conn, &key).unwrap(), "{key}");
+        let (watermark, project): (i64, String) = conn
+            .query_row(
+                "SELECT w.byte_offset, m.project
+                   FROM watermarks w JOIN session_meta m ON m.session_key = w.transcript_path
+                  WHERE w.transcript_path = ?1",
+                [&key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(header["watermark"], watermark, "{header}");
+        assert_eq!(header["project"], project, "{header}");
+        assert!(header.get("evicted").is_none(), "{header}");
+    }
+}
+
+/// Only the keys asked for, in that order. An evicted one is a bare header, and
+/// an unknown or excluded one is named on stderr and skipped.
+#[test]
+fn export_stdout_streams_only_the_keys_on_stdin() {
+    let (bench, keys) = stocked();
+    const HIDDEN: &str = "/data/projects/excluded-from-export";
+    bench.evict(&[keys[0].as_path()]);
+    bench
+        .conn()
+        .execute(
+            "UPDATE session_meta SET project = ?2 WHERE session_key = ?1",
+            rusqlite::params![key_of(&keys[1]), HIDDEN],
+        )
+        .unwrap();
+    bench.config(&format!("exclude = [\"{HIDDEN}\"]\n"));
+
+    let stdin = format!(
+        "{}\n{}\nno-such-session.jsonl\n{}\n",
+        key_of(&keys[2]),
+        key_of(&keys[0]),
+        key_of(&keys[1]),
+    );
+    let out = bench.run_with_stdin(&["export", "--stdout"], &stdin);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let sessions = streamed(&out);
+    let names: Vec<&str> = sessions
+        .iter()
+        .map(|(h, _)| h["session_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, [key_of(&keys[2]), key_of(&keys[0])]);
+    assert_eq!(sessions[1].0["evicted"], true, "{}", sessions[1].0);
+    assert!(sessions[1].1.is_empty(), "an evicted session carried lines");
+
+    let err = stderr(&out);
+    assert!(err.contains("no-such-session.jsonl: not found"), "{err}");
+    assert!(
+        err.contains(&format!("{}: not found", key_of(&keys[1]))),
+        "{err}"
+    );
+}
+
+#[test]
+fn export_stdout_with_a_directory_or_json_is_misuse() {
+    let (bench, _keys) = stocked();
+    let dest = bench.root.join("export");
+
+    for args in [
+        vec!["export", "--stdout", dest.to_str().unwrap()],
+        vec!["export", "--stdout", "--json"],
+    ] {
+        let out = bench.run_with_stdin(&args, "");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "", "{args:?}");
+    }
+    assert!(!dest.exists());
+}

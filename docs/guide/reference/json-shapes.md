@@ -606,6 +606,8 @@ snapshot, not an export.
   where the transcript sits on disk. The manifest is
   pretty-printed, unlike the one-line `--json` envelope: an envelope is piped,
   a manifest is opened and read.
+- `--stdout` writes no document. Stdout is the stream, so `--json` with it is
+  misuse (exit 2).
 
 ### `doctor`
 

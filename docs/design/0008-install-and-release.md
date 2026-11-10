@@ -17,7 +17,7 @@ What every check refuses, and the release steps one at a time, are already in [t
 | Stable path | `~/.local/bin/terminus`, a symbolic link. Every hook entry and the MCP entry name it, so they are written once and never rewritten when the version changes. |
 | Versions folder | `~/.local/lib/crenshawdev/terminus/versions/`, one folder per version, each holding one `terminus`. It sits outside the data directory, so `--purge` never touches it. |
 | Marker | `MARKER`, a fixed string compiled into every build, `terminus-stable-binary:` and a UUID. A file at the stable path that carries it is a Terminus build and may be replaced. One that does not is someone else's and is refused. |
-| Release files | For each of four platforms: the binary `terminus-<os>-<arch>`, its manifest `terminus-<os>-<arch>.manifest`, and the manifest's signature `terminus-<os>-<arch>.manifest.sig`. |
+| Release files | For each of four platforms: the binary `terminus-<os>-<arch>`, its manifest `terminus-<os>-<arch>.manifest`, and the manifest's signature `terminus-<os>-<arch>.manifest.sig`. One `THIRD-PARTY-LICENSES` covers all four. |
 | Manifest | Exactly two lines, `version X.Y.Z` and `sha256 <64 lowercase hex digits>`, each ending in a newline. The signature covers the manifest, and the manifest covers the binary. |
 | Release key | The Ed25519 SSH key `crenshawdev-release`. Its public half is the `release_key` line of `install.sh`, the only copy in the repository, and `scripts/sign-release.sh` reads it from there as a value and keeps no copy of it. The private half is `~/.ssh/crenshawdev-release` on the owner's machine. |
 | Namespace | `terminus-release`, the `-n` value every signature is made and checked under, so a signature made with the same key for anything else does not verify. |
@@ -38,7 +38,8 @@ What every check refuses, and the release steps one at a time, are already in [t
 | [`crates/terminus/src/cmd/install/targets.rs`](../../crates/terminus/src/cmd/install/targets.rs) | Where `settings.json` and `.claude.json` are, the exact hook entry and MCP entry, the merge rule, and the `claude mcp` commands that finish a registration by hand. |
 | [`crates/terminus/src/cmd/uninstall.rs`](../../crates/terminus/src/cmd/uninstall.rs) | `terminus uninstall [--purge] [-y]`: removes the hook entries, the MCP entry and the link, restores the backup when only Terminus's entries changed, and with `--purge` deletes the data directory under `LOCK`. |
 | [`crates/terminus/src/cmd/doctor.rs`](../../crates/terminus/src/cmd/doctor.rs) | `terminus doctor`: 14 checks, each with a state, a one-line finding and, where there is one, the command that fixes it. Writes nothing on any path. |
-| [`.github/workflows/release.yml`](../../.github/workflows/release.yml) | On a version tag: four builds, one per platform on its own runner, then one draft holding exactly the eight files. |
+| [`.github/workflows/release.yml`](../../.github/workflows/release.yml) | On a version tag: four builds, one per platform on its own runner, one license job, then one draft holding exactly the nine files. |
+| [`about.toml`](../../about.toml), [`about.hbs`](../../about.hbs) | What the license job runs on: the licenses `cargo about` accepts, the four targets it reads the dependency graph for, and the layout of `THIRD-PARTY-LICENSES`. Cargo can't see the Rust standard library or musl, so their notices are written out in the template. |
 | [`.github/workflows/release-check.yml`](../../.github/workflows/release-check.yml) | On a published release: installs it with the public one-line command on the same four runners and checks the installed version. |
 | [`.github/workflows/test.yml`](../../.github/workflows/test.yml) | On every pull request and every push to `main`: the whole suite in a release build on `ubuntu-24.04`, `ubuntu-24.04-arm` and `macos-15`, plus a debug build on `ubuntu-24.04`. |
 | [`scripts/sign-release.sh`](../../scripts/sign-release.sh) | Run by the owner on his own machine: checks a draft, signs its four manifests, verifies each signature the way `install.sh` will, uploads them and publishes the release as latest. |
@@ -61,7 +62,7 @@ This part owns no table. It writes files outside the data directory, and the rel
 | The versions folder | `~/.local/lib/crenshawdev/terminus/versions/<version>/terminus` | One stored binary per version. An upgrade adds a folder and deletes none, so a session or ingest already running keeps the file it started from. A rebuild at the same version is renamed over that version's file, and a process running the old one keeps its inode. Neither `uninstall` nor `--purge` deletes the folder. |
 | The stable link | `~/.local/bin/terminus` | A symbolic link to one stored binary. Moving it is how a version changes. Nothing edits `PATH` or a shell profile to add `~/.local/bin`. |
 | The MCP entry | `.mcpServers.terminus` in `~/.claude.json` | Written by `claude`, as [0006: Recall through MCP](0006-recall-through-mcp.md#4-records) describes. |
-| The release files | Eight files in a draft, then twelve in a published release | `terminus-<os>-<arch>` and `terminus-<os>-<arch>.manifest` for `linux-x86_64`, `linux-aarch64`, `macos-x86_64` and `macos-aarch64`, from CI, and the four `terminus-<os>-<arch>.manifest.sig` from the owner's machine. |
+| The release files | Nine files in a draft, then thirteen in a published release | `terminus-<os>-<arch>` and `terminus-<os>-<arch>.manifest` for `linux-x86_64`, `linux-aarch64`, `macos-x86_64` and `macos-aarch64`, and `THIRD-PARTY-LICENSES`, from CI, and the four `terminus-<os>-<arch>.manifest.sig` from the owner's machine. |
 
 ## 5. Commands and operations
 
@@ -101,14 +102,14 @@ Options are in [the command reference](../guide/reference/commands.md#setup), an
 ### Pushing a version tag
 
 - **Inputs:** a tag `v<X.Y.Z>` pushed to the repository. Nothing else starts `release.yml`.
-- **Outputs:** four build jobs, one per platform on its own runner: `ubuntu-24.04` for `x86_64-unknown-linux-musl`, `ubuntu-24.04-arm` for `aarch64-unknown-linux-musl`, `macos-15-intel` for `x86_64-apple-darwin` and `macos-15` for `aarch64-apple-darwin`. Each builds with `cargo build --release --locked -p terminus` and no features, checks that `--version` matches the tag, that a Linux binary is statically linked and a macOS binary links nothing outside `/usr/lib/`, and that the binary carries the marker read from `install.sh`, then writes the manifest and attests the binary with `actions/attest`. When all four pass, the draft job checks it holds exactly the eight files and creates the release as a draft.
-- **Refusals:** any failed check fails its job, and one failed build leaves no draft. The workflow has `contents: read`. The build jobs add `id-token: write` and `attestations: write` for the attestation, and only the draft job has `contents: write`, with the workflow's own token. No workflow names a signing key.
+- **Outputs:** four build jobs, one per platform on its own runner: `ubuntu-24.04` for `x86_64-unknown-linux-musl`, `ubuntu-24.04-arm` for `aarch64-unknown-linux-musl`, `macos-15-intel` for `x86_64-apple-darwin` and `macos-15` for `aarch64-apple-darwin`. Each builds with `cargo build --release --locked -p terminus` and no features, checks that `--version` matches the tag, that a Linux binary is statically linked and a macOS binary links nothing outside `/usr/lib/`, and that the binary carries the marker read from `install.sh`, then writes the manifest and attests the binary with `actions/attest`. The license job, on `ubuntu-24.04`, runs `cargo about generate` over `crates/terminus` from the crates Cargo has fetched, with no lookup online, and writes `THIRD-PARTY-LICENSES`. When all four builds and the license job pass, the draft job checks it holds exactly the nine files and creates the release as a draft.
+- **Refusals:** any failed check fails its job, a dependency under a license `about.toml` doesn't accept fails the license job, and one failed job leaves no draft. The workflow has `contents: read`. The build jobs add `id-token: write` and `attestations: write` for the attestation, the license job adds nothing, and only the draft job has `contents: write`, with the workflow's own token. No workflow names a signing key.
 
 ### `scripts/sign-release.sh v<X.Y.Z>`
 
 - **Inputs:** the tag, the owner's `gh` login, `~/.ssh/crenshawdev-release`, and `install.sh`'s one `release_key` line.
 - **Outputs:** it checks the tag's version with its own copy of `install.sh`'s `valid_version`, then downloads the draft, checks every binary against its manifest, every manifest with its own copy of `install.sh`'s manifest check, and every binary's attestation from `release.yml` at the tag on a GitHub-hosted runner before it signs anything, signs each manifest with `ssh-keygen -Y sign -n terminus-release` and verifies its signature with the command `install.sh` runs before it signs the next, uploads the four `.sig` files, and publishes the release as latest. A test holds the copies of `valid_version`, `digest` and the manifest check to `install.sh`'s text, so the signer refuses exactly what the installer refuses and runs none of `install.sh`. Publishing with the owner's own login is what starts `release-check.yml`, because a release published with a workflow's token starts no other workflow.
-- **Refusals:** a tag that does not start with `v` or whose version `valid_version` rejects, a release that is not a draft, a draft missing any of the eight files, a binary whose SHA-256 is not its manifest's, a manifest not exactly the two lines, a binary with no such attestation, a signature that does not verify, and a failed upload or publish all stop it, and the release stays a draft.
+- **Refusals:** a tag that does not start with `v` or whose version `valid_version` rejects, a release that is not a draft, a draft missing any binary or manifest, a binary whose SHA-256 is not its manifest's, a manifest not exactly the two lines, a binary with no such attestation, a signature that does not verify, and a failed upload or publish all stop it, and the release stays a draft.
 
 ### The CI runs
 
@@ -124,6 +125,7 @@ sequenceDiagram
   participant O as Owner
   participant GH as GitHub
   participant B as Four build jobs
+  participant L as License job
   participant D as Draft job
   participant S as sign-release.sh
   participant RC as release-check.yml
@@ -133,11 +135,14 @@ sequenceDiagram
   B->>B: cargo build --release --locked, no features
   B->>B: version matches the tag, linkage, marker, then the manifest
   B->>GH: attest each binary, signed as release.yml at the tag
-  alt every build passes
+  GH->>L: release.yml, one job on ubuntu-24.04
+  L->>L: cargo about generate, from about.toml and about.hbs
+  alt every build and the license job pass
     B->>D: four binaries and four manifests
-    D->>D: exactly eight files
+    L->>D: THIRD-PARTY-LICENSES
+    D->>D: exactly nine files
     D->>GH: gh release create --draft
-  else any build fails
+  else any of them fails
     Note over D: no draft
   end
   O->>S: sh scripts/sign-release.sh vX.Y.Z, on his own machine

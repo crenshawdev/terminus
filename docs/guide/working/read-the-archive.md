@@ -74,4 +74,6 @@ Every read command takes `--json` and writes one JSON document on stdout, with d
 
 To take the transcripts out of Terminus altogether, `terminus export <dir>` writes every session you can see, across every project, as one `.jsonl` file each with a `manifest.json`. The files are the unfiltered transcripts, whatever `redact_recall` says. Excluded projects are left out, and `<dir>` must not exist or must be empty.
 
+A tool that reads the archive on every run can use `terminus export --stdout` instead. It streams the sessions you name on stdin and writes nothing to disk.
+
 Every command and option is in the [command reference](../reference/commands.md).
