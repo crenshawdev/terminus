@@ -148,6 +148,9 @@ The export is not filtered. `[privacy] redact_recall` applies to text on its way
 
 `<dir>` must not exist or must be empty. A folder that already holds anything is refused, and nothing is written. A folder `export` creates is readable only by you.
 
+With `--stdout`, the transcripts go to stdout instead of a folder, and you don't give a `<dir>`. Session keys come on stdin, one per line, and an empty stdin means every session. Each session's lines follow one header line: `{"terminus":{"project":"…","session_key":"….jsonl","watermark":12034}}`. The watermark is the one those lines were read under, so a reader knows how far it got even when an ingest pass lands mid-stream. An evicted session gets its header with `"evicted": true` and no lines. A key that's unknown or in an excluded project is named on stderr as not found and skipped. The notice goes to stderr, and `--stdout` can't be used with `--json`.
+
+- `--stdout`
 - `--json`
 
 ### `terminus data move <path>`

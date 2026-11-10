@@ -24,9 +24,14 @@
 //! Sessions come from `config::visible::sessions`. Export is a read path and
 //! exclusion binds every read path alike: a project the user excluded is not
 //! written out to a directory they may hand to someone else.
+//!
+//! **`--stdout` is the same bytes for a reader that keeps none of them.** A tool
+//! that recomputes something from the archive on every run wants only the
+//! sessions that changed, piped, with nothing landing on disk. Keys come on
+//! stdin and each session's lines follow one header line naming it.
 
-use std::collections::BTreeSet;
-use std::io::Write as _;
+use std::collections::{BTreeSet, HashMap};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -60,8 +65,13 @@ injection decision log; and the observations. A session marked evicted here has 
 bytes reclaimed by retention, so its file is present and empty.";
 
 pub struct Args {
-    pub destination: PathBuf,
+    pub target: Target,
     pub json: bool,
+}
+
+pub enum Target {
+    Directory(PathBuf),
+    Stdout,
 }
 
 pub fn run(args: Args) -> Result<(), Failure> {
@@ -73,15 +83,19 @@ pub fn run(args: Args) -> Result<(), Failure> {
             return read::empty(empty(&args), &reason, args.json)
         }
     };
+    let destination = match args.target {
+        Target::Directory(destination) => destination,
+        Target::Stdout => return stream_out(&reader),
+    };
 
     // Every refusal happens before one byte is written. A half-written export
     // beside a manifest that does not describe it is worse than no export.
-    refuse_if_occupied(&args.destination)?;
+    refuse_if_occupied(&destination)?;
 
-    let written = write_export(&reader, &args.destination)?;
+    let written = write_export(&reader, &destination)?;
 
     if args.json {
-        document(&args.destination, &written).emit();
+        document(&destination, &written).emit();
         return Ok(());
     }
 
@@ -91,7 +105,7 @@ pub fn run(args: Args) -> Result<(), Failure> {
         outln!("{line}");
     }
     outln!();
-    outln!("wrote          {}", args.destination.display());
+    outln!("wrote          {}", destination.display());
     outln!("sessions       {}", written.sessions);
     outln!(
         "  evicted      {} (written as empty files, no body to write)",
@@ -103,11 +117,121 @@ pub fn run(args: Args) -> Result<(), Failure> {
         written.bytes,
         human(written.bytes)
     );
-    outln!(
-        "manifest       {}",
-        args.destination.join(MANIFEST).display()
-    );
+    outln!("manifest       {}", destination.join(MANIFEST).display());
     Ok(())
+}
+
+/// `--stdout`: the requested sessions, each behind its header line.
+fn stream_out(reader: &Reader) -> Result<(), Failure> {
+    for line in NOTICE.lines() {
+        errln!("terminus: {line}");
+    }
+    let conn = reader.store().conn();
+    let visible = visible::sessions(conn, reader.config()).map_err(op)?;
+    let requested = requested_keys()?;
+
+    let sessions: Vec<&visible::Session> = match requested.is_empty() {
+        true => visible.iter().collect(),
+        false => {
+            let by_key: HashMap<&str, &visible::Session> = visible
+                .iter()
+                .map(|session| (session.session_key.as_str(), session))
+                .collect();
+            requested
+                .iter()
+                .filter_map(|key| {
+                    let found = by_key.get(key.as_str()).copied();
+                    if found.is_none() {
+                        not_found(key);
+                    }
+                    found
+                })
+                .collect()
+        }
+    };
+
+    for session in sessions {
+        let Some(Streamed { header, body }) = read_one(reader, session)? else {
+            not_found(&session.session_key);
+            continue;
+        };
+        let written =
+            crate::out::try_write_raw(&header).and_then(|()| crate::out::try_write_raw(&body));
+        match written {
+            Ok(()) => {}
+            // The reader stopped reading, so there is no one left to decode for.
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+            Err(e) => return Err(Failure::Operational(format!("stdout: {e}"))),
+        }
+    }
+    Ok(())
+}
+
+/// The session keys on stdin, one per line. None means every session.
+fn requested_keys() -> Result<Vec<String>, Failure> {
+    let text = io::read_to_string(io::stdin()).map_err(|e| {
+        Failure::Misuse(format!("the session keys on stdin could not be read: {e}"))
+    })?;
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// An excluded project's key lands here too, so it reads like one that isn't there.
+fn not_found(key: &str) {
+    errln!("terminus: {key}: not found");
+}
+
+/// One session's header line and bytes, read under one snapshot so the
+/// watermark is the one those bytes were read under. `None` when retention
+/// deleted the session after it was listed.
+fn read_one(reader: &Reader, session: &visible::Session) -> Result<Option<Streamed>, Failure> {
+    let key = &session.session_key;
+    let fail = |e: &dyn std::fmt::Display| Failure::Operational(format!("{key}: {e}"));
+    let tx = reader
+        .store()
+        .conn()
+        .unchecked_transaction()
+        .map_err(|e| fail(&e))?;
+    let (exists, evicted, watermark): (bool, bool, Option<i64>) = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sessions WHERE session_key = ?1),
+                    coalesce((SELECT is_evicted FROM session_meta WHERE session_key = ?1), 0) <> 0,
+                    (SELECT byte_offset FROM watermarks WHERE transcript_path = ?1)",
+            [key],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|e| fail(&e))?;
+    if !exists {
+        return Ok(None);
+    }
+
+    let mut fields = json!({
+        "session_key": key,
+        "project": session.project,
+        "watermark": watermark,
+    });
+    let body = match evicted {
+        true => {
+            fields["evicted"] = true.into();
+            Vec::new()
+        }
+        false => archive::stream(&tx, key)
+            .map_err(|e| fail(&e))?
+            .map_err(|e| fail(&format!("could not be read out of the archive: {e}")))?,
+    };
+    let mut header = json!({ "terminus": fields }).to_string().into_bytes();
+    header.push(b'\n');
+    Ok(Some(Streamed { header, body }))
+}
+
+/// One session as `--stdout` writes it.
+struct Streamed {
+    header: Vec<u8>,
+    body: Vec<u8>,
 }
 
 /// What one export put on disk.
@@ -327,35 +451,55 @@ fn op(error: terminus_core::Error) -> Failure {
     Failure::Operational(error.to_string())
 }
 
-/// One positional destination and `--json`, so the loop rather than
-/// `super::json_flag`.
-///
-/// A missing destination is misuse and not a default. There is no sensible
-/// place to put an unredacted copy of every transcript that a user did not
-/// name.
 /// The document for an export that wrote nothing, naming the destination it was
 /// given. The no-store answer, and what `main` writes when the command fails,
 /// a destination that already holds something included.
 pub(crate) fn empty(args: &Args) -> Document {
-    document(&args.destination, &Written::default())
+    match &args.target {
+        Target::Directory(destination) => document(destination, &Written::default()),
+        // Never emitted: `--json` with `--stdout` is refused at parse.
+        Target::Stdout => Document::new(COMMAND),
+    }
 }
 
+/// One positional destination or `--stdout`, and `--json`, so the loop rather
+/// than `super::json_flag`.
+///
+/// A missing destination is misuse and not a default. There is no sensible
+/// place to put an unredacted copy of every transcript that a user did not
+/// name.
 pub fn parse(parser: &mut lexopt::Parser) -> Result<Args, Failure> {
     use lexopt::prelude::*;
 
     let mut destination: Option<PathBuf> = None;
     let mut json = false;
+    let mut stdout = false;
     while let Some(arg) = parser.next().map_err(|e| Failure::Misuse(e.to_string()))? {
         match arg {
             Long(super::JSON_FLAG) => json = true,
+            Long("stdout") => stdout = true,
             Value(value) if destination.is_none() => destination = Some(PathBuf::from(value)),
             other => return Err(Failure::Misuse(crate::unexpected(other))),
         }
     }
-    let Some(destination) = destination else {
-        return Err(Failure::Misuse(
-            "export needs a destination directory: terminus export <dir>".to_owned(),
-        ));
+    let target = match (stdout, destination) {
+        (true, Some(_)) => {
+            return Err(Failure::Misuse(
+                "--stdout takes no <dir>: the transcripts go to stdout".to_owned(),
+            ))
+        }
+        (true, None) if json => {
+            return Err(Failure::Misuse(
+                "--json can't be used with --stdout, because stdout is the stream".to_owned(),
+            ))
+        }
+        (true, None) => Target::Stdout,
+        (false, Some(destination)) => Target::Directory(destination),
+        (false, None) => {
+            return Err(Failure::Misuse(
+                "export needs a destination directory: terminus export <dir>".to_owned(),
+            ))
+        }
     };
-    Ok(Args { destination, json })
+    Ok(Args { target, json })
 }

@@ -38,6 +38,7 @@ const USAGE: &str = "usage: terminus [--version] <command>\n\
                        compact               reclaim the space retention freed, then truncate the wal\n  \
                        usage                 where the bytes went: by project, by month, by table\n  \
                        export <dir>          write the archived transcripts out, with a manifest\n  \
+                       export --stdout       stream the sessions named on stdin to stdout\n  \
                        stats                 whether injection is helping: precision, misses, chars\n  \
                        observations          what happened in every session that has closed\n  \
                        observations regenerate   recompute those facts for a selected set\n  \
