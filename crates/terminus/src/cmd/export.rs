@@ -64,6 +64,17 @@ Not in this export: the derived tables and the search index, which rebuild from 
 injection decision log; and the observations. A session marked evicted here has had its archived \
 bytes reclaimed by retention, so its file is present and empty.";
 
+/// [`NOTICE`] for `--stdout`, where there is no directory and no file.
+const STREAM_NOTICE: &str = "\
+This stream is the verbatim, unredacted transcripts: every prompt, tool call, tool result and \
+assistant turn exactly as terminus archived them, with nothing removed and nothing masked. \
+Terminus redacts at egress and keys that on the destination, and a pipe you set up is not \
+egress - so nothing was filtered on the way out, and whatever reads it deserves the care you \
+would give ~/.claude/projects itself.
+Not in this stream: the derived tables and the search index, which rebuild from these bytes; the \
+injection decision log; and the observations. A session marked evicted here has had its archived \
+bytes reclaimed by retention, so its header line carries \"evicted\": true and no lines follow it.";
+
 pub struct Args {
     pub target: Target,
     pub json: bool,
@@ -123,7 +134,7 @@ pub fn run(args: Args) -> Result<(), Failure> {
 
 /// `--stdout`: the requested sessions, each behind its header line.
 fn stream_out(reader: &Reader) -> Result<(), Failure> {
-    for line in NOTICE.lines() {
+    for line in STREAM_NOTICE.lines() {
         errln!("terminus: {line}");
     }
     let conn = reader.store().conn();
