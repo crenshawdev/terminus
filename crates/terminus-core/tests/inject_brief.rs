@@ -1289,6 +1289,110 @@ fn a_session_excluded_under_its_worktree_key_is_neither_quoted_nor_counted() {
     }
 }
 
+/// A second session on `project-zeta`'s own branch, and one in another project.
+const REPO_AGAIN: Session<'static> = Session {
+    file: "zeta-repo-again.jsonl",
+    id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    project: "project-zeta",
+    branch: Some("branch-of-the-repo-one"),
+    day: "2026-08-12",
+    prompt: "the second repo prompt, about washers",
+    reply: "the second repo reply, about washers",
+};
+
+const ELSEWHERE: Session<'static> = Session {
+    file: "eta.jsonl",
+    id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    project: "project-eta",
+    branch: None,
+    day: "2026-08-11",
+    prompt: "the other project's prompt, about bolts",
+    reply: "the other project's reply, about bolts",
+};
+
+/// The pick and the list read `session_summary` through the index meant for each,
+/// in the pick's order: no scan of the table and no sort, with and without the
+/// exclusion clauses in the SQL.
+///
+/// The plans come from the bundled SQLite on the statements the brief runs, since
+/// a system `sqlite3` can plan differently.
+#[test]
+fn the_pick_and_the_list_read_session_summary_through_their_indexes() {
+    let bench = bench();
+    for session in [&REPO, &REPO_AGAIN, &FORKED, &ELSEWHERE] {
+        bench.archive(session);
+    }
+    let cwd = bench.project(REPO.project);
+    let payload = Payload {
+        session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
+        transcript_path: Some("/home/user/.claude/projects/-p/s.jsonl"),
+        cwd: cwd.to_str(),
+        prompt: None,
+        source: Some("startup"),
+    };
+    let excluding = Config::from_parts(
+        Vec::new(),
+        [ELSEWHERE.project, FORKED.project]
+            .map(|name| bench.project(name).to_string_lossy().into_owned())
+            .to_vec(),
+    );
+
+    let meant = [
+        ("pick", "idx_session_summary_project_last"),
+        (
+            "pick on a branch",
+            "idx_session_summary_project_branch_last",
+        ),
+        ("other sessions", "idx_session_summary_project_last_titled"),
+    ];
+    for (label, config) in [
+        ("no exclusions", Config::default()),
+        ("exclusions", excluding),
+    ] {
+        let plans =
+            brief::session_start_plans(&bench.data_dir, &config, &payload, REPO.branch.unwrap())
+                .expect("the plans of a filled store");
+        assert_eq!(plans.len(), meant.len());
+        for ((name, lines), (expected, index)) in plans.iter().zip(meant) {
+            assert_eq!(*name, expected);
+            let shown = format!("{label}, {name}: {lines:#?}");
+            let reads_the_index = |line: &&String| {
+                line.contains(&format!("USING INDEX {index} ("))
+                    || line.contains(&format!("USING COVERING INDEX {index} ("))
+            };
+            let through = lines
+                .iter()
+                .find(reads_the_index)
+                .unwrap_or_else(|| panic!("no line reads {index}: {shown}"));
+            if *name == "pick on a branch" {
+                assert!(
+                    through.contains("project=?") && through.contains("branch=?"),
+                    "the index line leaves out the project or the branch: {shown}"
+                );
+            }
+            let subqueries = lines
+                .iter()
+                .filter(|l| l.starts_with("LIST SUBQUERY"))
+                .count();
+            assert_eq!(
+                subqueries,
+                if label == "exclusions" { 2 } else { 0 },
+                "both exclusion clauses belong in the SQL, and only then: {shown}"
+            );
+            for line in lines {
+                assert!(
+                    line != "SCAN m" && !line.starts_with("SCAN m "),
+                    "a scan of session_summary: {shown}"
+                );
+                assert!(
+                    !(line.contains("TEMP B-TREE") && line.contains("ORDER BY")),
+                    "a sort for the ORDER BY: {shown}"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Which session the brief picks
 // ---------------------------------------------------------------------------

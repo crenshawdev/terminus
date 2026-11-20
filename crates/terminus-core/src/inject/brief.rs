@@ -137,6 +137,43 @@ pub fn session_start_reads(
     Some(brief.reads)
 }
 
+/// The plan SQLite gives each statement the brief runs against the summary: the
+/// pick without a branch, the pick on `branch`, and the list of other sessions.
+/// Each is the detail column of `EXPLAIN QUERY PLAN`, one string per line,
+/// under the statement's name. Writes nothing and renders nothing. Test support
+/// only.
+#[cfg(feature = "testkit")]
+pub fn session_start_plans(
+    data_dir: &Path,
+    config: &Config,
+    payload: &Payload,
+    branch: &str,
+) -> Option<Vec<(&'static str, Vec<String>)>> {
+    let store = open_filled(data_dir)?;
+    let scoped = scoped(store.conn(), config, payload)?;
+    let statements = [
+        ("pick", newest_query(&scoped, None)),
+        ("pick on a branch", newest_query(&scoped, Some(branch))),
+        ("other sessions", others_query(&scoped)),
+    ];
+    let mut plans = Vec::new();
+    for (name, (sql, params)) in statements {
+        let mut statement = store
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .ok()?;
+        let lines = statement
+            .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                r.get::<_, String>(3)
+            })
+            .ok()?
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        plans.push((name, lines));
+    }
+    Some(plans)
+}
+
 /// The store the brief reads, once its summary is marked filled, or nothing.
 ///
 /// Whether the key row exists is the whole test, as `summary::fill` asks it, and
@@ -649,15 +686,7 @@ fn other_sessions(
     picked: Option<&str>,
     redaction: &Redaction,
 ) -> Option<String> {
-    let mut sql = String::from(
-        "SELECT m.session_key, m.last_turn_at, m.title, m.has_typed_prompt \
-         FROM session_summary m WHERE m.title IS NOT NULL",
-    );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    scoped.push_filter(&mut sql, &mut params);
-    sql.push_str(" ORDER BY m.last_turn_at DESC, m.session_key DESC LIMIT ?");
-    params.push(Box::new(SESSIONS_LOOKED_AT));
-
+    let (sql, params) = others_query(scoped);
     let mut statement = conn.prepare(&sql).ok()?;
     let rows = statement
         .query_map(rusqlite::params_from_iter(params.iter()), |r| {
@@ -693,6 +722,23 @@ fn other_sessions(
             lines.join("\n")
         )
     })
+}
+
+/// The list's statement and the values it binds. The test that reads its plan
+/// goes through this too, so it can't describe a statement the brief doesn't run.
+///
+/// `m.title IS NOT NULL` stays literal: the partial index serves the statement
+/// only when the `WHERE` states its condition.
+fn others_query(scoped: &Scoped) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut sql = String::from(
+        "SELECT m.session_key, m.last_turn_at, m.title, m.has_typed_prompt \
+         FROM session_summary m WHERE m.title IS NOT NULL",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    scoped.push_filter(&mut sql, &mut params);
+    sql.push_str(" ORDER BY m.last_turn_at DESC, m.session_key DESC LIMIT ?");
+    params.push(Box::new(SESSIONS_LOOKED_AT));
+    (sql, params)
 }
 
 /// The session the brief is about, and the later one it has to mention when it
@@ -735,6 +781,8 @@ const SESSIONS_LOOKED_AT: i64 = 64;
 /// branch if asked and with a typed prompt if asked. `session_summary` holds main
 /// sessions only.
 ///
+/// It reads through the index in its own order, with no sort.
+///
 /// Three things this query is not. It is not `is_final`: that column is
 /// declared in the schema and never written, so ordering by it would name a
 /// session for a reason nothing establishes. It is not a date
@@ -762,19 +810,7 @@ fn newest(
     branch: Option<&str>,
     typed: bool,
 ) -> crate::error::Result<Option<LastSession>> {
-    let mut sql = String::from(
-        "SELECT m.session_key, m.last_turn_at, m.branch, m.has_typed_prompt \
-         FROM session_summary m WHERE 1 = 1",
-    );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    scoped.push_filter(&mut sql, &mut params);
-    if let Some(branch) = branch {
-        sql.push_str(" AND m.branch = ?");
-        params.push(Box::new(branch.to_owned()));
-    }
-    sql.push_str(" ORDER BY m.last_turn_at DESC, m.session_key DESC LIMIT ?");
-    params.push(Box::new(SESSIONS_LOOKED_AT));
-
+    let (sql, params) = newest_query(scoped, branch);
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(rusqlite::params_from_iter(params.iter()), |r| {
         Ok((
@@ -793,6 +829,23 @@ fn newest(
         }
     }
     Ok(None)
+}
+
+/// [`newest`]'s statement and the values it binds, shared with the plan reader.
+fn newest_query(scoped: &Scoped, branch: Option<&str>) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut sql = String::from(
+        "SELECT m.session_key, m.last_turn_at, m.branch, m.has_typed_prompt \
+         FROM session_summary m WHERE 1 = 1",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    scoped.push_filter(&mut sql, &mut params);
+    if let Some(branch) = branch {
+        sql.push_str(" AND m.branch = ?");
+        params.push(Box::new(branch.to_owned()));
+    }
+    sql.push_str(" ORDER BY m.last_turn_at DESC, m.session_key DESC LIMIT ?");
+    params.push(Box::new(SESSIONS_LOOKED_AT));
+    (sql, params)
 }
 
 /// The most a read of `HEAD` or a worktree's `.git` file takes.
