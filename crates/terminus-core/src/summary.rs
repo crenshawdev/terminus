@@ -2,10 +2,19 @@
 //!
 //! Two tables, `project_summary` and `session_summary`, so the brief's numbers
 //! and its pick of session exist before any session starts and the hook reads
-//! a row instead of grouping the archive. Ingest writes both inside each file's
-//! transaction, from the rows as they stand after the file's writes and never
-//! from the scan, so a row is a function of committed rows alone and a killed
-//! pass leaves the summary equal to what the committed rows give.
+//! a row instead of grouping the archive. Three things write them, each in the
+//! transaction that changes the rows under them:
+//!
+//! - ingest, through [`write`], inside each file's transaction, from the rows as
+//!   they stand after the file's writes and never from the scan;
+//! - retention's delete, through `remove`, inside the delete's own transaction,
+//!   before the session's rows go;
+//! - `reindex`, which empties both tables and calls [`write`] for every session
+//!   inside its one transaction.
+//!
+//! A row is a function of committed rows alone, so a killed pass leaves the
+//! summary equal to what the committed rows give. An eviction changes nothing
+//! the summary holds and leaves it alone.
 //!
 //! Every function takes the transaction's `&Connection`, the way
 //! [`crate::derive`]'s do, and opens none of its own.

@@ -144,7 +144,7 @@ They hold what happened at prompt time, or facts read from block rows that reten
 
 ### Summary tables
 
-Two tables hold what the resume brief needs answered before a session starts: how much each project holds, and where each main session left off. Ingest writes both inside each file's transaction, from the rows as they stand after that file's writes, so a pass killed anywhere leaves them equal to what the committed rows give. They are not in `DERIVED_TABLES` and carry no enforced reference, because `terminus reindex` drops `turns` and retention deletes `sessions` rows without knowing them. `terminus reindex` and retention leave them as they are. No column holds prompt or reply text, and none holds the time of a write.
+Two tables hold what the resume brief needs answered before a session starts: how much each project holds, and where each main session left off. Three things change them, each in the transaction that changes the rows under them, so a pass killed anywhere leaves them equal to what the committed rows give. Ingest writes both inside each file's transaction, from the rows as they stand after that file's writes. Retention's delete takes the session's row and its share of its pair off them in the delete's own transaction, and an eviction leaves them as they are. `terminus reindex` empties both and writes every session again in its one transaction. They are not in `DERIVED_TABLES`, because `terminus reindex` writes them again from the rebuilt rows and never drops them. `session_summary.session_key` references `sessions(session_key)`, so retention removes the summary row before the `sessions` row. `project_summary` references nothing, because a pair is not a session, and neither table references `turns`. No column holds prompt or reply text, and none holds the time of a write.
 
 `project_summary`, one row per distinct pair of `session_meta.project` and `session_meta.project_pre_worktree`, a null key counting as a key:
 
@@ -156,7 +156,7 @@ Two tables hold what the resume brief needs answered before a session starts: ho
 | `session_count` | `INTEGER NOT NULL` | The sessions under the pair, subagents included. |
 | `turn_count` | `INTEGER NOT NULL` | Their `turns` rows. |
 
-Counts are adjusted by each file's transaction, never recounted. A file adds its new session and the turn rows it wrote to the pair its stored keys name. When a later pass supplies a key the first pass lacked, the session's whole count moves to the new pair, and the old pair's row is deleted once it holds no session.
+Ingest and retention adjust the counts and never recount them. A file adds its new session and the turn rows it wrote to the pair its stored keys name. When a later pass supplies a key the first pass lacked, the session's whole count moves to the new pair, and the old pair's row is deleted once it holds no session. A retention delete takes one session and its `turns` rows off the pair, counted before the delete, subagents included, and deletes the pair's row once it holds no session. No count goes below zero. `terminus reindex` writes every session again as a new one, because a rebuild that dropped `turns` reads zero turns while the pair still holds the old total.
 
 `session_summary`, one row per main session, a `session_meta` row with no `parent_session_key`. A subagent's file writes no row and leaves its parent's alone. The row is replaced whole on every commit:
 
@@ -307,7 +307,7 @@ Options are in [the command reference](../guide/reference/commands.md#the-store)
 ### `terminus reindex`
 
 - **Inputs:** the block rows.
-- **Outputs:** in one transaction, drops every table in `DERIVED_TABLES`, recreates them, reads each session's stream from its block rows, derives every turn's rows again through `derive.rs`, and stamps `archive_format` and `derived_schema`. Turn ids come out the same, because `sessions` is never dropped. When the store holds an evicted session, the rows of the sessions being rebuilt are deleted by turn id instead, and the evicted sessions' derived rows are left standing, because their block rows are gone and `turns_fts` cannot give its text back. It does not touch the archive or kept tables, `observations` included, or the summary tables.
+- **Outputs:** in one transaction, drops every table in `DERIVED_TABLES`, recreates them, reads each session's stream from its block rows, derives every turn's rows again through `derive.rs`, and stamps `archive_format` and `derived_schema`. Turn ids come out the same, because `sessions` is never dropped. When the store holds an evicted session, the rows of the sessions being rebuilt are deleted by turn id instead, and the evicted sessions' derived rows are left standing, because their block rows are gone and `turns_fts` cannot give its text back. It does not touch the archive or kept tables, `observations` included. It empties both summary tables and writes every session again from the rebuilt rows in the same transaction, the evicted sessions carried across and the sessions whose blob no longer decodes included, and its output is the same as before.
 - **Refusals:** it takes `LOCK` and exits 1 when another process holds it. A session that cannot be rebuilt is named and skipped, and the command exits 1.
 
 ### `terminus compact`
@@ -415,7 +415,7 @@ erDiagram
     INTEGER turn_count
   }
   session_summary {
-    TEXT session_key PK
+    TEXT session_key PK, FK
     TEXT last_turn_at
     TEXT branch
     TEXT project
@@ -491,6 +491,7 @@ erDiagram
   sessions ||--o{ blocks : "session_no"
   sessions ||--o| session_meta : "session_key"
   sessions ||--o| observations : "session_key"
+  sessions ||--o| session_summary : "session_key"
   sessions ||--o{ turns : "session_key"
   sessions ||--o{ compactions : "session_key"
   sessions ||--o| session_titles : "session_key"
@@ -502,7 +503,7 @@ erDiagram
   turns |o--o{ labels : "turn_id, not enforced"
 ```
 
-*Figure 1. Every table in `terminus.db` with its columns and types. `sessions`, `blocks` and `session_meta` are the archive. `decisions`, `labels` and `observations` are kept. `project_summary` and `session_summary` are the summary tables, kept by ingest and referencing nothing. `turns`, `compactions`, `session_titles`, `turns_fts`, `entities` and `paths` are derived from the block rows. `watermarks`, `runs` and `meta` are operational. Two references are not enforced: a watermark can exist before or after its session, and a label outlives the `turns` rows a rebuild drops.*
+*Figure 1. Every table in `terminus.db` with its columns and types. `sessions`, `blocks` and `session_meta` are the archive. `decisions`, `labels` and `observations` are kept. `project_summary` and `session_summary` are the summary tables, kept by ingest, retention's delete and `terminus reindex`. `session_summary` references `sessions` and `project_summary` references nothing. `turns`, `compactions`, `session_titles`, `turns_fts`, `entities` and `paths` are derived from the block rows. `watermarks`, `runs` and `meta` are operational. Two references are not enforced: a watermark can exist before or after its session, and a label outlives the `turns` rows a rebuild drops.*
 
 ### Opening the store
 
