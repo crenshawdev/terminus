@@ -101,6 +101,9 @@ impl Bench {
     /// One clock reading for the whole call and a bound value rather than a SQL
     /// expression per row, so two sessions aged the same way sort by their key
     /// and not by which millisecond SQLite got to them.
+    ///
+    /// The summary holds `last_turn_at` too, so it moves in step and keeps
+    /// agreeing with `session_meta` before retention runs.
     fn age(&self, keys: &[&PathBuf], offset: &str) {
         let conn = self.conn();
         let at: String = conn
@@ -119,6 +122,27 @@ impl Bench {
                 )
                 .unwrap();
             assert_eq!(changed, 1, "no session_meta row for {}", key.display());
+            conn.execute(
+                "UPDATE session_summary SET last_turn_at = ?2 WHERE session_key = ?1",
+                rusqlite::params![key_of(key), at],
+            )
+            .unwrap();
+        }
+    }
+
+    fn summary_rows(&self, key: &Path) -> i64 {
+        self.conn()
+            .query_row(
+                "SELECT count(*) FROM session_summary WHERE session_key = ?1",
+                [key_of(key)],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn checked(&self, after: &str) {
+        if let Err(e) = testkit::check_summary(&self.conn()) {
+            panic!("the summary disagrees with its rows after {after}: {e}");
         }
     }
 
@@ -346,9 +370,12 @@ fn an_evicted_session_stays_listed_and_searchable_while_a_deleted_one_is_gone() 
     bench.age(&[&evicted], AGED);
     bench.age(&[&doomed], FRESH);
 
+    bench.checked("ingest and aging");
+
     bench.ingest();
     assert_eq!(bench.is_evicted(&evicted), Some(1));
     assert_eq!(bench.is_evicted(&doomed), None);
+    bench.checked("the evicting pass");
 
     // Now the other verb, over the session whose transcript is gone.
     bench.config(DELETE_30);
@@ -368,11 +395,15 @@ fn an_evicted_session_stays_listed_and_searchable_while_a_deleted_one_is_gone() 
         "a delete policy evicts nothing: {value}"
     );
 
+    assert_eq!(bench.summary_rows(&doomed), 1, "the premise: it has a row");
     bench.ingest();
     assert!(
         !bench.archived(&doomed),
         "the deleted session is still there"
     );
+    assert_eq!(bench.summary_rows(&doomed), 0, "the deleted session kept its row");
+    assert_eq!(bench.summary_rows(&evicted), 1, "the evicted session lost its row");
+    bench.checked("the deleting pass");
     assert!(
         bench.archived(&evicted),
         "the deletion pass took the evicted session with it"
