@@ -812,6 +812,117 @@ fn a_delete_with_its_summary_rows_already_gone_succeeds_and_counts_stop_at_zero(
     assert_eq!(negative, 0);
 }
 
+impl Bench {
+    /// Close a session the way the idle rule does, which the summary does not
+    /// hold, so the check still agrees. Its last turn is already old.
+    fn close(&self, key: &str) {
+        let changed = self
+            .conn()
+            .execute(
+                "UPDATE session_meta SET is_final = 1 WHERE session_key = ?1",
+                [key],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "no session_meta row for {key}");
+    }
+}
+
+/// An eviction deletes block rows and nothing the summary holds, so no summary
+/// row moves, the evicted sessions' own included.
+#[test]
+fn an_eviction_leaves_every_summary_row_as_it_was() {
+    let bench = bench();
+    let (alpha, beta) = (bench.cwd("alpha"), bench.cwd("beta"));
+    let mut keys = vec![
+        bench.talk("a.jsonl", &alpha, 3),
+        bench.talk("b.jsonl", &alpha, 5),
+        bench.talk("c.jsonl", &beta, 4),
+    ];
+    for key in &keys {
+        bench.close(key);
+    }
+    bench.checked("ingest");
+    let before = bench.summary();
+
+    let selection = bench.evaluate(&config(EVICT_30));
+    let sorted = |mut list: Vec<String>| {
+        list.sort();
+        list
+    };
+    keys.sort();
+    assert_eq!(sorted(selection.evict.clone()), keys, "the premise: all three are named");
+    assert!(selection.delete.is_empty());
+    let applied = bench.apply(&selection);
+
+    assert_eq!(sorted(applied.evicted.clone()), keys, "{:?}", applied.notes);
+    assert_eq!(bench.summary(), before, "an eviction moved a summary row");
+    bench.checked("the eviction");
+}
+
+/// A project holding more sessions than the brief looks at keeps a row for
+/// each of them, and age evicts without pruning: the pair counts every session.
+#[test]
+fn a_project_past_the_briefs_sixty_four_sessions_keeps_every_row() {
+    const SESSIONS: usize = 66;
+    let bench = bench();
+    let alpha = bench.cwd("alpha");
+    let keys: Vec<String> = (0..SESSIONS)
+        .map(|n| bench.talk(&format!("s{n:02}.jsonl"), &alpha, 2))
+        .collect();
+    // Ten are past the age and closed, so they are evicted; the rest are open.
+    for key in &keys[..10] {
+        bench.close(key);
+    }
+    bench.checked("ingest");
+    assert_eq!(bench.pair(&alpha), Some((SESSIONS as i64, 2 * SESSIONS as i64)));
+
+    let selection = bench.evaluate(&config(EVICT_30));
+    assert_eq!(selection.evict.len(), 10, "the premise: ten are named");
+    let applied = bench.apply(&selection);
+    assert_eq!(applied.evicted.len(), 10, "{:?}", applied.notes);
+
+    let conn = bench.conn();
+    let mains: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM session_meta WHERE parent_session_key IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM session_summary", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mains, SESSIONS as i64);
+    assert_eq!(rows, mains, "a main session lost its summary row");
+    assert_eq!(bench.pair(&alpha), Some((SESSIONS as i64, 2 * SESSIONS as i64)));
+    bench.checked("the eviction");
+}
+
+/// One pass that evicts a session and deletes another leaves the summary equal
+/// to what the rows give.
+#[test]
+fn one_pass_that_evicts_and_deletes_leaves_the_summary_true() {
+    let bench = bench();
+    let alpha = bench.cwd("alpha");
+    let evicted = bench.talk("evicted.jsonl", &alpha, 3);
+    let deleted = bench.talk("deleted.jsonl", &alpha, 5);
+    let kept = bench.talk("kept.jsonl", &alpha, 4);
+    bench.checked("ingest");
+    bench.remove_transcript(&deleted);
+
+    let applied = bench.apply(&Selection {
+        evict: vec![evicted.clone()],
+        delete: vec![deleted.clone()],
+        ..Selection::default()
+    });
+
+    assert_eq!(applied.evicted, vec![evicted], "{:?}", applied.notes);
+    assert_eq!(applied.deleted, vec![deleted], "{:?}", applied.notes);
+    bench.checked("the pass");
+    assert_eq!(bench.pair(&alpha), Some((2, 7)));
+    assert_eq!(bench.count("SELECT count(*) FROM session_summary WHERE session_key = ?1", &kept), 1);
+}
+
 /// Retention must not be able to wedge on one damaged row, the way `pass::walk`
 /// cannot wedge on one damaged transcript. The fault is a trigger rather than a
 /// test hook: it makes SQLite refuse a real statement, so the rollback under
