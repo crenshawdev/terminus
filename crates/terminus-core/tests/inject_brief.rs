@@ -2033,3 +2033,85 @@ fn a_long_title_is_cut_with_a_mark() {
     assert!(line.chars().count() < 100, "{line}");
     assert!(line.ends_with("..."), "{line}");
 }
+
+// ---------------------------------------------------------------------------
+// The gate: no brief until the store's summary is marked filled
+
+impl Bench {
+    /// Turn a store ingest built into one from before the upgrade: `sql` runs
+    /// first, then the key goes, over a plain connection.
+    fn before_the_upgrade(&self, sql: &str) {
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
+                .unwrap();
+        conn.execute_batch(sql).unwrap();
+        conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            [terminus_core::summary::META_SUMMARY_FILLED],
+        )
+        .unwrap();
+    }
+
+    /// A `SessionStart` that follows a compaction, under a session of its own.
+    fn compacted_as(&self, session: &str, project: &str) -> Option<String> {
+        let cwd = self.project(project);
+        let payload = Payload {
+            session_id: Some(session),
+            transcript_path: Some("/home/user/.claude/projects/-p/s.jsonl"),
+            cwd: cwd.to_str(),
+            prompt: None,
+            source: Some("compact"),
+        };
+        brief::session_start(&self.data_dir, &Config::default(), &payload)
+    }
+}
+
+/// Every unfilled shape renders no brief and still leaves the next prompt its compaction debt.
+#[test]
+fn a_store_whose_summary_is_not_marked_filled_renders_no_brief() {
+    let project = EARLY.project;
+    let shapes = [
+        (
+            "no summary tables",
+            "DROP TABLE session_summary; DROP TABLE project_summary;".to_owned(),
+        ),
+        ("tables and no key", String::new()),
+        (
+            "part-filled and no key",
+            format!(
+                "DELETE FROM session_summary WHERE session_key IN \
+                 (SELECT session_key FROM session_meta WHERE session_id = '{}')",
+                LATE.id
+            ),
+        ),
+    ];
+
+    for (n, (shape, sql)) in shapes.iter().enumerate() {
+        let bench = bench();
+        bench.archive(&EARLY);
+        bench.archive(&LATE);
+        assert!(bench.brief(project).is_some(), "{shape}: the control");
+
+        bench.before_the_upgrade(sql);
+        assert_eq!(bench.brief(project), None, "{shape}");
+        if n == 0 {
+            let cwd = bench.project(project);
+            let payload = Payload {
+                session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
+                transcript_path: None,
+                cwd: cwd.to_str(),
+                prompt: None,
+                source: Some("startup"),
+            };
+            assert!(
+                brief::session_start_reads(&bench.data_dir, &Config::default(), &payload).is_none(),
+                "{shape}: the reads path renders where the hook would not"
+            );
+        }
+
+        let session = format!("99999999-0000-4000-8000-{n:012}");
+        assert_eq!(bench.compacted_as(&session, project), None, "{shape}");
+        let state = inject::state::State::load(&bench.data_dir, Some(&session));
+        assert!(state.compaction_owed, "{shape}: the debt was not left");
+    }
+}

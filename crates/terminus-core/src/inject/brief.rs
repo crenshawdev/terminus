@@ -24,6 +24,11 @@
 //! `parse::record` and rebuilt from the archive alone, and the brief spends exactly
 //! one `AND` on it - see [`last_turn`].
 //!
+//! **No brief until the summary is filled.** The brief renders nothing until the
+//! store's `meta` holds the key that marks its summary whole. A store from before
+//! the upgrade gets briefs once the first pass's fill commits, because the hook
+//! starts its ingest detached and renders straight away.
+//!
 //! The counts are read one way only: the project-only projection
 //! `scope::resolve` has already run, plus one targeted `count(*)` per number,
 //! and never `config::visible::sessions`. Measured on a store shaped like the
@@ -81,7 +86,7 @@ use crate::observe::egress::Redaction;
 use crate::observe::mechanical::WRITING_TOOLS;
 use crate::recall::scope::Scoped;
 use crate::recall::{excerpt, Query};
-use crate::store::archive;
+use crate::store::{archive, Store};
 
 /// Render the resume brief for one `SessionStart`, or nothing.
 ///
@@ -95,7 +100,7 @@ pub fn session_start(data_dir: &Path, config: &Config, payload: &Payload) -> Opt
     if payload.source == Some(super::COMPACT_SOURCE) {
         owe_compaction(data_dir, payload);
     }
-    let store = super::open(data_dir)?;
+    let store = open_filled(data_dir)?;
     let scoped = super::scoped(store.conn(), config, payload)?;
     // Resolved at the entry point that holds the `Config` and carried down. A
     // brief is hook stdout, which is the model's first context of the session,
@@ -122,7 +127,7 @@ pub fn session_start_reads(
     config: &Config,
     payload: &Payload,
 ) -> Option<excerpt::Reads> {
-    let store = super::open(data_dir)?;
+    let store = open_filled(data_dir)?;
     let scoped = super::scoped(store.conn(), config, payload)?;
     let brief = render(
         store.conn(),
@@ -132,6 +137,22 @@ pub fn session_start_reads(
         payload.cwd.and_then(checked_out_branch).as_deref(),
     )?;
     Some(brief.reads)
+}
+
+/// The store the brief reads, once its summary is marked filled, or nothing.
+///
+/// Whether the key row exists is the whole test, as `summary::fill` asks it, and
+/// it is asked before any statement names a summary table: a store from before
+/// the upgrade has none. No row, or any error, is no brief.
+fn open_filled(data_dir: &Path) -> Option<Store> {
+    let store = super::open(data_dir)?;
+    let filled = store
+        .conn()
+        .prepare_cached("SELECT 1 FROM meta WHERE key = ?1")
+        .ok()?
+        .exists([crate::summary::META_SUMMARY_FILLED])
+        .ok()?;
+    filled.then_some(store)
 }
 
 /// Leave the next prompt an injection to make.

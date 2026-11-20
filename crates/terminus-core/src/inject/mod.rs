@@ -23,9 +23,10 @@
 //! hook already spawned. What injection does write is two kinds of FILE beside
 //! the store and never inside it: [`state`], one session's disposable scratch,
 //! and [`decision`], one durable record per prompt that a later ingest pass
-//! drains into the store. A write on the prompt path is exactly what the
-//! deadline cannot tolerate, and a blocked writer behind a 49-second backfill
-//! is strictly worse than a blocked reader.
+//! drains into the store. The brief reads the summary that ingest, retention and
+//! reindex keep, and writes none of it. A write on the prompt path is exactly
+//! what the deadline cannot tolerate, and a blocked writer behind a 49-second
+//! backfill is strictly worse than a blocked reader.
 //!
 //! **The scope comes off the payload.** [`Scope::Directory`] built from the
 //! payload's `cwd`, never [`Scope::current_directory`]: the working directory
