@@ -2,7 +2,7 @@
 //!
 //! Two tables, `project_summary` and `session_summary`, so the brief's numbers
 //! and its pick of session exist before any session starts and the hook reads
-//! a row instead of grouping the archive. Three things write them, each in the
+//! a row instead of grouping the archive. Four things write them, each in the
 //! transaction that changes the rows under them:
 //!
 //! - ingest, through [`write`], inside each file's transaction, from the rows as
