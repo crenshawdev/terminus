@@ -187,8 +187,14 @@ pub(crate) struct Deleted {
 /// caught. It narrows the window between selection and delete without closing
 /// it, because the ingest lock guards the store and not the transcript tree.
 ///
+/// **The summary goes first.** `summary::remove` deletes the session's
+/// `session_summary` row and takes the session and its turns off its pair, before
+/// `clear_derived` empties `turns` and before `session_meta` goes, so the counts
+/// it takes off are the ones the session held. It runs in this transaction, so a
+/// failed delete leaves both summary tables as they were.
+///
 /// **Child first, and that is not tidiness.** The derived tables and their
-/// order are `reindex::clear_derived`'s, which this calls first. The bundled
+/// order are `reindex::clear_derived`'s, which this calls next. The bundled
 /// SQLite is compiled with `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`, so the references
 /// declared in `schema::CREATE_SQL` really are enforced on every connection
 /// whatever the pragma comment there says. What is retention's own:
@@ -223,14 +229,16 @@ fn delete_one(conn: &mut Connection, session_key: &str) -> Result<Option<Deleted
 }
 
 /// Delete one session and every row keyed on it, inside the caller's
-/// transaction: the derived rows through `reindex::clear_derived`, then the
-/// rows retention owns, child first.
+/// transaction: the session's share of the summary first, while its turns are
+/// still there to count, then the derived rows through `reindex::clear_derived`,
+/// then the rows retention owns, child first.
 pub(crate) fn delete_session(tx: &Connection, session_key: &str) -> Result<Deleted> {
     let session_id: Option<String> = tx.query_row(
         "SELECT session_id FROM session_meta WHERE session_key = ?1",
         [session_key],
         |r| r.get(0),
     )?;
+    crate::summary::remove(tx, session_key)?;
     crate::reindex::clear_derived(tx, session_key)?;
     let observations = tx.execute(
         "DELETE FROM observations WHERE session_key = ?1",

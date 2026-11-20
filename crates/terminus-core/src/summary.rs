@@ -74,6 +74,33 @@ pub fn write(conn: &Connection, session_key: &str, before: Option<Before>) -> Re
     keep_session(conn, session_key)
 }
 
+/// Take a session off the summary ahead of its delete: its own row, and its
+/// share of its pair.
+///
+/// Call it first in the delete's transaction, while `session_meta` and `turns`
+/// still hold what the session counted. The pair's counts are adjusted and
+/// never recounted, and stop at zero, so a row that is already missing or short
+/// is not an error. A subagent has no row of its own and only lowers its pair.
+pub(crate) fn remove(conn: &Connection, session_key: &str) -> Result<()> {
+    conn.prepare_cached("DELETE FROM session_summary WHERE session_key = ?1")?
+        .execute([session_key])?;
+    let Some(pair) = stored_pair(conn, session_key)? else {
+        return Ok(());
+    };
+    let turns = turn_count(conn, session_key)?;
+    conn.prepare_cached(
+        "UPDATE project_summary
+         SET session_count = max(session_count - 1, 0), turn_count = max(turn_count - ?3, 0)
+         WHERE pair_key = json_array(?1, ?2)",
+    )?
+    .execute(rusqlite::params![pair.project, pair.pre_worktree, turns])?;
+    conn.prepare_cached(
+        "DELETE FROM project_summary WHERE pair_key = json_array(?1, ?2) AND session_count <= 0",
+    )?
+    .execute(rusqlite::params![pair.project, pair.pre_worktree])?;
+    Ok(())
+}
+
 /// The main session's one row, written whole from the stored rows.
 ///
 /// A main session is a `session_meta` row with no parent, the brief's own test.

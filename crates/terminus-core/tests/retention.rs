@@ -370,6 +370,7 @@ impl Bench {
             ("paths", self.count("SELECT count(*) FROM paths WHERE turn_id IN (SELECT id FROM turns WHERE session_key = ?1)", key)),
             ("compactions", self.count("SELECT count(*) FROM compactions WHERE session_key = ?1", key)),
             ("observations", self.count("SELECT count(*) FROM observations WHERE session_key = ?1", key)),
+            ("session_summary", self.count("SELECT count(*) FROM session_summary WHERE session_key = ?1", key)),
             ("watermarks", self.count("SELECT count(*) FROM watermarks WHERE transcript_path = ?1", key)),
         ]
     }
@@ -574,6 +575,241 @@ fn a_deletion_takes_the_decisions_of_its_session_and_no_others() {
     );
     assert_eq!(decisions("other"), 1, "an unrelated decision went too");
     assert_eq!(labels("other"), 1, "an unrelated label went too");
+}
+
+// The summary a delete has to keep true. These stores are built through ingest,
+// because `plant` writes no summary rows for the check to compare.
+
+/// A transcript of `turns` alternating typed prompts and replies, every record
+/// naming `cwd`.
+fn talk(cwd: &str, session: &str, turns: usize) -> String {
+    (0..turns)
+        .map(|n| {
+            let (kind, text) = if n % 2 == 0 {
+                ("user", "ask")
+            } else {
+                ("assistant", "say")
+            };
+            let record = serde_json::json!({
+                "parentUuid": null,
+                "isSidechain": false,
+                "sessionId": session,
+                "uuid": format!("{session}-{n}"),
+                "timestamp": format!("2026-02-03T10:00:{n:02}.000Z"),
+                "type": kind,
+                "cwd": cwd,
+                "message": {"role": kind, "content": [{"type": "text", "text": text}]},
+            });
+            format!("{record}\n")
+        })
+        .collect()
+}
+
+type Table = Vec<Vec<rusqlite::types::Value>>;
+
+impl Bench {
+    /// A project directory name under this bench's root. Never created, so the
+    /// project key is the path itself.
+    fn cwd(&self, name: &str) -> String {
+        self.root.join(name).to_string_lossy().into_owned()
+    }
+
+    /// Ingest a transcript of `turns` records at `rel` under the work directory.
+    /// A path `<id>/subagents/agent-*.jsonl` is the sidecar of `<id>.jsonl`.
+    fn talk(&self, rel: &str, cwd: &str, turns: usize) -> String {
+        let path = self.work.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, talk(cwd, rel, turns)).unwrap();
+        match ingest::run(&self.data_dir, &path).unwrap() {
+            ingest::Outcome::Committed(_) => {}
+            other => panic!("{rel}: {other:?}"),
+        }
+        path.canonicalize().unwrap().to_string_lossy().into_owned()
+    }
+
+    fn turns(&self, key: &str) -> i64 {
+        self.count("SELECT count(*) FROM turns WHERE session_key = ?1", key)
+    }
+
+    /// `(session_count, turn_count)` of the pair a project key and no
+    /// pre-worktree key name.
+    fn pair(&self, cwd: &str) -> Option<(i64, i64)> {
+        self.conn()
+            .query_row(
+                "SELECT session_count, turn_count FROM project_summary
+                  WHERE project IS ?1 AND project_pre_worktree IS NULL",
+                [cwd],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()
+    }
+
+    /// Every column of every row of one summary table, ordered by its key.
+    fn table(&self, name: &str) -> Table {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {name} ORDER BY 1"))
+            .unwrap();
+        let width = statement.column_count();
+        statement
+            .query_map([], |r| (0..width).map(|i| r.get(i)).collect())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn summary(&self) -> (Table, Table) {
+        (self.table("project_summary"), self.table("session_summary"))
+    }
+
+    fn checked(&self, after: &str) {
+        if let Err(e) = testkit::check_summary(&self.conn()) {
+            panic!("the summary disagrees with its rows after {after}: {e}");
+        }
+    }
+
+    fn delete(&self, key: &str) -> Applied {
+        self.remove_transcript(key);
+        let applied = self.apply(&Selection {
+            delete: vec![key.to_owned()],
+            ..Selection::default()
+        });
+        assert_eq!(applied.deleted, vec![key.to_owned()], "{:?}", applied.notes);
+        applied
+    }
+}
+
+/// A delete takes the session's row and its share of its pair, counted before
+/// the delete, and the last session of a pair takes the pair's row.
+#[test]
+fn a_deletion_takes_the_session_off_the_summary_and_a_pair_left_empty_has_no_row() {
+    let bench = bench();
+    let (alpha, beta) = (bench.cwd("alpha"), bench.cwd("beta"));
+    let a = bench.talk("a.jsonl", &alpha, 3);
+    let b = bench.talk("b.jsonl", &alpha, 5);
+    let c = bench.talk("c.jsonl", &beta, 4);
+    bench.checked("ingest");
+    assert_eq!(bench.pair(&alpha), Some((2, 8)));
+
+    let a_turns = bench.turns(&a);
+    assert_eq!(a_turns, 3);
+    bench.delete(&a);
+    bench.checked("deleting a");
+    assert_eq!(bench.count("SELECT count(*) FROM session_summary WHERE session_key = ?1", &a), 0);
+    assert_eq!(bench.pair(&alpha), Some((1, 8 - a_turns)));
+    assert_eq!(bench.pair(&beta), Some((1, 4)));
+
+    bench.delete(&b);
+    bench.checked("deleting b");
+    assert_eq!(bench.pair(&alpha), None, "a pair no session holds kept its row");
+    assert_eq!(bench.pair(&beta), Some((1, 4)));
+
+    bench.delete(&c);
+    bench.checked("deleting c");
+    assert_eq!(bench.summary(), (Vec::new(), Vec::new()));
+}
+
+/// A subagent has no row of its own, so its delete lowers its pair and changes
+/// no `session_summary` row.
+#[test]
+fn deleting_a_subagent_lowers_its_pair_and_leaves_every_session_row() {
+    let bench = bench();
+    let alpha = bench.cwd("alpha");
+    let main = bench.talk("11111111-1111-4111-8111-111111111111.jsonl", &alpha, 3);
+    let sidecar = bench.talk(
+        "11111111-1111-4111-8111-111111111111/subagents/agent-1.jsonl",
+        &alpha,
+        4,
+    );
+    let parent: Option<String> = bench
+        .conn()
+        .query_row(
+            "SELECT parent_session_key FROM session_meta WHERE session_key = ?1",
+            [&sidecar],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent.as_deref(), Some(main.as_str()), "the premise: a subagent");
+    bench.checked("ingest");
+    assert_eq!(bench.pair(&alpha), Some((2, 7)));
+    let (_, rows) = bench.summary();
+
+    bench.delete(&sidecar);
+    bench.checked("deleting the subagent");
+    assert_eq!(bench.pair(&alpha), Some((1, 3)));
+    assert_eq!(bench.summary().1, rows, "a session_summary row changed");
+}
+
+/// The delete that fails rolls the summary back with everything else.
+#[test]
+fn a_delete_that_fails_leaves_both_summary_tables_as_they_were() {
+    let bench = bench();
+    let alpha = bench.cwd("alpha");
+    let doomed = bench.talk("doomed.jsonl", &alpha, 3);
+    bench.talk("kept.jsonl", &alpha, 5);
+    bench.remove_transcript(&doomed);
+    bench
+        .conn()
+        .execute_batch(&format!(
+            "CREATE TRIGGER retention_fault BEFORE DELETE ON sessions
+               WHEN old.session_key = '{}'
+               BEGIN SELECT RAISE(ABORT, 'planted fault'); END;",
+            doomed.replace('\'', "''")
+        ))
+        .unwrap();
+    let before = bench.summary();
+    assert_eq!(bench.pair(&alpha), Some((2, 8)));
+
+    let applied = bench.apply(&Selection {
+        delete: vec![doomed.clone()],
+        ..Selection::default()
+    });
+
+    assert!(applied.deleted.is_empty(), "{:?}", applied.deleted);
+    assert!(
+        applied.notes.iter().any(|n| n.contains("planted fault")),
+        "the premise: the delete failed: {:?}",
+        applied.notes
+    );
+    assert_eq!(bench.summary(), before, "a failed delete moved the summary");
+    bench.checked("the failed delete");
+}
+
+/// Rows already gone are not an error and no count goes below zero.
+#[test]
+fn a_delete_with_its_summary_rows_already_gone_succeeds_and_counts_stop_at_zero() {
+    let bench = bench();
+    let (alpha, beta) = (bench.cwd("alpha"), bench.cwd("beta"));
+    let lone = bench.talk("lone.jsonl", &alpha, 3);
+    let first = bench.talk("first.jsonl", &beta, 5);
+    bench.talk("second.jsonl", &beta, 3);
+    let conn = bench.conn();
+    conn.execute("DELETE FROM session_summary WHERE session_key = ?1", [&lone])
+        .unwrap();
+    conn.execute("DELETE FROM project_summary WHERE project = ?1", [&alpha])
+        .unwrap();
+    conn.execute("UPDATE project_summary SET turn_count = 1 WHERE project = ?1", [&beta])
+        .unwrap();
+    drop(conn);
+
+    bench.delete(&lone);
+    bench.delete(&first);
+
+    assert_eq!(bench.pair(&alpha), None);
+    assert_eq!(
+        bench.pair(&beta),
+        Some((1, 0)),
+        "the pair keeps one session and a turn count that stopped at zero"
+    );
+    let negative: i64 = bench
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM project_summary WHERE session_count < 0 OR turn_count < 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(negative, 0);
 }
 
 /// Retention must not be able to wedge on one damaged row, the way `pass::walk`
