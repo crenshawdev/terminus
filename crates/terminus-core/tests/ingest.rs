@@ -587,7 +587,8 @@ fn a_pass_moves_the_session_its_turns_and_its_watermark_together() {
             "entities",
             "watermarks",
             "runs",
-            "project_summary"
+            "project_summary",
+            "session_summary"
         ],
         "a pass must move exactly these tables"
     );

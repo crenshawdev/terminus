@@ -1010,7 +1010,75 @@ pub fn age(path: &std::path::Path) {
 /// working the expected rows out here from those two tables alone and never
 /// through [`crate::summary`]. The first difference comes back as the error.
 pub fn check_summary(conn: &rusqlite::Connection) -> Result<(), String> {
-    check_project_summary(conn).map_err(|e| format!("project_summary: {e}"))
+    check_project_summary(conn).map_err(|e| format!("project_summary: {e}"))?;
+    check_session_summary(conn).map_err(|e| format!("session_summary: {e}"))
+}
+
+/// What `session_summary` has to hold for one main session, by column, worked
+/// out from `session_meta`, `session_titles` and `turns` alone.
+const EXPECTED_SESSION_ROW: &str = "\
+    SELECT m.last_turn_at, m.branch, m.project, m.project_pre_worktree, m.cwd,
+           (SELECT title FROM session_titles s WHERE s.session_key = m.session_key),
+           EXISTS (SELECT 1 FROM turns t
+                   WHERE t.session_key = m.session_key AND t.is_typed = 1),
+           (SELECT count(*) FROM turns t WHERE t.session_key = m.session_key)
+    FROM session_meta m WHERE m.session_key = ?1";
+
+const STORED_SESSION_ROW: &str = "\
+    SELECT last_turn_at, branch, project, project_pre_worktree, cwd, title,
+           has_typed_prompt, turn_count
+    FROM session_summary WHERE session_key = ?1";
+
+const SESSION_COLUMNS: &[&str] = &[
+    "last_turn_at",
+    "branch",
+    "project",
+    "project_pre_worktree",
+    "cwd",
+    "title",
+    "has_typed_prompt",
+    "turn_count",
+];
+
+fn check_session_summary(conn: &rusqlite::Connection) -> Result<(), String> {
+    use rusqlite::types::Value;
+    let keys = |sql: &str| -> Result<Vec<String>, String> {
+        conn.prepare(sql)
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())
+    };
+    let mains =
+        keys("SELECT session_key FROM session_meta WHERE parent_session_key IS NULL ORDER BY 1")?;
+    let stored = keys("SELECT session_key FROM session_summary ORDER BY 1")?;
+    if mains != stored {
+        return Err(format!(
+            "rows for {stored:?}, but the main sessions are {mains:?}"
+        ));
+    }
+    let row = |sql: &str, key: &str| -> Result<Vec<Value>, String> {
+        conn.query_row(sql, [key], |r| {
+            (0..SESSION_COLUMNS.len())
+                .map(|i| r.get::<_, Value>(i))
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+    };
+    for key in &mains {
+        let (want, got) = (
+            row(EXPECTED_SESSION_ROW, key)?,
+            row(STORED_SESSION_ROW, key)?,
+        );
+        if let Some(at) = (0..want.len()).find(|&i| want[i] != got[i]) {
+            return Err(format!(
+                "{key}: {} holds {:?}, rows give {:?}",
+                SESSION_COLUMNS[at], got[at], want[at]
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn check_project_summary(conn: &rusqlite::Connection) -> Result<(), String> {

@@ -69,7 +69,64 @@ fn turn_count(conn: &Connection, session_key: &str) -> Result<i64> {
 /// Bring the summary up to date with the file's writes. Call it after the
 /// `session_meta` upsert and the file's turns, inside the same transaction.
 pub fn write(conn: &Connection, session_key: &str, before: Option<Before>) -> Result<()> {
-    keep_counts(conn, session_key, before)
+    keep_counts(conn, session_key, before)?;
+    keep_session(conn, session_key)
+}
+
+/// The main session's one row, written whole from the stored rows.
+///
+/// A main session is a `session_meta` row with no parent, the brief's own test.
+/// A subagent's file writes no row here and leaves its parent's alone. The row
+/// is replaced whole on every commit, so a tail pass leaves it equal to one pass
+/// over the whole file. Every value is read back from rows the transaction has
+/// already written, never from the scan, and none of them is prompt or reply
+/// text.
+fn keep_session(conn: &Connection, session_key: &str) -> Result<()> {
+    let Some((last_turn_at, branch, project, pre_worktree, cwd)) = conn
+        .prepare_cached(
+            "SELECT last_turn_at, branch, project, project_pre_worktree, cwd
+             FROM session_meta WHERE session_key = ?1 AND parent_session_key IS NULL",
+        )?
+        .query_row([session_key], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .optional()?
+    else {
+        return Ok(());
+    };
+    let title: Option<String> = conn
+        .prepare_cached("SELECT title FROM session_titles WHERE session_key = ?1")?
+        .query_row([session_key], |r| r.get(0))
+        .optional()?;
+    let typed = conn
+        .prepare_cached("SELECT 1 FROM turns WHERE session_key = ?1 AND is_typed = 1 LIMIT 1")?
+        .exists([session_key])?;
+
+    conn.prepare_cached(
+        "INSERT OR REPLACE INTO session_summary (
+            session_key, last_turn_at, branch, project, project_pre_worktree, cwd,
+            title, has_typed_prompt, turn_count, prompts,
+            reply_id, reply_stream_offset, reply_byte_len, edited_files
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '[]', NULL, NULL, NULL, '[]')",
+    )?
+    .execute(rusqlite::params![
+        session_key,
+        last_turn_at,
+        branch,
+        project,
+        pre_worktree,
+        cwd,
+        title,
+        typed,
+        turn_count(conn, session_key)?,
+    ])?;
+    Ok(())
 }
 
 /// Move this file's sessions and turns onto the pair the stored row names now.

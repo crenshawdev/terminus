@@ -156,6 +156,57 @@ fn talk(cwd: Option<&str>, session: &str, turns: usize) -> String {
         .collect()
 }
 
+/// One transcript line from a base of `sessionId`, `uuid` and `timestamp`, with
+/// `fields` laid over it. A field set to null is left out of the line, which is
+/// how a record loses its `uuid` or its `timestamp`.
+fn rec(session: &str, n: usize, fields: Value) -> String {
+    let mut record = json!({
+        "sessionId": session,
+        "uuid": format!("{session}-{n}"),
+        "timestamp": format!("2026-02-03T10:00:{n:02}.000Z"),
+    });
+    for (key, value) in fields.as_object().unwrap() {
+        record[key] = value.clone();
+    }
+    record.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+    format!("{record}\n")
+}
+
+/// `base` with every field of `extra` laid over it.
+fn with(mut base: Value, extra: Value) -> Value {
+    for (key, value) in extra.as_object().unwrap() {
+        base[key] = value.clone();
+    }
+    base
+}
+
+fn said(kind: &str, text: &str) -> Value {
+    json!({"type": kind, "message": {"role": kind, "content": [{"type": "text", "text": text}]}})
+}
+
+/// The one summary row whose key names `id`.
+fn session_row(conn: &Connection, id: &str) -> Vec<Cell> {
+    let mut statement = conn
+        .prepare("SELECT * FROM session_summary WHERE session_key LIKE ?1")
+        .unwrap();
+    let width = statement.column_count();
+    let mut rows: Vec<Vec<Cell>> = statement
+        .query_map([format!("%{id}%")], |r| {
+            (0..width).map(|i| r.get::<_, Cell>(i)).collect()
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows.len(), 1, "rows for {id}: {rows:?}");
+    rows.pop().unwrap()
+}
+
+fn column(table: &str, name: &str, conn: &Connection) -> usize {
+    let statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+    let position = statement.column_names().position(|c| c == name);
+    position.unwrap_or_else(|| panic!("{table} has no column {name}"))
+}
+
 fn write(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
@@ -298,4 +349,186 @@ fn a_tail_that_opens_in_a_worktree_leaves_no_row_for_the_repository_alone() {
     // `session_meta` itself differs between the two stores here: the one pass
     // saw the repository first and never the worktree's key.
     assert_eq!(project_row(&one, Some(&repo), None), Some((1, 5)));
+}
+
+const FOLDER: &str = "-tmp-session-rows";
+
+#[test]
+fn a_session_with_no_turn_still_has_a_row_holding_nothing() {
+    let world = World::new();
+    let id = "eeeeeeee-0000-4000-8000-000000000001";
+    // Every record lacks a `uuid` or a `timestamp`, so none is a turn.
+    let text = [
+        rec(
+            "e1",
+            0,
+            json!({"type": "user", "uuid": null, "message": {"content": "hi"}}),
+        ),
+        rec("e1", 1, json!({"type": "assistant", "timestamp": null})),
+    ]
+    .concat();
+    write(&world.main_path(FOLDER, id), &text);
+
+    for data in world.archive_three_ways() {
+        let conn = open(&data);
+        testkit::check_summary(&conn).unwrap();
+        let row = session_row(&conn, id);
+        assert_eq!(
+            row[column("session_summary", "turn_count", &conn)],
+            Cell::Integer(0)
+        );
+        assert_eq!(
+            row[column("session_summary", "has_typed_prompt", &conn)],
+            Cell::Integer(0)
+        );
+        for name in ["title", "branch", "last_turn_at"] {
+            assert_eq!(
+                row[column("session_summary", name, &conn)],
+                Cell::Null,
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_sidecar_has_no_row_and_leaves_its_parents_as_it_was() {
+    let world = World::new();
+    let id = "ffffffff-0000-4000-8000-000000000001";
+    let cwd = world.cwd("repo");
+    let data = world.data("store");
+    let main = world.main_path(FOLDER, id);
+    write(&main, &talk(Some(&cwd), "f1", 3));
+    committed(ingest::run_with(&data, &main, &world.config()).unwrap());
+    let before = session_row(&open(&data), id);
+
+    let sidecar = world.sidecar_path(FOLDER, id, 1);
+    write(&sidecar, &talk(Some(&world.cwd("elsewhere")), "f1", 4));
+    committed(ingest::run_with(&data, &sidecar, &world.config()).unwrap());
+
+    let conn = open(&data);
+    testkit::check_summary(&conn).unwrap();
+    assert_eq!(session_row(&conn, id), before);
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM session_summary", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "the sidecar got a row");
+}
+
+#[test]
+fn only_a_prompt_a_person_typed_turns_the_typed_flag_on() {
+    let world = World::new();
+    let scripted = [rec(
+        "g1",
+        0,
+        json!({"type": "user", "entrypoint": "sdk-cli", "message": {"content": "ask"}}),
+    )]
+    .concat();
+    let tool_result = [rec(
+        "g2",
+        0,
+        json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": "out"}]}}),
+    )]
+    .concat();
+    let typed = [rec("g3", 0, said("user", "please do the thing"))].concat();
+    let ids = [
+        ("11111111-0000-4000-8000-000000000001", scripted, 0),
+        ("11111111-0000-4000-8000-000000000002", tool_result, 0),
+        ("11111111-0000-4000-8000-000000000003", typed, 1),
+    ];
+    for (id, text, _) in &ids {
+        write(&world.main_path(FOLDER, id), text);
+    }
+
+    for data in world.archive_three_ways() {
+        let conn = open(&data);
+        testkit::check_summary(&conn).unwrap();
+        for (id, _, flag) in &ids {
+            let at = column("session_summary", "has_typed_prompt", &conn);
+            assert_eq!(session_row(&conn, id)[at], Cell::Integer(*flag), "{id}");
+        }
+    }
+}
+
+#[test]
+fn a_long_title_holding_a_key_is_stored_byte_for_byte() {
+    let world = World::new();
+    let id = "22222222-0000-4000-8000-000000000001";
+    let title = format!(
+        "{} sk-FAKEFAKEFAKEFAKEFAKEFAKEFAKE0000 {}",
+        "start".repeat(10),
+        "end".repeat(10)
+    );
+    assert!(title.chars().count() > 80);
+    let text = [
+        rec("h1", 0, said("user", "ask")),
+        rec(
+            "h1",
+            1,
+            json!({"type": "custom-title", "customTitle": title, "uuid": null, "timestamp": null}),
+        ),
+    ]
+    .concat();
+    write(&world.main_path(FOLDER, id), &text);
+
+    for data in world.archive_three_ways() {
+        let conn = open(&data);
+        testkit::check_summary(&conn).unwrap();
+        let at = column("session_summary", "title", &conn);
+        assert_eq!(session_row(&conn, id)[at], Cell::Text(title.clone()));
+    }
+}
+
+#[test]
+fn no_column_of_either_table_holds_prompt_or_reply_text() {
+    const MARKER: &str = "zorblax-marker-7731";
+    let world = World::new();
+    let id = "33333333-0000-4000-8000-000000000001";
+    let cwd = world.cwd("repo");
+    let text = [
+        rec(
+            "i1",
+            0,
+            with(said("user", &format!("{MARKER} first ask")), json!({"cwd": cwd, "gitBranch": "feature-x"})),
+        ),
+        rec("i1", 1, said("assistant", &format!("{MARKER} first answer"))),
+        rec("i1", 2, said("user", &format!("{MARKER} second ask"))),
+        rec("i1", 3, said("assistant", &format!("{MARKER} second answer"))),
+        rec("i1", 4, json!({"type": "ai-title", "aiTitle": "A plain title", "uuid": null, "timestamp": null})),
+    ]
+    .concat();
+    write(&world.main_path(FOLDER, id), &text);
+
+    for data in world.archive_three_ways() {
+        let conn = open(&data);
+        testkit::check_summary(&conn).unwrap();
+
+        // The row exists and says what the stored rows say, so an empty table
+        // cannot pass the absence below.
+        let row = session_row(&conn, id);
+        let at = |name| row[column("session_summary", name, &conn)].clone();
+        assert_eq!(at("title"), Cell::Text("A plain title".into()));
+        assert_eq!(at("branch"), Cell::Text("feature-x".into()));
+        assert_eq!(
+            at("last_turn_at"),
+            Cell::Text("2026-02-03T10:00:03.000Z".into())
+        );
+        assert_eq!(at("has_typed_prompt"), Cell::Integer(1));
+        assert_eq!(at("turn_count"), Cell::Integer(4));
+
+        for rows in summary_rows(&conn) {
+            for cell in rows.into_iter().flatten() {
+                let held = match cell {
+                    Cell::Text(text) => text.into_bytes(),
+                    Cell::Blob(bytes) => bytes,
+                    _ => continue,
+                };
+                assert!(
+                    !held.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+                    "a summary column holds prompt or reply text"
+                );
+            }
+        }
+    }
 }
