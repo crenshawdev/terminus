@@ -2,12 +2,12 @@
 //!
 //! A tree pass, a backfill and one named file are the same pass with a
 //! different walk, so they run through one function in one order: take the
-//! lock, recover, read the rows, walk, and write one `runs` row. Each caller
-//! hands [`drive`] its own [`Walk`]. The steps only the tree pass runs - the
-//! decision log drain, continuation links, labels, observations, retention and
-//! the snapshot gate - are that walk's own, and every step a walk does not name
-//! does nothing, so the backfill and a named file stay out of them by
-//! construction.
+//! lock, recover, fill the summary, read the rows, walk, and write one `runs`
+//! row. Each caller hands [`drive`] its own [`Walk`]. The steps only the tree
+//! pass runs - the decision log drain, continuation links, labels,
+//! observations, retention and the snapshot gate - are that walk's own, and
+//! every step a walk does not name does nothing, so the backfill and a named
+//! file stay out of them by construction.
 //!
 //! The driver starts no thread. The backfill's workers are started inside its
 //! own walk, which is reached only by `terminus backfill`.
@@ -85,6 +85,18 @@ pub(crate) fn drive(data_dir: &Path, walk: &mut impl Walk) -> Result<PassOutcome
         ..Summary::default()
     };
 
+    // The summary's fill, once and ahead of the walk's first step. A store
+    // from before the summary gets it whole here, on whichever walk runs
+    // first, and a store that already has the key costs one lookup. A fill
+    // that cannot run is a line in the `runs` row and never the pass's
+    // failure: no key is written, so the next pass tries again.
+    summary.summary_fill = fill_summary(&mut store).err().map(|e| {
+        format!(
+            "summary could not be filled: {}",
+            e.to_string().replace('\n', " ")
+        )
+    });
+
     walk.before(&mut store, &mut summary);
 
     // The rows in one query, after recovery and the step before, and before
@@ -120,6 +132,13 @@ pub(crate) fn drive(data_dir: &Path, walk: &mut impl Walk) -> Result<PassOutcome
 
     walk.after_row(&store);
     Ok(PassOutcome::Ran(summary))
+}
+
+/// The fill in a transaction of its own, which rolls back whole when dropped.
+fn fill_summary(store: &mut Store) -> Result<()> {
+    let tx = store.conn_mut().transaction()?;
+    crate::summary::fill(&tx)?;
+    Ok(tx.commit()?)
 }
 
 /// What one walked file did to the pass: counted, or recorded and skipped.

@@ -13,7 +13,8 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 use terminus_core::config::Config;
 use terminus_core::ingest::{self, backfill, pass, Outcome};
-use terminus_core::store::DB_FILE_NAME;
+use terminus_core::store::{DB_FILE_NAME, DERIVED_SCHEMA, META_DERIVED_SCHEMA};
+use terminus_core::summary::META_SUMMARY_FILLED;
 use terminus_core::testkit;
 
 /// Workers for the backfill: more than one, so it is not the sequential pass.
@@ -230,6 +231,41 @@ fn summary_rows(conn: &Connection) -> Vec<Vec<Vec<Cell>>> {
         .collect()
 }
 
+fn keyed(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM meta WHERE key = ?1",
+        [META_SUMMARY_FILLED],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap()
+        == 1
+}
+
+/// Turn a store ingest built back into one from before the upgrade: no summary
+/// tables and no key. The next writable open creates the tables empty.
+fn before_the_upgrade(data: &Path) {
+    let conn = open(data);
+    conn.execute_batch("DROP TABLE session_summary; DROP TABLE project_summary;")
+        .unwrap();
+    conn.execute("DELETE FROM meta WHERE key = ?1", [META_SUMMARY_FILLED])
+        .unwrap();
+}
+
+fn newest_run_error(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT error FROM runs ORDER BY id DESC LIMIT 1", [], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+/// A tree pass over the world, which must have run.
+fn tree_pass(world: &World, data: &Path) -> pass::Summary {
+    match pass::run_with(data, &world.config()).unwrap() {
+        pass::PassOutcome::Ran(summary) => summary,
+        pass::PassOutcome::LockHeld => panic!("nothing else holds the lock"),
+    }
+}
+
 fn project_row(conn: &Connection, project: Option<&str>, pre: Option<&str>) -> Option<(i64, i64)> {
     conn.query_row(
         "SELECT session_count, turn_count FROM project_summary
@@ -273,6 +309,7 @@ fn the_summary_reconciles_on_every_path_ingest_has() {
     for data in world.archive_three_ways() {
         let conn = open(&data);
         testkit::check_summary(&conn).unwrap_or_else(|e| panic!("{}: {e}", data.display()));
+        assert!(keyed(&conn), "{} has no summary key", data.display());
 
         let nulls: i64 = conn
             .query_row(
@@ -808,4 +845,175 @@ fn the_check_fails_on_each_state_a_skipped_summary_would_leave() {
         }
     }
     testkit::check_summary(&conn).unwrap();
+}
+
+/// The fixtures plus main sessions on two `cwd` values.
+fn place_sessions(world: &World) {
+    world.place_fixtures();
+    write(
+        &world.main_path(FOLDER, "a0a0a0a0-0000-4000-8000-000000000001"),
+        &talk(Some(&world.cwd("repo")), "n1", 3),
+    );
+    write(
+        &world.main_path(FOLDER, "a0a0a0a0-0000-4000-8000-000000000002"),
+        &talk(Some(&world.cwd("other")), "n2", 2),
+    );
+}
+
+#[test]
+fn the_first_pass_fills_a_store_from_before_the_upgrade_by_every_path() {
+    let world = World::new();
+    place_sessions(&world);
+    let stores = world.archive_three_ways();
+    let captured: Vec<_> = stores.iter().map(|d| summary_rows(&open(d))).collect();
+    for data in &stores {
+        before_the_upgrade(data);
+    }
+    let [tree, filled, named] = &stores;
+
+    tree_pass(&world, tree);
+    let report = backfill::run_with(filled, &world.config(), WORKERS).unwrap();
+    assert!(matches!(report.outcome, pass::PassOutcome::Ran(_)));
+    let archived = terminus_core::discover::discover(&world.config()).transcripts;
+    let up_to_date = ingest::run_with(named, &archived[0], &world.config()).unwrap();
+    assert_eq!(up_to_date, Outcome::UpToDate);
+
+    for (data, captured) in stores.iter().zip(&captured) {
+        let conn = open(data);
+        let at = data.display();
+        testkit::check_summary(&conn).unwrap_or_else(|e| panic!("{at}: {e}"));
+        assert!(keyed(&conn), "{at}: no key");
+        let stamp: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [META_DERIVED_SCHEMA],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamp, DERIVED_SCHEMA.to_string(), "{at}");
+        assert_eq!(
+            &summary_rows(&conn),
+            captured,
+            "{at}: the fill wrote other rows"
+        );
+    }
+}
+
+#[test]
+fn the_fill_commits_before_the_walk_and_rebuilds_nothing() {
+    let world = World::new();
+    place_sessions(&world);
+    let data = world.data("store");
+    tree_pass(&world, &data);
+    before_the_upgrade(&data);
+
+    let conn = open(&data);
+    // Children first, the order `reindex::clear_derived` uses: foreign keys are
+    // enforced, so the parent row goes last.
+    let gone: i64 = conn
+        .query_row("SELECT min(id) FROM turns", [], |r| r.get(0))
+        .unwrap();
+    for statement in [
+        "DELETE FROM paths WHERE turn_id = ?1",
+        "DELETE FROM entities WHERE turn_id = ?1",
+        "DELETE FROM turns_fts WHERE rowid = ?1",
+        "DELETE FROM turns WHERE id = ?1",
+    ] {
+        conn.execute(statement, [gone]).unwrap();
+    }
+    // Any `turns` insert before the key is in `meta` aborts the file's commit.
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER turns_before_the_fill BEFORE INSERT ON turns
+         WHEN NOT EXISTS (SELECT 1 FROM meta WHERE key = '{META_SUMMARY_FILLED}')
+         BEGIN SELECT RAISE(ABORT, 'a turn came before the fill'); END;"
+    ))
+    .unwrap();
+    let id = "b0b0b0b0-0000-4000-8000-000000000001";
+    write(
+        &world.main_path(FOLDER, id),
+        &talk(Some(&world.cwd("fresh")), "n3", 2),
+    );
+
+    let ran = tree_pass(&world, &data);
+
+    assert!(ran.failures.is_empty(), "{:?}", ran.failures);
+    assert_eq!(ran.files_committed, 1);
+    let turn: i64 = conn
+        .query_row("SELECT count(*) FROM turns WHERE id = ?1", [gone], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(turn, 0, "the pass rebuilt a turn the store had lost");
+    testkit::check_summary(&conn).unwrap();
+    session_row(&conn, id);
+}
+
+#[test]
+fn a_fill_that_fails_leaves_the_tables_and_the_pass_runs_and_the_next_pass_fills() {
+    let world = World::new();
+    place_sessions(&world);
+    let data = world.data("store");
+    tree_pass(&world, &data);
+
+    let conn = open(&data);
+    conn.execute("DELETE FROM meta WHERE key = ?1", [META_SUMMARY_FILLED])
+        .unwrap();
+    conn.execute_batch(
+        "DELETE FROM session_summary WHERE rowid IN (SELECT rowid FROM session_summary LIMIT 2);
+         UPDATE project_summary SET session_count = session_count + 5
+          WHERE rowid = (SELECT min(rowid) FROM project_summary);",
+    )
+    .unwrap();
+    let part = summary_rows(&conn);
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER key_fault BEFORE INSERT ON meta WHEN NEW.key = '{META_SUMMARY_FILLED}'
+         BEGIN SELECT RAISE(ABORT, 'planted fault'); END;"
+    ))
+    .unwrap();
+    let id = "c0c0c0c0-0000-4000-8000-000000000001";
+    let fresh = world.cwd("fresh");
+    write(&world.main_path(FOLDER, id), &talk(Some(&fresh), "n4", 2));
+
+    let ran = tree_pass(&world, &data);
+
+    assert_eq!(ran.files_committed, 1);
+    assert!(!keyed(&conn), "a failed fill wrote the key");
+    let mut after = summary_rows(&conn);
+    // The two new rows are the new session's and its new pair's.
+    let [project, session] = &mut after[..] else {
+        panic!("two tables")
+    };
+    project.retain(|row| row[1] != Cell::Text(fresh.clone()));
+    session.retain(|row| row[0] != session_row(&conn, id)[0]);
+    assert_eq!(after, part, "a failed fill moved a row it had no right to");
+    let error = newest_run_error(&conn).expect("the run recorded no error");
+    assert!(error.contains("planted fault"), "{error}");
+    assert!(!error.contains("pass failed:"), "{error}");
+
+    conn.execute_batch("DROP TRIGGER key_fault").unwrap();
+    tree_pass(&world, &data);
+    assert!(keyed(&conn), "the next pass did not fill");
+    testkit::check_summary(&conn).unwrap();
+}
+
+#[test]
+fn a_store_with_the_key_is_left_alone_by_a_pass_that_archives_nothing() {
+    let world = World::new();
+    place_sessions(&world);
+    let data = world.data("store");
+    tree_pass(&world, &data);
+    let conn = open(&data);
+    conn.execute_batch(
+        "UPDATE session_summary SET turn_count = turn_count + 1
+          WHERE rowid = (SELECT min(rowid) FROM session_summary);
+         UPDATE project_summary SET turn_count = turn_count + 1
+          WHERE rowid = (SELECT min(rowid) FROM project_summary);",
+    )
+    .unwrap();
+    let before = summary_rows(&conn);
+
+    let ran = tree_pass(&world, &data);
+
+    assert_eq!(ran.files_committed, 0);
+    assert_eq!(summary_rows(&conn), before);
 }

@@ -11,7 +11,9 @@
 //!   before the session's rows go;
 //! - `reindex`, which empties both tables and writes every session again
 //!   through `rewrite` inside its one transaction, and stamps
-//!   [`META_SUMMARY_FILLED`] last.
+//!   [`META_SUMMARY_FILLED`] last;
+//! - the pass's fill, which does the same through `rewrite` on a store whose
+//!   `meta` lacks [`META_SUMMARY_FILLED`], and stamps it last.
 //!
 //! A row is a function of committed rows alone, so a killed pass leaves the
 //! summary equal to what the committed rows give. An eviction changes nothing
@@ -103,6 +105,23 @@ pub(crate) fn rewrite(conn: &Connection) -> Result<()> {
     for session_key in &keys {
         write(conn, session_key, None)?;
     }
+    Ok(())
+}
+
+/// Fill the summary when `meta` lacks [`META_SUMMARY_FILLED`], and write that
+/// row last. A store that has the row is left exactly as it is.
+///
+/// Whether the row exists is the whole test, never whether its value parses.
+pub(crate) fn fill(conn: &Connection) -> Result<()> {
+    let filled = conn
+        .prepare_cached("SELECT 1 FROM meta WHERE key = ?1")?
+        .exists([META_SUMMARY_FILLED])?;
+    if filled {
+        return Ok(());
+    }
+    rewrite(conn)?;
+    conn.prepare_cached("INSERT INTO meta (key, value) VALUES (?1, '1')")?
+        .execute([META_SUMMARY_FILLED])?;
     Ok(())
 }
 

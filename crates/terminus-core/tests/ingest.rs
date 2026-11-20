@@ -587,6 +587,8 @@ fn a_pass_moves_the_session_its_turns_and_its_watermark_together() {
             "entities",
             "watermarks",
             "runs",
+            // A new store's first pass writes the summary's key.
+            "meta",
             "project_summary",
             "session_summary"
         ],
