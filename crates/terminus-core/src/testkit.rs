@@ -1005,3 +1005,52 @@ pub fn age(path: &std::path::Path) {
     )
     .unwrap();
 }
+
+/// Check the summary tables against what `session_meta` and `turns` give,
+/// working the expected rows out here from those two tables alone and never
+/// through [`crate::summary`]. The first difference comes back as the error.
+pub fn check_summary(conn: &rusqlite::Connection) -> Result<(), String> {
+    check_project_summary(conn).map_err(|e| format!("project_summary: {e}"))
+}
+
+fn check_project_summary(conn: &rusqlite::Connection) -> Result<(), String> {
+    type Pair = (Option<String>, Option<String>);
+    let read = |sql: &str| -> Result<std::collections::BTreeMap<Pair, (i64, i64)>, String> {
+        conn.prepare(sql)
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| Ok(((r.get(0)?, r.get(1)?), (r.get(2)?, r.get(3)?))))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())
+    };
+    let expected = read(
+        "SELECT m.project, m.project_pre_worktree, count(*),
+                sum((SELECT count(*) FROM turns t WHERE t.session_key = m.session_key))
+         FROM session_meta m GROUP BY m.project, m.project_pre_worktree",
+    )?;
+    let stored = read(
+        "SELECT project, project_pre_worktree, session_count, turn_count FROM project_summary",
+    )?;
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM project_summary", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if rows as usize != stored.len() {
+        return Err(format!(
+            "{rows} rows hold only {} distinct pairs",
+            stored.len()
+        ));
+    }
+    for (pair, counts) in &expected {
+        match stored.get(pair) {
+            None => return Err(format!("no row for {pair:?}, which holds {counts:?}")),
+            Some(got) if got != counts => {
+                return Err(format!("{pair:?} holds {got:?}, rows give {counts:?}"))
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(pair) = stored.keys().find(|pair| !expected.contains_key(*pair)) {
+        return Err(format!("a row for {pair:?}, which no session holds"));
+    }
+    Ok(())
+}

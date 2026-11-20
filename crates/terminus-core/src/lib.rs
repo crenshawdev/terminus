@@ -42,6 +42,7 @@ pub mod recover;
 pub mod reindex;
 pub mod retention;
 pub mod store;
+pub mod summary;
 pub mod verify;
 
 #[cfg(feature = "testkit")]

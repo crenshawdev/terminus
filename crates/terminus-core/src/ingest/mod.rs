@@ -648,6 +648,9 @@ pub(crate) fn apply(
     // row goes in before its blocks, because the block table's reference to it
     // is enforced.
     let tx = store.conn_mut().transaction()?;
+    // The pair the session was filed under, read before the upsert below can
+    // move it: the summary has to take its counts off the old pair.
+    let summarized = crate::summary::Before::read(&tx, &session_key)?;
     if existing_session_no.is_none() {
         tx.execute(
             "INSERT INTO sessions (session_key, session_no) VALUES (?1, ?2)",
@@ -702,6 +705,7 @@ pub(crate) fn apply(
         derive::derive_title(&tx, &session_key, record)?;
     }
     fault::stall(fault::IN_TX_AFTER_TURNS);
+    crate::summary::write(&tx, &session_key, summarized)?;
     write_watermark(&tx, &session_key, pass.watermark)?;
     fault::stall(fault::IN_TX_BEFORE_COMMIT);
     tx.commit()?;

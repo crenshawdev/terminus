@@ -151,6 +151,11 @@ path = "tests/snapshot.rs"
 required-features = ["testkit"]
 
 [[test]]
+name = "summary"
+path = "tests/summary.rs"
+required-features = ["testkit"]
+
+[[test]]
 name = "verify"
 path = "tests/verify.rs"
 required-features = ["testkit"]
