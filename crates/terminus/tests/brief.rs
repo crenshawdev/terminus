@@ -236,6 +236,70 @@ fn two_session_starts_against_an_unchanged_store_are_byte_identical() {
     }
 }
 
+/// One whole session-start render, while another process holds the ingest lock,
+/// leaves the store's three files byte for byte as they were.
+///
+/// The read-only open has its own tests; this is the one test of the render
+/// around it. The hook's detached ingest meets the held lock and leaves without
+/// touching the store, so what could write is the render itself. The
+/// preconditions carry the proof: the lock is held, all three files exist
+/// before the snapshot (a read-only open is what materializes the WAL and SHM),
+/// and a brief really came out.
+#[test]
+fn a_session_start_render_leaves_the_store_files_byte_identical_under_a_held_lock() {
+    use terminus_core::ingest::{self, Attempt};
+    use terminus_core::store::{Store, DB_FILE_NAME};
+
+    let bench = bench();
+    bench.ingest(MOVED_FIXTURE);
+
+    let _lock = match ingest::lock::try_acquire(&bench.data_dir).unwrap() {
+        Attempt::Acquired(lock) => lock,
+        Attempt::Held => panic!("nothing else holds the lock before this test takes it"),
+    };
+    assert!(
+        matches!(
+            ingest::lock::try_acquire(&bench.data_dir).unwrap(),
+            Attempt::Held
+        ),
+        "the lock is not held, so the hook would not meet a held one"
+    );
+
+    drop(Store::open_read_only(&bench.data_dir).expect("open the store for reading"));
+
+    let files: Vec<PathBuf> = [
+        DB_FILE_NAME.to_owned(),
+        format!("{DB_FILE_NAME}-wal"),
+        format!("{DB_FILE_NAME}-shm"),
+    ]
+    .iter()
+    .map(|name| bench.data_dir.join(name))
+    .collect();
+    for file in &files {
+        assert!(
+            file.is_file(),
+            "{} is missing before the render",
+            file.display()
+        );
+    }
+    let before: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
+
+    let output = bench.hook("SessionStart", &payload(&bench.project(MOVED_FIXTURE)));
+    let context = additional_context(&output, "the render under the held lock");
+    assert!(!context.is_empty(), "the render carried no brief");
+
+    for (file, was) in files.iter().zip(&before) {
+        let now = std::fs::read(file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        assert!(
+            &now == was,
+            "{} changed across the render ({} bytes before, {} after)",
+            file.display(),
+            was.len(),
+            now.len()
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The brief inside its wall budget, over a hundred runs
 
