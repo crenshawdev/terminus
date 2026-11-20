@@ -2094,20 +2094,18 @@ fn a_store_whose_summary_is_not_marked_filled_renders_no_brief() {
 
         bench.before_the_upgrade(sql);
         assert_eq!(bench.brief(project), None, "{shape}");
-        if n == 0 {
-            let cwd = bench.project(project);
-            let payload = Payload {
-                session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
-                transcript_path: None,
-                cwd: cwd.to_str(),
-                prompt: None,
-                source: Some("startup"),
-            };
-            assert!(
-                brief::session_start_reads(&bench.data_dir, &Config::default(), &payload).is_none(),
-                "{shape}: the reads path renders where the hook would not"
-            );
-        }
+        let cwd = bench.project(project);
+        let payload = Payload {
+            session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
+            transcript_path: None,
+            cwd: cwd.to_str(),
+            prompt: None,
+            source: Some("startup"),
+        };
+        assert!(
+            brief::session_start_reads(&bench.data_dir, &Config::default(), &payload).is_none(),
+            "{shape}: the reads path renders where the hook would not"
+        );
 
         let session = format!("99999999-0000-4000-8000-{n:012}");
         assert_eq!(bench.compacted_as(&session, project), None, "{shape}");
