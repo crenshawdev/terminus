@@ -1221,3 +1221,53 @@ pub fn cache_misses(conn: &rusqlite::Connection) -> i64 {
     assert_eq!(rc, ffi::SQLITE_OK, "sqlite3_db_status refused CACHE_MISS");
     i64::from(current)
 }
+
+/// Drop a file's pages from the kernel's page cache: fsync it so none is left
+/// dirty, then advise the whole file `DONTNEED`. Linux only, no root. The call is
+/// advisory, so a caller that needs the pages gone checks with
+/// [`resident_pages`].
+#[cfg(target_os = "linux")]
+pub fn evict_from_page_cache(path: &Path) {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    file.sync_all()
+        .unwrap_or_else(|e| panic!("sync {}: {e}", path.display()));
+    // SAFETY: the descriptor stays open for the whole call and the call touches no memory of ours.
+    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    assert_eq!(rc, 0, "posix_fadvise on {} returned {rc}", path.display());
+}
+
+/// How many of a file's pages are in the kernel's page cache right now. A
+/// zero-length file has none. Maps the file and asks `mincore`, which faults
+/// nothing in. Linux only.
+#[cfg(target_os = "linux")]
+pub fn resident_pages(path: &Path) -> usize {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let len = file.metadata().unwrap().len() as usize;
+    if len == 0 {
+        return 0;
+    }
+    // SAFETY: sysconf takes no pointer.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    // SAFETY: a read-only shared map of an open file; the kernel picks the address and the result is checked below.
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(map, libc::MAP_FAILED, "mmap {}", path.display());
+    let mut resident = vec![0u8; len.div_ceil(page)];
+    // SAFETY: `map` is a live mapping of `len` bytes and the vector holds one byte per page of it.
+    let rc = unsafe { libc::mincore(map, len, resident.as_mut_ptr()) };
+    let failure = std::io::Error::last_os_error();
+    // SAFETY: unmapping exactly what was mapped above, and nothing else holds a reference into it.
+    unsafe { libc::munmap(map, len) };
+    assert_eq!(rc, 0, "mincore {}: {failure}", path.display());
+    resident.iter().filter(|byte| **byte & 1 == 1).count()
+}

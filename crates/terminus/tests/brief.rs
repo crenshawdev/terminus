@@ -68,7 +68,17 @@ struct Bench {
 }
 
 fn bench() -> Bench {
-    let dir = tempfile::tempdir().unwrap();
+    bench_from(tempfile::tempdir().unwrap())
+}
+
+/// A bench whose directory is made under `parent`, for a test that needs the
+/// store on a real filesystem rather than the tmpfs `/tmp` can be.
+#[cfg(target_os = "linux")]
+fn bench_in(parent: &std::path::Path) -> Bench {
+    bench_from(tempfile::tempdir_in(parent).unwrap())
+}
+
+fn bench_from(dir: tempfile::TempDir) -> Bench {
     let data_dir = dir.path().join("data");
     let work = dir.path().join("work");
     let config_dir = dir.path().join("config");
@@ -643,4 +653,85 @@ fn the_session_start_document_carries_a_c1_control_raw() {
         .as_str()
         .unwrap();
     assert!(context.contains('\u{9b}'), "{context:?}");
+}
+
+// ---------------------------------------------------------------------------
+// One brief from a cold page cache
+
+/// One `SessionStart` render, with `terminus.db` and its `-wal` evicted from
+/// the page cache first, still delivers a brief. The elapsed time is printed and
+/// never asserted: a slow runner must not turn this into a wall-clock failure.
+///
+/// Cold means those two files and nothing else. The hook binary and the small
+/// files (the config, the state file and the `.git` files) stay warm, because
+/// the binary runs on every prompt and this work changes only what the store
+/// read costs. Eviction is `posix_fadvise` after an fsync and needs no root, and
+/// the test shows that no page of either file is resident before it renders: an
+/// advisory call that did nothing must never produce a figure labelled cold.
+/// The store is built under the target directory, because `/tmp` can be a tmpfs
+/// where there is nothing to evict. The test holds the ingest lock, so the
+/// hook's own detached ingest can neither warm the files nor race the read.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_start_from_a_cold_page_cache_still_delivers_the_brief() {
+    use terminus_core::ingest::{self, Attempt};
+    use terminus_core::store::{Store, DB_FILE_NAME};
+
+    let bench = bench_in(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")));
+    bench.ingest(MOVED_FIXTURE);
+
+    let _lock = match ingest::lock::try_acquire(&bench.data_dir).unwrap() {
+        Attempt::Acquired(lock) => lock,
+        Attempt::Held => panic!("nothing else holds the lock before this test takes it"),
+    };
+    assert!(
+        matches!(
+            ingest::lock::try_acquire(&bench.data_dir).unwrap(),
+            Attempt::Held
+        ),
+        "the lock is not held, so the hook would not meet a held one"
+    );
+
+    // A read-only open is what brings the WAL and the SHM into being.
+    drop(Store::open_read_only(&bench.data_dir).expect("open the store for reading"));
+    let db = bench.data_dir.join(DB_FILE_NAME);
+    let wal = bench.data_dir.join(format!("{DB_FILE_NAME}-wal"));
+    assert!(db.is_file() && wal.is_file(), "the store has no db and wal");
+
+    // The check can see pages: read both files whole, and the db has some.
+    for file in [&db, &wal] {
+        std::fs::read(file).unwrap();
+    }
+    assert!(
+        testkit::resident_pages(&db) > 0,
+        "no page of the db is resident after reading it whole"
+    );
+
+    for file in [&db, &wal] {
+        testkit::evict_from_page_cache(file);
+        assert_eq!(
+            testkit::resident_pages(file),
+            0,
+            "{} still has pages in the page cache after eviction",
+            file.display()
+        );
+    }
+
+    let started = Instant::now();
+    let output = bench.hook("SessionStart", &payload(&bench.project(MOVED_FIXTURE)));
+    let elapsed = started.elapsed();
+    let context = additional_context(&output, "the render from a cold page cache");
+    assert!(!context.is_empty(), "the render carried no brief");
+    println!(
+        "one SessionStart from a cold page cache: {:.1} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+}
+
+/// The cold page cache test needs `posix_fadvise` and `mincore`, which macOS
+/// doesn't have.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_session_start_from_a_cold_page_cache_still_delivers_the_brief() {
+    println!("skipped: a cold page cache needs posix_fadvise, which is Linux only");
 }
