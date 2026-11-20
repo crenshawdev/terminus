@@ -743,3 +743,69 @@ fn a_file_edited_in_the_prefix_and_again_in_the_tail_reads_the_same_as_one_pass(
         assert_eq!(held, r#"["src/a.rs","src/c.rs","src/b.rs"]"#);
     }
 }
+
+/// Each edit below is a state a retention or reindex that skipped the summary
+/// would leave, made on a store the check accepted a moment before and undone
+/// before the next. The check has to fail on it and name the table it broke.
+#[test]
+fn the_check_fails_on_each_state_a_skipped_summary_would_leave() {
+    let world = World::new();
+    let id = "99999999-0000-4000-8000-000000000001";
+    let data = world.data("store");
+    let main = world.main_path(FOLDER, id);
+    write(&main, &talk(Some(&world.cwd("repo")), "h1", 4));
+    committed(ingest::run_with(&data, &main, &world.config()).unwrap());
+    let conn = open(&data);
+    testkit::check_summary(&conn).unwrap();
+    let row = session_row(&conn, id);
+    assert_eq!(row[column("session_summary", "has_typed_prompt", &conn)], Cell::Integer(1));
+    assert_ne!(row[column("session_summary", "reply_id", &conn)], Cell::Null);
+
+    let edits: [(&str, &str, &[&str]); 5] = [
+        (
+            "a row for a session that is gone",
+            "INSERT INTO sessions (session_key, session_no) VALUES ('ghost', 99);
+             INSERT INTO session_summary
+                 (session_key, has_typed_prompt, turn_count, prompts, edited_files)
+             VALUES ('ghost', 0, 0, '[]', '[]')",
+            &["session_summary"],
+        ),
+        (
+            "a pair no session holds",
+            "INSERT INTO project_summary
+                 (pair_key, project, project_pre_worktree, session_count, turn_count)
+             VALUES (json_array('/nowhere', NULL), '/nowhere', NULL, 1, 1)",
+            &["project_summary"],
+        ),
+        (
+            "a wrong turn count",
+            "UPDATE session_summary SET turn_count = turn_count + 1",
+            &["session_summary", "turn_count"],
+        ),
+        (
+            "a prompt naming a missing turn",
+            "UPDATE session_summary SET prompts = json_array(json_array(999999999, 0, 1))",
+            &["session_summary", "prompts"],
+        ),
+        (
+            "a reply naming a missing turn",
+            "UPDATE session_summary SET reply_id = 999999999",
+            &["session_summary", "reply_id"],
+        ),
+    ];
+    for (what, sql, names) in edits {
+        testkit::check_summary(&conn).unwrap_or_else(|e| panic!("{what}: before the edit: {e}"));
+        conn.execute_batch("BEGIN").unwrap();
+        conn.execute_batch(sql).unwrap();
+        let complaint = testkit::check_summary(&conn)
+            .expect_err(&format!("{what}: the check accepted it"));
+        conn.execute_batch("ROLLBACK").unwrap();
+        for name in names {
+            assert!(
+                complaint.contains(name),
+                "{what}: the complaint does not name {name}: {complaint}"
+            );
+        }
+    }
+    testkit::check_summary(&conn).unwrap();
+}
