@@ -2440,3 +2440,224 @@ fn the_page_counter_counts_each_page_a_connection_loads_once() {
         "a second connection counts alike"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The pages the brief reads do not follow the size of the store
+// ---------------------------------------------------------------------------
+
+/// What one store of the page-count test holds besides the picked session: how
+/// many titled sessions in the picked project and in another one, how many
+/// untitled sessions dated just before the picked one, and how many sessions
+/// under the excluded worktree key dated just after it.
+struct Fill {
+    titled_in_project: usize,
+    titled_elsewhere: usize,
+    untitled: usize,
+    excluded: usize,
+}
+
+/// The session the brief picks in both stores: the newest in `project-zeta`
+/// that the worktree exclusion keeps.
+const PICKED: Session<'static> = Session {
+    file: "picked.jsonl",
+    id: "99999999-9999-4999-8999-999999999999",
+    project: "project-zeta",
+    branch: None,
+    day: "2026-03-01",
+    prompt: "the picked prompt, about sprockets",
+    reply: "the picked reply, about sprockets",
+};
+
+/// The most pages the large store's brief may read beyond the small store's:
+/// the measured difference of 17, and 4 for a b-tree that grows a level.
+///
+/// The two stores hold the same pairs in `project_summary` and the same picked
+/// session. What differs is how deep the b-trees are, the table pages the
+/// list's few rows sit in, and the index pages the pick walks past the excluded
+/// sessions in front of it, about one page for every sixteen of them.
+const PAGE_ALLOWANCE: i64 = 21;
+
+impl Bench {
+    /// A store built the ordinary way, one transcript to a session.
+    ///
+    /// The blocks are archived spread evenly through one another, as sessions
+    /// of one project arrive among everyone else's. A block archived in a run
+    /// would sit in a few table pages and hide what a table row per session
+    /// costs.
+    fn filled(&self, fill: &Fill) {
+        // (kind, position among its block, project, day, titled)
+        let mut order: Vec<(f64, u32, usize, &str, &str, bool)> = Vec::new();
+        for (kind, count, project, day, titled) in [
+            (
+                1,
+                fill.titled_in_project,
+                PICKED.project,
+                "2026-01-01",
+                true,
+            ),
+            (
+                2,
+                fill.titled_elsewhere,
+                ELSEWHERE.project,
+                "2026-01-01",
+                true,
+            ),
+            (3, fill.untitled, PICKED.project, "2026-02-01", false),
+            (4, fill.excluded, FORKED.project, "2026-04-01", true),
+        ] {
+            for n in 0..count {
+                order.push((
+                    (n as f64 + 0.5) / count as f64,
+                    kind,
+                    n,
+                    project,
+                    day,
+                    titled,
+                ));
+            }
+        }
+        order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, kind, n, project, day, titled) in order {
+            let (file, id) = (
+                format!("k{kind}-{n}.jsonl"),
+                format!("{kind:08x}-0000-4000-8000-{n:012x}"),
+            );
+            let (prompt, reply) = (format!("prompt {kind}-{n}"), format!("reply {kind}-{n}"));
+            let session = Session {
+                file: &file,
+                id: &id,
+                project,
+                branch: None,
+                day,
+                prompt: &prompt,
+                reply: &reply,
+            };
+            if titled {
+                self.archive_titled(&session, &format!("Work number {kind}-{n}"));
+            } else {
+                self.archive(&session);
+            }
+        }
+        self.archive_titled(&PICKED, "The picked work");
+    }
+
+    /// How many pages the brief of the picked project reads in, under a config.
+    fn page_reads(&self, config: &Config) -> i64 {
+        let cwd = self.project(PICKED.project);
+        let payload = Payload {
+            session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
+            transcript_path: Some("/home/user/.claude/projects/-p/s.jsonl"),
+            cwd: cwd.to_str(),
+            prompt: None,
+            source: Some("startup"),
+        };
+        brief::session_start_page_reads(&self.data_dir, config, &payload).expect("a brief renders")
+    }
+
+    fn count(&self, sql: &str) -> i64 {
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
+                .unwrap();
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+}
+
+/// The pages a brief reads in stay inside a stated allowance when the sessions,
+/// the untitled ones and the excluded ones all grow tenfold, and the test can
+/// tell: take the indexes away and they don't, with the brief unchanged.
+///
+/// Two stores hold the same projects and the same picked session. The large one
+/// has ten times the sessions, ten times the untitled sessions the list would
+/// have to look at without a partial index, and ten times the sessions under
+/// the excluded worktree key that sit in front of the pick. Measured, in
+/// pages: small 29, large 46, large with the indexes dropped 94.
+#[test]
+fn the_pages_the_brief_reads_do_not_follow_the_size_of_the_store() {
+    let small = bench();
+    small.filled(&Fill {
+        titled_in_project: 80,
+        titled_elsewhere: 20,
+        untitled: 20,
+        excluded: 20,
+    });
+    let large = bench();
+    large.filled(&Fill {
+        titled_in_project: 810,
+        titled_elsewhere: 200,
+        untitled: 200,
+        excluded: 200,
+    });
+
+    let worktree = small.project(FORKED.project).to_string_lossy().into_owned();
+    let large_worktree = large.project(FORKED.project).to_string_lossy().into_owned();
+    let excluding = |worktree: String| Config::from_parts(Vec::new(), vec![worktree]);
+    let (small_config, large_config) = (excluding(worktree), excluding(large_worktree));
+
+    // The premises: what the two stores hold, counted.
+    let rows = |b: &Bench| b.count("SELECT count(*) FROM session_summary");
+    let in_project = |b: &Bench, extra: &str| {
+        b.count(&format!(
+            "SELECT count(*) FROM session_summary WHERE project = '{}' {extra}",
+            b.project(PICKED.project).to_string_lossy()
+        ))
+    };
+    for b in [&small, &large] {
+        assert!(
+            in_project(b, "AND title IS NOT NULL AND project_pre_worktree IS NULL") > 64,
+            "the picked project holds more titled sessions than the pick looks at"
+        );
+    }
+    assert!(rows(&large) >= 10 * rows(&small), "sessions");
+    let untitled = "AND title IS NULL";
+    assert!(in_project(&large, untitled) >= 10 * in_project(&small, untitled));
+    assert!(in_project(&small, untitled) > 0);
+    let excluded = "AND project_pre_worktree IS NOT NULL";
+    assert!(in_project(&large, excluded) >= 10 * in_project(&small, excluded));
+    assert!(in_project(&small, excluded) > 0);
+
+    let small_text = small.brief_with(PICKED.project, &small_config).unwrap();
+    let large_text = large.brief_with(PICKED.project, &large_config).unwrap();
+    for (name, text) in [("small", &small_text), ("large", &large_text)] {
+        assert!(text.contains(PICKED.prompt), "{name}: {text}");
+        assert!(!text.contains("Work number 4-"), "{name}: {text}");
+    }
+
+    let (small_pages, large_pages) = (
+        small.page_reads(&small_config),
+        large.page_reads(&large_config),
+    );
+    assert!(
+        large_pages <= small_pages + PAGE_ALLOWANCE,
+        "the large store's brief reads {large_pages} pages, the small one's {small_pages}"
+    );
+
+    // The same large store without its indexes: the answer is the same, and the
+    // pages are not.
+    let conn = rusqlite::Connection::open(large.data_dir.join(terminus_core::store::DB_FILE_NAME))
+        .unwrap();
+    let indexes: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND name LIKE 'idx\\_session\\_summary\\_%' ESCAPE '\\'",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(indexes.len(), 3, "{indexes:?}");
+    for name in &indexes {
+        conn.execute(&format!("DROP INDEX {name}"), []).unwrap();
+    }
+    drop(conn);
+    assert_eq!(
+        large.brief_with(PICKED.project, &large_config).unwrap(),
+        large_text,
+        "the indexes change the plan and not the answer"
+    );
+    let unindexed = large.page_reads(&large_config);
+    assert!(
+        unindexed > small_pages + PAGE_ALLOWANCE,
+        "without its indexes the large store reads {unindexed} pages"
+    );
+}
