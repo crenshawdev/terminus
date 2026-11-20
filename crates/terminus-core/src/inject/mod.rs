@@ -42,10 +42,6 @@ pub mod state;
 
 use std::path::Path;
 
-use rusqlite::Connection;
-
-use crate::error::Result;
-use crate::recall::scope::Scoped;
 use crate::store::Store;
 
 /// The shortest and longest a `session_id` may be and still name a file.
@@ -452,18 +448,6 @@ pub(crate) fn frame(description: &str, body: &str, budget: usize) -> Option<Stri
 
 fn framed(description: &str, body: &str) -> String {
     format!("{description} {QUOTED_HISTORY}\n{OPEN_TAG}\n{body}\n{CLOSE_TAG}")
-}
-
-/// One count over the visible rows of a scoped project.
-pub(crate) fn count(conn: &Connection, head: &str, scoped: &Scoped) -> Result<i64> {
-    let mut sql = format!("{head} WHERE 1 = 1");
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    scoped.push_filter(&mut sql, &mut params);
-
-    let count = conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| {
-        r.get(0)
-    })?;
-    Ok(count)
 }
 
 #[cfg(test)]

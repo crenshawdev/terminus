@@ -29,14 +29,10 @@
 //! the upgrade gets briefs once the first pass's fill commits, because the hook
 //! starts its ingest detached and renders straight away.
 //!
-//! The counts are read one way only: the project-only projection
-//! `scope::resolve` has already run, plus one targeted `count(*)` per number,
-//! and never `config::visible::sessions`. Measured on a store shaped like the
-//! real one - 2,000 sessions, 250,000 turns, warm - `sessions()` costs 6.2-6.8
-//! ms against 0.56-0.58 ms for the project-only join, because of its
-//! per-session `count(*)` over `turns` and its watermark lookup. The whole
-//! budget here is single digit milliseconds, so a brief built on it would spend
-//! the budget before reading a useful row.
+//! The counts are the sums of `session_count` and `turn_count` over the
+//! project's `project_summary` rows, filtered the way every scoped read is, so
+//! the pointer costs one aggregate over a handful of rows and no walk of
+//! `session_meta` or `turns`.
 //!
 //! **The live git fact is the branch, read as a file.**
 //! `session_meta.branch`, the branch the session's last record that named one
@@ -1098,8 +1094,14 @@ fn inside_project<'p>(path: &'p str, roots: &[&str]) -> Option<&'p str> {
 /// nothing archived renders no pointer at all - "0 sessions indexed" is a line
 /// that costs context and tells the model to stop asking.
 fn index_pointer(conn: &Connection, scoped: &Scoped) -> Option<String> {
-    let sessions = super::count(conn, SESSIONS, scoped).ok()?;
-    let turns = super::count(conn, TURNS, scoped).ok()?;
+    let mut sql = String::from(COUNTS);
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    scoped.push_filter(&mut sql, &mut params);
+    let (sessions, turns): (i64, i64) = conn
+        .query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .ok()?;
     if sessions == 0 {
         return None;
     }
@@ -1113,13 +1115,9 @@ fn index_pointer(conn: &Connection, scoped: &Scoped) -> Option<String> {
     ))
 }
 
-/// Sessions of the scoped project. `idx_session_meta_project` covers it.
-const SESSIONS: &str = "SELECT count(*) FROM session_meta m";
-
-/// Turns of those sessions. The join is on `session_key`, which is
-/// `session_meta`'s primary key and the leading column of `turns`'
-/// `UNIQUE (session_key, turn_seq)` index, so neither side is a scan.
-const TURNS: &str = "SELECT count(*) FROM turns t JOIN session_meta m USING (session_key)";
+/// Both counts of the scoped project's pairs, which `Scoped::push_filter` narrows by their two keys.
+const COUNTS: &str = "SELECT coalesce(sum(session_count), 0), coalesce(sum(turn_count), 0) \
+                      FROM project_summary m WHERE 1 = 1";
 
 /// `1 session` / `2 sessions`, for a brief that reads as English.
 fn plural(count: i64, noun: &str) -> String {
