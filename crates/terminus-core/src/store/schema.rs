@@ -403,6 +403,23 @@ CREATE TABLE IF NOT EXISTS session_summary (
     edited_files         TEXT    NOT NULL
 );
 
+-- The brief's reads, each in the pick's own order so none scans the table or
+-- sorts. `project_pre_worktree` trails every key so the worktree exclusion is
+-- answered in the index entry and a session it drops costs no table row.
+-- The first serves the pick with no branch, the second the pick on a branch, and
+-- the third the list of other sessions, which only ever wants titled sessions.
+--
+-- A store from before the summary has no summary tables, so `bring_forward`'s
+-- missing-table arm runs this batch and creates the indexes with the tables. A
+-- store that already holds the tables gets them at its next `reindex`.
+CREATE INDEX IF NOT EXISTS idx_session_summary_project_last
+    ON session_summary(project, last_turn_at, session_key, project_pre_worktree);
+CREATE INDEX IF NOT EXISTS idx_session_summary_project_branch_last
+    ON session_summary(project, branch, last_turn_at, session_key, project_pre_worktree);
+CREATE INDEX IF NOT EXISTS idx_session_summary_project_last_titled
+    ON session_summary(project, last_turn_at, session_key, project_pre_worktree)
+    WHERE title IS NOT NULL;
+
 -- OPERATIONAL.
 
 -- The byte offset just past the last newline of a transcript, never its end:
