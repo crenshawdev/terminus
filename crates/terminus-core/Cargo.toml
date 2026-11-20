@@ -41,6 +41,11 @@ path = "tests/backfill.rs"
 required-features = ["testkit"]
 
 [[test]]
+name = "brief_golden"
+path = "tests/brief_golden.rs"
+required-features = ["testkit"]
+
+[[test]]
 name = "capture"
 path = "tests/capture.rs"
 required-features = ["testkit"]
