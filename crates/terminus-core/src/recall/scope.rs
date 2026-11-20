@@ -210,6 +210,17 @@ impl Scoped {
 
 /// Resolve a scope against the project keys the archive holds.
 pub fn resolve(conn: &Connection, config: &Config, scope: &Scope) -> Result<Scoped> {
+    resolve_with(config, scope, || visible::projects(conn, config))
+}
+
+/// [`resolve`] over keys the caller reads, so every rule after the read exists once.
+///
+/// `read` runs only after the exclusion short circuit, as the read in `resolve` does.
+pub(crate) fn resolve_with(
+    config: &Config,
+    scope: &Scope,
+    read: impl FnOnce() -> Result<Vec<visible::ProjectKeys>>,
+) -> Result<Scoped> {
     // The short circuit for excluding everything. An exclusion of the
     // filesystem root is "read nothing", and answering it with a query would be
     // asking the store for rows it may not return.
@@ -217,7 +228,7 @@ pub fn resolve(conn: &Connection, config: &Config, scope: &Scope) -> Result<Scop
         return Ok(Scoped::nothing(Reason::EverythingExcluded));
     }
 
-    let keys = visible::projects(conn, config)?;
+    let keys = read()?;
 
     let mut excluded_projects: Vec<String> = keys
         .iter()

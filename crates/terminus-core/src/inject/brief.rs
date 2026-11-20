@@ -81,10 +81,11 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use super::{chars, clip, Payload};
+use crate::config::visible::ProjectKeys;
 use crate::config::Config;
 use crate::observe::egress::Redaction;
 use crate::observe::mechanical::WRITING_TOOLS;
-use crate::recall::scope::Scoped;
+use crate::recall::scope::{self, Scope, Scoped};
 use crate::recall::{excerpt, Query};
 use crate::store::{archive, Store};
 
@@ -101,7 +102,7 @@ pub fn session_start(data_dir: &Path, config: &Config, payload: &Payload) -> Opt
         owe_compaction(data_dir, payload);
     }
     let store = open_filled(data_dir)?;
-    let scoped = super::scoped(store.conn(), config, payload)?;
+    let scoped = scoped(store.conn(), config, payload)?;
     // Resolved at the entry point that holds the `Config` and carried down. A
     // brief is hook stdout, which is the model's first context of the session,
     // so its quotations are an egress boundary in exactly the way a search
@@ -128,7 +129,7 @@ pub fn session_start_reads(
     payload: &Payload,
 ) -> Option<excerpt::Reads> {
     let store = open_filled(data_dir)?;
-    let scoped = super::scoped(store.conn(), config, payload)?;
+    let scoped = scoped(store.conn(), config, payload)?;
     let brief = render(
         store.conn(),
         &scoped,
@@ -153,6 +154,46 @@ fn open_filled(data_dir: &Path) -> Option<Store> {
         .exists([crate::summary::META_SUMMARY_FILLED])
         .ok()?;
     filled.then_some(store)
+}
+
+/// The project the payload's `cwd` sits in, found among the pairs the summary holds.
+///
+/// `None` when the payload carries no `cwd`, when the read failed, or when the
+/// scope can match nothing at all - no pair, a directory no pair covers, or a
+/// project the config excludes. Every one of those is silence.
+fn scoped(conn: &Connection, config: &Config, payload: &Payload) -> Option<Scoped> {
+    let cwd = payload.cwd?;
+    let scope = Scope::Directory(cwd.into());
+    let scoped = scope::resolve_with(config, &scope, || summary_pairs(conn, config)).ok()?;
+    (!scoped.is_empty()).then_some(scoped)
+}
+
+/// The summary's `(project, project_pre_worktree)` pairs, ordered and flagged the way `visible::projects` does.
+fn summary_pairs(conn: &Connection, config: &Config) -> crate::error::Result<Vec<ProjectKeys>> {
+    let mut statement = conn
+        .prepare("SELECT project, project_pre_worktree FROM project_summary ORDER BY project, 2")?;
+    let rows = statement.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+        ))
+    })?;
+
+    let excludes = |key: &Option<String>| {
+        key.as_deref()
+            .is_some_and(|k| config.excludes_path(Path::new(k)))
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let (project, project_pre_worktree) = row?;
+        out.push(ProjectKeys {
+            project_excluded: excludes(&project),
+            pre_worktree_excluded: excludes(&project_pre_worktree),
+            project,
+            project_pre_worktree,
+        });
+    }
+    Ok(out)
 }
 
 /// Leave the next prompt an injection to make.

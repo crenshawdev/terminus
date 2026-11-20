@@ -2115,3 +2115,23 @@ fn a_store_whose_summary_is_not_marked_filled_renders_no_brief() {
         assert!(state.compaction_owed, "{shape}: the debt was not left");
     }
 }
+
+/// The brief finds its project among the summary's pairs, so a project the
+/// summary does not hold is unknown even where `session_meta` has its sessions.
+#[test]
+fn a_project_with_no_summary_row_renders_no_brief() {
+    let bench = bench();
+    bench.archive(&EARLY);
+    bench.archive(&LATE);
+    assert!(bench.brief(LATE.project).is_some(), "the control");
+
+    let conn = rusqlite::Connection::open(bench.data_dir.join(terminus_core::store::DB_FILE_NAME))
+        .unwrap();
+    let cwd = bench.project(LATE.project).to_string_lossy().into_owned();
+    let gone = conn
+        .execute("DELETE FROM project_summary WHERE project = ?1", [&cwd])
+        .unwrap();
+    assert_eq!(gone, 1, "the bench project has one pair");
+
+    assert_eq!(bench.brief(LATE.project), None);
+}
