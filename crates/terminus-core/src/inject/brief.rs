@@ -137,6 +137,28 @@ pub fn session_start_reads(
     Some(brief.reads)
 }
 
+/// How many pages the brief's one connection read in to render what
+/// [`session_start`] would: the open, the `meta` check, the scope's pair read, the
+/// pick, the list, the located row, the block read and the counts. Renders the
+/// same brief and writes no state. Test support only.
+#[cfg(feature = "testkit")]
+pub fn session_start_page_reads(
+    data_dir: &Path,
+    config: &Config,
+    payload: &Payload,
+) -> Option<i64> {
+    let store = open_filled(data_dir)?;
+    let scoped = scoped(store.conn(), config, payload)?;
+    render(
+        store.conn(),
+        &scoped,
+        config.brief_chars(),
+        &Redaction::of(config),
+        payload.cwd.and_then(checked_out_branch).as_deref(),
+    )?;
+    Some(crate::testkit::cache_misses(store.conn()))
+}
+
 /// The plan SQLite gives each statement the brief runs against the summary: the
 /// pick without a branch, the pick on `branch`, and the list of other sessions.
 /// Each is the detail column of `EXPLAIN QUERY PLAN`, one string per line,

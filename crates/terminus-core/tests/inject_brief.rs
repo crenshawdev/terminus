@@ -2365,3 +2365,78 @@ fn the_file_line_is_the_summarys_list() {
         "{brief}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The page counter
+// ---------------------------------------------------------------------------
+
+/// A scratch WAL-mode database with one table of 200 one-KiB blobs, and the
+/// number of pages `dbstat` gives that table.
+fn scratch_table(dir: &Path) -> (PathBuf, i64) {
+    let path = dir.join("scratch.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.pragma_update(None, "journal_mode", "wal").unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB NOT NULL)",
+        [],
+    )
+    .unwrap();
+    for _ in 0..200 {
+        conn.execute("INSERT INTO t (b) VALUES (randomblob(1024))", [])
+            .unwrap();
+    }
+    let pages = conn
+        .query_row("SELECT count(*) FROM dbstat WHERE name = ?1", ["t"], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    (path, pages)
+}
+
+/// Read every blob of `t` on a connection and return how far its counter moved.
+fn full_read(conn: &rusqlite::Connection) -> i64 {
+    let before = terminus_core::testkit::cache_misses(conn);
+    let mut statement = conn.prepare("SELECT b FROM t").unwrap();
+    let bytes: usize = statement
+        .query_map([], |r| Ok(r.get::<_, Vec<u8>>(0)?.len()))
+        .unwrap()
+        .map(Result::unwrap)
+        .sum();
+    assert_eq!(bytes, 200 * 1024);
+    terminus_core::testkit::cache_misses(conn) - before
+}
+
+/// The counter every page-count criterion rests on counts the pages one
+/// connection loads, once each, and the same number every time.
+///
+/// A full read of a table on a fresh connection loads at least the table's own
+/// pages and at most a couple more for the schema, and reading it again loads
+/// none, because the connection's page cache already holds them.
+#[test]
+fn the_page_counter_counts_each_page_a_connection_loads_once() {
+    // Measured at 2 over the table's pages: the schema page and one more. 4 leaves room.
+    const SLACK: i64 = 4;
+    let bench = bench();
+    std::fs::create_dir_all(&bench.work).unwrap();
+    let (path, pages) = scratch_table(&bench.work);
+    assert!(pages > 40, "the table is a real b-tree: {pages} pages");
+
+    let open = || {
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+    };
+    let first = open();
+    let moved = full_read(&first);
+    assert!(
+        (pages..=pages + SLACK).contains(&moved),
+        "a full read moved the counter by {moved}, and the table has {pages} pages"
+    );
+    assert_eq!(full_read(&first), 0, "the same read again loads nothing");
+
+    let second = open();
+    assert_eq!(
+        full_read(&second),
+        moved,
+        "a second connection counts alike"
+    );
+}

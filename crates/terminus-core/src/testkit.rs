@@ -1201,3 +1201,23 @@ fn check_project_summary(conn: &rusqlite::Connection) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// How many pages this connection has had to read in, from the database file or
+/// the WAL, because its own page cache didn't hold them. SQLite's
+/// `SQLITE_DBSTATUS_CACHE_MISS`, read without resetting it.
+pub fn cache_misses(conn: &rusqlite::Connection) -> i64 {
+    use rusqlite::ffi;
+    let (mut current, mut highwater) = (0, 0);
+    // SAFETY: the handle is the live connection's, and both out-pointers are locals that outlive the call.
+    let rc = unsafe {
+        ffi::sqlite3_db_status(
+            conn.handle(),
+            ffi::SQLITE_DBSTATUS_CACHE_MISS,
+            &mut current,
+            &mut highwater,
+            0,
+        )
+    };
+    assert_eq!(rc, ffi::SQLITE_OK, "sqlite3_db_status refused CACHE_MISS");
+    i64::from(current)
+}
