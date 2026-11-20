@@ -1,0 +1,39 @@
+{
+  "scope": "thorough",
+  "coverage": {
+    "lines": 85,
+    "branches": 0,
+    "statements": 0,
+    "include": [
+      "crates/*/src/**"
+    ],
+    "exclude": [
+      "crates/terminus-core/src/testkit.rs"
+    ],
+    "commands": [
+      "cargo llvm-cov --workspace --all-features --locked --ignore-filename-regex 'crates/terminus-core/src/testkit\\.rs' --fail-under-lines {lines}"
+    ]
+  },
+  "strong_areas": [
+    "crates/terminus-core/src/store/",
+    "crates/terminus-core/src/blob/",
+    "crates/terminus-core/src/ingest/",
+    "crates/terminus-core/src/recover.rs",
+    "crates/terminus-core/src/retention/",
+    "crates/terminus-core/src/reindex.rs",
+    "crates/terminus-core/src/inject/",
+    "crates/terminus/src/cmd/hook.rs",
+    "crates/terminus/src/cmd/spawn.rs",
+    "crates/terminus/src/cmd/mcp/",
+    "crates/terminus/src/escape.rs",
+    "install.sh",
+    "scripts/sign-release.sh",
+    "crates/terminus/src/cmd/install/",
+    "crates/terminus/src/cmd/uninstall.rs",
+    "crates/terminus-core/src/observe/egress.rs",
+    "crates/terminus-core/src/owner_only.rs"
+  ],
+  "required_jobs": [
+    "test"
+  ]
+}
