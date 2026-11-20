@@ -2456,12 +2456,20 @@ struct Fill {
     excluded: usize,
 }
 
-/// The session the brief picks in both stores: the newest in `project-zeta`
+/// The `cwd` of each project in the page-count test: made up, absolute, and
+/// holding no temp path, so no index key's length depends on the machine. The
+/// bench's root joined to an absolute path is that path.
+const PICKED_CWD: &str = "/bench/project-zeta";
+const WORKTREE_CWD: &str = "/bench/project-zeta/.claude/worktrees/wt-a";
+const OTHER_CWD: &str = "/bench/project-eta";
+
+/// The session the brief picks in both stores: the newest in the picked project
 /// that the worktree exclusion keeps.
 const PICKED: Session<'static> = Session {
-    file: "picked.jsonl",
+    // Below a `projects` folder with a uuid name, ingest keys it by the name alone.
+    file: "projects/bench/99999999-9999-4999-8999-999999999999.jsonl",
     id: "99999999-9999-4999-8999-999999999999",
-    project: "project-zeta",
+    project: PICKED_CWD,
     branch: None,
     day: "2026-03-01",
     prompt: "the picked prompt, about sprockets",
@@ -2470,6 +2478,9 @@ const PICKED: Session<'static> = Session {
 
 /// The most pages the large store's brief may read beyond the small store's:
 /// the measured difference of 17, and 4 for a b-tree that grows a level.
+///
+/// No index column holds a temp path, so the count is the same under any
+/// `TMPDIR`: 28 and 45 here and under a 120-character one.
 ///
 /// The two stores hold the same pairs in `project_summary` and the same picked
 /// session. What differs is how deep the b-trees are, the table pages the
@@ -2495,15 +2506,9 @@ impl Bench {
                 "2026-01-01",
                 true,
             ),
-            (
-                2,
-                fill.titled_elsewhere,
-                ELSEWHERE.project,
-                "2026-01-01",
-                true,
-            ),
+            (2, fill.titled_elsewhere, OTHER_CWD, "2026-01-01", true),
             (3, fill.untitled, PICKED.project, "2026-02-01", false),
-            (4, fill.excluded, FORKED.project, "2026-04-01", true),
+            (4, fill.excluded, WORKTREE_CWD, "2026-04-01", true),
         ] {
             for n in 0..count {
                 order.push((
@@ -2519,7 +2524,7 @@ impl Bench {
         order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         for (_, kind, n, project, day, titled) in order {
             let (file, id) = (
-                format!("k{kind}-{n}.jsonl"),
+                format!("projects/bench/{kind:08x}-0000-4000-8000-{n:012x}.jsonl"),
                 format!("{kind:08x}-0000-4000-8000-{n:012x}"),
             );
             let (prompt, reply) = (format!("prompt {kind}-{n}"), format!("reply {kind}-{n}"));
@@ -2554,6 +2559,36 @@ impl Bench {
         brief::session_start_page_reads(&self.data_dir, config, &payload).expect("a brief renders")
     }
 
+    /// No `project`, `session_key` or `project_pre_worktree` of `session_summary`
+    /// holds this bench's directory, as given or canonical.
+    fn assert_no_temp_path_in_the_index_keys(&self) {
+        let dir = self._dir.path();
+        let canonical = dir.canonicalize().unwrap();
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
+                .unwrap();
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM session_summary", [], |r| r.get(0))
+            .unwrap();
+        assert!(total > 0, "the store holds no sessions");
+        for path in [dir, canonical.as_path()] {
+            let holding: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM session_summary WHERE instr(project, ?1) > 0 \
+                     OR instr(session_key, ?1) > 0 OR instr(project_pre_worktree, ?1) > 0",
+                    [path.to_string_lossy()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                holding,
+                0,
+                "{holding} of {total} rows hold {}",
+                path.display()
+            );
+        }
+    }
+
     fn count(&self, sql: &str) -> i64 {
         let conn =
             rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
@@ -2570,7 +2605,7 @@ impl Bench {
 /// has ten times the sessions, ten times the untitled sessions the list would
 /// have to look at without a partial index, and ten times the sessions under
 /// the excluded worktree key that sit in front of the pick. Measured, in
-/// pages: small 29, large 46, large with the indexes dropped 94.
+/// pages: small 28, large 45, large with the indexes dropped 87.
 #[test]
 fn the_pages_the_brief_reads_do_not_follow_the_size_of_the_store() {
     let small = bench();
@@ -2588,12 +2623,13 @@ fn the_pages_the_brief_reads_do_not_follow_the_size_of_the_store() {
         excluded: 200,
     });
 
-    let worktree = small.project(FORKED.project).to_string_lossy().into_owned();
-    let large_worktree = large.project(FORKED.project).to_string_lossy().into_owned();
-    let excluding = |worktree: String| Config::from_parts(Vec::new(), vec![worktree]);
-    let (small_config, large_config) = (excluding(worktree), excluding(large_worktree));
+    let excluding = || Config::from_parts(Vec::new(), vec![WORKTREE_CWD.to_owned()]);
+    let (small_config, large_config) = (excluding(), excluding());
 
-    // The premises: what the two stores hold, counted.
+    // The premises: what the two stores hold, counted. No index column holds the
+    // temp path, which is what keeps the count the same on every machine.
+    small.assert_no_temp_path_in_the_index_keys();
+    large.assert_no_temp_path_in_the_index_keys();
     let rows = |b: &Bench| b.count("SELECT count(*) FROM session_summary");
     let in_project = |b: &Bench, extra: &str| {
         b.count(&format!(
