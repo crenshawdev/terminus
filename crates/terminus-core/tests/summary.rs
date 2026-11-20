@@ -532,3 +532,111 @@ fn no_column_of_either_table_holds_prompt_or_reply_text() {
         }
     }
 }
+
+/// `(id, stream_offset, byte_len)` of the turn at `turn_seq`, off its `turns` row.
+fn turn_locator(conn: &Connection, id: &str, turn_seq: i64) -> Value {
+    let (turn, offset, len): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT id, stream_offset, byte_len FROM turns
+             WHERE session_key LIKE ?1 AND turn_seq = ?2",
+            rusqlite::params![format!("%{id}%"), turn_seq],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    json!([turn, offset, len])
+}
+
+fn text_of(row: &[Cell], conn: &Connection, name: &str) -> String {
+    match &row[column("session_summary", name, conn)] {
+        Cell::Text(text) => text.clone(),
+        other => panic!("{name} is {other:?}"),
+    }
+}
+
+#[test]
+fn the_row_locates_the_newest_twelve_typed_prompts_and_a_reply_that_is_only_a_tool_call() {
+    let world = World::new();
+    let id = "44444444-0000-4000-8000-000000000001";
+    let mut text = String::new();
+    let mut n = 0;
+    // Fourteen typed prompts, each followed by a tool result (a `user` record
+    // nobody typed) and an assistant answer: turn sequences 0, 3, 6 ... 39.
+    for i in 0..14 {
+        text += &rec("j1", n, said("user", &format!("typed prompt {i}")));
+        text += &rec(
+            "j1",
+            n + 1,
+            json!({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "out"}]}}),
+        );
+        text += &rec("j1", n + 2, said("assistant", &format!("answer {i}")));
+        n += 3;
+    }
+    // The session ends on an assistant turn holding only a tool call.
+    text += &rec(
+        "j1",
+        n,
+        json!({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t9", "name": "Bash", "input": {"command": "ls"}}]}}),
+    );
+    write(&world.main_path(FOLDER, id), &text);
+
+    for data in world.archive_three_ways() {
+        let conn = open(&data);
+        testkit::check_summary(&conn).unwrap();
+        let row = session_row(&conn, id);
+        // Prompts 13 down to 2, at turn sequences 39, 36 ... 6.
+        let expected: Vec<Value> = (2..14)
+            .rev()
+            .map(|i| turn_locator(&conn, id, 3 * i))
+            .collect();
+        assert_eq!(expected.len(), 12);
+        let held: Value = serde_json::from_str(&text_of(&row, &conn, "prompts")).unwrap();
+        assert_eq!(held, Value::Array(expected));
+
+        let last = turn_locator(&conn, id, 42);
+        let at = |name| row[column("session_summary", name, &conn)].clone();
+        assert_eq!(
+            vec![
+                at("reply_id"),
+                at("reply_stream_offset"),
+                at("reply_byte_len")
+            ],
+            last.as_array()
+                .unwrap()
+                .iter()
+                .map(|v| Cell::Integer(v.as_i64().unwrap()))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn a_session_that_was_never_answered_locates_its_prompts_and_no_reply() {
+    let world = World::new();
+    let id = "55555555-0000-4000-8000-000000000001";
+    let text = [
+        rec("k1", 0, said("user", "first ask")),
+        rec("k1", 1, said("user", "second ask")),
+    ]
+    .concat();
+    write(&world.main_path(FOLDER, id), &text);
+
+    for data in world.archive_three_ways() {
+        let conn = open(&data);
+        testkit::check_summary(&conn).unwrap();
+        let row = session_row(&conn, id);
+        let held: Value = serde_json::from_str(&text_of(&row, &conn, "prompts")).unwrap();
+        assert_eq!(
+            held,
+            json!([turn_locator(&conn, id, 1), turn_locator(&conn, id, 0)])
+        );
+        for name in ["reply_id", "reply_stream_offset", "reply_byte_len"] {
+            assert_eq!(
+                row[column("session_summary", name, &conn)],
+                Cell::Null,
+                "{name}"
+            );
+        }
+    }
+}

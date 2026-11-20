@@ -1021,12 +1021,23 @@ const EXPECTED_SESSION_ROW: &str = "\
            (SELECT title FROM session_titles s WHERE s.session_key = m.session_key),
            EXISTS (SELECT 1 FROM turns t
                    WHERE t.session_key = m.session_key AND t.is_typed = 1),
-           (SELECT count(*) FROM turns t WHERE t.session_key = m.session_key)
+           (SELECT count(*) FROM turns t WHERE t.session_key = m.session_key),
+           (SELECT json_group_array(json_array(id, stream_offset, byte_len)) FROM
+              (SELECT id, stream_offset, byte_len FROM turns
+               WHERE session_key = ?1 AND record_type = 'user' AND is_typed IS NOT 0
+               ORDER BY turn_seq DESC LIMIT 12)),
+           (SELECT id FROM turns WHERE session_key = ?1 AND record_type = 'assistant'
+            ORDER BY turn_seq DESC LIMIT 1),
+           (SELECT stream_offset FROM turns WHERE session_key = ?1
+            AND record_type = 'assistant' ORDER BY turn_seq DESC LIMIT 1),
+           (SELECT byte_len FROM turns WHERE session_key = ?1
+            AND record_type = 'assistant' ORDER BY turn_seq DESC LIMIT 1)
     FROM session_meta m WHERE m.session_key = ?1";
 
 const STORED_SESSION_ROW: &str = "\
     SELECT last_turn_at, branch, project, project_pre_worktree, cwd, title,
-           has_typed_prompt, turn_count
+           has_typed_prompt, turn_count, prompts, reply_id, reply_stream_offset,
+           reply_byte_len
     FROM session_summary WHERE session_key = ?1";
 
 const SESSION_COLUMNS: &[&str] = &[
@@ -1038,6 +1049,10 @@ const SESSION_COLUMNS: &[&str] = &[
     "title",
     "has_typed_prompt",
     "turn_count",
+    "prompts",
+    "reply_id",
+    "reply_stream_offset",
+    "reply_byte_len",
 ];
 
 fn check_session_summary(conn: &rusqlite::Connection) -> Result<(), String> {

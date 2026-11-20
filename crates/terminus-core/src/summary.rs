@@ -108,12 +108,15 @@ fn keep_session(conn: &Connection, session_key: &str) -> Result<()> {
         .prepare_cached("SELECT 1 FROM turns WHERE session_key = ?1 AND is_typed = 1 LIMIT 1")?
         .exists([session_key])?;
 
+    let prompts = newest_prompts(conn, session_key)?;
+    let reply = newest_reply(conn, session_key)?;
+
     conn.prepare_cached(
         "INSERT OR REPLACE INTO session_summary (
             session_key, last_turn_at, branch, project, project_pre_worktree, cwd,
             title, has_typed_prompt, turn_count, prompts,
             reply_id, reply_stream_offset, reply_byte_len, edited_files
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '[]', NULL, NULL, NULL, '[]')",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, '[]')",
     )?
     .execute(rusqlite::params![
         session_key,
@@ -125,8 +128,57 @@ fn keep_session(conn: &Connection, session_key: &str) -> Result<()> {
         title,
         typed,
         turn_count(conn, session_key)?,
+        serde_json::json!(prompts).to_string(),
+        reply.map(|(id, _, _)| id),
+        reply.map(|(_, offset, _)| offset),
+        reply.map(|(_, _, len)| len),
     ])?;
     Ok(())
+}
+
+/// How many of a session's newest typed prompts the row locates: the number the
+/// brief looks at to find the few it quotes. The quoting, the length rule and
+/// the read budget stay with the brief, which reads the text and redacts it.
+const PROMPTS_KEPT: i64 = 12;
+
+/// `(id, stream_offset, byte_len)` of one `turns` row: where a turn's bytes sit
+/// in the session's stream, never what they say.
+type Locator = (i64, i64, i64);
+
+/// The newest typed `user` turns, newest first, or all when fewer. A `user`
+/// record nobody typed is skipped, and the order is `turn_seq` and never `ts`.
+fn newest_prompts(conn: &Connection, session_key: &str) -> Result<Vec<Locator>> {
+    locators(
+        conn,
+        "SELECT id, stream_offset, byte_len FROM turns
+         WHERE session_key = ?1 AND record_type = 'user' AND is_typed IS NOT 0
+         ORDER BY turn_seq DESC LIMIT ?2",
+        session_key,
+        PROMPTS_KEPT,
+    )
+}
+
+/// The newest `assistant` turn, whatever it holds: a turn that is only a tool
+/// call is still the last reply.
+fn newest_reply(conn: &Connection, session_key: &str) -> Result<Option<Locator>> {
+    Ok(locators(
+        conn,
+        "SELECT id, stream_offset, byte_len FROM turns
+         WHERE session_key = ?1 AND record_type = 'assistant'
+         ORDER BY turn_seq DESC LIMIT ?2",
+        session_key,
+        1,
+    )?
+    .pop())
+}
+
+fn locators(conn: &Connection, sql: &str, session_key: &str, limit: i64) -> Result<Vec<Locator>> {
+    Ok(conn
+        .prepare_cached(sql)?
+        .query_map(rusqlite::params![session_key, limit], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?)
 }
 
 /// Move this file's sessions and turns onto the pair the stored row names now.
