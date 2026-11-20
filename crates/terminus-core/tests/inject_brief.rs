@@ -2157,3 +2157,66 @@ fn the_pointer_names_the_counts_the_summary_holds() {
     let brief = bench.brief(LATE.project).expect("a brief");
     assert!(brief.contains("7 sessions and 41 turns"), "{brief}");
 }
+
+impl Bench {
+    /// Set columns of one session's summary row by hand, as the one row it should be.
+    fn edit_summary(&self, session_id: &str, set: &str) {
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
+                .unwrap();
+        let changed = conn
+            .execute(
+                &format!(
+                    "UPDATE session_summary SET {set} WHERE session_key IN \
+                     (SELECT session_key FROM session_meta WHERE session_id = '{session_id}')"
+                ),
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "{session_id}: {set}");
+    }
+}
+
+/// Two titled sessions of one project, each with a typed prompt, the newer one picked.
+fn two_titled() -> Bench {
+    let bench = bench();
+    bench.archive_titled(&titled("a.jsonl", "a", "2026-08-10"), "Older work");
+    bench.archive_titled(&titled("b.jsonl", "b", "2026-08-12"), "Newer work");
+    let control = bench.brief("listed").expect("a brief");
+    assert!(control.contains("ended 2026-08-12."), "{control}");
+    assert!(control.contains("2026-08-10 Older work"), "{control}");
+    bench
+}
+
+#[test]
+fn a_listed_sessions_title_is_the_summarys() {
+    let bench = two_titled();
+    bench.edit_summary("a", "title = 'Title from the summary'");
+    let brief = bench.brief("listed").expect("a brief");
+    assert!(
+        brief.contains("2026-08-10 Title from the summary"),
+        "{brief}"
+    );
+    assert!(!brief.contains("Older work"), "{brief}");
+}
+
+#[test]
+fn the_picked_sessions_branch_is_the_summarys() {
+    let bench = two_titled();
+    bench.edit_summary("b", "branch = 'branch-from-the-summary'");
+    let brief = bench.brief("listed").expect("a brief");
+    assert!(
+        brief.contains("ended 2026-08-12, on branch branch-from-the-summary."),
+        "{brief}"
+    );
+}
+
+#[test]
+fn the_sessions_are_ordered_by_the_summarys_last_turn_at() {
+    let bench = two_titled();
+    bench.edit_summary("a", "last_turn_at = '2026-08-20T10:00:00.000Z'");
+    let brief = bench.brief("listed").expect("a brief");
+    assert!(brief.contains("ended 2026-08-20."), "{brief}");
+    assert!(brief.contains("2026-08-12 Newer work"), "{brief}");
+    assert!(!brief.contains("Older work"), "{brief}");
+}

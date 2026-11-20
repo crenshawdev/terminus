@@ -35,8 +35,8 @@
 //! `session_meta` or `turns`.
 //!
 //! **The live git fact is the branch, read as a file.**
-//! `session_meta.branch`, the branch the session's last record that named one
-//! was on, is the only git fact the archive holds. A fuller delta
+//! The branch the summary stores, the one the session's last record that named
+//! one was on, is the only git fact the archive holds. A fuller delta
 //! would add HEAD-then-versus-now and a dirty-file list, and both need `git`,
 //! whose 10-30 ms process spawn is the whole budget several times over -
 //! `project::Resolver` is already kept off the cold-start path for the same
@@ -273,7 +273,7 @@ struct Brief {
 /// catch, and the brief would be the one output where a long turn leaks.
 ///
 /// The head line, the branch and the index pointer are built here out of
-/// `session_meta` and counts and are not redacted. The day, the branch and the
+/// `session_summary` and counts and are not redacted. The day, the branch and the
 /// project label are archived strings all the same, so each has any closing tag
 /// neutralized where it is built.
 ///
@@ -547,7 +547,7 @@ fn project_label(scoped: &Scoped) -> &str {
     scoped.project().unwrap_or("this machine")
 }
 
-/// The `session_meta` row the brief is about, and the coordinates it needs.
+/// The `session_summary` row the brief is about, and the coordinates it needs.
 struct LastSession {
     session_key: String,
     last_turn_at: Option<String>,
@@ -635,9 +635,9 @@ const TITLE_CHARS: usize = 80;
 /// The newest sessions other than the one the brief is about, with a typed
 /// prompt and a title, one `<day> <title>` line each.
 ///
-/// `CROSS JOIN` for the reason [`edited_files`] gives: left alone, SQLite may start
-/// from every title in the store. A session a script ran has no typed prompt, so
-/// it isn't listed. Any failure is just no list.
+/// The 64 newest titled rows are read and the typed test is applied to each after
+/// the limit, as [`newest`] explains. A session a script ran has no typed prompt,
+/// so it isn't listed. Any failure is just no list.
 fn other_sessions(
     conn: &Connection,
     scoped: &Scoped,
@@ -645,9 +645,8 @@ fn other_sessions(
     redaction: &Redaction,
 ) -> Option<String> {
     let mut sql = String::from(
-        "SELECT m.session_key, m.last_turn_at, s.title FROM session_meta m \
-         CROSS JOIN session_titles s ON s.session_key = m.session_key \
-         WHERE m.parent_session_key IS NULL",
+        "SELECT m.session_key, m.last_turn_at, m.title, m.has_typed_prompt \
+         FROM session_summary m WHERE m.title IS NOT NULL",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     scoped.push_filter(&mut sql, &mut params);
@@ -661,18 +660,17 @@ fn other_sessions(
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, bool>(3)?,
             ))
         })
         .ok()?;
 
     let mut lines: Vec<String> = Vec::new();
-    for (session_key, last_turn_at, title) in rows.flatten() {
+    for (session_key, last_turn_at, title, typed) in rows.flatten() {
         if lines.len() == SESSIONS_NAMED {
             break;
         }
-        if picked == Some(session_key.as_str())
-            || !has_typed_prompt(conn, &session_key).unwrap_or(false)
-        {
+        if picked == Some(session_key.as_str()) || !typed {
             continue;
         }
         let title = clip(
@@ -729,7 +727,8 @@ fn pick_session(
 const SESSIONS_LOOKED_AT: i64 = 64;
 
 /// The greatest `last_turn_at` among the scoped project's own sessions, on one
-/// branch if asked and with a typed prompt if asked.
+/// branch if asked and with a typed prompt if asked. `session_summary` holds main
+/// sessions only.
 ///
 /// Three things this query is not. It is not `is_final`: that column is
 /// declared in the schema and never written, so ordering by it would name a
@@ -737,8 +736,7 @@ const SESSIONS_LOOKED_AT: i64 = 64;
 /// comparison: 22,412 turns of a 180-file sample carry exactly the shape
 /// `NNNN-NN-NNTNN:NN:NN.NNNZ`, which sorts lexicographically, so
 /// no parsing happens on the stored side. And it does not consider sidecars: a
-/// session with a `parent_session_key` is a subagent transcript, and the brief
-/// carries no subagent turns.
+/// subagent transcript has no summary row, and the brief carries no subagent turns.
 ///
 /// The tie-break on `session_key` is the brief's own, not SQL's: two sessions
 /// whose last turn carries the same timestamp must not be ordered by whatever
@@ -749,8 +747,10 @@ const SESSIONS_LOOKED_AT: i64 = 64;
 /// always wins over one that does not, and a project where nothing has a
 /// timestamp still names a session.
 ///
-/// The typed check runs row by row after the sort. As an `EXISTS` in the `WHERE`
-/// SQLite would run it for every session in the project before sorting.
+/// The typed check runs on each row after the limit, and never in the `WHERE`,
+/// though `has_typed_prompt` is a column: with the test in the `WHERE`, a project
+/// with more than 64 newer one-shot or other-branch sessions would name a
+/// different session than it always has.
 fn newest(
     conn: &Connection,
     scoped: &Scoped,
@@ -759,7 +759,7 @@ fn newest(
 ) -> crate::error::Result<Option<LastSession>> {
     let mut sql = String::from(
         "SELECT m.session_key, m.last_turn_at, m.branch, m.project, m.cwd, \
-         m.project_pre_worktree FROM session_meta m WHERE m.parent_session_key IS NULL",
+         m.project_pre_worktree, m.has_typed_prompt FROM session_summary m WHERE 1 = 1",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     scoped.push_filter(&mut sql, &mut params);
@@ -772,29 +772,25 @@ fn newest(
 
     let mut statement = conn.prepare(&sql)?;
     let rows = statement.query_map(rusqlite::params_from_iter(params.iter()), |r| {
-        Ok(LastSession {
-            session_key: r.get(0)?,
-            last_turn_at: r.get(1)?,
-            branch: r.get(2)?,
-            project: r.get(3)?,
-            cwd: r.get(4)?,
-            pre_worktree: r.get(5)?,
-        })
+        Ok((
+            LastSession {
+                session_key: r.get(0)?,
+                last_turn_at: r.get(1)?,
+                branch: r.get(2)?,
+                project: r.get(3)?,
+                cwd: r.get(4)?,
+                pre_worktree: r.get(5)?,
+            },
+            r.get::<_, bool>(6)?,
+        ))
     })?;
     for row in rows {
-        let row = row?;
-        if !typed || has_typed_prompt(conn, &row.session_key)? {
+        let (row, has_typed_prompt) = row?;
+        if !typed || has_typed_prompt {
             return Ok(Some(row));
         }
     }
     Ok(None)
-}
-
-/// `UNIQUE (session_key, turn_seq)` covers it, and it stops at the first one.
-fn has_typed_prompt(conn: &Connection, session_key: &str) -> crate::error::Result<bool> {
-    let mut statement =
-        conn.prepare_cached("SELECT 1 FROM turns WHERE session_key = ?1 AND is_typed = 1 LIMIT 1")?;
-    Ok(statement.exists([session_key])?)
 }
 
 /// The most a read of `HEAD` or a worktree's `.git` file takes.
