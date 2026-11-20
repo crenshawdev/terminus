@@ -217,6 +217,7 @@ sequenceDiagram
       P->>DB: sessions row if new, block rows, session_meta
       P->>DB: for each turn: turns, turns_fts, entities, paths, compactions
       P->>DB: compactions for boundaries that are not turns
+      P->>DB: the summary: the pair's counts, and a main session's row
       P->>DB: the watermark
       P->>DB: COMMIT
     end
