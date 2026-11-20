@@ -9,8 +9,9 @@
 //!   they stand after the file's writes and never from the scan;
 //! - retention's delete, through `remove`, inside the delete's own transaction,
 //!   before the session's rows go;
-//! - `reindex`, which empties both tables and calls [`write`] for every session
-//!   inside its one transaction.
+//! - `reindex`, which empties both tables and writes every session again
+//!   through `rewrite` inside its one transaction, and stamps
+//!   [`META_SUMMARY_FILLED`] last.
 //!
 //! A row is a function of committed rows alone, so a killed pass leaves the
 //! summary equal to what the committed rows give. An eviction changes nothing
@@ -23,6 +24,14 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
 use crate::observe::mechanical::WRITING_TOOLS;
+
+/// `meta` key whose row says the summary has been written whole.
+///
+/// A store that holds the row has had every session's summary written by the
+/// pass's fill or by `reindex`. Only those two write it, each last in its own
+/// transaction, and code only asks whether the row exists. A pass fills a store
+/// whose `meta` lacks it.
+pub const META_SUMMARY_FILLED: &str = "summary_filled";
 
 /// The project keys a `session_meta` row names, a null key being a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +90,20 @@ fn turn_count(conn: &Connection, session_key: &str) -> Result<i64> {
 pub fn write(conn: &Connection, session_key: &str, before: Option<Before>) -> Result<()> {
     keep_counts(conn, session_key, before)?;
     keep_session(conn, session_key)
+}
+
+/// Empty both tables and write every stored session as new, from the rows the
+/// transaction can see. The one rewrite `reindex` and the fill share.
+pub(crate) fn rewrite(conn: &Connection) -> Result<()> {
+    conn.execute_batch("DELETE FROM session_summary; DELETE FROM project_summary;")?;
+    let keys: Vec<String> = conn
+        .prepare("SELECT session_key FROM sessions ORDER BY session_no")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    for session_key in &keys {
+        write(conn, session_key, None)?;
+    }
+    Ok(())
 }
 
 /// Take a session off the summary ahead of its delete: its own row, and its

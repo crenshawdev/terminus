@@ -22,6 +22,10 @@
 //! zero turns while the pair still holds the old total, which would count the
 //! pair twice.
 //!
+//! The version stamp also carries [`crate::summary::META_SUMMARY_FILLED`], so
+//! the next pass does not fill what a rebuild just wrote, and a rebuild that
+//! aborts leaves no key.
+//!
 //! `sessions` and `session_meta` are never touched by `reindex` itself. The
 //! archive table never migrates: a derived-schema change rebuilds derived
 //! tables *only*, and a store in an older archive format is refused at open
@@ -158,14 +162,12 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
     // that keeps a store missing a derived table from failing the rebuild
     // outright instead of rebuilding what it still can.
     tx.execute_batch(schema::CREATE_SQL)?;
-    // Both tables start empty, so the write below is every session's first.
-    tx.execute_batch("DELETE FROM session_summary; DELETE FROM project_summary;")?;
 
     for (session_key, session_no, evicted) in &keys {
         let (session_key, session_no) = (session_key.as_str(), *session_no);
         // Left exactly as it is, and not counted as rebuilt: `sessions` here
         // would claim this build wrote rows it did not write. Its summary is
-        // still written again, by the walk after the loop.
+        // still written again, by the rewrite after the loop.
         if *evicted {
             continue;
         }
@@ -223,24 +225,23 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
         }
     }
 
-    // A second walk and not a write inside the loop, because both `continue`s
-    // above would skip it: an evicted session and a session whose blob failed to
-    // decode both need their summary written, the second one holding no turns.
-    for (session_key, _, _) in &keys {
-        summary::write(&tx, session_key, None)?;
-    }
+    // Not a write inside the loop, because both `continue`s above would skip
+    // it: an evicted session and a session whose blob failed to decode both need
+    // their summary written, the second one holding no turns.
+    summary::rewrite(&tx)?;
 
-    // The version integers move with the rebuild, inside the same transaction:
-    // a store stamped up to date whose rebuild rolled back is the one state
-    // this must not be able to produce.
+    // The version integers and the summary's key move with the rebuild, inside
+    // the same transaction: a store stamped up to date whose rebuild rolled back
+    // is the one state this must not be able to produce.
     tx.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2), (?3, ?4)
+        "INSERT INTO meta (key, value) VALUES (?1, ?2), (?3, ?4), (?5, '1')
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         rusqlite::params![
             META_ARCHIVE_FORMAT,
             ARCHIVE_FORMAT.to_string(),
             META_DERIVED_SCHEMA,
             DERIVED_SCHEMA.to_string(),
+            summary::META_SUMMARY_FILLED,
         ],
     )?;
 

@@ -16,6 +16,7 @@ use rusqlite::Connection;
 use terminus_core::store::{
     schema, Store, DB_FILE_NAME, DERIVED_SCHEMA, META_ARCHIVE_FORMAT, META_DERIVED_SCHEMA,
 };
+use terminus_core::summary::META_SUMMARY_FILLED;
 use terminus_core::{ingest, reindex, testkit};
 
 struct Bench {
@@ -826,14 +827,20 @@ fn the_preserving_path_writes_the_summary_again_and_keeps_an_evicted_sessions_ro
     assert_ne!(bench.row(&replaced), replaced_before, "the stream change reached no row");
 }
 
-/// A rebuild that aborts leaves the summary and the version stamp as they were,
-/// and the same rebuild without the fault changes the summary, which is what
-/// makes the first half a test of the transaction.
+/// A rebuild that aborts leaves the summary, the version stamp and the summary's
+/// key as they were, and the same rebuild without the fault changes the
+/// summary and writes the key, which is what makes the first half a test of the
+/// transaction.
 #[test]
 fn an_aborted_reindex_leaves_the_summary_and_the_version_stamp_as_they_were() {
     let bench = bench();
     bench.change_blobs();
     testkit::age(&bench.data_dir.join(DB_FILE_NAME));
+    // A store that ingest built has the key already, and this one must lack it.
+    bench
+        .conn()
+        .execute("DELETE FROM meta WHERE key = ?1", [META_SUMMARY_FILLED])
+        .unwrap();
     bench
         .conn()
         .execute_batch(
@@ -853,6 +860,16 @@ fn an_aborted_reindex_leaves_the_summary_and_the_version_stamp_as_they_were() {
             )
             .unwrap()
     };
+    let keyed = || -> i64 {
+        bench
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM meta WHERE key = ?1",
+                [META_SUMMARY_FILLED],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
     let lowered = stamp();
     assert_eq!(lowered, (DERIVED_SCHEMA - 1).to_string());
 
@@ -864,10 +881,12 @@ fn an_aborted_reindex_leaves_the_summary_and_the_version_stamp_as_they_were() {
     assert_eq!(bench.summary(), before, "an aborted rebuild moved the summary");
     assert_eq!(stamp(), lowered, "an aborted rebuild moved derived_schema");
     assert_eq!(count(&bench.conn(), "turns"), turns, "an aborted rebuild kept some of its writes");
+    assert_eq!(keyed(), 0, "an aborted rebuild wrote the summary's key");
 
     bench.conn().execute_batch("DROP TRIGGER meta_fault").unwrap();
     bench.reindex();
     assert_ne!(bench.summary(), before, "the rebuild changes nothing, so the abort proved nothing");
     bench.checked("the retried reindex");
     assert_eq!(stamp(), DERIVED_SCHEMA.to_string());
+    assert_eq!(keyed(), 1, "the retried reindex left no summary key");
 }
