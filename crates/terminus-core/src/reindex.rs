@@ -11,6 +11,17 @@
 //! the derived half of retention's delete, so the child-first list of derived
 //! tables is written once.
 //!
+//! The summary tables are not derived tables and are not dropped, but a rebuild
+//! can change what they hold: a session's turns, its titles and its locators all
+//! come back from the blob. So `reindex` empties both and writes every session
+//! again through [`crate::summary::write`], as if each were new, once the
+//! session's derived rows are final and before the version stamp, all in the
+//! one transaction. That covers the rebuilt sessions, the evicted sessions
+//! carried across and the sessions whose blob no longer decodes. It never
+//! adjusts a session from a `Before` read: a rebuild that drops `turns` reads
+//! zero turns while the pair still holds the old total, which would count the
+//! pair twice.
+//!
 //! `sessions` and `session_meta` are never touched by `reindex` itself. The
 //! archive table never migrates: a derived-schema change rebuilds derived
 //! tables *only*, and a store in an older archive format is refused at open
@@ -60,6 +71,7 @@ use crate::store::{
     archive, schema, Store, ARCHIVE_FORMAT, DERIVED_SCHEMA, META_ARCHIVE_FORMAT,
     META_DERIVED_SCHEMA,
 };
+use crate::summary;
 
 /// What a rebuild produced.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -88,7 +100,8 @@ pub struct Rebuilt {
     pub preserved: usize,
 }
 
-/// Drop every derived table and rebuild it from the sessions' block rows.
+/// Drop every derived table and rebuild it from the sessions' block rows, then
+/// write every session's summary again from the rebuilt rows.
 ///
 /// One transaction: a rebuild that committed half way would leave the store
 /// with derived tables that describe some sessions and not others, and no
@@ -145,11 +158,15 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
     // that keeps a store missing a derived table from failing the rebuild
     // outright instead of rebuilding what it still can.
     tx.execute_batch(schema::CREATE_SQL)?;
+    // Both tables start empty, so the write below is every session's first.
+    tx.execute_batch("DELETE FROM session_summary; DELETE FROM project_summary;")?;
 
-    for (session_key, session_no, evicted) in keys {
+    for (session_key, session_no, evicted) in &keys {
+        let (session_key, session_no) = (session_key.as_str(), *session_no);
         // Left exactly as it is, and not counted as rebuilt: `sessions` here
-        // would claim this build wrote rows it did not write.
-        if evicted {
+        // would claim this build wrote rows it did not write. Its summary is
+        // still written again, by the walk after the loop.
+        if *evicted {
             continue;
         }
         // The preserving path's equivalent of the drop, and only there: the
@@ -162,16 +179,16 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
         // upgrade path, inside the ingest lock, times every session ever
         // archived.
         if preserved > 0 {
-            clear_derived(&tx, &session_key)?;
+            clear_derived(&tx, session_key)?;
         }
         rebuilt.sessions += 1;
-        let stream = match archive::stream(&tx, &session_key)? {
+        let stream = match archive::stream(&tx, session_key)? {
             Ok(stream) => stream,
             Err(e) => {
                 // Named and skipped. `verify` is the command that reports this
                 // in detail; a rebuild that stopped here would take every
                 // undamaged session down with it.
-                rebuilt.failed.push((session_key, e.to_string()));
+                rebuilt.failed.push((session_key.to_owned(), e.to_string()));
                 continue;
             }
         };
@@ -181,7 +198,7 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
             derive::derive_turn(
                 &tx,
                 TurnRow {
-                    session_key: &session_key,
+                    session_key,
                     session_no,
                     turn,
                     stream_offset: record.offset,
@@ -201,9 +218,16 @@ pub fn reindex(store: &mut Store) -> Result<Rebuilt> {
         // The boundaries that are not turns, at their offset in the blob's
         // scan, through the same seam ingest used.
         for record in &scan.records {
-            derive::derive_boundary(&tx, &session_key, record)?;
-            derive::derive_title(&tx, &session_key, record)?;
+            derive::derive_boundary(&tx, session_key, record)?;
+            derive::derive_title(&tx, session_key, record)?;
         }
+    }
+
+    // A second walk and not a write inside the loop, because both `continue`s
+    // above would skip it: an evicted session and a session whose blob failed to
+    // decode both need their summary written, the second one holding no turns.
+    for (session_key, _, _) in &keys {
+        summary::write(&tx, session_key, None)?;
     }
 
     // The version integers move with the rebuild, inside the same transaction:
