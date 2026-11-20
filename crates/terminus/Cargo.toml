@@ -68,6 +68,11 @@ path = "tests/datamove.rs"
 required-features = ["testkit"]
 
 [[test]]
+name = "brief_differential"
+path = "tests/brief_differential.rs"
+required-features = ["testkit"]
+
+[[test]]
 name = "mcp"
 path = "tests/mcp.rs"
 required-features = ["testkit"]
