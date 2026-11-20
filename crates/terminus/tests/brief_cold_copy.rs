@@ -139,6 +139,10 @@ mod linux {
         (elapsed, delivered, abandoned)
     }
 
+    /// How long the lock stays held after the last render. A hook returns without
+    /// waiting for its detached ingest, which starts through an intermediate.
+    const SETTLE: Duration = Duration::from_secs(2);
+
     /// A count from the copy, failing without anything the query returned.
     fn count(conn: &Connection, sql: &str, what: &str) -> i64 {
         conn.query_row(sql, [], |r| r.get(0))
@@ -262,7 +266,9 @@ mod linux {
             rows
         };
 
-        // Held until every render is done: no hook's detached ingest may touch the copy.
+        // Held through every render and then for SETTLE, so a hook's detached ingest
+        // that starts in that window finds it held and gives up. A bounded wait, not
+        // proof: an ingest slower to start than SETTLE could still win the lock.
         let _lock =
             match ingest::lock::try_acquire(&copy).unwrap_or_else(|_| panic!("take the lock")) {
                 Attempt::Acquired(lock) => lock,
@@ -298,6 +304,7 @@ mod linux {
             abandoned += usize::from(gave_up);
         }
 
+        std::thread::sleep(SETTLE);
         times.sort();
         let ms = |d: Option<&Duration>| d.map_or(0.0, |d| d.as_secs_f64() * 1000.0);
         let renders = times.len();
