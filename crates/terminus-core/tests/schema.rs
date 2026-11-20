@@ -440,25 +440,48 @@ fn the_summary_tables_reach_a_store_that_predates_them() {
     );
 }
 
-/// The summary is kept, so `reindex` must not drop it, and it declares no
-/// reference: `reindex` drops `turns` and retention deletes `sessions` rows
-/// without knowing these tables.
+/// The summary is kept, so `reindex` must not drop it. `session_summary`
+/// references `sessions` and the store holds it to that, and `project_summary`
+/// references nothing, because a pair is not a session.
 #[test]
-fn the_summary_tables_are_kept_and_reference_nothing() {
+fn the_summary_tables_are_kept_and_session_summary_references_sessions() {
     let (_dir, store) = fresh();
-    for table in SUMMARY_TABLES {
-        assert!(!schema::DERIVED_TABLES.contains(&table), "{table}");
-        assert!(schema::TABLES.contains(&table), "{table}");
-        let sql: String = store
+    let sql = |table: &str| -> String {
+        store
             .conn()
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name = ?1",
                 [table],
                 |r| r.get(0),
             )
-            .unwrap();
-        assert!(!sql.contains("REFERENCES"), "{table}: {sql}");
+            .unwrap()
+    };
+    for table in SUMMARY_TABLES {
+        assert!(!schema::DERIVED_TABLES.contains(&table), "{table}");
+        assert!(schema::TABLES.contains(&table), "{table}");
     }
+    assert_eq!(terminus_core::DERIVED_SCHEMA, 6);
+    let session = sql("session_summary");
+    assert!(session.contains("REFERENCES sessions(session_key)"), "{session}");
+    assert!(!session.contains("REFERENCES turns"), "{session}");
+    let project = sql("project_summary");
+    assert!(!project.contains("REFERENCES"), "{project}");
+
+    let conn = store.conn();
+    conn.execute("INSERT INTO sessions (session_key, session_no) VALUES ('k', 1)", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO session_summary (session_key, has_typed_prompt, turn_count, prompts, edited_files)
+         VALUES ('k', 0, 0, '[]', '[]')",
+        [],
+    )
+    .unwrap();
+    let refused = conn.execute("DELETE FROM sessions WHERE session_key = 'k'", []);
+    assert!(refused.is_err(), "a session was deleted under its summary row");
+    conn.execute("DELETE FROM session_summary WHERE session_key = 'k'", [])
+        .unwrap();
+    conn.execute("DELETE FROM sessions WHERE session_key = 'k'", [])
+        .expect("a session with no summary row deletes");
 }
 
 // --- session_meta.capture_mode -----------------------------------------------

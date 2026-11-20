@@ -7,9 +7,13 @@
 //! derived-schema bump rebuild rather than migrate. `watermarks`, `runs` and
 //! `meta` are operational state.
 //!
-//! `project_summary` and `session_summary` are a group of their own, written by
-//! ingest inside each file's transaction from the rows as they stand. They are
-//! kept, never dropped by `reindex`, and they reference nothing.
+//! `project_summary` and `session_summary` are a group of their own. Ingest
+//! writes them inside each file's transaction from the rows as they stand,
+//! retention's delete takes a session off them in its own transaction, and
+//! `reindex` empties and writes them again from the rebuilt rows. They are not
+//! derived: `reindex` never drops them, because a drop would leave the brief
+//! with nothing until the next ingest. `session_summary` references
+//! `sessions(session_key)` and `project_summary` references nothing.
 //!
 //! `decisions` and `labels` belong to the archive group: a logged injection
 //! decision is prompt-time state the archive does not contain, so it is kept
@@ -350,10 +354,12 @@ CREATE INDEX IF NOT EXISTS idx_paths_path ON paths(path);
 CREATE INDEX IF NOT EXISTS idx_paths_turn ON paths(turn_id);
 
 -- SUMMARY. What the resume brief needs answered before a session starts, kept
--- current by ingest inside each file's transaction. Not in `DERIVED_TABLES`: a
--- `reindex` leaves both as they are. Neither references another table, because
--- `reindex` drops `turns` and retention deletes `sessions` rows without knowing
--- these tables, and the bundled SQLite enforces references.
+-- current by ingest inside each file's transaction, by retention's delete in its
+-- own, and by `reindex` writing every session again. Not in `DERIVED_TABLES`: a
+-- `reindex` empties and rewrites them and never drops them. `session_summary`
+-- references `sessions`, so retention deletes a session's row before its
+-- `sessions` row, and neither table references `turns`, which `reindex` drops.
+-- A pair is not a session, so `project_summary` references nothing.
 --
 -- No column holds prompt or reply text, and none holds the time of a write, so
 -- a row is a function of the committed rows under it.
@@ -381,7 +387,7 @@ CREATE TABLE IF NOT EXISTS project_summary (
 -- every in-project path the session edited, most recent first. Both list
 -- columns hold `[]` when empty.
 CREATE TABLE IF NOT EXISTS session_summary (
-    session_key          TEXT    PRIMARY KEY,
+    session_key          TEXT    PRIMARY KEY REFERENCES sessions(session_key),
     last_turn_at         TEXT,
     branch               TEXT,
     project              TEXT,
@@ -464,8 +470,8 @@ pub const TABLES: &[&str] = &[
     "runs",
     "meta",
     // Summary group, appended last so it reaches an already-initialized store
-    // through the same missing-table arm. Absent from `DERIVED_TABLES`, and
-    // referencing no table.
+    // through the same missing-table arm. Absent from `DERIVED_TABLES`.
+    // `session_summary` references `sessions` and `project_summary` nothing.
     "project_summary",
     "session_summary",
 ];
@@ -476,8 +482,9 @@ pub const TABLES: &[&str] = &[
 /// injector decided at prompt time. `observations` is absent too: its facts
 /// come off the session's archived stream, and retention eviction deletes its
 /// block rows, so a `reindex` that dropped the table could not recompute an
-/// evicted session's row. The summary tables are absent as well: ingest keeps
-/// them and a `reindex` leaves them as they are.
+/// evicted session's row. The summary tables are absent as well: `reindex`
+/// empties and writes them again through `summary::write`, and a drop would
+/// leave the brief with nothing until the next ingest.
 ///
 /// In creation order, because `reindex` drops in reverse: `entities` and
 /// `paths` reference `turns(id)`, so they sit **after** `turns` here and are

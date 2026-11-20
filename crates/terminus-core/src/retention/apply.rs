@@ -198,7 +198,8 @@ pub(crate) struct Deleted {
 /// SQLite is compiled with `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`, so the references
 /// declared in `schema::CREATE_SQL` really are enforced on every connection
 /// whatever the pragma comment there says. What is retention's own:
-/// `observations` and `session_meta` hang off `sessions(session_key)` and
+/// `observations`, `session_summary` and `session_meta` hang off
+/// `sessions(session_key)` and
 /// `blocks` off `sessions(session_no)`, so they go after the derived rows and
 /// before `sessions`.
 ///
