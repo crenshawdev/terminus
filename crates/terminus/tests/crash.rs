@@ -320,6 +320,8 @@ struct Snapshot {
     session_titles: Vec<Vec<Value>>,
     entities: Vec<Vec<Value>>,
     paths: Vec<Vec<Value>>,
+    project_summary: Vec<Vec<Value>>,
+    session_summary: Vec<Vec<Value>>,
 }
 
 /// Every row a query returns, each column as SQLite holds it.
@@ -343,6 +345,8 @@ impl Snapshot {
             ("session_titles", &self.session_titles),
             ("entities", &self.entities),
             ("paths", &self.paths),
+            ("project_summary", &self.project_summary),
+            ("session_summary", &self.session_summary),
         ] {
             assert!(!table.is_empty(), "the reference has no {what} rows");
         }
@@ -400,6 +404,8 @@ impl Snapshot {
             session_titles: rows(&conn, "SELECT * FROM session_titles ORDER BY 1"),
             entities: rows(&conn, "SELECT * FROM entities ORDER BY 1, 2, 3"),
             paths: rows(&conn, "SELECT * FROM paths ORDER BY 1, 2"),
+            project_summary: rows(&conn, "SELECT * FROM project_summary ORDER BY 1"),
+            session_summary: rows(&conn, "SELECT * FROM session_summary ORDER BY 1"),
         };
         snapshot
     }
@@ -408,7 +414,7 @@ impl Snapshot {
 /// The convergence invariants, as a check that returns its complaint instead
 /// of panicking: the negative tests need to assert that it *does* complain.
 ///
-/// Five properties, each stated over the committed block rows, and it
+/// Six properties, each stated over the committed block rows, and it
 /// is worth being explicit about which is which, because two of them look like
 /// one and are not:
 ///
@@ -430,6 +436,13 @@ impl Snapshot {
 ///    `\n`, so the byte before it, read from the committed rows, is a newline.
 ///    A watermark one byte short of a boundary passes 4 and fails 5, and a pass
 ///    resuming from it would archive half a record as a whole one.
+///
+/// 6. **The summary is what the committed rows give.** Both summary tables are
+///    written inside each file's transaction, so a killed pass leaves them equal
+///    to what `session_meta`, `session_titles` and `turns` say: one project row
+///    per pair with its counts, and a session row for exactly the committed
+///    main sessions. A row from the unfinished file, or a count that moved
+///    without its turns, fails here.
 ///
 /// Plus a store-wide one: a watermark past zero with no archived session claims
 /// bytes nothing holds at all.
@@ -541,6 +554,10 @@ fn check_invariants(data_dir: &Path) -> Result<(), String> {
             _ => {}
         }
     }
+
+    // (6) The summary equals what the committed rows give.
+    testkit::check_summary(conn)
+        .map_err(|why| format!("the summary disagrees with its rows: {why}"))?;
 
     // A watermark with no session claims bytes nothing archived.
     let dangling: Vec<String> = conn
@@ -939,6 +956,14 @@ fn the_snapshot_notices_a_change_in_each_derived_table() {
             "paths",
             "DELETE FROM paths WHERE rowid = (SELECT min(rowid) FROM paths)",
         ),
+        (
+            "project_summary",
+            "UPDATE project_summary SET turn_count = turn_count + 1",
+        ),
+        (
+            "session_summary",
+            "UPDATE session_summary SET turn_count = turn_count + 1",
+        ),
     ] {
         let changed = dirs.data(what);
         copy_dir(&reference_dir, &changed);
@@ -1027,4 +1052,40 @@ fn the_harness_catches_a_watermark_off_a_record_boundary() {
         !complaint.contains("is past the"),
         "this must fail the boundary check, not the containment one: {complaint}"
     );
+}
+
+/// The summary property can fail: a project row whose count moved without its
+/// turns, and a main session whose row is gone, are each caught on a store that
+/// was clean a moment before.
+#[test]
+fn the_harness_catches_a_summary_that_disagrees_with_its_rows() {
+    let dirs = dirs();
+    let transcript = testkit::copy_fixture_into("session-basic.jsonl", &dirs.work);
+    let reference_dir = dirs.data("summary");
+    ingest_fully(&dirs, &reference_dir, Some(&transcript));
+    check_invariants(&reference_dir).expect("a completed pass is consistent");
+
+    for (what, sql) in [
+        (
+            "a project count",
+            "UPDATE project_summary SET turn_count = turn_count + 1",
+        ),
+        ("a session row", "DELETE FROM session_summary"),
+    ] {
+        let changed = dirs.data(&what.replace(' ', "-"));
+        copy_dir(&reference_dir, &changed);
+        let conn = Connection::open(changed.join(DB_FILE_NAME)).unwrap();
+        assert!(
+            conn.execute(sql, []).unwrap() > 0,
+            "{what}: nothing changed"
+        );
+        drop(conn);
+
+        let complaint = check_invariants(&changed)
+            .expect_err("a summary that disagrees with its rows must be caught");
+        assert!(
+            complaint.contains("summary"),
+            "{what}: the complaint must name the summary: {complaint}"
+        );
+    }
 }
