@@ -7,6 +7,10 @@
 //! derived-schema bump rebuild rather than migrate. `watermarks`, `runs` and
 //! `meta` are operational state.
 //!
+//! `project_summary` and `session_summary` are a group of their own, written by
+//! ingest inside each file's transaction from the rows as they stand. They are
+//! kept, never dropped by `reindex`, and they reference nothing.
+//!
 //! `decisions` and `labels` belong to the archive group: a logged injection
 //! decision is prompt-time state the archive does not contain, so it is kept
 //! rather than rebuilt, and a `reindex` must never drop it. `observations`
@@ -345,6 +349,54 @@ CREATE TABLE IF NOT EXISTS paths (
 CREATE INDEX IF NOT EXISTS idx_paths_path ON paths(path);
 CREATE INDEX IF NOT EXISTS idx_paths_turn ON paths(turn_id);
 
+-- SUMMARY. What the resume brief needs answered before a session starts, kept
+-- current by ingest inside each file's transaction. Not in `DERIVED_TABLES`: a
+-- `reindex` leaves both as they are. Neither references another table, because
+-- `reindex` drops `turns` and retention deletes `sessions` rows without knowing
+-- these tables, and the bundled SQLite enforces references.
+--
+-- No column holds prompt or reply text, and none holds the time of a write, so
+-- a row is a function of the committed rows under it.
+
+-- One row per distinct `(project, project_pre_worktree)` pair in
+-- `session_meta`, counting every session under it, subagents included. A null
+-- key is a key: `UNIQUE` treats nulls as distinct, so the row is keyed on
+-- `json_array(project, project_pre_worktree)`, which is one value for a null
+-- key and a different one for every string, `''` and `'null'` included.
+CREATE TABLE IF NOT EXISTS project_summary (
+    pair_key             TEXT    PRIMARY KEY,
+    project              TEXT,
+    project_pre_worktree TEXT,
+    session_count        INTEGER NOT NULL,
+    turn_count           INTEGER NOT NULL
+);
+
+-- One row per main session, a `session_meta` row with no parent. Read back
+-- whole, so the list-shaped columns are JSON the way `decisions` carries its
+-- own and the row lands in one statement.
+--
+-- `prompts` is the newest typed prompts, newest first, each entry
+-- `[id, stream_offset, byte_len]` of a `turns` row: a locator, never text.
+-- `reply_*` locate the newest assistant turn the same way. `edited_files` is
+-- every in-project path the session edited, most recent first. Both list
+-- columns hold `[]` when empty.
+CREATE TABLE IF NOT EXISTS session_summary (
+    session_key          TEXT    PRIMARY KEY,
+    last_turn_at         TEXT,
+    branch               TEXT,
+    project              TEXT,
+    project_pre_worktree TEXT,
+    cwd                  TEXT,
+    title                TEXT,
+    has_typed_prompt     INTEGER NOT NULL,
+    turn_count           INTEGER NOT NULL,
+    prompts              TEXT    NOT NULL,
+    reply_id             INTEGER,
+    reply_stream_offset  INTEGER,
+    reply_byte_len       INTEGER,
+    edited_files         TEXT    NOT NULL
+);
+
 -- OPERATIONAL.
 
 -- The byte offset just past the last newline of a transcript, never its end:
@@ -411,6 +463,11 @@ pub const TABLES: &[&str] = &[
     "watermarks",
     "runs",
     "meta",
+    // Summary group, appended last so it reaches an already-initialized store
+    // through the same missing-table arm. Absent from `DERIVED_TABLES`, and
+    // referencing no table.
+    "project_summary",
+    "session_summary",
 ];
 
 /// The derived tables `reindex` drops and rebuilds from the block rows.
@@ -419,7 +476,8 @@ pub const TABLES: &[&str] = &[
 /// injector decided at prompt time. `observations` is absent too: its facts
 /// come off the session's archived stream, and retention eviction deletes its
 /// block rows, so a `reindex` that dropped the table could not recompute an
-/// evicted session's row.
+/// evicted session's row. The summary tables are absent as well: ingest keeps
+/// them and a `reindex` leaves them as they are.
 ///
 /// In creation order, because `reindex` drops in reverse: `entities` and
 /// `paths` reference `turns(id)`, so they sit **after** `turns` here and are

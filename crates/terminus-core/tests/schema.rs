@@ -411,6 +411,56 @@ fn observations_declares_no_reference_to_turns() {
     assert!(sql.contains("REFERENCES sessions"), "{sql}");
 }
 
+const SUMMARY_TABLES: [&str; 2] = ["project_summary", "session_summary"];
+
+/// The summary tables reach a store written before they existed through the
+/// same missing-table arm, with no rebuild scheduled.
+#[test]
+fn the_summary_tables_reach_a_store_that_predates_them() {
+    let (dir, store) = fresh();
+    for table in SUMMARY_TABLES {
+        assert!(names(store.conn(), "table").contains(table));
+        store
+            .conn()
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .unwrap();
+    }
+    drop(store);
+
+    let reopened = Store::open(dir.path()).expect("an older store still opens");
+    for table in SUMMARY_TABLES {
+        assert!(
+            names(reopened.conn(), "table").contains(table),
+            "the missing-table arm did not create `{table}`"
+        );
+    }
+    assert!(
+        reopened.rebuild_required().is_none(),
+        "adding the summary tables must not force a derived rebuild"
+    );
+}
+
+/// The summary is kept, so `reindex` must not drop it, and it declares no
+/// reference: `reindex` drops `turns` and retention deletes `sessions` rows
+/// without knowing these tables.
+#[test]
+fn the_summary_tables_are_kept_and_reference_nothing() {
+    let (_dir, store) = fresh();
+    for table in SUMMARY_TABLES {
+        assert!(!schema::DERIVED_TABLES.contains(&table), "{table}");
+        assert!(schema::TABLES.contains(&table), "{table}");
+        let sql: String = store
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = ?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!sql.contains("REFERENCES"), "{table}: {sql}");
+    }
+}
+
 // --- session_meta.capture_mode -----------------------------------------------
 
 /// A config directory holding one `terminus.toml` naming a capture mode.
