@@ -220,7 +220,7 @@ fn keep_session(conn: &Connection, session_key: &str) -> Result<()> {
 /// How many of a session's newest typed prompts the row locates: the number the
 /// brief looks at to find the few it quotes. The quoting, the length rule and
 /// the read budget stay with the brief, which reads the text and redacts it.
-const PROMPTS_KEPT: i64 = 12;
+pub(crate) const PROMPTS_KEPT: i64 = 12;
 
 /// `(id, stream_offset, byte_len)` of one `turns` row: where a turn's bytes sit
 /// in the session's stream, never what they say.

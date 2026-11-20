@@ -2220,3 +2220,44 @@ fn the_sessions_are_ordered_by_the_summarys_last_turn_at() {
     assert!(brief.contains("2026-08-12 Newer work"), "{brief}");
     assert!(!brief.contains("Older work"), "{brief}");
 }
+
+/// The quotes are located by the summary row, and the blocks hold only their text.
+#[test]
+fn the_quotes_are_located_by_the_summary_row() {
+    let bench = bench();
+    bench.archive(&LATE);
+    let control = bench.brief(LATE.project).expect("a brief");
+    assert!(control.contains("It last asked: "), "{control}");
+    assert!(control.contains("It last answered: "), "{control}");
+
+    bench.edit_summary(
+        LATE.id,
+        "prompts = '[]', reply_id = NULL, reply_stream_offset = NULL, reply_byte_len = NULL",
+    );
+    let brief = bench.brief(LATE.project).expect("a brief");
+    assert!(!brief.contains("It last asked"), "{brief}");
+    assert!(!brief.contains("It last answered"), "{brief}");
+}
+
+/// The file line is the summary's list, cut and counted at read time.
+#[test]
+fn the_file_line_is_the_summarys_list() {
+    let bench = bench();
+    bench.archive(&LATE);
+    assert_eq!(edited(&bench.brief(LATE.project).unwrap()), None);
+
+    let files: Vec<String> = (0..10).map(|n| format!("src/{n:02}.rs")).collect();
+    bench.edit_summary(
+        LATE.id,
+        &format!("edited_files = '{}'", serde_json::json!(files)),
+    );
+    let brief = bench.brief(LATE.project).expect("a brief");
+    assert_eq!(
+        edited(&brief),
+        Some(
+            "src/00.rs, src/01.rs, src/02.rs, src/03.rs, src/04.rs, src/05.rs, src/06.rs, \
+             src/07.rs and 2 more."
+        ),
+        "{brief}"
+    );
+}
