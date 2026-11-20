@@ -1126,7 +1126,7 @@ fn expected_edits(conn: &rusqlite::Connection, key: &str) -> Result<Vec<String>,
         )
         .map_err(|e| e.to_string())?;
     let mut roots: Vec<String> = roots.into_iter().flatten().collect();
-    roots.sort_by(|a, b| b.len().cmp(&a.len()));
+    roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
 
     let mut last: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
     let mut statement = conn
