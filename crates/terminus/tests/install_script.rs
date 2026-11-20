@@ -9,7 +9,9 @@
 //! The server is `openssl s_server -WWW` from OpenSSL 3 or later, with a
 //! certificate made for each test and named by `CURL_CA_BUNDLE`, so the script
 //! stays https-only. OpenSSL 1.1.1's `-WWW` closes without a close_notify,
-//! which a curl on OpenSSL 3 reports as a failed download. The served
+//! which a curl on OpenSSL 3 reports as a failed download. Each server binds
+//! a port of its own and the test reads it from the server's `ACCEPT` line, so
+//! no test can reach another test's server. The served
 //! binary is a copy of this build, with bytes appended when a test needs a
 //! different digest; it still runs and still carries the marker.
 //!
@@ -33,7 +35,6 @@
 //! runs a copy of `install.sh` with the pinned line swapped for that key. Only
 //! the tests that need the shipped file run the real one.
 
-use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -164,40 +165,45 @@ impl Server {
             .expect("openssl runs");
         assert!(made.status.success(), "openssl req: {}", text(&made));
 
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Port 0, so s_server binds a port of its own. Picking one here first
+        // let a parallel test's server take it, and curl then met that
+        // server's certificate.
+        let said = root.join("server.out");
         let log = root.join("server.log");
         let child = Command::new("openssl")
-            .args(["s_server", "-WWW", "-accept"])
-            .arg(format!("127.0.0.1:{port}"))
+            .args(["s_server", "-WWW", "-accept", "127.0.0.1:0"])
             .arg("-cert")
             .arg(&cert)
             .arg("-key")
             .arg(&key)
             .current_dir(served)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(std::fs::File::create(&said).unwrap())
             .stderr(std::fs::File::create(&log).unwrap())
             .spawn()
             .expect("openssl s_server starts");
-        let mut server = Server { child, port, cert };
+        let mut server = Server {
+            child,
+            port: 0,
+            cert,
+        };
 
-        let address = SocketAddr::from(([127, 0, 0, 1], port));
         let deadline = Instant::now() + Duration::from_secs(10);
-        while TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err() {
+        loop {
+            let said = std::fs::read_to_string(&said).unwrap_or_default();
+            if let Some(port) = accepted_port(&said) {
+                server.port = port;
+                return server;
+            }
             let exited = server.child.try_wait().unwrap();
             if exited.is_some() || Instant::now() > deadline {
                 panic!(
-                    "s_server on port {port} never accepted ({exited:?}): {}",
+                    "s_server never said which port it accepts on ({exited:?}): {said}{}",
                     std::fs::read_to_string(&log).unwrap_or_default()
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        server
     }
 
     fn url(&self) -> String {
@@ -210,6 +216,18 @@ impl Drop for Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The port in s_server's `ACCEPT 127.0.0.1:<port>` line, which it prints once
+/// it is listening. A line still being written doesn't count.
+fn accepted_port(said: &str) -> Option<u16> {
+    let (whole_lines, _) = said.rsplit_once('\n')?;
+    let address = whole_lines
+        .lines()
+        .find_map(|line| line.strip_prefix("ACCEPT "))?
+        .split_whitespace()
+        .next()?;
+    address.rsplit_once(':')?.1.parse().ok()
 }
 
 /// The shell a test runs `install.sh` under.
