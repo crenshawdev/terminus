@@ -13,6 +13,7 @@
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
+use crate::observe::mechanical::WRITING_TOOLS;
 
 /// The project keys a `session_meta` row names, a null key being a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,13 +111,14 @@ fn keep_session(conn: &Connection, session_key: &str) -> Result<()> {
 
     let prompts = newest_prompts(conn, session_key)?;
     let reply = newest_reply(conn, session_key)?;
+    let files = edited_files(conn, session_key, [&cwd, &pre_worktree, &project])?;
 
     conn.prepare_cached(
         "INSERT OR REPLACE INTO session_summary (
             session_key, last_turn_at, branch, project, project_pre_worktree, cwd,
             title, has_typed_prompt, turn_count, prompts,
             reply_id, reply_stream_offset, reply_byte_len, edited_files
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, '[]')",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?
     .execute(rusqlite::params![
         session_key,
@@ -132,6 +134,7 @@ fn keep_session(conn: &Connection, session_key: &str) -> Result<()> {
         reply.map(|(id, _, _)| id),
         reply.map(|(_, offset, _)| offset),
         reply.map(|(_, _, len)| len),
+        serde_json::json!(files).to_string(),
     ])?;
     Ok(())
 }
@@ -254,4 +257,51 @@ fn add(conn: &Connection, pair: &Pair, sessions: i64, turns: i64) -> Result<()> 
         turns
     ])?;
     Ok(())
+}
+
+/// Every path the session called a writing tool on that sits inside its
+/// project, most recently edited first, relative to the root it sits under.
+///
+/// The brief's own query over the session's whole history. Redaction, the
+/// clip, deduplication after the clip and the cap on how many are named stay
+/// with the brief. A call that failed still counts: the record says it was
+/// tried. `CROSS JOIN` starts from the session's turns, because left alone
+/// SQLite starts from every `path` entity in the store.
+fn edited_files(
+    conn: &Connection,
+    session_key: &str,
+    roots: [&Option<String>; 3],
+) -> Result<Vec<String>> {
+    let tools: serde_json::Value = WRITING_TOOLS.iter().copied().collect();
+    let mut roots: Vec<&str> = roots.into_iter().flatten().map(String::as_str).collect();
+    roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+
+    let mut statement = conn.prepare_cached(
+        "SELECT e.value_norm FROM turns t CROSS JOIN entities e ON e.turn_id = t.id
+         WHERE t.session_key = ?1 AND e.kind = 'path'
+           AND t.tool_name IN (SELECT value FROM json_each(?2))
+         GROUP BY e.value_norm ORDER BY max(t.turn_seq) DESC, e.value_norm",
+    )?;
+    let paths = statement.query_map(rusqlite::params![session_key, tools.to_string()], |r| {
+        r.get::<_, String>(0)
+    })?;
+    let mut files = Vec::new();
+    for path in paths {
+        if let Some(inside) = inside_project(&path?, &roots) {
+            files.push(inside.to_owned());
+        }
+    }
+    Ok(files)
+}
+
+/// `path` relative to the longest root it sits under. A relative path stays as
+/// written, and an absolute one under no root is outside the project.
+fn inside_project<'p>(path: &'p str, roots: &[&str]) -> Option<&'p str> {
+    let relative = roots
+        .iter()
+        .find_map(|root| path.strip_prefix(root)?.strip_prefix('/'));
+    match relative {
+        Some(relative) => Some(relative),
+        None => (!path.starts_with(['/', '~'])).then_some(path),
+    }
 }

@@ -1092,8 +1092,72 @@ fn check_session_summary(conn: &rusqlite::Connection) -> Result<(), String> {
                 SESSION_COLUMNS[at], got[at], want[at]
             ));
         }
+        let (want, got) = (expected_edits(conn, key)?, stored_edits(conn, key)?);
+        if want != got {
+            return Err(format!(
+                "{key}: edited_files holds {got:?}, rows give {want:?}"
+            ));
+        }
     }
     Ok(())
+}
+
+fn stored_edits(conn: &rusqlite::Connection, key: &str) -> Result<Vec<String>, String> {
+    let json: String = conn
+        .query_row(
+            "SELECT edited_files FROM session_summary WHERE session_key = ?1",
+            [key],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    serde_json::from_str(&json).map_err(|e| format!("edited_files is not a list of strings: {e}"))
+}
+
+/// The in-project paths a session edited, last touched first, with a root rule
+/// of this file's own: the longest of the session's three roots that the path
+/// sits under, a relative path as written, an absolute one under no root left
+/// out.
+fn expected_edits(conn: &rusqlite::Connection, key: &str) -> Result<Vec<String>, String> {
+    let roots: Vec<Option<String>> = conn
+        .query_row(
+            "SELECT cwd, project_pre_worktree, project FROM session_meta WHERE session_key = ?1",
+            [key],
+            |r| Ok(vec![r.get(0)?, r.get(1)?, r.get(2)?]),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut roots: Vec<String> = roots.into_iter().flatten().collect();
+    roots.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    let mut last: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut statement = conn
+        .prepare(
+            "SELECT t.turn_seq, e.value_norm FROM turns t JOIN entities e ON e.turn_id = t.id
+             WHERE t.session_key = ?1 AND e.kind = 'path'
+               AND t.tool_name IN ('Edit', 'MultiEdit', 'Write', 'NotebookEdit')",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (seq, path) = row.map_err(|e| e.to_string())?;
+        let at = last.entry(path).or_insert(seq);
+        *at = (*at).max(seq);
+    }
+    let mut ordered: Vec<(i64, String)> = last.into_iter().map(|(p, s)| (s, p)).collect();
+    ordered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    Ok(ordered
+        .into_iter()
+        .filter_map(|(_, path)| {
+            let under = roots.iter().find_map(|root| {
+                path.strip_prefix(root.as_str())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .map(str::to_owned)
+            });
+            under.or_else(|| (!path.starts_with('/') && !path.starts_with('~')).then_some(path))
+        })
+        .collect())
 }
 
 fn check_project_summary(conn: &rusqlite::Connection) -> Result<(), String> {

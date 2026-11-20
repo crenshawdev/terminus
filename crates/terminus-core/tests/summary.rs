@@ -640,3 +640,106 @@ fn a_session_that_was_never_answered_locates_its_prompts_and_no_reply() {
         }
     }
 }
+
+/// An assistant record calling one writing tool on one path.
+fn edit(cwd: &str, session: &str, n: usize, tool: &str, path: &str) -> String {
+    rec(
+        session,
+        n,
+        json!({"type": "assistant", "cwd": cwd, "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": format!("t{n}"), "name": tool, "input": {"file_path": path}}]}}),
+    )
+}
+
+fn edited(row: &[Cell], conn: &Connection) -> Value {
+    serde_json::from_str(&text_of(row, conn, "edited_files")).unwrap()
+}
+
+#[test]
+fn the_row_keeps_every_in_project_edit_whole_and_most_recent_first() {
+    let world = World::new();
+    let id = "66666666-0000-4000-8000-000000000001";
+    let cwd = world.cwd("repo");
+    let long = format!("{cwd}/{}long.rs", "deep/".repeat(30));
+    assert!(long.len() > 120);
+    let mut text = rec("l1", 0, with(said("user", "go"), json!({"cwd": cwd})));
+    let mut calls = vec![("Edit", format!("{cwd}/src/early.rs"))];
+    for i in 1..=8 {
+        let tool = if i % 2 == 1 { "Write" } else { "Edit" };
+        calls.push((tool, format!("{cwd}/src/a{i}.rs")));
+    }
+    calls.push(("Write", long.clone()));
+    calls.push(("Edit", "docs/notes.md".to_owned()));
+    calls.push(("Write", world.cwd("scratch/tmp.txt")));
+    calls.push(("Edit", format!("{cwd}/src/early.rs")));
+    for (n, (tool, path)) in calls.iter().enumerate() {
+        text += &edit(&cwd, "l1", n + 1, tool, path);
+    }
+    write(&world.main_path(FOLDER, id), &text);
+
+    // Eleven in-project files, none cut, clipped or capped; the file edited
+    // first and last leads, the file outside every root is absent.
+    let mut expected = vec![json!("src/early.rs"), json!("docs/notes.md")];
+    expected.push(json!(format!("{}long.rs", "deep/".repeat(30))));
+    expected.extend((1..=8).rev().map(|i| json!(format!("src/a{i}.rs"))));
+
+    for data in world.archive_three_ways() {
+        let conn = open(&data);
+        testkit::check_summary(&conn).unwrap();
+        assert_eq!(
+            edited(&session_row(&conn, id), &conn),
+            Value::Array(expected.clone())
+        );
+    }
+}
+
+#[test]
+fn a_fixtures_edit_is_kept_relative_to_its_project() {
+    let world = World::new();
+    let copied = testkit::copy_rooted_fixture_into(
+        "session-edits.jsonl",
+        &world.claude.parent().unwrap().join("rooted"),
+        &world.root,
+    );
+    let id = "77777777-0000-4000-8000-000000000001";
+    let dest = world.main_path(FOLDER, id);
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::fs::copy(copied, &dest).unwrap();
+
+    for data in world.archive_three_ways() {
+        let conn = open(&data);
+        testkit::check_summary(&conn).unwrap();
+        assert_eq!(
+            edited(&session_row(&conn, id), &conn),
+            json!(["crates/gizmo/lantern.rs"])
+        );
+    }
+}
+
+#[test]
+fn a_file_edited_in_the_prefix_and_again_in_the_tail_reads_the_same_as_one_pass() {
+    let world = World::new();
+    let cwd = world.cwd("repo");
+    let prefix = [
+        rec("m1", 0, with(said("user", "go"), json!({"cwd": cwd}))),
+        edit(&cwd, "m1", 1, "Edit", &format!("{cwd}/src/a.rs")),
+        edit(&cwd, "m1", 2, "Write", &format!("{cwd}/src/b.rs")),
+    ]
+    .concat();
+    let whole = format!(
+        "{prefix}{}{}",
+        edit(&cwd, "m1", 3, "Edit", &format!("{cwd}/src/c.rs")),
+        edit(&cwd, "m1", 4, "Edit", &format!("{cwd}/src/a.rs")),
+    );
+    let (two, one) = two_passes_and_one(&world, &prefix, &whole);
+
+    testkit::check_summary(&two).unwrap();
+    testkit::check_summary(&one).unwrap();
+    assert_eq!(summary_rows(&two), summary_rows(&one));
+    for conn in [&two, &one] {
+        let held: String = conn
+            .query_row("SELECT edited_files FROM session_summary", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(held, r#"["src/a.rs","src/c.rs","src/b.rs"]"#);
+    }
+}
