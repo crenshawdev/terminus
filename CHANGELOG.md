@@ -7,6 +7,20 @@ Each release bumps the middle number of the version, a release with only fixes
 bumps the last, and the first moves only for a large change. The number does not
 promise compatibility; the entry for each release says what it changes.
 
+## [2.2.0] - 2026-11-20
+
+The first ingest pass after this update builds a summary of your archive, once,
+and there's nothing to run. Until that pass finishes, a new session starts
+without a brief. Your archived sessions aren't touched.
+
+### Fixed
+
+- The `SessionStart` hook could give up on the brief at its 50 ms deadline, and
+  the session started without one. Ingest now keeps a summary of each project
+  and each main session as it archives, and the brief reads that summary
+  through three indexes instead of working it out from the archive when the
+  session starts. (#152)
+
 ## [2.1.0] - 2026-11-10
 
 ### Added
@@ -136,6 +150,7 @@ you run and gives that history back to Claude and to you.
 
 It calls no model, runs no daemon and opens no network connection.
 
+[2.2.0]: https://github.com/crenshawdev/terminus/releases/tag/v2.2.0
 [2.1.0]: https://github.com/crenshawdev/terminus/releases/tag/v2.1.0
 [2.0.0]: https://github.com/crenshawdev/terminus/releases/tag/v2.0.0
 [1.1.0]: https://github.com/crenshawdev/terminus/releases/tag/v1.1.0
