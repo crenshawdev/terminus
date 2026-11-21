@@ -21,21 +21,23 @@
 //! writes tool results, `isMeta` command caveats and `<task-notification>`
 //! envelopes as `user` records as well, and 12.3% of measured sessions end on
 //! one. The discriminator is `turns.is_typed`, written at ingest by
-//! `parse::record` and rebuilt from the archive alone, and the brief spends exactly
-//! one `AND` on it - see [`last_turn`].
+//! `parse::record` and rebuilt from the archive alone, and the typed rule is
+//! applied where the summary locates the prompts, so the brief reads only the
+//! locators of turns somebody typed.
 //!
-//! The counts are read one way only: the project-only projection
-//! `scope::resolve` has already run, plus one targeted `count(*)` per number,
-//! and never `config::visible::sessions`. Measured on a store shaped like the
-//! real one - 2,000 sessions, 250,000 turns, warm - `sessions()` costs 6.2-6.8
-//! ms against 0.56-0.58 ms for the project-only join, because of its
-//! per-session `count(*)` over `turns` and its watermark lookup. The whole
-//! budget here is single digit milliseconds, so a brief built on it would spend
-//! the budget before reading a useful row.
+//! **No brief until the summary is filled.** The brief renders nothing until the
+//! store's `meta` holds the key that marks its summary whole. A store from before
+//! the upgrade gets briefs once the first pass's fill commits, because the hook
+//! starts its ingest detached and renders straight away.
+//!
+//! The counts are the sums of `session_count` and `turn_count` over the
+//! project's `project_summary` rows, filtered the way every scoped read is, so
+//! the pointer costs one aggregate over a handful of rows and no walk of
+//! `session_meta` or `turns`.
 //!
 //! **The live git fact is the branch, read as a file.**
-//! `session_meta.branch`, the branch the session's last record that named one
-//! was on, is the only git fact the archive holds. A fuller delta
+//! The branch the summary stores, the one the session's last record that named
+//! one was on, is the only git fact the archive holds. A fuller delta
 //! would add HEAD-then-versus-now and a dirty-file list, and both need `git`,
 //! whose 10-30 ms process spawn is the whole budget several times over -
 //! `project::Resolver` is already kept off the cold-start path for the same
@@ -76,12 +78,13 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 
 use super::{chars, clip, Payload};
+use crate::config::visible::ProjectKeys;
 use crate::config::Config;
 use crate::observe::egress::Redaction;
-use crate::observe::mechanical::WRITING_TOOLS;
-use crate::recall::scope::Scoped;
+use crate::recall::scope::{self, Scope, Scoped};
 use crate::recall::{excerpt, Query};
-use crate::store::archive;
+use crate::store::{archive, Store};
+use crate::summary::PROMPTS_KEPT;
 
 /// Render the resume brief for one `SessionStart`, or nothing.
 ///
@@ -95,8 +98,8 @@ pub fn session_start(data_dir: &Path, config: &Config, payload: &Payload) -> Opt
     if payload.source == Some(super::COMPACT_SOURCE) {
         owe_compaction(data_dir, payload);
     }
-    let store = super::open(data_dir)?;
-    let scoped = super::scoped(store.conn(), config, payload)?;
+    let store = open_filled(data_dir)?;
+    let scoped = scoped(store.conn(), config, payload)?;
     // Resolved at the entry point that holds the `Config` and carried down. A
     // brief is hook stdout, which is the model's first context of the session,
     // so its quotations are an egress boundary in exactly the way a search
@@ -122,8 +125,8 @@ pub fn session_start_reads(
     config: &Config,
     payload: &Payload,
 ) -> Option<excerpt::Reads> {
-    let store = super::open(data_dir)?;
-    let scoped = super::scoped(store.conn(), config, payload)?;
+    let store = open_filled(data_dir)?;
+    let scoped = scoped(store.conn(), config, payload)?;
     let brief = render(
         store.conn(),
         &scoped,
@@ -132,6 +135,121 @@ pub fn session_start_reads(
         payload.cwd.and_then(checked_out_branch).as_deref(),
     )?;
     Some(brief.reads)
+}
+
+/// How many pages the brief's one connection read in to render what
+/// [`session_start`] would: the open, the `meta` check, the scope's pair read, the
+/// pick, the list, the located row, the block read and the counts. Renders the
+/// same brief and writes no state. Test support only.
+#[cfg(feature = "testkit")]
+pub fn session_start_page_reads(
+    data_dir: &Path,
+    config: &Config,
+    payload: &Payload,
+) -> Option<i64> {
+    let store = open_filled(data_dir)?;
+    let scoped = scoped(store.conn(), config, payload)?;
+    render(
+        store.conn(),
+        &scoped,
+        config.brief_chars(),
+        &Redaction::of(config),
+        payload.cwd.and_then(checked_out_branch).as_deref(),
+    )?;
+    Some(crate::testkit::cache_misses(store.conn()))
+}
+
+/// The plan SQLite gives each statement the brief runs against the summary: the
+/// pick without a branch, the pick on `branch`, and the list of other sessions.
+/// Each is the detail column of `EXPLAIN QUERY PLAN`, one string per line,
+/// under the statement's name. Writes nothing and renders nothing. Test support
+/// only.
+#[cfg(feature = "testkit")]
+pub fn session_start_plans(
+    data_dir: &Path,
+    config: &Config,
+    payload: &Payload,
+    branch: &str,
+) -> Option<Vec<(&'static str, Vec<String>)>> {
+    let store = open_filled(data_dir)?;
+    let scoped = scoped(store.conn(), config, payload)?;
+    let statements = [
+        ("pick", newest_query(&scoped, None)),
+        ("pick on a branch", newest_query(&scoped, Some(branch))),
+        ("other sessions", others_query(&scoped)),
+    ];
+    let mut plans = Vec::new();
+    for (name, (sql, params)) in statements {
+        let mut statement = store
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .ok()?;
+        let lines = statement
+            .query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                r.get::<_, String>(3)
+            })
+            .ok()?
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        plans.push((name, lines));
+    }
+    Some(plans)
+}
+
+/// The store the brief reads, once its summary is marked filled, or nothing.
+///
+/// Whether the key row exists is the whole test, as `summary::fill` asks it, and
+/// it is asked before any statement names a summary table: a store from before
+/// the upgrade has none. No row, or any error, is no brief.
+fn open_filled(data_dir: &Path) -> Option<Store> {
+    let store = super::open(data_dir)?;
+    let filled = store
+        .conn()
+        .prepare_cached("SELECT 1 FROM meta WHERE key = ?1")
+        .ok()?
+        .exists([crate::summary::META_SUMMARY_FILLED])
+        .ok()?;
+    filled.then_some(store)
+}
+
+/// The project the payload's `cwd` sits in, found among the pairs the summary holds.
+///
+/// `None` when the payload carries no `cwd`, when the read failed, or when the
+/// scope can match nothing at all - no pair, a directory no pair covers, or a
+/// project the config excludes. Every one of those is silence.
+fn scoped(conn: &Connection, config: &Config, payload: &Payload) -> Option<Scoped> {
+    let cwd = payload.cwd?;
+    let scope = Scope::Directory(cwd.into());
+    let scoped = scope::resolve_with(config, &scope, || summary_pairs(conn, config)).ok()?;
+    (!scoped.is_empty()).then_some(scoped)
+}
+
+/// The summary's `(project, project_pre_worktree)` pairs, ordered and flagged the way `visible::projects` does.
+fn summary_pairs(conn: &Connection, config: &Config) -> crate::error::Result<Vec<ProjectKeys>> {
+    let mut statement = conn
+        .prepare("SELECT project, project_pre_worktree FROM project_summary ORDER BY project, 2")?;
+    let rows = statement.query_map([], |r| {
+        Ok((
+            r.get::<_, Option<String>>(0)?,
+            r.get::<_, Option<String>>(1)?,
+        ))
+    })?;
+
+    let excludes = |key: &Option<String>| {
+        key.as_deref()
+            .is_some_and(|k| config.excludes_path(Path::new(k)))
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let (project, project_pre_worktree) = row?;
+        out.push(ProjectKeys {
+            project_excluded: excludes(&project),
+            pre_worktree_excluded: excludes(&project_pre_worktree),
+            project,
+            project_pre_worktree,
+        });
+    }
+    Ok(out)
 }
 
 /// Leave the next prompt an injection to make.
@@ -215,7 +333,7 @@ struct Brief {
 /// catch, and the brief would be the one output where a long turn leaks.
 ///
 /// The head line, the branch and the index pointer are built here out of
-/// `session_meta` and counts and are not redacted. The day, the branch and the
+/// `session_summary` and counts and are not redacted. The day, the branch and the
 /// project label are archived strings all the same, so each has any closing tag
 /// neutralized where it is built.
 ///
@@ -489,14 +607,11 @@ fn project_label(scoped: &Scoped) -> &str {
     scoped.project().unwrap_or("this machine")
 }
 
-/// The `session_meta` row the brief is about, and the coordinates it needs.
+/// The `session_summary` row the brief is about, as far as the head line needs it.
 struct LastSession {
     session_key: String,
     last_turn_at: Option<String>,
     branch: Option<String>,
-    project: Option<String>,
-    cwd: Option<String>,
-    pre_worktree: Option<String>,
 }
 
 /// The continuity blocks: which session was last here, when it ended, on
@@ -513,13 +628,20 @@ fn last_session(
     };
     let row = &pick.row;
     let head = head(scoped, row, pick.later.as_ref());
-    let (prompts, reply, reads) = last_exchange(conn, &row.session_key, redaction);
+    let located = located(conn, &row.session_key);
+    let (prompts, reply, reads) = last_exchange(
+        conn,
+        &row.session_key,
+        located.prompts,
+        located.reply,
+        redaction,
+    );
     let continuity = Continuity {
         session_key: row.session_key.clone(),
         head,
         prompts,
         reply,
-        edited: edited_files(conn, row, redaction),
+        edited: edited_files(&located.files, redaction),
     };
     (Some(continuity), reads)
 }
@@ -577,25 +699,16 @@ const TITLE_CHARS: usize = 80;
 /// The newest sessions other than the one the brief is about, with a typed
 /// prompt and a title, one `<day> <title>` line each.
 ///
-/// `CROSS JOIN` for the reason [`edited_files`] gives: left alone, SQLite may start
-/// from every title in the store. A session a script ran has no typed prompt, so
-/// it isn't listed. Any failure is just no list.
+/// The 64 newest titled rows are read and the typed test is applied to each after
+/// the limit, as [`newest`] explains. A session a script ran has no typed prompt,
+/// so it isn't listed. Any failure is just no list.
 fn other_sessions(
     conn: &Connection,
     scoped: &Scoped,
     picked: Option<&str>,
     redaction: &Redaction,
 ) -> Option<String> {
-    let mut sql = String::from(
-        "SELECT m.session_key, m.last_turn_at, s.title FROM session_meta m \
-         CROSS JOIN session_titles s ON s.session_key = m.session_key \
-         WHERE m.parent_session_key IS NULL",
-    );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    scoped.push_filter(&mut sql, &mut params);
-    sql.push_str(" ORDER BY m.last_turn_at DESC, m.session_key DESC LIMIT ?");
-    params.push(Box::new(SESSIONS_LOOKED_AT));
-
+    let (sql, params) = others_query(scoped);
     let mut statement = conn.prepare(&sql).ok()?;
     let rows = statement
         .query_map(rusqlite::params_from_iter(params.iter()), |r| {
@@ -603,18 +716,17 @@ fn other_sessions(
                 r.get::<_, String>(0)?,
                 r.get::<_, Option<String>>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, bool>(3)?,
             ))
         })
         .ok()?;
 
     let mut lines: Vec<String> = Vec::new();
-    for (session_key, last_turn_at, title) in rows.flatten() {
+    for (session_key, last_turn_at, title, typed) in rows.flatten() {
         if lines.len() == SESSIONS_NAMED {
             break;
         }
-        if picked == Some(session_key.as_str())
-            || !has_typed_prompt(conn, &session_key).unwrap_or(false)
-        {
+        if picked == Some(session_key.as_str()) || !typed {
             continue;
         }
         let title = clip(
@@ -632,6 +744,23 @@ fn other_sessions(
             lines.join("\n")
         )
     })
+}
+
+/// The list's statement and the values it binds. The test that reads its plan
+/// goes through this too, so it can't describe a statement the brief doesn't run.
+///
+/// `m.title IS NOT NULL` stays literal: the partial index serves the statement
+/// only when the `WHERE` states its condition.
+fn others_query(scoped: &Scoped) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut sql = String::from(
+        "SELECT m.session_key, m.last_turn_at, m.title, m.has_typed_prompt \
+         FROM session_summary m WHERE m.title IS NOT NULL",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    scoped.push_filter(&mut sql, &mut params);
+    sql.push_str(" ORDER BY m.last_turn_at DESC, m.session_key DESC LIMIT ?");
+    params.push(Box::new(SESSIONS_LOOKED_AT));
+    (sql, params)
 }
 
 /// The session the brief is about, and the later one it has to mention when it
@@ -671,7 +800,10 @@ fn pick_session(
 const SESSIONS_LOOKED_AT: i64 = 64;
 
 /// The greatest `last_turn_at` among the scoped project's own sessions, on one
-/// branch if asked and with a typed prompt if asked.
+/// branch if asked and with a typed prompt if asked. `session_summary` holds main
+/// sessions only.
+///
+/// It reads through the index in its own order, with no sort.
 ///
 /// Three things this query is not. It is not `is_final`: that column is
 /// declared in the schema and never written, so ordering by it would name a
@@ -679,8 +811,7 @@ const SESSIONS_LOOKED_AT: i64 = 64;
 /// comparison: 22,412 turns of a 180-file sample carry exactly the shape
 /// `NNNN-NN-NNTNN:NN:NN.NNNZ`, which sorts lexicographically, so
 /// no parsing happens on the stored side. And it does not consider sidecars: a
-/// session with a `parent_session_key` is a subagent transcript, and the brief
-/// carries no subagent turns.
+/// subagent transcript has no summary row, and the brief carries no subagent turns.
 ///
 /// The tie-break on `session_key` is the brief's own, not SQL's: two sessions
 /// whose last turn carries the same timestamp must not be ordered by whatever
@@ -691,17 +822,42 @@ const SESSIONS_LOOKED_AT: i64 = 64;
 /// always wins over one that does not, and a project where nothing has a
 /// timestamp still names a session.
 ///
-/// The typed check runs row by row after the sort. As an `EXISTS` in the `WHERE`
-/// SQLite would run it for every session in the project before sorting.
+/// The typed check runs on each row after the limit, and never in the `WHERE`,
+/// though `has_typed_prompt` is a column: with the test in the `WHERE`, a project
+/// with more than 64 newer one-shot or other-branch sessions would name a
+/// different session than it always has.
 fn newest(
     conn: &Connection,
     scoped: &Scoped,
     branch: Option<&str>,
     typed: bool,
 ) -> crate::error::Result<Option<LastSession>> {
+    let (sql, params) = newest_query(scoped, branch);
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+        Ok((
+            LastSession {
+                session_key: r.get(0)?,
+                last_turn_at: r.get(1)?,
+                branch: r.get(2)?,
+            },
+            r.get::<_, bool>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (row, has_typed_prompt) = row?;
+        if !typed || has_typed_prompt {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+/// [`newest`]'s statement and the values it binds, shared with the plan reader.
+fn newest_query(scoped: &Scoped, branch: Option<&str>) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     let mut sql = String::from(
-        "SELECT m.session_key, m.last_turn_at, m.branch, m.project, m.cwd, \
-         m.project_pre_worktree FROM session_meta m WHERE m.parent_session_key IS NULL",
+        "SELECT m.session_key, m.last_turn_at, m.branch, m.has_typed_prompt \
+         FROM session_summary m WHERE 1 = 1",
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     scoped.push_filter(&mut sql, &mut params);
@@ -711,32 +867,7 @@ fn newest(
     }
     sql.push_str(" ORDER BY m.last_turn_at DESC, m.session_key DESC LIMIT ?");
     params.push(Box::new(SESSIONS_LOOKED_AT));
-
-    let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(params.iter()), |r| {
-        Ok(LastSession {
-            session_key: r.get(0)?,
-            last_turn_at: r.get(1)?,
-            branch: r.get(2)?,
-            project: r.get(3)?,
-            cwd: r.get(4)?,
-            pre_worktree: r.get(5)?,
-        })
-    })?;
-    for row in rows {
-        let row = row?;
-        if !typed || has_typed_prompt(conn, &row.session_key)? {
-            return Ok(Some(row));
-        }
-    }
-    Ok(None)
-}
-
-/// `UNIQUE (session_key, turn_seq)` covers it, and it stops at the first one.
-fn has_typed_prompt(conn: &Connection, session_key: &str) -> crate::error::Result<bool> {
-    let mut statement =
-        conn.prepare_cached("SELECT 1 FROM turns WHERE session_key = ?1 AND is_typed = 1 LIMIT 1")?;
-    Ok(statement.exists([session_key])?)
+    (sql, params)
 }
 
 /// The most a read of `HEAD` or a worktree's `.git` file takes.
@@ -802,6 +933,52 @@ fn day(ts: &str) -> &str {
     ts.get(..10).unwrap_or(ts)
 }
 
+/// `(id, stream_offset, byte_len)` of one `turns` row, as the summary stores it.
+type Locator = (i64, i64, i64);
+
+/// Where the picked session's quotes and files are, read off its summary row.
+#[derive(Default)]
+struct Located {
+    /// Newest first, at most [`PROMPTS_KEPT`] of them.
+    prompts: Vec<Locator>,
+    reply: Option<Locator>,
+    files: Vec<String>,
+}
+
+/// The picked row's locators and file list. Each value that will not parse is
+/// dropped alone, and a row that will not read is nothing located.
+fn located(conn: &Connection, session_key: &str) -> Located {
+    let row = conn
+        .prepare_cached(
+            "SELECT prompts, reply_id, reply_stream_offset, reply_byte_len, edited_files \
+             FROM session_summary WHERE session_key = ?1",
+        )
+        .and_then(|mut statement| {
+            statement.query_row([session_key], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, Option<i64>>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+        });
+    let Ok((prompts, id, offset, len, files)) = row else {
+        return Located::default();
+    };
+    let mut prompts: Vec<Locator> = serde_json::from_str(&prompts).unwrap_or_default();
+    prompts.truncate(PROMPTS_KEPT as usize);
+    Located {
+        prompts,
+        reply: id
+            .zip(offset)
+            .zip(len)
+            .map(|((id, offset), len)| (id, offset, len)),
+        files: serde_json::from_str(&files).unwrap_or_default(),
+    }
+}
+
 /// The last few turns the person TYPED and the last assistant turn of one
 /// session, as text.
 ///
@@ -809,18 +986,14 @@ fn day(ts: &str) -> &str {
 /// tool results, `isMeta` command caveats and `<task-notification>` envelopes as
 /// `user` records too, and one session in eight ends on one of them. Quoting
 /// that back is a brief that opens by telling the model a file listing was the
-/// last thing it was asked. [`recent_turns`] carries the rule; a session with no
-/// typed `user` record at all renders no "It last asked" line, because the
-/// lookup returns nothing and [`Continuity::text`] omits what it has not got.
+/// last thing it was asked. The summary's locators carry the rule; a session with
+/// no typed `user` record at all renders no "It last asked" line, because it
+/// locates nothing and [`Continuity::text`] omits what it has not got.
 ///
 /// **One read for all of them, of only the rows they cover.** Every turn is
 /// in the same session, so one read fetches and decompresses each block row the
 /// turns cover once, on the path with the tightest budget in the product. What
 /// it cost comes back beside the quotes.
-///
-/// `turn_seq` order and never `ts` order: 31 of 62 sampled real transcripts
-/// carry a record whose timestamp runs backwards, so the last
-/// turn by clock is not the last turn of the conversation.
 ///
 /// The text is cut through [`excerpt::of_record_with`] under the caller's
 /// redaction, which is the same projection under the same filter that ingest
@@ -832,11 +1005,12 @@ fn day(ts: &str) -> &str {
 fn last_exchange(
     conn: &Connection,
     session_key: &str,
+    prompts: Vec<Locator>,
+    reply: Option<Locator>,
     redaction: &Redaction,
 ) -> (Vec<Quote>, Option<Quote>, excerpt::Reads) {
     let mut reads = excerpt::Reads::default();
-    let prompts = prompts_to_read(recent_turns(conn, session_key, "user", PROMPTS_LOOKED_AT));
-    let reply = recent_turns(conn, session_key, "assistant", 1).pop();
+    let prompts = prompts_to_read(prompts);
     if prompts.is_empty() && reply.is_none() {
         return (Vec::new(), None, reads);
     }
@@ -853,7 +1027,7 @@ fn last_exchange(
 
     let query = Query::parse("");
     let mut bytes = read.bytes.into_iter();
-    let mut cut = |coordinates: &(i64, i64, i64)| -> Option<Quote> {
+    let mut cut = |coordinates: &Locator| -> Option<Quote> {
         let bytes = bytes.next()?.ok()?;
         let text = excerpt::of_record_scrubbed(&query, &bytes, redaction, super::neutralize);
         (!text.trim().is_empty()).then_some(Quote {
@@ -867,10 +1041,6 @@ fn last_exchange(
     (worth_quoting(prompts), reply, reads)
 }
 
-/// How many of a session's newest typed prompts get read to find three worth
-/// quoting.
-const PROMPTS_LOOKED_AT: i64 = 12;
-
 /// The most prompt bytes one brief reads, so a run of huge pastes can't eat the
 /// hook's 50 ms. The newest prompt is always read.
 const PROMPT_READ_BYTES: i64 = 256 * 1024;
@@ -882,7 +1052,7 @@ const PROMPTS_QUOTED: usize = 3;
 const SHORTEST_ASK_CHARS: usize = 20;
 
 /// The newest prompts, stopping once they've used up [`PROMPT_READ_BYTES`].
-fn prompts_to_read(newest_first: Vec<(i64, i64, i64)>) -> Vec<(i64, i64, i64)> {
+fn prompts_to_read(newest_first: Vec<Locator>) -> Vec<Locator> {
     let mut spent = 0;
     newest_first
         .into_iter()
@@ -917,113 +1087,33 @@ fn says_something(text: &str) -> bool {
         && !text.starts_with("[Request interrupted")
 }
 
-/// `(id, stream_offset, byte_len)` of one session's newest turns of a record
-/// type, newest first, skipping the `user` records nobody typed.
-///
-/// Both offsets address the UNCOMPRESSED session stream, never a block.
-/// `UNIQUE (session_key, turn_seq)` covers the lookup. The id comes back too
-/// because the prompt arm suppresses a turn the brief quoted and cannot
-/// recognize one from its text.
-///
-/// **`is_typed IS NOT 0` and not `is_typed = 1`**, which is what lets one
-/// statement serve all three callers. `IS NOT` is SQLite's null-safe
-/// comparison, so a null passes: an `assistant` row carries null by
-/// construction (`parse::record` classifies `user` records and nothing else).
-/// For an evicted session the choice is unobservable -
-/// `retention::apply` deletes its block rows, so [`last_exchange`] reads no bytes
-/// and renders no quote either way.
-///
-/// One `AND` and no new index. Measured against the live 1.16 GB store
-/// (450,834 turns), the lookup costs 0.002 ms and a variant forced to scan a
-/// 2,465-turn session backwards without matching costs 0.362 ms, both planned
-/// as `SEARCH turns USING INDEX sqlite_autoindex_turns_1`, against a 10 ms
-/// wall; real scan depth is p50 27, p90 181, p99 404, max 520 rows.
-fn recent_turns(
-    conn: &Connection,
-    session_key: &str,
-    record_type: &str,
-    limit: i64,
-) -> Vec<(i64, i64, i64)> {
-    let turns = || -> rusqlite::Result<Vec<(i64, i64, i64)>> {
-        conn.prepare_cached(
-            "SELECT id, stream_offset, byte_len FROM turns \
-             WHERE session_key = ?1 AND record_type = ?2 AND is_typed IS NOT 0 \
-             ORDER BY turn_seq DESC LIMIT ?3",
-        )?
-        .query_map(rusqlite::params![session_key, record_type, limit], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })?
-        .collect()
-    };
-    turns().unwrap_or_default()
-}
-
 /// How many files a brief names before it says how many more there were.
 const FILES_NAMED: usize = 8;
 
 /// The longest a named file gets.
 const FILE_CHARS: usize = 120;
 
-/// The files the session called a writing tool on, newest first and relative to
-/// the project. A call that failed still counts: the record says it was tried,
-/// not that it worked. Files outside the project are scratch, so they're left out.
-///
-/// `CROSS JOIN` forces turns first. Left alone, SQLite starts from every `path`
-/// entity in the store, and that's a second against this hook's 50 ms.
-fn edited_files(conn: &Connection, row: &LastSession, redaction: &Redaction) -> Option<String> {
-    let tools: serde_json::Value = WRITING_TOOLS.iter().copied().collect();
-    let mut statement = conn
-        .prepare_cached(
-            "SELECT e.value_norm FROM turns t CROSS JOIN entities e ON e.turn_id = t.id \
-             WHERE t.session_key = ?1 AND e.kind = 'path' \
-             AND t.tool_name IN (SELECT value FROM json_each(?2)) \
-             GROUP BY e.value_norm ORDER BY max(t.turn_seq) DESC, e.value_norm",
-        )
-        .ok()?;
-    let paths = statement
-        .query_map(rusqlite::params![row.session_key, tools.to_string()], |r| {
-            r.get::<_, String>(0)
-        })
-        .ok()?;
-
-    let mut roots: Vec<&str> = [&row.cwd, &row.pre_worktree, &row.project]
-        .into_iter()
-        .filter_map(|root| root.as_deref())
-        .collect();
-    roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
-
-    let mut files: Vec<String> = Vec::new();
-    for path in paths.flatten() {
-        let Some(relative) = inside_project(&path, &roots) else {
-            continue;
-        };
+/// The files the session edited, as the summary lists them: in the project,
+/// relative to it and most recent first. A call that failed still counts, the
+/// record says it was tried and not that it worked.
+fn edited_files(files: &[String], redaction: &Redaction) -> Option<String> {
+    let mut named: Vec<String> = Vec::new();
+    for path in files {
         let file = clip(
-            &excerpt::flatten(&super::neutralize(&redaction.apply(relative))),
+            &excerpt::flatten(&super::neutralize(&redaction.apply(path))),
             FILE_CHARS,
         );
-        if !files.contains(&file) {
-            files.push(file);
+        if !named.contains(&file) {
+            named.push(file);
         }
     }
-    let hidden = files.len().saturating_sub(FILES_NAMED);
-    files.truncate(FILES_NAMED);
-    let named = files.join(", ");
+    let hidden = named.len().saturating_sub(FILES_NAMED);
+    named.truncate(FILES_NAMED);
+    let named = named.join(", ");
     match hidden {
         _ if named.is_empty() => None,
         0 => Some(format!("{named}.")),
         _ => Some(format!("{named} and {hidden} more.")),
-    }
-}
-
-/// `path` relative to the longest root it sits under. An absolute path under no
-/// root is outside the project.
-fn inside_project<'p>(path: &'p str, roots: &[&str]) -> Option<&'p str> {
-    let relative = roots
-        .iter()
-        .find_map(|root| path.strip_prefix(root)?.strip_prefix('/'));
-    match relative {
-        Some(relative) => Some(relative),
-        None => (!path.starts_with(['/', '~'])).then_some(path),
     }
 }
 
@@ -1036,8 +1126,14 @@ fn inside_project<'p>(path: &'p str, roots: &[&str]) -> Option<&'p str> {
 /// nothing archived renders no pointer at all - "0 sessions indexed" is a line
 /// that costs context and tells the model to stop asking.
 fn index_pointer(conn: &Connection, scoped: &Scoped) -> Option<String> {
-    let sessions = super::count(conn, SESSIONS, scoped).ok()?;
-    let turns = super::count(conn, TURNS, scoped).ok()?;
+    let mut sql = String::from(COUNTS);
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    scoped.push_filter(&mut sql, &mut params);
+    let (sessions, turns): (i64, i64) = conn
+        .query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .ok()?;
     if sessions == 0 {
         return None;
     }
@@ -1051,13 +1147,9 @@ fn index_pointer(conn: &Connection, scoped: &Scoped) -> Option<String> {
     ))
 }
 
-/// Sessions of the scoped project. `idx_session_meta_project` covers it.
-const SESSIONS: &str = "SELECT count(*) FROM session_meta m";
-
-/// Turns of those sessions. The join is on `session_key`, which is
-/// `session_meta`'s primary key and the leading column of `turns`'
-/// `UNIQUE (session_key, turn_seq)` index, so neither side is a scan.
-const TURNS: &str = "SELECT count(*) FROM turns t JOIN session_meta m USING (session_key)";
+/// Both counts of the scoped project's pairs, which `Scoped::push_filter` narrows by their two keys.
+const COUNTS: &str = "SELECT coalesce(sum(session_count), 0), coalesce(sum(turn_count), 0) \
+                      FROM project_summary m WHERE 1 = 1";
 
 /// `1 session` / `2 sessions`, for a brief that reads as English.
 fn plural(count: i64, noun: &str) -> String {

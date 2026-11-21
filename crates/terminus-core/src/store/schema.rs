@@ -7,6 +7,14 @@
 //! derived-schema bump rebuild rather than migrate. `watermarks`, `runs` and
 //! `meta` are operational state.
 //!
+//! `project_summary` and `session_summary` are a group of their own. Ingest
+//! writes them inside each file's transaction from the rows as they stand,
+//! retention's delete takes a session off them in its own transaction, and
+//! `reindex` empties and writes them again from the rebuilt rows. They are not
+//! derived: `reindex` never drops them, because a drop would leave the brief
+//! with nothing until the next ingest. `session_summary` references
+//! `sessions(session_key)` and `project_summary` references nothing.
+//!
 //! `decisions` and `labels` belong to the archive group: a logged injection
 //! decision is prompt-time state the archive does not contain, so it is kept
 //! rather than rebuilt, and a `reindex` must never drop it. `observations`
@@ -345,6 +353,73 @@ CREATE TABLE IF NOT EXISTS paths (
 CREATE INDEX IF NOT EXISTS idx_paths_path ON paths(path);
 CREATE INDEX IF NOT EXISTS idx_paths_turn ON paths(turn_id);
 
+-- SUMMARY. What the resume brief needs answered before a session starts, kept
+-- current by ingest inside each file's transaction, by retention's delete in its
+-- own, and by `reindex` writing every session again. Not in `DERIVED_TABLES`: a
+-- `reindex` empties and rewrites them and never drops them. `session_summary`
+-- references `sessions`, so retention deletes a session's row before its
+-- `sessions` row, and neither table references `turns`, which `reindex` drops.
+-- A pair is not a session, so `project_summary` references nothing.
+--
+-- No column holds prompt or reply text, and none holds the time of a write, so
+-- a row is a function of the committed rows under it.
+
+-- One row per distinct `(project, project_pre_worktree)` pair in
+-- `session_meta`, counting every session under it, subagents included. A null
+-- key is a key: `UNIQUE` treats nulls as distinct, so the row is keyed on
+-- `json_array(project, project_pre_worktree)`, which is one value for a null
+-- key and a different one for every string, `''` and `'null'` included.
+CREATE TABLE IF NOT EXISTS project_summary (
+    pair_key             TEXT    PRIMARY KEY,
+    project              TEXT,
+    project_pre_worktree TEXT,
+    session_count        INTEGER NOT NULL,
+    turn_count           INTEGER NOT NULL
+);
+
+-- One row per main session, a `session_meta` row with no parent. Read back
+-- whole, so the list-shaped columns are JSON the way `decisions` carries its
+-- own and the row lands in one statement.
+--
+-- `prompts` is the newest typed prompts, newest first, each entry
+-- `[id, stream_offset, byte_len]` of a `turns` row: a locator, never text.
+-- `reply_*` locate the newest assistant turn the same way. `edited_files` is
+-- every in-project path the session edited, most recent first. Both list
+-- columns hold `[]` when empty.
+CREATE TABLE IF NOT EXISTS session_summary (
+    session_key          TEXT    PRIMARY KEY REFERENCES sessions(session_key),
+    last_turn_at         TEXT,
+    branch               TEXT,
+    project              TEXT,
+    project_pre_worktree TEXT,
+    cwd                  TEXT,
+    title                TEXT,
+    has_typed_prompt     INTEGER NOT NULL,
+    turn_count           INTEGER NOT NULL,
+    prompts              TEXT    NOT NULL,
+    reply_id             INTEGER,
+    reply_stream_offset  INTEGER,
+    reply_byte_len       INTEGER,
+    edited_files         TEXT    NOT NULL
+);
+
+-- The brief's reads, each in the pick's own order so none scans the table or
+-- sorts. `project_pre_worktree` trails every key so the worktree exclusion is
+-- answered in the index entry and a session it drops costs no table row.
+-- The first serves the pick with no branch, the second the pick on a branch, and
+-- the third the list of other sessions, which only ever wants titled sessions.
+--
+-- A store from before the summary has no summary tables, so `bring_forward`'s
+-- missing-table arm runs this batch and creates the indexes with the tables. A
+-- store that already holds the tables gets them at its next `reindex`.
+CREATE INDEX IF NOT EXISTS idx_session_summary_project_last
+    ON session_summary(project, last_turn_at, session_key, project_pre_worktree);
+CREATE INDEX IF NOT EXISTS idx_session_summary_project_branch_last
+    ON session_summary(project, branch, last_turn_at, session_key, project_pre_worktree);
+CREATE INDEX IF NOT EXISTS idx_session_summary_project_last_titled
+    ON session_summary(project, last_turn_at, session_key, project_pre_worktree)
+    WHERE title IS NOT NULL;
+
 -- OPERATIONAL.
 
 -- The byte offset just past the last newline of a transcript, never its end:
@@ -411,6 +486,11 @@ pub const TABLES: &[&str] = &[
     "watermarks",
     "runs",
     "meta",
+    // Summary group, appended last so it reaches an already-initialized store
+    // through the same missing-table arm. Absent from `DERIVED_TABLES`.
+    // `session_summary` references `sessions` and `project_summary` nothing.
+    "project_summary",
+    "session_summary",
 ];
 
 /// The derived tables `reindex` drops and rebuilds from the block rows.
@@ -419,7 +499,9 @@ pub const TABLES: &[&str] = &[
 /// injector decided at prompt time. `observations` is absent too: its facts
 /// come off the session's archived stream, and retention eviction deletes its
 /// block rows, so a `reindex` that dropped the table could not recompute an
-/// evicted session's row.
+/// evicted session's row. The summary tables are absent as well: `reindex`
+/// empties and writes them again through `summary::write`, and a drop would
+/// leave the brief with nothing until the next ingest.
 ///
 /// In creation order, because `reindex` drops in reverse: `entities` and
 /// `paths` reference `turns(id)`, so they sit **after** `turns` here and are

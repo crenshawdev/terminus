@@ -411,6 +411,209 @@ fn observations_declares_no_reference_to_turns() {
     assert!(sql.contains("REFERENCES sessions"), "{sql}");
 }
 
+const SUMMARY_TABLES: [&str; 2] = ["project_summary", "session_summary"];
+
+/// The summary tables reach a store written before they existed through the
+/// same missing-table arm, with no rebuild scheduled.
+#[test]
+fn the_summary_tables_reach_a_store_that_predates_them() {
+    let (dir, store) = fresh();
+    for table in SUMMARY_TABLES {
+        assert!(names(store.conn(), "table").contains(table));
+        store
+            .conn()
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .unwrap();
+    }
+    drop(store);
+
+    let reopened = Store::open(dir.path()).expect("an older store still opens");
+    for table in SUMMARY_TABLES {
+        assert!(
+            names(reopened.conn(), "table").contains(table),
+            "the missing-table arm did not create `{table}`"
+        );
+    }
+    assert!(
+        reopened.rebuild_required().is_none(),
+        "adding the summary tables must not force a derived rebuild"
+    );
+}
+
+/// The summary is kept, so `reindex` must not drop it. `session_summary`
+/// references `sessions` and the store holds it to that, and `project_summary`
+/// references nothing, because a pair is not a session.
+#[test]
+fn the_summary_tables_are_kept_and_session_summary_references_sessions() {
+    let (_dir, store) = fresh();
+    let sql = |table: &str| -> String {
+        store
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = ?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    for table in SUMMARY_TABLES {
+        assert!(!schema::DERIVED_TABLES.contains(&table), "{table}");
+        assert!(schema::TABLES.contains(&table), "{table}");
+    }
+    assert_eq!(terminus_core::DERIVED_SCHEMA, 6);
+    let session = sql("session_summary");
+    assert!(session.contains("REFERENCES sessions(session_key)"), "{session}");
+    assert!(!session.contains("REFERENCES turns"), "{session}");
+    let project = sql("project_summary");
+    assert!(!project.contains("REFERENCES"), "{project}");
+
+    let conn = store.conn();
+    conn.execute("INSERT INTO sessions (session_key, session_no) VALUES ('k', 1)", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO session_summary (session_key, has_typed_prompt, turn_count, prompts, edited_files)
+         VALUES ('k', 0, 0, '[]', '[]')",
+        [],
+    )
+    .unwrap();
+    let refused = conn.execute("DELETE FROM sessions WHERE session_key = 'k'", []);
+    assert!(refused.is_err(), "a session was deleted under its summary row");
+    conn.execute("DELETE FROM session_summary WHERE session_key = 'k'", [])
+        .unwrap();
+    conn.execute("DELETE FROM sessions WHERE session_key = 'k'", [])
+        .expect("a session with no summary row deletes");
+}
+
+const SUMMARY_INDEXES: [&str; 3] = [
+    "idx_session_summary_project_last",
+    "idx_session_summary_project_branch_last",
+    "idx_session_summary_project_last_titled",
+];
+
+/// An index's key columns, in order.
+fn key_columns(conn: &Connection, index: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA index_info({index})"))
+        .unwrap();
+    stmt.query_map([], |r| r.get::<_, String>(2))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// The indexes ride `session_summary`'s own create SQL, so a store written by
+/// 2.1.0, which has no summary tables, gets them with the tables on its first
+/// writable open and no rebuild is scheduled.
+#[test]
+fn the_summary_indexes_reach_a_store_that_predates_the_summary() {
+    use terminus_core::store::META_DERIVED_SCHEMA;
+
+    let (dir, store) = fresh();
+    for index in SUMMARY_INDEXES {
+        assert_eq!(index_count(store.conn(), index), 1, "{index}");
+    }
+    for table in SUMMARY_TABLES {
+        store
+            .conn()
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .unwrap();
+    }
+    for index in SUMMARY_INDEXES {
+        assert_eq!(index_count(store.conn(), index), 0, "{index}");
+    }
+    drop(store);
+
+    let reopened = Store::open(dir.path()).expect("an older store still opens");
+    for table in SUMMARY_TABLES {
+        assert!(names(reopened.conn(), "table").contains(table), "{table}");
+    }
+    let conn = reopened.conn();
+    let key = [
+        "project",
+        "last_turn_at",
+        "session_key",
+        "project_pre_worktree",
+    ];
+    let branch_key = [
+        "project",
+        "branch",
+        "last_turn_at",
+        "session_key",
+        "project_pre_worktree",
+    ];
+    let expected: [(&str, &[&str], bool); 3] = [
+        (SUMMARY_INDEXES[0], &key, false),
+        (SUMMARY_INDEXES[1], &branch_key, false),
+        (SUMMARY_INDEXES[2], &key, true),
+    ];
+    for (index, columns, partial) in expected {
+        assert_eq!(index_count(conn, index), 1, "{index}");
+        assert_eq!(key_columns(conn, index), columns, "{index}");
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [index],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sql.contains("WHERE title IS NOT NULL"), partial, "{sql}");
+        assert_eq!(sql.contains("WHERE"), partial, "{sql}");
+    }
+    assert!(reopened.rebuild_required().is_none());
+    assert_eq!(reopened.meta_int(META_DERIVED_SCHEMA).unwrap(), Some(6));
+    assert_eq!(terminus_core::DERIVED_SCHEMA, 6);
+}
+
+fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Only the table's own create SQL makes the indexes: no arm in the writable
+/// open, nothing in the fill and nothing in `reindex` names one.
+#[test]
+fn only_the_summary_tables_create_sql_creates_the_summary_indexes() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&manifest.join("src"), &mut files);
+    rust_files(&manifest.join("../terminus/src"), &mut files);
+    assert!(files.len() > 10, "the walk found {} files", files.len());
+
+    let schema_file = manifest.join("src/store/schema.rs");
+    for file in &files {
+        if file.canonicalize().unwrap() == schema_file.canonicalize().unwrap() {
+            continue;
+        }
+        let text = std::fs::read_to_string(file).unwrap();
+        let creates = text.lines().any(|line| {
+            let upper = line.to_ascii_uppercase();
+            upper.contains("CREATE INDEX") && line.contains("session_summary")
+        });
+        assert!(
+            !creates,
+            "{} creates a session_summary index",
+            file.display()
+        );
+    }
+
+    let sql = schema::CREATE_SQL;
+    let table = sql
+        .find("CREATE TABLE IF NOT EXISTS session_summary")
+        .expect("the table's create statement");
+    for index in SUMMARY_INDEXES {
+        let at = sql
+            .find(&format!("CREATE INDEX IF NOT EXISTS {index}\n"))
+            .unwrap_or_else(|| panic!("{index} is not in CREATE_SQL"));
+        assert!(at > table, "{index} comes before the table it indexes");
+    }
+}
+
 // --- session_meta.capture_mode -----------------------------------------------
 
 /// A config directory holding one `terminus.toml` naming a capture mode.

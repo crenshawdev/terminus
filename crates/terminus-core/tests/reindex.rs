@@ -16,6 +16,7 @@ use rusqlite::Connection;
 use terminus_core::store::{
     schema, Store, DB_FILE_NAME, DERIVED_SCHEMA, META_ARCHIVE_FORMAT, META_DERIVED_SCHEMA,
 };
+use terminus_core::summary::META_SUMMARY_FILLED;
 use terminus_core::{ingest, reindex, testkit};
 
 struct Bench {
@@ -687,4 +688,205 @@ fn rebuilding_twice_with_an_evicted_session_changes_nothing() {
 
     assert_eq!(twice.preserved, 1);
     assert_eq!(testkit::query_set_json(&bench.conn()), after_one);
+}
+
+// ---------------------------------------------------------------------------
+// The summary. A rebuild that reproduces the rows ingest wrote cannot tell a
+// reindex that keeps the summary right from one that ignores it, so these
+// stores are changed first: one blob damaged, another stream replaced.
+// ---------------------------------------------------------------------------
+
+type Table = Vec<Vec<rusqlite::types::Value>>;
+
+impl Bench {
+    fn table(&self, name: &str) -> Table {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {name} ORDER BY 1"))
+            .unwrap();
+        let width = statement.column_count();
+        statement
+            .query_map([], |r| (0..width).map(|i| r.get(i)).collect())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn summary(&self) -> (Table, Table) {
+        (self.table("project_summary"), self.table("session_summary"))
+    }
+
+    fn row(&self, key: &str) -> Vec<rusqlite::types::Value> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare("SELECT * FROM session_summary WHERE session_key = ?1")
+            .unwrap();
+        let width = statement.column_count();
+        statement
+            .query_row([key], |r| (0..width).map(|i| r.get(i)).collect())
+            .unwrap_or_else(|e| panic!("no session_summary row for {key}: {e}"))
+    }
+
+    fn column(&self, row: &[rusqlite::types::Value], name: &str) -> rusqlite::types::Value {
+        let conn = self.conn();
+        let statement = conn.prepare("SELECT * FROM session_summary").unwrap();
+        let at = statement.column_names().position(|c| c == name).unwrap();
+        row[at].clone()
+    }
+
+    fn checked(&self, after: &str) {
+        if let Err(e) = testkit::check_summary(&self.conn()) {
+            panic!("the summary disagrees with its rows after {after}: {e}");
+        }
+    }
+
+    /// Damage one main session's blob and replace another's stream with its
+    /// first two records, so a rebuild gives both different rows. Answers
+    /// `(damaged, replaced)`.
+    fn change_blobs(&self) -> (String, String) {
+        let damaged = self.key_ending("session-recall.jsonl");
+        let replaced = self.key_ending("session-basic.jsonl");
+        let conn = self.conn();
+        for key in [&damaged, &replaced] {
+            let parent: Option<String> = conn
+                .query_row(
+                    "SELECT parent_session_key FROM session_meta WHERE session_key = ?1",
+                    [key],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(parent.is_none(), "{key} is not a main session");
+        }
+        testkit::damage(&conn, &damaged);
+
+        let stream = testkit::stream(&conn, &replaced).unwrap();
+        let cut = stream
+            .split_inclusive(|b| *b == b'\n')
+            .take(2)
+            .flatten()
+            .copied()
+            .collect::<Vec<u8>>();
+        assert!(cut.len() < stream.len(), "the replacement drops nothing");
+        testkit::rewrite_stream(&conn, &replaced, &cut);
+        conn.execute(
+            "UPDATE session_meta SET uncompressed_len = ?2 WHERE session_key = ?1",
+            rusqlite::params![replaced, cut.len() as i64],
+        )
+        .unwrap();
+        (damaged, replaced)
+    }
+
+    /// Reindex, the way `terminus reindex` does.
+    fn reindex(&self) -> reindex::Rebuilt {
+        let mut store = self.store();
+        reindex::reindex(&mut store).unwrap()
+    }
+}
+
+/// On the drop path the summary is what the rebuilt rows give: the damaged
+/// session holds no turns, the replaced one holds its new ones, and the pairs
+/// follow.
+#[test]
+fn a_reindex_writes_the_summary_again_from_the_rebuilt_rows() {
+    let bench = bench();
+    bench.checked("ingest");
+    let (damaged, replaced) = bench.change_blobs();
+    let (damaged_before, replaced_before) = (bench.row(&damaged), bench.row(&replaced));
+    assert_ne!(bench.column(&damaged_before, "turn_count"), 0.into());
+
+    let rebuilt = bench.reindex();
+
+    assert_eq!(rebuilt.preserved, 0, "the premise: the drop path");
+    assert_eq!(rebuilt.failed.len(), 1);
+    bench.checked("a reindex");
+    let row = bench.row(&damaged);
+    assert_eq!(bench.column(&row, "turn_count"), 0.into());
+    assert_eq!(bench.column(&row, "prompts"), "[]".to_owned().into());
+    for name in ["reply_id", "reply_stream_offset", "reply_byte_len"] {
+        assert_eq!(bench.column(&row, name), rusqlite::types::Value::Null, "{name}");
+    }
+    assert_ne!(bench.row(&replaced), replaced_before, "the stream change reached no row");
+}
+
+/// The same on the preserving path, where an evicted session is carried across
+/// with the summary it had.
+#[test]
+fn the_preserving_path_writes_the_summary_again_and_keeps_an_evicted_sessions_row() {
+    let bench = bench();
+    let evicted = bench.key_ending("session-errors-a.jsonl");
+    let evicted_before = bench.row(&evicted);
+    bench.evict(&evicted);
+    let (_, replaced) = bench.change_blobs();
+    let replaced_before = bench.row(&replaced);
+
+    let rebuilt = bench.reindex();
+
+    assert!(rebuilt.preserved >= 1);
+    bench.checked("a preserving reindex");
+    assert_eq!(bench.row(&evicted), evicted_before, "the evicted session's row moved");
+    assert_ne!(bench.row(&replaced), replaced_before, "the stream change reached no row");
+}
+
+/// A rebuild that aborts leaves the summary, the version stamp and the summary's
+/// key as they were, and the same rebuild without the fault changes the
+/// summary and writes the key, which is what makes the first half a test of the
+/// transaction.
+#[test]
+fn an_aborted_reindex_leaves_the_summary_and_the_version_stamp_as_they_were() {
+    let bench = bench();
+    bench.change_blobs();
+    testkit::age(&bench.data_dir.join(DB_FILE_NAME));
+    // A store that ingest built has the key already, and this one must lack it.
+    bench
+        .conn()
+        .execute("DELETE FROM meta WHERE key = ?1", [META_SUMMARY_FILLED])
+        .unwrap();
+    bench
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER meta_fault BEFORE INSERT ON meta
+             BEGIN SELECT RAISE(ABORT, 'planted fault'); END;",
+        )
+        .unwrap();
+    let before = bench.summary();
+    let turns = count(&bench.conn(), "turns");
+    let stamp = || -> String {
+        bench
+            .conn()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [META_DERIVED_SCHEMA],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let keyed = || -> i64 {
+        bench
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM meta WHERE key = ?1",
+                [META_SUMMARY_FILLED],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let lowered = stamp();
+    assert_eq!(lowered, (DERIVED_SCHEMA - 1).to_string());
+
+    let mut store = bench.store();
+    let err = reindex::reindex(&mut store).expect_err("the planted fault must abort the rebuild");
+    drop(store);
+
+    assert!(err.to_string().contains("planted fault"), "{err}");
+    assert_eq!(bench.summary(), before, "an aborted rebuild moved the summary");
+    assert_eq!(stamp(), lowered, "an aborted rebuild moved derived_schema");
+    assert_eq!(count(&bench.conn(), "turns"), turns, "an aborted rebuild kept some of its writes");
+    assert_eq!(keyed(), 0, "an aborted rebuild wrote the summary's key");
+
+    bench.conn().execute_batch("DROP TRIGGER meta_fault").unwrap();
+    bench.reindex();
+    assert_ne!(bench.summary(), before, "the rebuild changes nothing, so the abort proved nothing");
+    bench.checked("the retried reindex");
+    assert_eq!(stamp(), DERIVED_SCHEMA.to_string());
+    assert_eq!(keyed(), 1, "the retried reindex left no summary key");
 }

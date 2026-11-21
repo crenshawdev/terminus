@@ -23,12 +23,13 @@
 //! hook already spawned. What injection does write is two kinds of FILE beside
 //! the store and never inside it: [`state`], one session's disposable scratch,
 //! and [`decision`], one durable record per prompt that a later ingest pass
-//! drains into the store. A write on the prompt path is exactly what the
-//! deadline cannot tolerate, and a blocked writer behind a 49-second backfill
-//! is strictly worse than a blocked reader.
+//! drains into the store. The brief reads the summary that ingest, retention and
+//! reindex keep, and writes none of it. A write on the prompt path is exactly
+//! what the deadline cannot tolerate, and a blocked writer behind a 49-second
+//! backfill is strictly worse than a blocked reader.
 //!
-//! **The scope comes off the payload.** [`Scope::Directory`] built from the
-//! payload's `cwd`, never [`Scope::current_directory`]: the working directory
+//! **The scope comes off the payload.** A `Scope::Directory` built from the
+//! payload's `cwd`, never `Scope::current_directory`: the working directory
 //! Claude Code chose for a hook may be a plugin root, a worktree or `/`, and
 //! resolving it here would scope the most history-laden sessions to the wrong
 //! project or to `Reason::UnknownProject`.
@@ -41,11 +42,6 @@ pub mod state;
 
 use std::path::Path;
 
-use rusqlite::Connection;
-
-use crate::config::Config;
-use crate::error::Result;
-use crate::recall::scope::{self, Scope, Scoped};
 use crate::store::Store;
 
 /// The shortest and longest a `session_id` may be and still name a file.
@@ -144,22 +140,6 @@ pub(crate) fn open(data_dir: &Path) -> Option<Store> {
         return None;
     }
     Some(store)
-}
-
-/// The project the payload's `cwd` sits in, resolved against the keys the
-/// archive already holds.
-///
-/// `None` when the payload carries no `cwd`, when the resolve failed, or when
-/// the scope can match nothing at all - an empty archive, a directory no
-/// archived project covers, or a project the config excludes. Every one of
-/// those is silence.
-pub(crate) fn scoped(conn: &Connection, config: &Config, payload: &Payload) -> Option<Scoped> {
-    let cwd = payload.cwd?;
-    let scoped = scope::resolve(conn, config, &Scope::Directory(cwd.into())).ok()?;
-    if scoped.is_empty() {
-        return None;
-    }
-    Some(scoped)
 }
 
 /// How many characters a string is, which is what an injection budget counts.
@@ -470,22 +450,11 @@ fn framed(description: &str, body: &str) -> String {
     format!("{description} {QUOTED_HISTORY}\n{OPEN_TAG}\n{body}\n{CLOSE_TAG}")
 }
 
-/// One count over the visible rows of a scoped project.
-pub(crate) fn count(conn: &Connection, head: &str, scoped: &Scoped) -> Result<i64> {
-    let mut sql = format!("{head} WHERE 1 = 1");
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    scoped.push_filter(&mut sql, &mut params);
-
-    let count = conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| {
-        r.get(0)
-    })?;
-    Ok(count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use crate::config::Config;
     use rusqlite::OpenFlags;
 
     /// The three stores injection must answer with silence, as directories a

@@ -447,6 +447,7 @@ name = "terminus-core"
 version = "2.1.0"
 dependencies = [
  "blake3",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

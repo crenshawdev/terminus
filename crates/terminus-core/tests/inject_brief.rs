@@ -1289,6 +1289,110 @@ fn a_session_excluded_under_its_worktree_key_is_neither_quoted_nor_counted() {
     }
 }
 
+/// A second session on `project-zeta`'s own branch, and one in another project.
+const REPO_AGAIN: Session<'static> = Session {
+    file: "zeta-repo-again.jsonl",
+    id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    project: "project-zeta",
+    branch: Some("branch-of-the-repo-one"),
+    day: "2026-08-12",
+    prompt: "the second repo prompt, about washers",
+    reply: "the second repo reply, about washers",
+};
+
+const ELSEWHERE: Session<'static> = Session {
+    file: "eta.jsonl",
+    id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    project: "project-eta",
+    branch: None,
+    day: "2026-08-11",
+    prompt: "the other project's prompt, about bolts",
+    reply: "the other project's reply, about bolts",
+};
+
+/// The pick and the list read `session_summary` through the index meant for each,
+/// in the pick's order: no scan of the table and no sort, with and without the
+/// exclusion clauses in the SQL.
+///
+/// The plans come from the bundled SQLite on the statements the brief runs, since
+/// a system `sqlite3` can plan differently.
+#[test]
+fn the_pick_and_the_list_read_session_summary_through_their_indexes() {
+    let bench = bench();
+    for session in [&REPO, &REPO_AGAIN, &FORKED, &ELSEWHERE] {
+        bench.archive(session);
+    }
+    let cwd = bench.project(REPO.project);
+    let payload = Payload {
+        session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
+        transcript_path: Some("/home/user/.claude/projects/-p/s.jsonl"),
+        cwd: cwd.to_str(),
+        prompt: None,
+        source: Some("startup"),
+    };
+    let excluding = Config::from_parts(
+        Vec::new(),
+        [ELSEWHERE.project, FORKED.project]
+            .map(|name| bench.project(name).to_string_lossy().into_owned())
+            .to_vec(),
+    );
+
+    let meant = [
+        ("pick", "idx_session_summary_project_last"),
+        (
+            "pick on a branch",
+            "idx_session_summary_project_branch_last",
+        ),
+        ("other sessions", "idx_session_summary_project_last_titled"),
+    ];
+    for (label, config) in [
+        ("no exclusions", Config::default()),
+        ("exclusions", excluding),
+    ] {
+        let plans =
+            brief::session_start_plans(&bench.data_dir, &config, &payload, REPO.branch.unwrap())
+                .expect("the plans of a filled store");
+        assert_eq!(plans.len(), meant.len());
+        for ((name, lines), (expected, index)) in plans.iter().zip(meant) {
+            assert_eq!(*name, expected);
+            let shown = format!("{label}, {name}: {lines:#?}");
+            let reads_the_index = |line: &&String| {
+                line.contains(&format!("USING INDEX {index} ("))
+                    || line.contains(&format!("USING COVERING INDEX {index} ("))
+            };
+            let through = lines
+                .iter()
+                .find(reads_the_index)
+                .unwrap_or_else(|| panic!("no line reads {index}: {shown}"));
+            if *name == "pick on a branch" {
+                assert!(
+                    through.contains("project=?") && through.contains("branch=?"),
+                    "the index line leaves out the project or the branch: {shown}"
+                );
+            }
+            let subqueries = lines
+                .iter()
+                .filter(|l| l.starts_with("LIST SUBQUERY"))
+                .count();
+            assert_eq!(
+                subqueries,
+                if label == "exclusions" { 2 } else { 0 },
+                "both exclusion clauses belong in the SQL, and only then: {shown}"
+            );
+            for line in lines {
+                assert!(
+                    line != "SCAN m" && !line.starts_with("SCAN m "),
+                    "a scan of session_summary: {shown}"
+                );
+                assert!(
+                    !(line.contains("TEMP B-TREE") && line.contains("ORDER BY")),
+                    "a sort for the ORDER BY: {shown}"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Which session the brief picks
 // ---------------------------------------------------------------------------
@@ -2032,4 +2136,564 @@ fn a_long_title_is_cut_with_a_mark() {
         .expect("the listed session");
     assert!(line.chars().count() < 100, "{line}");
     assert!(line.ends_with("..."), "{line}");
+}
+
+// ---------------------------------------------------------------------------
+// The gate: no brief until the store's summary is marked filled
+
+impl Bench {
+    /// Turn a store ingest built into one from before the upgrade: `sql` runs
+    /// first, then the key goes, over a plain connection.
+    fn before_the_upgrade(&self, sql: &str) {
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
+                .unwrap();
+        conn.execute_batch(sql).unwrap();
+        conn.execute(
+            "DELETE FROM meta WHERE key = ?1",
+            [terminus_core::summary::META_SUMMARY_FILLED],
+        )
+        .unwrap();
+    }
+
+    /// A `SessionStart` that follows a compaction, under a session of its own.
+    fn compacted_as(&self, session: &str, project: &str) -> Option<String> {
+        let cwd = self.project(project);
+        let payload = Payload {
+            session_id: Some(session),
+            transcript_path: Some("/home/user/.claude/projects/-p/s.jsonl"),
+            cwd: cwd.to_str(),
+            prompt: None,
+            source: Some("compact"),
+        };
+        brief::session_start(&self.data_dir, &Config::default(), &payload)
+    }
+}
+
+/// Every unfilled shape renders no brief and still leaves the next prompt its compaction debt.
+#[test]
+fn a_store_whose_summary_is_not_marked_filled_renders_no_brief() {
+    let project = EARLY.project;
+    let shapes = [
+        (
+            "no summary tables",
+            "DROP TABLE session_summary; DROP TABLE project_summary;".to_owned(),
+        ),
+        ("tables and no key", String::new()),
+        (
+            "part-filled and no key",
+            format!(
+                "DELETE FROM session_summary WHERE session_key IN \
+                 (SELECT session_key FROM session_meta WHERE session_id = '{}')",
+                LATE.id
+            ),
+        ),
+    ];
+
+    for (n, (shape, sql)) in shapes.iter().enumerate() {
+        let bench = bench();
+        bench.archive(&EARLY);
+        bench.archive(&LATE);
+        assert!(bench.brief(project).is_some(), "{shape}: the control");
+
+        bench.before_the_upgrade(sql);
+        assert_eq!(bench.brief(project), None, "{shape}");
+        let cwd = bench.project(project);
+        let payload = Payload {
+            session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
+            transcript_path: None,
+            cwd: cwd.to_str(),
+            prompt: None,
+            source: Some("startup"),
+        };
+        assert!(
+            brief::session_start_reads(&bench.data_dir, &Config::default(), &payload).is_none(),
+            "{shape}: the reads path renders where the hook would not"
+        );
+
+        let session = format!("99999999-0000-4000-8000-{n:012}");
+        assert_eq!(bench.compacted_as(&session, project), None, "{shape}");
+        let state = inject::state::State::load(&bench.data_dir, Some(&session));
+        assert!(state.compaction_owed, "{shape}: the debt was not left");
+    }
+}
+
+/// The brief finds its project among the summary's pairs, so a project the
+/// summary does not hold is unknown even where `session_meta` has its sessions.
+#[test]
+fn a_project_with_no_summary_row_renders_no_brief() {
+    let bench = bench();
+    bench.archive(&EARLY);
+    bench.archive(&LATE);
+    assert!(bench.brief(LATE.project).is_some(), "the control");
+
+    let conn = rusqlite::Connection::open(bench.data_dir.join(terminus_core::store::DB_FILE_NAME))
+        .unwrap();
+    let cwd = bench.project(LATE.project).to_string_lossy().into_owned();
+    let gone = conn
+        .execute("DELETE FROM project_summary WHERE project = ?1", [&cwd])
+        .unwrap();
+    assert_eq!(gone, 1, "the bench project has one pair");
+
+    assert_eq!(bench.brief(LATE.project), None);
+}
+
+/// The pointer's two numbers are the summary's, not a count of the archive.
+#[test]
+fn the_pointer_names_the_counts_the_summary_holds() {
+    let bench = bench();
+    bench.archive(&EARLY);
+    bench.archive(&LATE);
+    let control = bench.brief(LATE.project).expect("a brief");
+    assert!(control.contains("2 sessions and 4 turns"), "{control}");
+
+    let conn = rusqlite::Connection::open(bench.data_dir.join(terminus_core::store::DB_FILE_NAME))
+        .unwrap();
+    let cwd = bench.project(LATE.project).to_string_lossy().into_owned();
+    let set = conn
+        .execute(
+            "UPDATE project_summary SET session_count = 7, turn_count = 41 WHERE project = ?1",
+            [&cwd],
+        )
+        .unwrap();
+    assert_eq!(set, 1, "the bench project has one pair");
+
+    let brief = bench.brief(LATE.project).expect("a brief");
+    assert!(brief.contains("7 sessions and 41 turns"), "{brief}");
+}
+
+impl Bench {
+    /// Set columns of one session's summary row by hand, as the one row it should be.
+    fn edit_summary(&self, session_id: &str, set: &str) {
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
+                .unwrap();
+        let changed = conn
+            .execute(
+                &format!(
+                    "UPDATE session_summary SET {set} WHERE session_key IN \
+                     (SELECT session_key FROM session_meta WHERE session_id = '{session_id}')"
+                ),
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "{session_id}: {set}");
+    }
+}
+
+/// Two titled sessions of one project, each with a typed prompt, the newer one picked.
+fn two_titled() -> Bench {
+    let bench = bench();
+    bench.archive_titled(&titled("a.jsonl", "a", "2026-08-10"), "Older work");
+    bench.archive_titled(&titled("b.jsonl", "b", "2026-08-12"), "Newer work");
+    let control = bench.brief("listed").expect("a brief");
+    assert!(control.contains("ended 2026-08-12."), "{control}");
+    assert!(control.contains("2026-08-10 Older work"), "{control}");
+    bench
+}
+
+#[test]
+fn a_listed_sessions_title_is_the_summarys() {
+    let bench = two_titled();
+    bench.edit_summary("a", "title = 'Title from the summary'");
+    let brief = bench.brief("listed").expect("a brief");
+    assert!(
+        brief.contains("2026-08-10 Title from the summary"),
+        "{brief}"
+    );
+    assert!(!brief.contains("Older work"), "{brief}");
+}
+
+#[test]
+fn the_picked_sessions_branch_is_the_summarys() {
+    let bench = two_titled();
+    bench.edit_summary("b", "branch = 'branch-from-the-summary'");
+    let brief = bench.brief("listed").expect("a brief");
+    assert!(
+        brief.contains("ended 2026-08-12, on branch branch-from-the-summary."),
+        "{brief}"
+    );
+}
+
+#[test]
+fn the_sessions_are_ordered_by_the_summarys_last_turn_at() {
+    let bench = two_titled();
+    bench.edit_summary("a", "last_turn_at = '2026-08-20T10:00:00.000Z'");
+    let brief = bench.brief("listed").expect("a brief");
+    assert!(brief.contains("ended 2026-08-20."), "{brief}");
+    assert!(brief.contains("2026-08-12 Newer work"), "{brief}");
+    assert!(!brief.contains("Older work"), "{brief}");
+}
+
+/// The quotes are located by the summary row, and the blocks hold only their text.
+#[test]
+fn the_quotes_are_located_by_the_summary_row() {
+    let bench = bench();
+    bench.archive(&LATE);
+    let control = bench.brief(LATE.project).expect("a brief");
+    assert!(control.contains("It last asked: "), "{control}");
+    assert!(control.contains("It last answered: "), "{control}");
+
+    bench.edit_summary(
+        LATE.id,
+        "prompts = '[]', reply_id = NULL, reply_stream_offset = NULL, reply_byte_len = NULL",
+    );
+    let brief = bench.brief(LATE.project).expect("a brief");
+    assert!(!brief.contains("It last asked"), "{brief}");
+    assert!(!brief.contains("It last answered"), "{brief}");
+}
+
+/// The file line is the summary's list, cut and counted at read time.
+#[test]
+fn the_file_line_is_the_summarys_list() {
+    let bench = bench();
+    bench.archive(&LATE);
+    assert_eq!(edited(&bench.brief(LATE.project).unwrap()), None);
+
+    let files: Vec<String> = (0..10).map(|n| format!("src/{n:02}.rs")).collect();
+    bench.edit_summary(
+        LATE.id,
+        &format!("edited_files = '{}'", serde_json::json!(files)),
+    );
+    let brief = bench.brief(LATE.project).expect("a brief");
+    assert_eq!(
+        edited(&brief),
+        Some(
+            "src/00.rs, src/01.rs, src/02.rs, src/03.rs, src/04.rs, src/05.rs, src/06.rs, \
+             src/07.rs and 2 more."
+        ),
+        "{brief}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The page counter
+// ---------------------------------------------------------------------------
+
+/// A scratch WAL-mode database with one table of 200 one-KiB blobs, and the
+/// number of pages `dbstat` gives that table.
+fn scratch_table(dir: &Path) -> (PathBuf, i64) {
+    let path = dir.join("scratch.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.pragma_update(None, "journal_mode", "wal").unwrap();
+    conn.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB NOT NULL)",
+        [],
+    )
+    .unwrap();
+    for _ in 0..200 {
+        conn.execute("INSERT INTO t (b) VALUES (randomblob(1024))", [])
+            .unwrap();
+    }
+    let pages = conn
+        .query_row("SELECT count(*) FROM dbstat WHERE name = ?1", ["t"], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    (path, pages)
+}
+
+/// Read every blob of `t` on a connection and return how far its counter moved.
+fn full_read(conn: &rusqlite::Connection) -> i64 {
+    let before = terminus_core::testkit::cache_misses(conn);
+    let mut statement = conn.prepare("SELECT b FROM t").unwrap();
+    let bytes: usize = statement
+        .query_map([], |r| Ok(r.get::<_, Vec<u8>>(0)?.len()))
+        .unwrap()
+        .map(Result::unwrap)
+        .sum();
+    assert_eq!(bytes, 200 * 1024);
+    terminus_core::testkit::cache_misses(conn) - before
+}
+
+/// The counter every page-count criterion rests on counts the pages one
+/// connection loads, once each, and the same number every time.
+///
+/// A full read of a table on a fresh connection loads at least the table's own
+/// pages and at most a couple more for the schema, and reading it again loads
+/// none, because the connection's page cache already holds them.
+#[test]
+fn the_page_counter_counts_each_page_a_connection_loads_once() {
+    // Measured at 2 over the table's pages: the schema page and one more. 4 leaves room.
+    const SLACK: i64 = 4;
+    let bench = bench();
+    std::fs::create_dir_all(&bench.work).unwrap();
+    let (path, pages) = scratch_table(&bench.work);
+    assert!(pages > 40, "the table is a real b-tree: {pages} pages");
+
+    let open = || {
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap()
+    };
+    let first = open();
+    let moved = full_read(&first);
+    assert!(
+        (pages..=pages + SLACK).contains(&moved),
+        "a full read moved the counter by {moved}, and the table has {pages} pages"
+    );
+    assert_eq!(full_read(&first), 0, "the same read again loads nothing");
+
+    let second = open();
+    assert_eq!(
+        full_read(&second),
+        moved,
+        "a second connection counts alike"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The pages the brief reads do not follow the size of the store
+// ---------------------------------------------------------------------------
+
+/// What one store of the page-count test holds besides the picked session: how
+/// many titled sessions in the picked project and in another one, how many
+/// untitled sessions dated just before the picked one, and how many sessions
+/// under the excluded worktree key dated just after it.
+struct Fill {
+    titled_in_project: usize,
+    titled_elsewhere: usize,
+    untitled: usize,
+    excluded: usize,
+}
+
+/// The `cwd` of each project in the page-count test: made up, absolute, and
+/// holding no temp path, so no index key's length depends on the machine. The
+/// bench's root joined to an absolute path is that path.
+const PICKED_CWD: &str = "/bench/project-zeta";
+const WORKTREE_CWD: &str = "/bench/project-zeta/.claude/worktrees/wt-a";
+const OTHER_CWD: &str = "/bench/project-eta";
+
+/// The session the brief picks in both stores: the newest in the picked project
+/// that the worktree exclusion keeps.
+const PICKED: Session<'static> = Session {
+    // Below a `projects` folder with a uuid name, ingest keys it by the name alone.
+    file: "projects/bench/99999999-9999-4999-8999-999999999999.jsonl",
+    id: "99999999-9999-4999-8999-999999999999",
+    project: PICKED_CWD,
+    branch: None,
+    day: "2026-03-01",
+    prompt: "the picked prompt, about sprockets",
+    reply: "the picked reply, about sprockets",
+};
+
+/// The most pages the large store's brief may read beyond the small store's:
+/// the measured difference of 17, and 4 for a b-tree that grows a level.
+///
+/// No index column holds a temp path, so the count is the same under any
+/// `TMPDIR`: 28 and 45 here and under a 120-character one.
+///
+/// The two stores hold the same pairs in `project_summary` and the same picked
+/// session. What differs is how deep the b-trees are, the table pages the
+/// list's few rows sit in, and the index pages the pick walks past the excluded
+/// sessions in front of it, about one page for every sixteen of them.
+const PAGE_ALLOWANCE: i64 = 21;
+
+impl Bench {
+    /// A store built the ordinary way, one transcript to a session.
+    ///
+    /// The blocks are archived spread evenly through one another, as sessions
+    /// of one project arrive among everyone else's. A block archived in a run
+    /// would sit in a few table pages and hide what a table row per session
+    /// costs.
+    fn filled(&self, fill: &Fill) {
+        // (kind, position among its block, project, day, titled)
+        let mut order: Vec<(f64, u32, usize, &str, &str, bool)> = Vec::new();
+        for (kind, count, project, day, titled) in [
+            (
+                1,
+                fill.titled_in_project,
+                PICKED.project,
+                "2026-01-01",
+                true,
+            ),
+            (2, fill.titled_elsewhere, OTHER_CWD, "2026-01-01", true),
+            (3, fill.untitled, PICKED.project, "2026-02-01", false),
+            (4, fill.excluded, WORKTREE_CWD, "2026-04-01", true),
+        ] {
+            for n in 0..count {
+                order.push((
+                    (n as f64 + 0.5) / count as f64,
+                    kind,
+                    n,
+                    project,
+                    day,
+                    titled,
+                ));
+            }
+        }
+        order.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, kind, n, project, day, titled) in order {
+            let (file, id) = (
+                format!("projects/bench/{kind:08x}-0000-4000-8000-{n:012x}.jsonl"),
+                format!("{kind:08x}-0000-4000-8000-{n:012x}"),
+            );
+            let (prompt, reply) = (format!("prompt {kind}-{n}"), format!("reply {kind}-{n}"));
+            let session = Session {
+                file: &file,
+                id: &id,
+                project,
+                branch: None,
+                day,
+                prompt: &prompt,
+                reply: &reply,
+            };
+            if titled {
+                self.archive_titled(&session, &format!("Work number {kind}-{n}"));
+            } else {
+                self.archive(&session);
+            }
+        }
+        self.archive_titled(&PICKED, "The picked work");
+    }
+
+    /// How many pages the brief of the picked project reads in, under a config.
+    fn page_reads(&self, config: &Config) -> i64 {
+        let cwd = self.project(PICKED.project);
+        let payload = Payload {
+            session_id: Some("0e5e6a1e-9f2b-4c7a-8d31-6b4f2a9c1d55"),
+            transcript_path: Some("/home/user/.claude/projects/-p/s.jsonl"),
+            cwd: cwd.to_str(),
+            prompt: None,
+            source: Some("startup"),
+        };
+        brief::session_start_page_reads(&self.data_dir, config, &payload).expect("a brief renders")
+    }
+
+    /// No `project`, `session_key` or `project_pre_worktree` of `session_summary`
+    /// holds this bench's directory, as given or canonical.
+    fn assert_no_temp_path_in_the_index_keys(&self) {
+        let dir = self._dir.path();
+        let canonical = dir.canonicalize().unwrap();
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
+                .unwrap();
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM session_summary", [], |r| r.get(0))
+            .unwrap();
+        assert!(total > 0, "the store holds no sessions");
+        for path in [dir, canonical.as_path()] {
+            let holding: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM session_summary WHERE instr(project, ?1) > 0 \
+                     OR instr(session_key, ?1) > 0 OR instr(project_pre_worktree, ?1) > 0",
+                    [path.to_string_lossy()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                holding,
+                0,
+                "{holding} of {total} rows hold {}",
+                path.display()
+            );
+        }
+    }
+
+    fn count(&self, sql: &str) -> i64 {
+        let conn =
+            rusqlite::Connection::open(self.data_dir.join(terminus_core::store::DB_FILE_NAME))
+                .unwrap();
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+}
+
+/// The pages a brief reads in stay inside a stated allowance when the sessions,
+/// the untitled ones and the excluded ones all grow tenfold, and the test can
+/// tell: take the indexes away and they don't, with the brief unchanged.
+///
+/// Two stores hold the same projects and the same picked session. The large one
+/// has ten times the sessions, ten times the untitled sessions the list would
+/// have to look at without a partial index, and ten times the sessions under
+/// the excluded worktree key that sit in front of the pick. Measured, in
+/// pages: small 28, large 45, large with the indexes dropped 87.
+#[test]
+fn the_pages_the_brief_reads_do_not_follow_the_size_of_the_store() {
+    let small = bench();
+    small.filled(&Fill {
+        titled_in_project: 80,
+        titled_elsewhere: 20,
+        untitled: 20,
+        excluded: 20,
+    });
+    let large = bench();
+    large.filled(&Fill {
+        titled_in_project: 810,
+        titled_elsewhere: 200,
+        untitled: 200,
+        excluded: 200,
+    });
+
+    let excluding = || Config::from_parts(Vec::new(), vec![WORKTREE_CWD.to_owned()]);
+    let (small_config, large_config) = (excluding(), excluding());
+
+    // The premises: what the two stores hold, counted. No index column holds the
+    // temp path, which is what keeps the count the same on every machine.
+    small.assert_no_temp_path_in_the_index_keys();
+    large.assert_no_temp_path_in_the_index_keys();
+    let rows = |b: &Bench| b.count("SELECT count(*) FROM session_summary");
+    let in_project = |b: &Bench, extra: &str| {
+        b.count(&format!(
+            "SELECT count(*) FROM session_summary WHERE project = '{}' {extra}",
+            b.project(PICKED.project).to_string_lossy()
+        ))
+    };
+    for b in [&small, &large] {
+        assert!(
+            in_project(b, "AND title IS NOT NULL AND project_pre_worktree IS NULL") > 64,
+            "the picked project holds more titled sessions than the pick looks at"
+        );
+    }
+    assert!(rows(&large) >= 10 * rows(&small), "sessions");
+    let untitled = "AND title IS NULL";
+    assert!(in_project(&large, untitled) >= 10 * in_project(&small, untitled));
+    assert!(in_project(&small, untitled) > 0);
+    let excluded = "AND project_pre_worktree IS NOT NULL";
+    assert!(in_project(&large, excluded) >= 10 * in_project(&small, excluded));
+    assert!(in_project(&small, excluded) > 0);
+
+    let small_text = small.brief_with(PICKED.project, &small_config).unwrap();
+    let large_text = large.brief_with(PICKED.project, &large_config).unwrap();
+    for (name, text) in [("small", &small_text), ("large", &large_text)] {
+        assert!(text.contains(PICKED.prompt), "{name}: {text}");
+        assert!(!text.contains("Work number 4-"), "{name}: {text}");
+    }
+
+    let (small_pages, large_pages) = (
+        small.page_reads(&small_config),
+        large.page_reads(&large_config),
+    );
+    assert!(
+        large_pages <= small_pages + PAGE_ALLOWANCE,
+        "the large store's brief reads {large_pages} pages, the small one's {small_pages}"
+    );
+
+    // The same large store without its indexes: the answer is the same, and the
+    // pages are not.
+    let conn = rusqlite::Connection::open(large.data_dir.join(terminus_core::store::DB_FILE_NAME))
+        .unwrap();
+    let indexes: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema
+             WHERE type = 'index' AND name LIKE 'idx\\_session\\_summary\\_%' ESCAPE '\\'",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(indexes.len(), 3, "{indexes:?}");
+    for name in &indexes {
+        conn.execute(&format!("DROP INDEX {name}"), []).unwrap();
+    }
+    drop(conn);
+    assert_eq!(
+        large.brief_with(PICKED.project, &large_config).unwrap(),
+        large_text,
+        "the indexes change the plan and not the answer"
+    );
+    let unindexed = large.page_reads(&large_config);
+    assert!(
+        unindexed > small_pages + PAGE_ALLOWANCE,
+        "without its indexes the large store reads {unindexed} pages"
+    );
 }

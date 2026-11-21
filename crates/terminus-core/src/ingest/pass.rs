@@ -57,6 +57,10 @@ pub struct Summary {
     pub excluded: Vec<PathBuf>,
     /// What recovery repaired before the walk began.
     pub recovery: crate::recover::Recovered,
+    /// The line saying the summary's fill could not run, when it could not. It
+    /// reaches `runs.error`; a fill that worked, or had nothing to do, leaves
+    /// it `None` and says nothing.
+    pub summary_fill: Option<String>,
     /// The line saying the continuation-link sweep could not finish, when it
     /// could not. It reaches `runs.error`; a healthy sweep leaves it `None`
     /// and says nothing.

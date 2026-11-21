@@ -80,6 +80,7 @@ pub(crate) fn insert(
     for (path, reason) in summary.failures.iter().chain(&summary.unreadable) {
         errors.push(note(path, reason));
     }
+    errors.extend(summary.summary_fill.clone());
     errors.extend(summary.feedback.lines());
     errors.extend(summary.continuations.clone());
     errors.extend(summary.outcomes.errors());

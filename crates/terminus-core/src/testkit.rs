@@ -1005,3 +1005,269 @@ pub fn age(path: &std::path::Path) {
     )
     .unwrap();
 }
+
+/// Check the summary tables against what `session_meta` and `turns` give,
+/// working the expected rows out here from those two tables alone and never
+/// through [`crate::summary`]. The first difference comes back as the error.
+pub fn check_summary(conn: &rusqlite::Connection) -> Result<(), String> {
+    check_project_summary(conn).map_err(|e| format!("project_summary: {e}"))?;
+    check_session_summary(conn).map_err(|e| format!("session_summary: {e}"))
+}
+
+/// What `session_summary` has to hold for one main session, by column, worked
+/// out from `session_meta`, `session_titles` and `turns` alone.
+const EXPECTED_SESSION_ROW: &str = "\
+    SELECT m.last_turn_at, m.branch, m.project, m.project_pre_worktree, m.cwd,
+           (SELECT title FROM session_titles s WHERE s.session_key = m.session_key),
+           EXISTS (SELECT 1 FROM turns t
+                   WHERE t.session_key = m.session_key AND t.is_typed = 1),
+           (SELECT count(*) FROM turns t WHERE t.session_key = m.session_key),
+           (SELECT json_group_array(json_array(id, stream_offset, byte_len)) FROM
+              (SELECT id, stream_offset, byte_len FROM turns
+               WHERE session_key = ?1 AND record_type = 'user' AND is_typed IS NOT 0
+               ORDER BY turn_seq DESC LIMIT 12)),
+           (SELECT id FROM turns WHERE session_key = ?1 AND record_type = 'assistant'
+            ORDER BY turn_seq DESC LIMIT 1),
+           (SELECT stream_offset FROM turns WHERE session_key = ?1
+            AND record_type = 'assistant' ORDER BY turn_seq DESC LIMIT 1),
+           (SELECT byte_len FROM turns WHERE session_key = ?1
+            AND record_type = 'assistant' ORDER BY turn_seq DESC LIMIT 1)
+    FROM session_meta m WHERE m.session_key = ?1";
+
+const STORED_SESSION_ROW: &str = "\
+    SELECT last_turn_at, branch, project, project_pre_worktree, cwd, title,
+           has_typed_prompt, turn_count, prompts, reply_id, reply_stream_offset,
+           reply_byte_len
+    FROM session_summary WHERE session_key = ?1";
+
+const SESSION_COLUMNS: &[&str] = &[
+    "last_turn_at",
+    "branch",
+    "project",
+    "project_pre_worktree",
+    "cwd",
+    "title",
+    "has_typed_prompt",
+    "turn_count",
+    "prompts",
+    "reply_id",
+    "reply_stream_offset",
+    "reply_byte_len",
+];
+
+fn check_session_summary(conn: &rusqlite::Connection) -> Result<(), String> {
+    use rusqlite::types::Value;
+    let keys = |sql: &str| -> Result<Vec<String>, String> {
+        conn.prepare(sql)
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())
+    };
+    let mains =
+        keys("SELECT session_key FROM session_meta WHERE parent_session_key IS NULL ORDER BY 1")?;
+    let stored = keys("SELECT session_key FROM session_summary ORDER BY 1")?;
+    if mains != stored {
+        return Err(format!(
+            "rows for {stored:?}, but the main sessions are {mains:?}"
+        ));
+    }
+    let row = |sql: &str, key: &str| -> Result<Vec<Value>, String> {
+        conn.query_row(sql, [key], |r| {
+            (0..SESSION_COLUMNS.len())
+                .map(|i| r.get::<_, Value>(i))
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+    };
+    for key in &mains {
+        let (want, got) = (
+            row(EXPECTED_SESSION_ROW, key)?,
+            row(STORED_SESSION_ROW, key)?,
+        );
+        if let Some(at) = (0..want.len()).find(|&i| want[i] != got[i]) {
+            return Err(format!(
+                "{key}: {} holds {:?}, rows give {:?}",
+                SESSION_COLUMNS[at], got[at], want[at]
+            ));
+        }
+        let (want, got) = (expected_edits(conn, key)?, stored_edits(conn, key)?);
+        if want != got {
+            return Err(format!(
+                "{key}: edited_files holds {got:?}, rows give {want:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn stored_edits(conn: &rusqlite::Connection, key: &str) -> Result<Vec<String>, String> {
+    let json: String = conn
+        .query_row(
+            "SELECT edited_files FROM session_summary WHERE session_key = ?1",
+            [key],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    serde_json::from_str(&json).map_err(|e| format!("edited_files is not a list of strings: {e}"))
+}
+
+/// The in-project paths a session edited, last touched first, with a root rule
+/// of this file's own: the longest of the session's three roots that the path
+/// sits under, a relative path as written, an absolute one under no root left
+/// out.
+fn expected_edits(conn: &rusqlite::Connection, key: &str) -> Result<Vec<String>, String> {
+    let roots: Vec<Option<String>> = conn
+        .query_row(
+            "SELECT cwd, project_pre_worktree, project FROM session_meta WHERE session_key = ?1",
+            [key],
+            |r| Ok(vec![r.get(0)?, r.get(1)?, r.get(2)?]),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut roots: Vec<String> = roots.into_iter().flatten().collect();
+    roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+
+    let mut last: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut statement = conn
+        .prepare(
+            "SELECT t.turn_seq, e.value_norm FROM turns t JOIN entities e ON e.turn_id = t.id
+             WHERE t.session_key = ?1 AND e.kind = 'path'
+               AND t.tool_name IN ('Edit', 'MultiEdit', 'Write', 'NotebookEdit')",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = statement
+        .query_map([key], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (seq, path) = row.map_err(|e| e.to_string())?;
+        let at = last.entry(path).or_insert(seq);
+        *at = (*at).max(seq);
+    }
+    let mut ordered: Vec<(i64, String)> = last.into_iter().map(|(p, s)| (s, p)).collect();
+    ordered.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+    Ok(ordered
+        .into_iter()
+        .filter_map(|(_, path)| {
+            let under = roots.iter().find_map(|root| {
+                path.strip_prefix(root.as_str())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .map(str::to_owned)
+            });
+            under.or_else(|| (!path.starts_with('/') && !path.starts_with('~')).then_some(path))
+        })
+        .collect())
+}
+
+fn check_project_summary(conn: &rusqlite::Connection) -> Result<(), String> {
+    type Pair = (Option<String>, Option<String>);
+    let read = |sql: &str| -> Result<std::collections::BTreeMap<Pair, (i64, i64)>, String> {
+        conn.prepare(sql)
+            .map_err(|e| e.to_string())?
+            .query_map([], |r| Ok(((r.get(0)?, r.get(1)?), (r.get(2)?, r.get(3)?))))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())
+    };
+    let expected = read(
+        "SELECT m.project, m.project_pre_worktree, count(*),
+                sum((SELECT count(*) FROM turns t WHERE t.session_key = m.session_key))
+         FROM session_meta m GROUP BY m.project, m.project_pre_worktree",
+    )?;
+    let stored = read(
+        "SELECT project, project_pre_worktree, session_count, turn_count FROM project_summary",
+    )?;
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM project_summary", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if rows as usize != stored.len() {
+        return Err(format!(
+            "{rows} rows hold only {} distinct pairs",
+            stored.len()
+        ));
+    }
+    for (pair, counts) in &expected {
+        match stored.get(pair) {
+            None => return Err(format!("no row for {pair:?}, which holds {counts:?}")),
+            Some(got) if got != counts => {
+                return Err(format!("{pair:?} holds {got:?}, rows give {counts:?}"))
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(pair) = stored.keys().find(|pair| !expected.contains_key(*pair)) {
+        return Err(format!("a row for {pair:?}, which no session holds"));
+    }
+    Ok(())
+}
+
+/// How many pages this connection has had to read in, from the database file or
+/// the WAL, because its own page cache didn't hold them. SQLite's
+/// `SQLITE_DBSTATUS_CACHE_MISS`, read without resetting it.
+pub fn cache_misses(conn: &rusqlite::Connection) -> i64 {
+    use rusqlite::ffi;
+    let (mut current, mut highwater) = (0, 0);
+    // SAFETY: the handle is the live connection's, and both out-pointers are locals that outlive the call.
+    let rc = unsafe {
+        ffi::sqlite3_db_status(
+            conn.handle(),
+            ffi::SQLITE_DBSTATUS_CACHE_MISS,
+            &mut current,
+            &mut highwater,
+            0,
+        )
+    };
+    assert_eq!(rc, ffi::SQLITE_OK, "sqlite3_db_status refused CACHE_MISS");
+    i64::from(current)
+}
+
+/// Drop a file's pages from the kernel's page cache: fsync it so none is left
+/// dirty, then advise the whole file `DONTNEED`. Linux only, no root. The call is
+/// advisory, so a caller that needs the pages gone checks with
+/// [`resident_pages`].
+#[cfg(target_os = "linux")]
+pub fn evict_from_page_cache(path: &Path) {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    file.sync_all()
+        .unwrap_or_else(|e| panic!("sync {}: {e}", path.display()));
+    // SAFETY: the descriptor stays open for the whole call and the call touches no memory of ours.
+    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    assert_eq!(rc, 0, "posix_fadvise on {} returned {rc}", path.display());
+}
+
+/// How many of a file's pages are in the kernel's page cache right now. A
+/// zero-length file has none. Maps the file and asks `mincore`, which faults
+/// nothing in. Linux only.
+#[cfg(target_os = "linux")]
+pub fn resident_pages(path: &Path) -> usize {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let len = file.metadata().unwrap().len() as usize;
+    if len == 0 {
+        return 0;
+    }
+    // SAFETY: sysconf takes no pointer.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    // SAFETY: a read-only shared map of an open file; the kernel picks the address and the result is checked below.
+    let map = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(map, libc::MAP_FAILED, "mmap {}", path.display());
+    let mut resident = vec![0u8; len.div_ceil(page)];
+    // SAFETY: `map` is a live mapping of `len` bytes and the vector holds one byte per page of it.
+    let rc = unsafe { libc::mincore(map, len, resident.as_mut_ptr()) };
+    let failure = std::io::Error::last_os_error();
+    // SAFETY: unmapping exactly what was mapped above, and nothing else holds a reference into it.
+    unsafe { libc::munmap(map, len) };
+    assert_eq!(rc, 0, "mincore {}: {failure}", path.display());
+    resident.iter().filter(|byte| **byte & 1 == 1).count()
+}
